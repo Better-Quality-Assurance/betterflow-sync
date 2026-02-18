@@ -21,18 +21,33 @@ datas = [
     (str(resources_dir), "resources"),
 ]
 
-# Hidden imports for pystray and keyring backends
+# Hidden imports for pystray, keyring backends, and our modules
 hiddenimports = [
     "pystray._darwin" if is_mac else "pystray._win32",
     "keyring.backends.macOS" if is_mac else "keyring.backends.Windows",
     "PIL._tkinter_finder",
     "apscheduler.triggers.interval",
     "apscheduler.schedulers.background",
+    # Our modules (absolute imports from src/)
+    "config",
+    "sync",
+    "sync.aw_client",
+    "sync.bf_client",
+    "sync.sync_engine",
+    "sync.queue",
+    "sync.privacy",
+    "sync.retry",
+    "auth",
+    "auth.keychain",
+    "auth.login",
+    "ui",
+    "ui.tray",
+    "ui.preferences",
 ]
 
 a = Analysis(
-    [str(src_dir / "main.py")],
-    pathex=[str(root_dir)],
+    [str(src_dir / "entry_point.py")],
+    pathex=[str(root_dir), str(src_dir)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

@@ -1,29 +1,33 @@
-"""BetterFlow Sync - Main entry point."""
+"""Entry point for PyInstaller bundle."""
+
+import sys
+import os
+
+# Add the src directory to path for absolute imports
+if getattr(sys, 'frozen', False):
+    # Running as compiled
+    bundle_dir = sys._MEIPASS
+    sys.path.insert(0, bundle_dir)
+else:
+    # Running in development
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, src_dir)
+
+# Now import and run the app
+from config import Config, setup_logging
+from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
+from auth import KeychainManager, LoginManager
+from ui.tray import TrayIcon, TrayState
+from ui.preferences import show_login_window, show_preferences_window
 
 import logging
 import signal
-import sys
 import threading
-import time
 from datetime import datetime
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-
-# Support both relative imports (module) and absolute imports (PyInstaller)
-try:
-    from .config import Config, setup_logging
-    from .sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
-    from .auth import KeychainManager, LoginManager
-    from .ui.tray import TrayIcon, TrayState
-    from .ui.preferences import show_login_window, show_preferences_window
-except ImportError:
-    from config import Config, setup_logging
-    from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
-    from auth import KeychainManager, LoginManager
-    from ui.tray import TrayIcon, TrayState
-    from ui.preferences import show_login_window, show_preferences_window
 
 logger = logging.getLogger(__name__)
 
