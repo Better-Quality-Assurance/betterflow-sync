@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betterflow-sync"
+version = "1.0.0"
+description = "BetterFlow Sync Companion - Syncs ActivityWatch data to BetterFlow"
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.10"
+authors = [
+    {name = "BetterQA", email = "support@betterqa.co"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Scheduling",
+]
+
+dependencies = [
+    "requests>=2.31",
+    "pystray>=0.19",
+    "keyring>=24.0",
+    "apscheduler>=3.10",
+    "platformdirs>=3.0",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.0",
+    "pytest-cov>=4.0",
+    "responses>=0.23",
+    "pyinstaller>=6.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+betterflow-sync = "src.main:main"
+
+[project.gui-scripts]
+betterflow-sync-gui = "src.main:main"
+
+[project.urls]
+Homepage = "https://betterflow.eu"
+Documentation = "https://betterflow.eu/docs/agent"
+Repository = "https://github.com/BetterQA/betterflow"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
