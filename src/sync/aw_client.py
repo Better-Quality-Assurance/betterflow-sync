@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 BUCKET_TYPE_WINDOW = "aw-watcher-window"
 BUCKET_TYPE_AFK = "aw-watcher-afk"
 BUCKET_TYPE_WEB = "aw-watcher-web"
+BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
 
 
 @dataclass
@@ -55,6 +56,21 @@ class AWEvent:
     def status(self) -> Optional[str]:
         """Get AFK status from event data."""
         return self.data.get("status")
+
+    @property
+    def presses(self) -> int:
+        """Get keystroke count from input event."""
+        return self.data.get("presses", 0)
+
+    @property
+    def clicks(self) -> int:
+        """Get mouse click count from input event."""
+        return self.data.get("clicks", 0)
+
+    @property
+    def scrolls(self) -> int:
+        """Get scroll count from input event."""
+        return self.data.get("scrolls", 0)
 
 
 @dataclass
@@ -190,6 +206,11 @@ class AWClient:
         """Get all web watcher buckets."""
         buckets = self.get_buckets()
         return [b for b in buckets.values() if b.type == BUCKET_TYPE_WEB]
+
+    def get_input_buckets(self) -> list[AWBucket]:
+        """Get all input watcher buckets (keystroke/click tracking)."""
+        buckets = self.get_buckets()
+        return [b for b in buckets.values() if b.type == BUCKET_TYPE_INPUT]
 
     def get_events_since(
         self, bucket_id: str, since: datetime, limit: int = 1000

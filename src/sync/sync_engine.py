@@ -8,7 +8,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from ..config import Config, PrivacySettings
-from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK
+from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT
 from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
 from .queue import OfflineQueue
 
@@ -109,13 +109,14 @@ class SyncEngine:
         try:
             window_buckets = self.aw.get_window_buckets()
             afk_buckets = self.aw.get_afk_buckets()
+            input_buckets = self.aw.get_input_buckets()
         except AWClientError as e:
             stats.errors.append(f"Failed to get buckets: {e}")
             return stats
 
-        # Sync each bucket
+        # Sync each bucket (including input for fraud detection)
         all_events = []
-        for bucket in window_buckets + afk_buckets:
+        for bucket in window_buckets + afk_buckets + input_buckets:
             try:
                 events = self._sync_bucket(bucket.id, bucket.type, stats)
                 all_events.extend(events)
@@ -212,10 +213,16 @@ class SyncEngine:
                 data["url"] = self._process_url(event.url, privacy)
         elif bucket_type == BUCKET_TYPE_AFK:
             data["status"] = event.status
+        elif bucket_type == BUCKET_TYPE_INPUT:
+            # Input events track keystrokes, clicks, scrolls for fraud detection
+            data["presses"] = event.presses
+            data["clicks"] = event.clicks
+            data["scrolls"] = event.scrolls
 
         return {
             "timestamp": event.timestamp.isoformat(),
             "duration": round(event.duration, 2),
+            "bucket_type": bucket_type,
             "data": data,
         }
 
