@@ -1,17 +1,16 @@
 """BetterFlow API client - syncs events to BetterFlow server."""
 
-import gzip
-import json
 import logging
 import platform
+import warnings
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
 
 import requests
 
 from ..config import DEFAULT_API_URL
-from .retry import RetryConfig, retry_with_backoff, RetryExhausted
+from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+from .retry import RetryConfig
 
 __all__ = [
     "BetterFlowClient",
@@ -75,35 +74,15 @@ class SyncResult:
     error: Optional[str] = None
 
 
-class BetterFlowClientError(Exception):
-    """BetterFlow client error."""
+class BetterFlowClient(BaseApiClient):
+    """Client for syncing events to BetterFlow server.
 
-    pass
-
-
-class BetterFlowAuthError(BetterFlowClientError):
-    """Authentication error."""
-
-    pass
-
-
-class _TransientError(Exception):
-    """Internal: Marks an error as transient/retryable."""
-
-    pass
-
-
-class BetterFlowClient:
-    """Client for syncing events to BetterFlow server."""
-
-    # Default retry configuration for transient network failures
-    DEFAULT_RETRY_CONFIG = RetryConfig(
-        max_retries=3,
-        base_delay=1.0,
-        max_delay=30.0,
-        exponential_base=2.0,
-        jitter=True,
-    )
+    Inherits HTTP functionality from BaseApiClient.
+    Provides domain-specific methods for:
+    - Authentication (exchange_code, revoke)
+    - Event sync (send_events, start_session, end_session)
+    - Configuration (get_config, get_projects, update_project_mapping)
+    """
 
     def __init__(
         self,
@@ -124,138 +103,18 @@ class BetterFlowClient:
             timeout: Request timeout in seconds
             retry_config: Configuration for retry with exponential backoff
         """
-        self.api_url = api_url.rstrip("/")
-        self._web_base_url: Optional[str] = None
-        self.token = token
-        self.device_id = device_id
-        self.compress = compress
-        self.timeout = timeout
-        self.retry_config = retry_config or self.DEFAULT_RETRY_CONFIG
-        self._session = requests.Session()
+        super().__init__(
+            api_url=api_url,
+            token=token,
+            device_id=device_id,
+            compress=compress,
+            timeout=timeout,
+            retry_config=retry_config,
+        )
 
-    def _get_headers(self) -> dict:
-        """Get request headers."""
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "BetterFlow-Sync/1.0.0",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        if self.device_id:
-            headers["X-Device-ID"] = self.device_id
-        return headers
-
-    def _request(
-        self,
-        method: str,
-        endpoint: str,
-        data: Optional[dict] = None,
-        compress: bool = False,
-        retry: bool = True,
-    ) -> dict:
-        """Make request to BetterFlow API.
-
-        Args:
-            method: HTTP method
-            endpoint: API endpoint
-            data: Request data
-            compress: Whether to gzip compress the payload
-            retry: Whether to retry on transient failures (default True)
-
-        Returns:
-            Response data as dict
-
-        Raises:
-            BetterFlowAuthError: For 401/403 responses (not retried)
-            BetterFlowClientError: For other errors
-        """
-        url = f"{self.api_url}/{endpoint.lstrip('/')}"
-        headers = self._get_headers()
-
-        kwargs = {"timeout": self.timeout, "headers": headers}
-
-        if data:
-            if compress and self.compress:
-                # Gzip compress the JSON payload
-                json_data = json.dumps(data).encode("utf-8")
-                compressed = gzip.compress(json_data)
-                headers["Content-Type"] = "application/json"
-                headers["Content-Encoding"] = "gzip"
-                kwargs["data"] = compressed
-            else:
-                kwargs["json"] = data
-
-        def do_request() -> dict:
-            try:
-                response = self._session.request(method, url, **kwargs)
-
-                if response.status_code == 401:
-                    raise BetterFlowAuthError("Invalid or expired API token")
-                if response.status_code == 403:
-                    raise BetterFlowAuthError("Device not authorized")
-
-                # Server errors (5xx) are retryable
-                if response.status_code >= 500:
-                    raise _TransientError(f"Server error: {response.status_code}")
-
-                response.raise_for_status()
-                return response.json() if response.content else {}
-
-            except requests.exceptions.ConnectionError:
-                raise _TransientError("Cannot connect to BetterFlow API")
-            except requests.exceptions.Timeout:
-                raise _TransientError("Request timed out")
-            except requests.exceptions.HTTPError as e:
-                error_detail = ""
-                try:
-                    error_detail = e.response.json().get("message", "")
-                except Exception:
-                    pass
-                raise BetterFlowClientError(
-                    f"API error ({e.response.status_code}): {error_detail or str(e)}"
-                ) from e
-
-        if retry:
-            try:
-                return retry_with_backoff(
-                    do_request,
-                    config=self.retry_config,
-                    retryable_exceptions=(_TransientError,),
-                )
-            except RetryExhausted as e:
-                # Convert to client error after exhausting retries
-                if e.last_error:
-                    raise BetterFlowClientError(str(e.last_error)) from e.last_error
-                raise BetterFlowClientError("Request failed after retries") from e
-        else:
-            try:
-                return do_request()
-            except _TransientError as e:
-                raise BetterFlowClientError(str(e)) from e
-
-    @property
-    def web_base_url(self) -> str:
-        """Derive the web base URL from the API URL.
-
-        e.g. "https://betterflow.eu/api/agent" -> "https://betterflow.eu"
-        """
-        if self._web_base_url:
-            return self._web_base_url
-        parsed = urlparse(self.api_url)
-        return f"{parsed.scheme}://{parsed.netloc}"
-
-    def is_reachable(self) -> bool:
-        """Check if BetterFlow API is reachable."""
-        try:
-            self._request("GET", "health", retry=False)
-            return True
-        except BetterFlowClientError:
-            # Try the status endpoint as fallback
-            try:
-                self._request("GET", "events/status", retry=False)
-                return True
-            except BetterFlowClientError:
-                return False
+    # =========================================================================
+    # Authentication
+    # =========================================================================
 
     def exchange_code(
         self, code: str, device_name: str, code_verifier: Optional[str] = None
@@ -265,7 +124,7 @@ class BetterFlowClient:
         Args:
             code: 64-char authorization code from browser flow
             device_name: Name for this device token
-            code_verifier: PKCE code verifier (if PKCE was used in auth flow)
+            code_verifier: PKCE code verifier (required for PKCE flow)
 
         Returns:
             AuthResult with api_token on success
@@ -274,11 +133,12 @@ class BetterFlowClient:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "BetterFlow-Sync/1.0.0",
+            "User-Agent": self.USER_AGENT,
         }
         payload = {"code": code, "device_name": device_name}
         if code_verifier:
             payload["code_verifier"] = code_verifier
+
         try:
             response = self._session.post(
                 url,
@@ -320,18 +180,7 @@ class BetterFlowClient:
         """Register this device with BetterFlow.
 
         DEPRECATED: Use exchange_code() with browser OAuth flow instead.
-        This method sends passwords over the network which is less secure
-        than the browser-based OAuth flow with PKCE.
-
-        Args:
-            email: User's BetterFlow email
-            password: User's BetterFlow password
-            device_info: Optional device information
-
-        Returns:
-            AuthResult with device_id and api_token on success
         """
-        import warnings
         warnings.warn(
             "register() is deprecated. Use browser OAuth flow with exchange_code() instead.",
             DeprecationWarning,
@@ -367,6 +216,10 @@ class BetterFlowClient:
             return True
         except BetterFlowClientError:
             return False
+
+    # =========================================================================
+    # Event Sync
+    # =========================================================================
 
     def send_events(self, events: list[dict]) -> SyncResult:
         """Send a batch of events to BetterFlow.
@@ -413,6 +266,10 @@ class BetterFlowClient:
         """Get sync status."""
         return self._request("GET", "events/status")
 
+    # =========================================================================
+    # Configuration
+    # =========================================================================
+
     def get_config(self) -> dict:
         """Get configuration from server."""
         return self._request("GET", "config")
@@ -428,23 +285,3 @@ class BetterFlowClient:
             mappings: Dict of app_name -> project_id
         """
         return self._request("POST", "config/project-mapping", data={"mappings": mappings})
-
-    def set_credentials(self, token: str, device_id: str) -> None:
-        """Set authentication credentials."""
-        self.token = token
-        self.device_id = device_id
-
-    def clear_credentials(self) -> None:
-        """Clear authentication credentials."""
-        self.token = None
-        self.device_id = None
-
-    def close(self) -> None:
-        """Close the session."""
-        self._session.close()
-
-    def __enter__(self) -> "BetterFlowClient":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()

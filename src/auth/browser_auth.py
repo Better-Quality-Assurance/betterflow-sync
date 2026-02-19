@@ -8,8 +8,6 @@ Security features:
 - PKCE (Proof Key for Code Exchange) for public client security
 """
 
-import base64
-import hashlib
 import logging
 import secrets
 import threading
@@ -18,6 +16,8 @@ from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, quote
+
+from .pkce import generate_pkce_pair
 
 __all__ = ["BrowserAuthFlow", "AuthFlowResult"]
 
@@ -32,22 +32,6 @@ class AuthFlowResult:
     code: Optional[str] = None
     code_verifier: Optional[str] = None  # For PKCE token exchange
     error: Optional[str] = None
-
-
-def _generate_pkce_pair() -> tuple[str, str]:
-    """Generate PKCE code_verifier and code_challenge.
-
-    Returns:
-        Tuple of (code_verifier, code_challenge)
-    """
-    # Generate random 32-byte code verifier (43 chars base64url)
-    code_verifier = secrets.token_urlsafe(32)
-
-    # Create SHA256 hash, then base64url encode (no padding)
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-    return code_verifier, code_challenge
 
 _SUCCESS_HTML = """\
 <!DOCTYPE html>
@@ -189,7 +173,7 @@ class BrowserAuthFlow:
         """
         # Generate security tokens
         state = secrets.token_urlsafe(32)
-        code_verifier, code_challenge = _generate_pkce_pair()
+        code_verifier, code_challenge = generate_pkce_pair()
 
         # Create server on random port
         self._server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
