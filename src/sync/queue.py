@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from ..config import Config, MAX_QUEUE_SIZE
+from config import Config, MAX_QUEUE_SIZE
 
 logger = logging.getLogger(__name__)
 

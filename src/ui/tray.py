@@ -83,6 +83,7 @@ class TrayIcon:
 
     def __init__(
         self,
+        on_login: Optional[Callable[[], None]] = None,
         on_pause: Optional[Callable[[], None]] = None,
         on_resume: Optional[Callable[[], None]] = None,
         on_preferences: Optional[Callable[[], None]] = None,
@@ -92,6 +93,7 @@ class TrayIcon:
         """Initialize tray icon.
 
         Args:
+            on_login: Callback when login is clicked (opens browser)
             on_pause: Callback when pause is clicked
             on_resume: Callback when resume is clicked
             on_preferences: Callback when preferences is clicked
@@ -101,9 +103,10 @@ class TrayIcon:
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
 
+        self._on_login = on_login
         self._on_pause = on_pause
         self._on_resume = on_resume
-        self._on_preferences = on_preferences
+        self._on_preferences = on_preferences  # callback(key, value) for setting changes
         self._on_logout = on_logout
         self._on_quit = on_quit
 
@@ -115,6 +118,13 @@ class TrayIcon:
         self._queue_size = 0
         self._user_email: Optional[str] = None
         self._user_name: Optional[str] = None
+
+        # Preferences state
+        self._sync_interval: int = 60
+        self._hash_titles: bool = True
+        self._domain_only_urls: bool = True
+        self._debug_mode: bool = False
+        self._config_file_path: Optional[str] = None
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
@@ -146,7 +156,34 @@ class TrayIcon:
             items.append(Item("Pause Tracking", self._handle_pause))
 
         # Actions
-        items.append(Item("Preferences...", self._handle_preferences))
+        items.append(Item("Preferences", pystray.Menu(
+            Item(
+                "Sync Interval",
+                pystray.Menu(
+                    Item("30s", self._make_interval_handler(30), checked=lambda item: self._sync_interval == 30),
+                    Item("60s", self._make_interval_handler(60), checked=lambda item: self._sync_interval == 60),
+                    Item("120s", self._make_interval_handler(120), checked=lambda item: self._sync_interval == 120),
+                    Item("300s", self._make_interval_handler(300), checked=lambda item: self._sync_interval == 300),
+                ),
+            ),
+            Item(
+                "Hash Window Titles",
+                self._handle_toggle_hash_titles,
+                checked=lambda item: self._hash_titles,
+            ),
+            Item(
+                "Domain Only URLs",
+                self._handle_toggle_domain_only,
+                checked=lambda item: self._domain_only_urls,
+            ),
+            Item(
+                "Debug Mode",
+                self._handle_toggle_debug,
+                checked=lambda item: self._debug_mode,
+            ),
+            Item("─" * 15, None, enabled=False),
+            Item("Open Config File", self._handle_open_config),
+        )))
         items.append(Item("View Dashboard", self._handle_dashboard))
 
         items.append(Item("─" * 20, None, enabled=False))
@@ -155,7 +192,7 @@ class TrayIcon:
         if self._user_email:
             items.append(Item("Sign Out", self._handle_logout))
         else:
-            items.append(Item("Sign In...", self._handle_preferences))
+            items.append(Item("Login", self._handle_login))
 
         items.append(Item("─" * 20, None, enabled=False))
         items.append(Item("Quit", self._handle_quit))
@@ -176,6 +213,11 @@ class TrayIcon:
             return "Status: Waiting for browser login..."
         else:
             return "Status: Starting..."
+
+    def _handle_login(self, icon, item) -> None:
+        """Handle login menu click."""
+        if self._on_login:
+            self._on_login()
 
     def _handle_pause(self, icon, item) -> None:
         """Handle pause menu click."""
@@ -206,6 +248,44 @@ class TrayIcon:
         if self._on_quit:
             self._on_quit()
         self.stop()
+
+    def _make_interval_handler(self, seconds: int):
+        """Create a handler for setting sync interval."""
+        def handler(icon, item):
+            self._sync_interval = seconds
+            if self._on_preferences:
+                self._on_preferences("sync_interval", seconds)
+            self._update_menu()
+        return handler
+
+    def _handle_toggle_hash_titles(self, icon, item) -> None:
+        self._hash_titles = not self._hash_titles
+        if self._on_preferences:
+            self._on_preferences("hash_titles", self._hash_titles)
+
+    def _handle_toggle_domain_only(self, icon, item) -> None:
+        self._domain_only_urls = not self._domain_only_urls
+        if self._on_preferences:
+            self._on_preferences("domain_only_urls", self._domain_only_urls)
+
+    def _handle_toggle_debug(self, icon, item) -> None:
+        self._debug_mode = not self._debug_mode
+        if self._on_preferences:
+            self._on_preferences("debug_mode", self._debug_mode)
+
+    def _handle_open_config(self, icon, item) -> None:
+        if self._config_file_path:
+            import subprocess
+            subprocess.Popen(["open", self._config_file_path])
+
+    def set_config(self, config) -> None:
+        """Sync tray preferences state from Config object."""
+        self._sync_interval = config.sync.interval_seconds
+        self._hash_titles = config.privacy.hash_titles
+        self._domain_only_urls = config.privacy.domain_only_urls
+        self._debug_mode = config.debug_mode
+        self._config_file_path = str(config.get_config_file())
+        self._update_menu()
 
     def set_state(self, state: TrayState, status_text: Optional[str] = None) -> None:
         """Update tray icon state.

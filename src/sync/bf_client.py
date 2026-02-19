@@ -1,6 +1,7 @@
 """BetterFlow API client - syncs events to BetterFlow server."""
 
 import gzip
+import hashlib
 import json
 import logging
 import platform
@@ -11,9 +12,11 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from ..config import DEFAULT_API_URL
+from config import DEFAULT_API_URL
 
 logger = logging.getLogger(__name__)
+
+AGENT_VERSION = "1.0.0"
 
 
 @dataclass
@@ -26,7 +29,7 @@ class DeviceInfo:
     agent_version: str
 
     @classmethod
-    def collect(cls, agent_version: str = "1.0.0") -> "DeviceInfo":
+    def collect(cls, agent_version: str = AGENT_VERSION) -> "DeviceInfo":
         """Collect device information."""
         return cls(
             hostname=platform.node(),
@@ -35,13 +38,21 @@ class DeviceInfo:
             agent_version=agent_version,
         )
 
-    def to_dict(self) -> dict:
-        return {
-            "hostname": self.hostname,
-            "os_name": self.os_name,
-            "os_version": self.os_version,
-            "agent_version": self.agent_version,
-        }
+    @property
+    def device_name(self) -> str:
+        return f"{self.hostname} ({self.os_name})"
+
+    @property
+    def machine_id(self) -> str:
+        """Generate a stable machine ID from hostname + OS."""
+        raw = f"{self.hostname}-{self.os_name}-{self.os_version}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+    @property
+    def platform_key(self) -> str:
+        """Map OS name to backend platform enum."""
+        mapping = {"Darwin": "darwin", "Windows": "win32", "Linux": "linux"}
+        return mapping.get(self.os_name, "linux")
 
 
 @dataclass
@@ -125,7 +136,11 @@ class BetterFlowClient:
         data: Optional[dict] = None,
         compress: bool = False,
     ) -> dict:
-        """Make request to BetterFlow API."""
+        """Make request to BetterFlow API.
+
+        Returns the unwrapped 'data' field from the API response envelope.
+        Backend wraps all responses as: {"success": bool, "data": {...}, "meta": {...}}
+        """
         url = f"{self.api_url}/{endpoint.lstrip('/')}"
         headers = self._get_headers()
 
@@ -151,7 +166,12 @@ class BetterFlowClient:
                 raise BetterFlowAuthError("Device not authorized")
 
             response.raise_for_status()
-            return response.json() if response.content else {}
+            body = response.json() if response.content else {}
+
+            # Unwrap the API envelope — backend returns {success, data, meta}
+            if isinstance(body, dict) and "data" in body:
+                return body["data"]
+            return body
 
         except requests.exceptions.ConnectionError as e:
             raise BetterFlowClientError(f"Cannot connect to BetterFlow API") from e
@@ -210,13 +230,24 @@ class BetterFlowClient:
         try:
             response = self._session.post(
                 url,
-                json={"code": code, "device_name": device_name},
+                json={
+                    "code": code,
+                    "device_name": device_name,
+                    "platform": DeviceInfo.collect().platform_key,
+                    "os_version": platform.release(),
+                    "machine_id": DeviceInfo.collect().machine_id,
+                    "agent_version": AGENT_VERSION,
+                },
                 headers=headers,
                 timeout=self.timeout,
             )
-            if response.status_code == 401:
-                data = response.json()
-                return AuthResult(success=False, error=data.get("message", "Invalid code"))
+            if response.status_code in (401, 403, 422):
+                try:
+                    data = response.json()
+                    msg = data.get("message", response.reason)
+                except Exception:
+                    msg = response.text or response.reason
+                return AuthResult(success=False, error=msg)
             response.raise_for_status()
             data = response.json()
             user = data.get("user", {})
@@ -257,12 +288,16 @@ class BetterFlowClient:
                 data={
                     "email": email,
                     "password": password,
-                    "device_info": device_info.to_dict(),
+                    "device_name": device_info.device_name,
+                    "machine_id": device_info.machine_id,
+                    "platform": device_info.platform_key,
+                    "os_version": device_info.os_version,
+                    "agent_version": device_info.agent_version,
                 },
             )
             return AuthResult(
                 success=True,
-                device_id=response.get("device_id"),
+                device_id=str(response.get("device_id", "")),
                 api_token=response.get("api_token"),
             )
         except BetterFlowAuthError as e:
@@ -282,7 +317,7 @@ class BetterFlowClient:
         """Send a batch of events to BetterFlow.
 
         Args:
-            events: List of event dictionaries with timestamp, duration, data
+            events: List of event dictionaries with timestamp, duration, bucket_id, data
 
         Returns:
             SyncResult with success status and count
@@ -299,8 +334,8 @@ class BetterFlowClient:
             )
             return SyncResult(
                 success=True,
-                events_synced=response.get("synced", len(events)),
-                events_queued=response.get("queued", 0),
+                events_synced=response.get("processed", len(events)),
+                events_queued=response.get("failed", 0),
             )
         except BetterFlowAuthError as e:
             return SyncResult(success=False, error=str(e))
@@ -311,13 +346,22 @@ class BetterFlowClient:
         """Start a tracking session."""
         return self._request("POST", "sessions/start")
 
-    def end_session(self, reason: str = "user_stopped") -> dict:
+    def end_session(self, reason: str = "app_quit") -> dict:
         """End the current tracking session.
 
         Args:
-            reason: Reason for ending (user_stopped, idle, shutdown, error)
+            reason: Reason for ending (user_logout, idle_timeout, app_quit, crash)
         """
         return self._request("POST", "sessions/end", data={"reason": reason})
+
+    def heartbeat(self, agent_version: str = AGENT_VERSION) -> dict:
+        """Send heartbeat to server.
+
+        Returns server commands (pause/deregister) and config update flag.
+        """
+        return self._request(
+            "POST", "heartbeat", data={"agent_version": agent_version}
+        )
 
     def get_status(self) -> dict:
         """Get sync status."""
@@ -331,13 +375,18 @@ class BetterFlowClient:
         """Get list of projects for app mapping."""
         return self._request("GET", "projects")
 
-    def update_project_mapping(self, mappings: dict[str, int]) -> dict:
-        """Update app to project mappings.
+    def update_project_mapping(self, app_name: str, project_id: int) -> dict:
+        """Update app to project mapping.
 
         Args:
-            mappings: Dict of app_name -> project_id
+            app_name: Application name to map
+            project_id: Project ID to assign
         """
-        return self._request("POST", "config/project-mapping", data={"mappings": mappings})
+        return self._request(
+            "POST",
+            "config/project-mapping",
+            data={"app_name": app_name, "project_id": project_id},
+        )
 
     def set_credentials(self, token: str, device_id: str) -> None:
         """Set authentication credentials."""

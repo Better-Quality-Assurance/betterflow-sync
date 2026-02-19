@@ -7,7 +7,7 @@ from typing import Optional, Callable
 
 from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
-from ..sync.bf_client import BetterFlowClient, DeviceInfo, AuthResult
+from sync.bf_client import BetterFlowClient, DeviceInfo, AuthResult
 
 logger = logging.getLogger(__name__)
 

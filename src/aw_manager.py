@@ -135,14 +135,7 @@ class AWManager:
 
     def start(self) -> bool:
         """Start AW components. Returns True if AW is available."""
-        # Check if AW is already running externally
-        if self._port_in_use():
-            logger.info(
-                f"ActivityWatch already running on port {self.aw_port}, "
-                "using external instance"
-            )
-            self._using_external = True
-            return True
+        server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
 
@@ -154,23 +147,31 @@ class AWManager:
                 binaries_dir = install_dir
             else:
                 logger.error("Failed to download ActivityWatch binaries")
+                return server_already_running
+
+        if server_already_running:
+            logger.info(
+                f"ActivityWatch server already running on port {self.aw_port}, "
+                "using external instance"
+            )
+            self._using_external = True
+        else:
+            logger.info(f"Starting bundled ActivityWatch from {binaries_dir}")
+
+            # Start server first
+            if not self._start_component(AW_SERVER, binaries_dir):
                 return False
 
-        logger.info(f"Starting bundled ActivityWatch from {binaries_dir}")
+            # Wait for server to be ready
+            if not self._wait_for_server():
+                logger.error("aw-server-rust failed to start")
+                self.stop()
+                return False
 
-        # Start server first
-        if not self._start_component(AW_SERVER, binaries_dir):
-            return False
-
-        # Wait for server to be ready
-        if not self._wait_for_server():
-            logger.error("aw-server-rust failed to start")
-            self.stop()
-            return False
-
-        # Start watchers
+        # Always start watchers if they're not already running
         for watcher in AW_WATCHERS:
-            self._start_component(watcher, binaries_dir)
+            if not self._is_process_running(watcher):
+                self._start_component(watcher, binaries_dir)
 
         logger.info("ActivityWatch components started")
         return True
@@ -325,6 +326,16 @@ class AWManager:
 
         logger.error(f"aw-server-rust not ready after {STARTUP_TIMEOUT}s")
         return False
+
+    def _is_process_running(self, name: str) -> bool:
+        """Check if a process with this name is already running (outside our management)."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", name], capture_output=True, text=True
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
     def _port_in_use(self) -> bool:
         """Check if something is listening on the AW port."""

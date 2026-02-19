@@ -18,9 +18,9 @@ from config import Config, setup_logging
 from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
 from auth import KeychainManager, LoginManager
 from ui.tray import TrayIcon, TrayState
-from ui.preferences import show_login_window, show_preferences_window
 from aw_manager import AWManager
 
+import fcntl
 import logging
 import signal
 import threading
@@ -72,12 +72,14 @@ class BetterFlowSyncApp:
 
         # Tray icon
         self.tray = TrayIcon(
+            on_login=self._on_login,
             on_pause=self._on_pause,
             on_resume=self._on_resume,
-            on_preferences=self._on_preferences,
+            on_preferences=self._on_preference_changed,
             on_logout=self._on_logout,
             on_quit=self._on_quit,
         )
+        self.tray.set_config(self.config)
 
         # State
         self._running = False
@@ -91,25 +93,18 @@ class BetterFlowSyncApp:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
+        # Always start ActivityWatch so events are collected from the start
+        self.aw_manager.start()
+
         # Try auto-login
         login_state = self.login_manager.try_auto_login()
 
-        if not login_state.logged_in:
-            # Show login window
-            self._show_login()
-            # Check if we logged in
-            if not self.login_manager.is_logged_in():
-                logger.info("Login cancelled, exiting")
-                return
-
-        # Update tray with user info
-        self.tray.set_user(self.login_manager.get_current_user())
-
-        # Start bundled ActivityWatch
-        self.aw_manager.start()
-
-        # Start sync scheduler
-        self._start_sync_loop()
+        if login_state.logged_in:
+            self.tray.set_user(self.login_manager.get_current_user())
+            self._start_services()
+        else:
+            # Show tray with "Login" — user clicks it to open browser
+            self.tray.set_state(TrayState.WAITING_AUTH)
 
         # Start tray icon (blocking)
         self._running = True
@@ -119,6 +114,11 @@ class BetterFlowSyncApp:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _start_services(self) -> None:
+        """Fetch server config and begin sync loop (AW already started in run())."""
+        self.sync_engine.fetch_server_config()
+        self._start_sync_loop()
 
     def _start_sync_loop(self) -> None:
         """Start the sync scheduler."""
@@ -191,16 +191,18 @@ class BetterFlowSyncApp:
         """Format time for display."""
         return dt.strftime("%H:%M")
 
-    def _show_login(self) -> None:
-        """Show login window."""
-
-        def on_login(email: str, password: str) -> bool:
-            state = self.login_manager.login(email, password)
+    def _on_login(self) -> None:
+        """Handle login action — open browser auth flow in background thread."""
+        def do_browser_login():
+            self.tray.set_state(TrayState.WAITING_AUTH)
+            state = self.login_manager.login_via_browser()
             if state.logged_in:
-                self.tray.set_user(email)
-            return state.logged_in
+                self.tray.set_user(state.user_email, state.user_name)
+                self._start_services()
+            else:
+                self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
 
-        show_login_window(on_login)
+        threading.Thread(target=do_browser_login, daemon=True).start()
 
     def _on_pause(self) -> None:
         """Handle pause action."""
@@ -214,39 +216,34 @@ class BetterFlowSyncApp:
         self.tray.set_paused(False)
         logger.info("Tracking resumed")
 
-    def _on_preferences(self) -> None:
-        """Handle preferences action."""
-
-        def on_save(config: Config) -> None:
-            self.config = config
-            config.save()
-
-            # Update sync interval if changed
+    def _on_preference_changed(self, key: str, value) -> None:
+        """Handle a preference change from tray menu."""
+        if key == "sync_interval":
+            self.config.sync.interval_seconds = value
             if self.scheduler.running:
                 self.scheduler.reschedule_job(
                     "sync_job",
-                    trigger=IntervalTrigger(seconds=config.sync.interval_seconds),
+                    trigger=IntervalTrigger(seconds=value),
                 )
+        elif key == "hash_titles":
+            self.config.privacy.hash_titles = value
+        elif key == "domain_only_urls":
+            self.config.privacy.domain_only_urls = value
+        elif key == "debug_mode":
+            self.config.debug_mode = value
+            setup_logging(value)
 
-            logger.info("Preferences saved")
-
-        # Show in new thread to not block tray
-        threading.Thread(
-            target=lambda: show_preferences_window(self.config, on_save),
-            daemon=True,
-        ).start()
+        self.config.save()
+        logger.info(f"Preference changed: {key} = {value}")
 
     def _on_logout(self) -> None:
         """Handle logout action."""
         self.login_manager.logout()
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         self.tray.set_user(None)
-        logger.info("Logged out")
-
-        # Show login window
-        self._show_login()
-
-        if not self.login_manager.is_logged_in():
-            self._on_quit()
+        self.tray.set_state(TrayState.WAITING_AUTH)
+        logger.info("Logged out — waiting for re-login")
 
     def _on_quit(self) -> None:
         """Handle quit action."""
@@ -283,8 +280,34 @@ class BetterFlowSyncApp:
         logger.info("Shutdown complete")
 
 
+_lock_file = None
+
+
+def _acquire_lock() -> bool:
+    """Ensure only one instance is running. Returns True if lock acquired."""
+    global _lock_file
+    lock_path = os.path.join(
+        Config.get_config_dir(), ".betterflow-sync.lock"
+    )
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    _lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+        return True
+    except OSError:
+        _lock_file.close()
+        _lock_file = None
+        return False
+
+
 def main() -> None:
     """Main entry point."""
+    if not _acquire_lock():
+        print("BetterFlow Sync is already running.")
+        sys.exit(0)
+
     app = BetterFlowSyncApp()
     app.run()
 

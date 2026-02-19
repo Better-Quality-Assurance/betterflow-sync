@@ -1,13 +1,11 @@
 """Sync engine - orchestrates data flow from ActivityWatch to BetterFlow."""
 
-import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urlparse
 
-from ..config import Config, PrivacySettings
+from config import Config
 from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK
 from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
 from .queue import OfflineQueue
@@ -41,27 +39,23 @@ class SyncEngine:
         queue: OfflineQueue,
         config: Config,
     ):
-        """Initialize sync engine.
-
-        Args:
-            aw: ActivityWatch client
-            bf: BetterFlow client
-            queue: Offline queue for failed syncs
-            config: Application configuration
-        """
         self.aw = aw
         self.bf = bf
         self.queue = queue
         self.config = config
         self._paused = False
         self._session_active = False
+        self._config_fetched = False
+        self._heartbeat_count = 0
+        # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
+        self._heartbeat_interval = 5
 
     def pause(self) -> None:
         """Pause syncing."""
         self._paused = True
         if self._session_active:
             try:
-                self.bf.end_session("user_paused")
+                self.bf.end_session("app_quit")
                 self._session_active = False
             except BetterFlowClientError:
                 pass
@@ -74,22 +68,34 @@ class SyncEngine:
     def is_paused(self) -> bool:
         return self._paused
 
+    def fetch_server_config(self) -> None:
+        """Fetch and apply server-side configuration."""
+        try:
+            server_config = self.bf.get_config()
+            self.config.update_from_server(server_config)
+            self._config_fetched = True
+            logger.info("Server configuration applied")
+        except BetterFlowClientError as e:
+            logger.warning(f"Failed to fetch server config: {e}")
+
     def sync(self) -> SyncStats:
         """Perform a sync cycle.
 
-        1. Check if ActivityWatch is running
-        2. Get events since last checkpoint
-        3. Transform and filter events
-        4. Send to BetterFlow (or queue if offline)
+        1. Fetch server config (first time only)
+        2. Check if ActivityWatch is running
+        3. Get events since last checkpoint
+        4. Send raw events to BetterFlow (server handles privacy)
         5. Update checkpoints
-
-        Returns:
-            SyncStats with results
+        6. Send heartbeat periodically
         """
         stats = SyncStats()
 
         if self._paused:
             return stats
+
+        # Fetch server config on first successful sync
+        if not self._config_fetched and self.bf.is_reachable():
+            self.fetch_server_config()
 
         # Check ActivityWatch
         if not self.aw.is_running():
@@ -131,21 +137,18 @@ class SyncEngine:
         if self.bf.is_reachable() and not self.queue.is_empty():
             self._process_queue(stats)
 
+        # Periodic heartbeat
+        self._heartbeat_count += 1
+        if self._heartbeat_count >= self._heartbeat_interval:
+            self._send_heartbeat()
+            self._heartbeat_count = 0
+
         return stats
 
     def _sync_bucket(
         self, bucket_id: str, bucket_type: str, stats: SyncStats
     ) -> list[dict]:
-        """Sync events from a single bucket.
-
-        Args:
-            bucket_id: ActivityWatch bucket ID
-            bucket_type: Bucket type (window, afk, etc.)
-            stats: Stats object to update
-
-        Returns:
-            List of transformed events ready for BetterFlow
-        """
+        """Sync events from a single bucket."""
         # Get checkpoint
         checkpoint = self.queue.get_checkpoint(bucket_id)
         if checkpoint is None:
@@ -161,10 +164,10 @@ class SyncEngine:
         if not events:
             return []
 
-        # Transform and filter
+        # Transform events — include bucket_id and pass raw data
         transformed = []
         for event in events:
-            transformed_event = self._transform_event(event, bucket_type)
+            transformed_event = self._transform_event(event, bucket_id, bucket_type)
             if transformed_event:
                 transformed.append(transformed_event)
             else:
@@ -178,22 +181,16 @@ class SyncEngine:
         return transformed
 
     def _transform_event(
-        self, event: AWEvent, bucket_type: str
+        self, event: AWEvent, bucket_id: str, bucket_type: str
     ) -> Optional[dict]:
         """Transform an ActivityWatch event to BetterFlow format.
 
-        Applies privacy filtering and normalization.
-
-        Args:
-            event: ActivityWatch event
-            bucket_type: Type of bucket (window, afk, etc.)
-
-        Returns:
-            Transformed event dict, or None if filtered out
+        Sends raw data to the server — the backend handles privacy
+        (title hashing, URL domain extraction) based on device settings.
         """
         privacy = self.config.privacy
 
-        # Skip excluded apps
+        # Skip excluded apps (client-side — sensitive apps never leave the machine)
         app = event.app
         if app and app in privacy.exclude_apps:
             return None
@@ -202,85 +199,19 @@ class SyncEngine:
         if event.duration < 1:
             return None
 
-        # Build data object
-        data = {}
-
-        if bucket_type == BUCKET_TYPE_WINDOW:
-            data["app"] = app
-            data["title"] = self._process_title(app, event.title, privacy)
-            if event.url:
-                data["url"] = self._process_url(event.url, privacy)
-        elif bucket_type == BUCKET_TYPE_AFK:
-            data["status"] = event.status
+        # Pass through all raw AW event data — server handles privacy
+        data = dict(event.data)
 
         return {
+            "id": event.id,
             "timestamp": event.timestamp.isoformat(),
             "duration": round(event.duration, 2),
+            "bucket_id": bucket_id,
             "data": data,
         }
 
-    def _process_title(
-        self, app: Optional[str], title: Optional[str], privacy: PrivacySettings
-    ) -> Optional[str]:
-        """Process window title according to privacy settings.
-
-        Args:
-            app: Application name
-            title: Window title
-            privacy: Privacy settings
-
-        Returns:
-            Processed title (hashed, original, or None)
-        """
-        if not title:
-            return None
-
-        # Check if app is in allowlist for raw titles
-        if app and app in privacy.title_allowlist:
-            return title
-
-        # Hash title if configured
-        if privacy.hash_titles:
-            return self._hash_string(title)
-
-        return title
-
-    def _process_url(self, url: Optional[str], privacy: PrivacySettings) -> Optional[str]:
-        """Process URL according to privacy settings.
-
-        Args:
-            url: Full URL
-            privacy: Privacy settings
-
-        Returns:
-            Processed URL (domain only or full)
-        """
-        if not url:
-            return None
-
-        if privacy.domain_only_urls:
-            try:
-                parsed = urlparse(url)
-                return parsed.netloc
-            except Exception:
-                return None
-
-        return url
-
-    def _hash_string(self, value: str) -> str:
-        """Hash a string with SHA-256.
-
-        Returns first 16 characters of hex digest for readability.
-        """
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
-        """Send events to BetterFlow or queue if offline.
-
-        Args:
-            events: Events to send
-            stats: Stats object to update
-        """
+        """Send events to BetterFlow or queue if offline."""
         # Batch events
         batch_size = self.config.sync.batch_size
         batches = [events[i : i + batch_size] for i in range(0, len(events), batch_size)]
@@ -306,11 +237,7 @@ class SyncEngine:
                 stats.events_queued += len(batch)
 
     def _process_queue(self, stats: SyncStats) -> None:
-        """Process offline queue.
-
-        Args:
-            stats: Stats object to update
-        """
+        """Process offline queue."""
         # Remove events that exceeded retry limit
         self.queue.remove_failed(max_retries=5)
 
@@ -342,12 +269,31 @@ class SyncEngine:
                 self.queue.increment_retry(event_ids)
                 break
 
-    def get_status(self) -> dict:
-        """Get current sync status.
+    def _send_heartbeat(self) -> None:
+        """Send heartbeat to server and process commands."""
+        try:
+            response = self.bf.heartbeat()
 
-        Returns:
-            Dict with status information
-        """
+            # Handle server commands
+            commands = response.get("commands", [])
+            for cmd in commands:
+                cmd_type = cmd.get("type")
+                if cmd_type == "pause":
+                    logger.info(f"Server requested pause: {cmd.get('reason')}")
+                    self._paused = True
+                elif cmd_type == "deregister":
+                    logger.warning(f"Device revoked: {cmd.get('reason')}")
+                    self._paused = True
+
+            # Re-fetch config if server says it changed
+            if response.get("config_updated"):
+                self.fetch_server_config()
+
+        except BetterFlowClientError as e:
+            logger.debug(f"Heartbeat failed: {e}")
+
+    def get_status(self) -> dict:
+        """Get current sync status."""
         aw_running = self.aw.is_running()
         bf_reachable = self.bf.is_reachable() if not self._paused else False
         queue_size = self.queue.size()
@@ -367,7 +313,7 @@ class SyncEngine:
         """Shutdown the sync engine gracefully."""
         if self._session_active:
             try:
-                self.bf.end_session("shutdown")
+                self.bf.end_session("app_quit")
             except BetterFlowClientError:
                 pass
             self._session_active = False
