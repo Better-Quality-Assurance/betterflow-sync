@@ -7,7 +7,7 @@ import platform
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -51,6 +51,8 @@ class AuthResult:
     success: bool
     device_id: Optional[str] = None
     api_token: Optional[str] = None
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -97,6 +99,7 @@ class BetterFlowClient:
             timeout: Request timeout in seconds
         """
         self.api_url = api_url.rstrip("/")
+        self._web_base_url: Optional[str] = None
         self.token = token
         self.device_id = device_id
         self.compress = compress
@@ -164,6 +167,17 @@ class BetterFlowClient:
                 f"API error ({e.response.status_code}): {error_detail or str(e)}"
             ) from e
 
+    @property
+    def web_base_url(self) -> str:
+        """Derive the web base URL from the API URL.
+
+        e.g. "https://betterflow.eu/api/agent" -> "https://betterflow.eu"
+        """
+        if self._web_base_url:
+            return self._web_base_url
+        parsed = urlparse(self.api_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
     def is_reachable(self) -> bool:
         """Check if BetterFlow API is reachable."""
         try:
@@ -176,6 +190,49 @@ class BetterFlowClient:
                 return True
             except BetterFlowClientError:
                 return False
+
+    def exchange_code(self, code: str, device_name: str) -> AuthResult:
+        """Exchange an authorization code for a Sanctum token.
+
+        Args:
+            code: 64-char authorization code from browser flow
+            device_name: Name for this device token
+
+        Returns:
+            AuthResult with api_token on success
+        """
+        url = f"{self.web_base_url}/api/v1/sync/auth/token"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "BetterFlow-Sync/1.0.0",
+        }
+        try:
+            response = self._session.post(
+                url,
+                json={"code": code, "device_name": device_name},
+                headers=headers,
+                timeout=self.timeout,
+            )
+            if response.status_code == 401:
+                data = response.json()
+                return AuthResult(success=False, error=data.get("message", "Invalid code"))
+            response.raise_for_status()
+            data = response.json()
+            user = data.get("user", {})
+            return AuthResult(
+                success=True,
+                api_token=data["access_token"],
+                device_id=device_name,
+                user_email=user.get("email"),
+                user_name=user.get("name"),
+            )
+        except requests.exceptions.ConnectionError:
+            return AuthResult(success=False, error="Cannot connect to BetterFlow")
+        except requests.exceptions.Timeout:
+            return AuthResult(success=False, error="Request timed out")
+        except Exception as e:
+            return AuthResult(success=False, error=str(e))
 
     def register(
         self, email: str, password: str, device_info: Optional[DeviceInfo] = None

@@ -1,7 +1,6 @@
-"""Preferences and login windows using tkinter."""
+"""Preferences window using tkinter."""
 
 import logging
-import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
@@ -9,145 +8,6 @@ from typing import Callable, Optional
 from ..config import Config
 
 logger = logging.getLogger(__name__)
-
-
-class LoginWindow:
-    """Login dialog window."""
-
-    def __init__(
-        self,
-        on_login: Callable[[str, str], bool],
-        on_cancel: Optional[Callable[[], None]] = None,
-    ):
-        """Initialize login window.
-
-        Args:
-            on_login: Callback with (email, password), returns True if successful
-            on_cancel: Callback when cancelled
-        """
-        self._on_login = on_login
-        self._on_cancel = on_cancel
-        self._window: Optional[tk.Tk] = None
-        self._email_var: Optional[tk.StringVar] = None
-        self._password_var: Optional[tk.StringVar] = None
-        self._error_var: Optional[tk.StringVar] = None
-        self._login_button: Optional[ttk.Button] = None
-
-    def show(self) -> None:
-        """Show the login window."""
-        self._window = tk.Tk()
-        self._window.title("BetterFlow Sync - Sign In")
-        self._window.geometry("400x300")
-        self._window.resizable(False, False)
-
-        # Center on screen
-        self._window.update_idletasks()
-        x = (self._window.winfo_screenwidth() - 400) // 2
-        y = (self._window.winfo_screenheight() - 300) // 2
-        self._window.geometry(f"+{x}+{y}")
-
-        # Variables
-        self._email_var = tk.StringVar()
-        self._password_var = tk.StringVar()
-        self._error_var = tk.StringVar()
-
-        # Main frame
-        frame = ttk.Frame(self._window, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Title
-        title = ttk.Label(
-            frame, text="Sign in to BetterFlow", font=("Helvetica", 16, "bold")
-        )
-        title.pack(pady=(0, 20))
-
-        # Email
-        email_frame = ttk.Frame(frame)
-        email_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(email_frame, text="Email:").pack(anchor=tk.W)
-        email_entry = ttk.Entry(email_frame, textvariable=self._email_var, width=40)
-        email_entry.pack(fill=tk.X)
-        email_entry.focus()
-
-        # Password
-        password_frame = ttk.Frame(frame)
-        password_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(password_frame, text="Password:").pack(anchor=tk.W)
-        password_entry = ttk.Entry(
-            password_frame, textvariable=self._password_var, show="*", width=40
-        )
-        password_entry.pack(fill=tk.X)
-
-        # Error message
-        error_label = ttk.Label(
-            frame, textvariable=self._error_var, foreground="red", wraplength=360
-        )
-        error_label.pack(pady=10)
-
-        # Buttons
-        button_frame = ttk.Frame(frame)
-        button_frame.pack(fill=tk.X, pady=10)
-
-        cancel_button = ttk.Button(button_frame, text="Cancel", command=self._cancel)
-        cancel_button.pack(side=tk.LEFT)
-
-        self._login_button = ttk.Button(
-            button_frame, text="Sign In", command=self._login
-        )
-        self._login_button.pack(side=tk.RIGHT)
-
-        # Bind Enter key
-        self._window.bind("<Return>", lambda e: self._login())
-        self._window.bind("<Escape>", lambda e: self._cancel())
-
-        # Handle window close
-        self._window.protocol("WM_DELETE_WINDOW", self._cancel)
-
-        self._window.mainloop()
-
-    def _login(self) -> None:
-        """Handle login button click."""
-        email = self._email_var.get().strip()
-        password = self._password_var.get()
-
-        if not email:
-            self._error_var.set("Please enter your email")
-            return
-        if not password:
-            self._error_var.set("Please enter your password")
-            return
-
-        # Disable button while logging in
-        self._login_button.config(state=tk.DISABLED)
-        self._error_var.set("Signing in...")
-
-        # Run login in background
-        def do_login():
-            try:
-                success = self._on_login(email, password)
-                self._window.after(0, lambda: self._handle_login_result(success))
-            except Exception as e:
-                self._window.after(
-                    0, lambda: self._handle_login_result(False, str(e))
-                )
-
-        threading.Thread(target=do_login, daemon=True).start()
-
-    def _handle_login_result(self, success: bool, error: Optional[str] = None) -> None:
-        """Handle login result on main thread."""
-        self._login_button.config(state=tk.NORMAL)
-
-        if success:
-            self._window.destroy()
-        else:
-            self._error_var.set(error or "Invalid email or password")
-
-    def _cancel(self) -> None:
-        """Handle cancel."""
-        if self._on_cancel:
-            self._on_cancel()
-        if self._window:
-            self._window.destroy()
 
 
 class PreferencesWindow:
@@ -333,16 +193,6 @@ class PreferencesWindow:
     def _cancel(self) -> None:
         """Cancel and close."""
         self._window.destroy()
-
-
-def show_login_window(on_login: Callable[[str, str], bool]) -> None:
-    """Show login window in a new thread.
-
-    Args:
-        on_login: Callback with (email, password), returns True if successful
-    """
-    window = LoginWindow(on_login)
-    window.show()
 
 
 def show_preferences_window(config: Config, on_save: Callable[[Config], None]) -> None:
