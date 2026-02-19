@@ -26,6 +26,7 @@ class TrayState(Enum):
     ERROR = "error"  # Red - auth failed or AW not running
     PAUSED = "paused"  # Gray - user paused tracking
     STARTING = "starting"  # Blue - starting up
+    WAITING_AUTH = "waiting_auth"  # Amber - waiting for browser login
 
 
 # Colors for each state
@@ -35,6 +36,7 @@ STATE_COLORS = {
     TrayState.ERROR: "#ef4444",  # Red
     TrayState.PAUSED: "#9ca3af",  # Gray
     TrayState.STARTING: "#3b82f6",  # Blue
+    TrayState.WAITING_AUTH: "#f59e0b",  # Amber
 }
 
 
@@ -98,6 +100,7 @@ class TrayIcon:
         self._last_sync = "Never"
         self._queue_size = 0
         self._user_email: Optional[str] = None
+        self._user_name: Optional[str] = None
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
@@ -105,6 +108,10 @@ class TrayIcon:
     def _create_menu(self) -> pystray.Menu:
         """Create the tray menu."""
         items = []
+
+        # User name at top
+        if self._user_name:
+            items.append(Item(self._user_name, None, enabled=False))
 
         # Status line
         items.append(Item(self._get_status_line(), None, enabled=False))
@@ -132,7 +139,6 @@ class TrayIcon:
 
         # Account
         if self._user_email:
-            items.append(Item(f"Signed in as {self._user_email}", None, enabled=False))
             items.append(Item("Sign Out", self._handle_logout))
         else:
             items.append(Item("Sign In...", self._handle_preferences))
@@ -152,6 +158,8 @@ class TrayIcon:
             return f"Status: {self._status_text}"
         elif self._state == TrayState.PAUSED:
             return "Status: Paused"
+        elif self._state == TrayState.WAITING_AUTH:
+            return "Status: Waiting for browser login..."
         else:
             return "Status: Starting..."
 
@@ -226,9 +234,10 @@ class TrayIcon:
             self._queue_size = queue_size
         self._update_menu()
 
-    def set_user(self, email: Optional[str]) -> None:
-        """Set current user email."""
+    def set_user(self, email: Optional[str], name: Optional[str] = None) -> None:
+        """Set current user info."""
         self._user_email = email
+        self._user_name = name
         self._update_menu()
 
     def _update_icon(self) -> None:

@@ -1,9 +1,11 @@
 """Login management and authentication flow."""
 
 import logging
+import platform
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
 from ..sync.bf_client import BetterFlowClient, DeviceInfo, AuthResult
 
@@ -16,6 +18,7 @@ class LoginState:
 
     logged_in: bool = False
     user_email: Optional[str] = None
+    user_name: Optional[str] = None
     device_id: Optional[str] = None
     error: Optional[str] = None
 
@@ -115,6 +118,59 @@ class LoginManager:
             device_id=result.device_id,
         )
         logger.info(f"Login successful for {email}")
+
+        if self._on_login_callback:
+            self._on_login_callback(state)
+
+        return state
+
+    def login_via_browser(self) -> LoginState:
+        """Log in via browser-based OAuth flow.
+
+        Opens the browser to BetterFlow authorize page, waits for callback,
+        then exchanges the code for a Sanctum token.
+
+        Returns:
+            LoginState with result
+        """
+        authorize_url = f"{self.bf.web_base_url}/sync/auth/authorize"
+        flow = BrowserAuthFlow(authorize_url)
+
+        logger.info("Starting browser auth flow...")
+        code = flow.start()
+
+        if not code:
+            return LoginState(logged_in=False, error="Authorization was cancelled or timed out")
+
+        # Exchange code for token
+        device_name = f"sync:{platform.node()}"
+        result = self.bf.exchange_code(code, device_name)
+
+        if not result.success:
+            return LoginState(logged_in=False, error=result.error)
+
+        # Store credentials in keychain
+        user_email = result.user_email or device_name
+        user_name = result.user_name or user_email
+        credentials = StoredCredentials(
+            api_token=result.api_token,
+            device_id=result.device_id,
+            user_email=user_email,
+        )
+
+        if not self.keychain.store(credentials):
+            logger.warning("Failed to store credentials in keychain")
+
+        # Set credentials on client
+        self.bf.set_credentials(result.api_token, result.device_id)
+
+        state = LoginState(
+            logged_in=True,
+            user_email=user_email,
+            user_name=user_name,
+            device_id=result.device_id,
+        )
+        logger.info("Browser auth login successful")
 
         if self._on_login_callback:
             self._on_login_callback(state)
