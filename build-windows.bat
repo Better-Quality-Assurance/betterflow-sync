@@ -33,6 +33,10 @@ REM Generate icons
 echo Generating icons...
 python scripts\generate_icons.py
 
+REM Download ActivityWatch binaries
+echo Downloading ActivityWatch binaries...
+python scripts\download_aw.py
+
 REM Build with PyInstaller
 echo Building executable...
 pyinstaller build.spec --clean

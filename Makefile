@@ -1,6 +1,6 @@
 # BetterFlow Sync - Build Makefile
 
-.PHONY: install install-dev test lint format clean build build-mac build-windows run
+.PHONY: install install-dev test lint format clean build build-mac build-windows run download-aw clean-aw
 
 # Install production dependencies
 install:
@@ -28,17 +28,25 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 
+# Download ActivityWatch binaries for current platform
+download-aw:
+	python scripts/download_aw.py
+
+# Clean ActivityWatch binaries
+clean-aw:
+	rm -rf resources/activitywatch/
+
 # Build for current platform
-build:
+build: download-aw
 	pyinstaller build.spec --clean
 
 # Build for macOS
-build-mac:
+build-mac: download-aw
 	pyinstaller build.spec --clean
 	@echo "Built: dist/BetterFlow Sync.app"
 
 # Build for Windows (run on Windows)
-build-windows:
+build-windows: download-aw
 	pyinstaller build.spec --clean
 	@echo "Built: dist/BetterFlow Sync.exe"
 

@@ -21,6 +21,17 @@ datas = [
     (str(resources_dir), "resources"),
 ]
 
+# ActivityWatch binaries (included as binaries to preserve execute permissions)
+aw_platform = "darwin" if is_mac else "windows"
+aw_dir = resources_dir / "activitywatch" / aw_platform
+aw_binaries = []
+if aw_dir.exists():
+    for binary in aw_dir.iterdir():
+        if binary.is_file():
+            aw_binaries.append(
+                (str(binary), f"resources/activitywatch/{aw_platform}")
+            )
+
 # Hidden imports for pystray, keyring backends, and our modules
 hiddenimports = [
     "pystray._darwin" if is_mac else "pystray._win32",
@@ -43,12 +54,13 @@ hiddenimports = [
     "ui",
     "ui.tray",
     "ui.preferences",
+    "aw_manager",
 ]
 
 a = Analysis(
     [str(src_dir / "entry_point.py")],
     pathex=[str(root_dir), str(src_dir)],
-    binaries=[],
+    binaries=aw_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -19,6 +19,7 @@ from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
 from auth import KeychainManager, LoginManager
 from ui.tray import TrayIcon, TrayState
 from ui.preferences import show_login_window, show_preferences_window
+from aw_manager import AWManager
 
 import logging
 import signal
@@ -41,6 +42,9 @@ class BetterFlowSyncApp:
         setup_logging(self.config.debug_mode)
 
         logger.info("BetterFlow Sync starting...")
+
+        # Initialize AW process manager
+        self.aw_manager = AWManager(aw_port=self.config.aw.port)
 
         # Initialize components
         self.aw = AWClient(
@@ -101,6 +105,9 @@ class BetterFlowSyncApp:
         # Update tray with user info
         self.tray.set_user(self.login_manager.get_current_user())
 
+        # Start bundled ActivityWatch
+        self.aw_manager.start()
+
         # Start sync scheduler
         self._start_sync_loop()
 
@@ -133,6 +140,10 @@ class BetterFlowSyncApp:
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         try:
+            # Health-check managed AW processes, restart if crashed
+            if self.aw_manager.is_managing:
+                self.aw_manager.restart_if_needed()
+
             # Check AW first
             if not self.aw.is_running():
                 self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
@@ -265,6 +276,9 @@ class BetterFlowSyncApp:
         self.aw.close()
         self.bf.close()
         self.queue.close()
+
+        # Stop bundled ActivityWatch
+        self.aw_manager.stop()
 
         logger.info("Shutdown complete")
 

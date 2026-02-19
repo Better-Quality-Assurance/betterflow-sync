@@ -1,10 +1,24 @@
 """System tray icon and menu."""
 
 import logging
+import platform
 import threading
 import webbrowser
 from enum import Enum
 from typing import Callable, Optional
+
+
+def _hide_from_dock() -> None:
+    """Hide the app from the macOS Dock."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        import AppKit
+        NSApp = AppKit.NSApplication.sharedApplication()
+        # NSApplicationActivationPolicyAccessory = 1 (no Dock icon)
+        NSApp.setActivationPolicy_(1)
+    except Exception:
+        pass
 
 from PIL import Image, ImageDraw
 
@@ -241,10 +255,11 @@ class TrayIcon:
         self._update_menu()
 
     def _update_icon(self) -> None:
-        """Update the tray icon image."""
+        """Update the tray icon image and menu."""
         if self._icon:
             color = STATE_COLORS.get(self._state, STATE_COLORS[TrayState.STARTING])
             self._icon.icon = create_icon_image(color)
+            self._icon.menu = self._create_menu()
 
     def _update_menu(self) -> None:
         """Update the tray menu."""
@@ -278,6 +293,7 @@ class TrayIcon:
 
     def run_blocking(self) -> None:
         """Run the tray icon in the main thread (blocking)."""
+        _hide_from_dock()
         if self._icon is None:
             color = STATE_COLORS[self._state]
             self._icon = pystray.Icon(

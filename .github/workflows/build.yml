@@ -41,6 +41,10 @@ jobs:
         working-directory: agent
         run: python scripts/generate_icons.py
 
+      - name: Download ActivityWatch binaries
+        working-directory: agent
+        run: python scripts/download_aw.py
+
       - name: Build with PyInstaller
         working-directory: agent
         run: pyinstaller build.spec --clean

@@ -59,5 +59,8 @@ logs/
 .DS_Store
 Thumbs.db
 
+# ActivityWatch binaries (downloaded during build)
+resources/activitywatch/
+
 # Keep resources placeholder
 !resources/.gitkeep

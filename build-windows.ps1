@@ -34,6 +34,10 @@ pip install pyinstaller
 Write-Host "Generating icons..." -ForegroundColor Yellow
 python scripts\generate_icons.py
 
+# Download ActivityWatch binaries
+Write-Host "Downloading ActivityWatch binaries..." -ForegroundColor Yellow
+python scripts\download_aw.py
+
 # Build with PyInstaller
 Write-Host "Building executable..." -ForegroundColor Yellow
 pyinstaller build.spec --clean
