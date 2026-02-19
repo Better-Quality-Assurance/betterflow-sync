@@ -148,22 +148,29 @@ class Config:
         logger.info(f"Config saved to {config_file}")
 
     def update_from_server(self, server_config: dict) -> None:
-        """Update local config from server response."""
+        """Update local config from server response.
+
+        Server returns:
+            privacy.hash_window_titles -> local hash_titles
+            privacy.title_allowlist -> local title_allowlist
+            privacy.track_browser_domains -> local domain_only_urls (inverted)
+            sync.sync_interval_seconds -> local interval_seconds
+            sync.batch_size -> local batch_size
+        """
         if "privacy" in server_config:
             privacy = server_config["privacy"]
-            if "hash_titles" in privacy:
-                self.privacy.hash_titles = privacy["hash_titles"]
+            if "hash_window_titles" in privacy:
+                self.privacy.hash_titles = privacy["hash_window_titles"]
             if "title_allowlist" in privacy:
                 self.privacy.title_allowlist = privacy["title_allowlist"]
-            if "domain_only_urls" in privacy:
-                self.privacy.domain_only_urls = privacy["domain_only_urls"]
-            if "exclude_apps" in privacy:
-                self.privacy.exclude_apps = privacy["exclude_apps"]
+            if "track_browser_domains" in privacy:
+                # Server tracks domains = we extract domain only
+                self.privacy.domain_only_urls = privacy["track_browser_domains"]
 
         if "sync" in server_config:
             sync = server_config["sync"]
-            if "interval_seconds" in sync:
-                self.sync.interval_seconds = max(30, sync["interval_seconds"])
+            if "sync_interval_seconds" in sync:
+                self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
 

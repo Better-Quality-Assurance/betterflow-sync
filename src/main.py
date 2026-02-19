@@ -100,6 +100,9 @@ class BetterFlowSyncApp:
         # Set user on tray
         self.tray.set_user(state.user_email, state.user_name)
 
+        # Fetch server config (privacy settings, sync intervals, category rules)
+        self.sync_engine.fetch_server_config()
+
         # Start bundled ActivityWatch
         self.aw_manager.start()
 

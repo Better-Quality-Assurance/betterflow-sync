@@ -2,16 +2,50 @@
 
 Opens the user's browser to the BetterFlow authorize page.
 A local HTTP server receives the callback with the authorization code.
+
+Security features:
+- State parameter (CSRF protection)
+- PKCE (Proof Key for Code Exchange) for public client security
 """
 
+import base64
+import hashlib
 import logging
+import secrets
 import threading
 import webbrowser
+from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AuthFlowResult:
+    """Result of browser auth flow."""
+
+    success: bool
+    code: Optional[str] = None
+    code_verifier: Optional[str] = None  # For PKCE token exchange
+    error: Optional[str] = None
+
+
+def _generate_pkce_pair() -> tuple[str, str]:
+    """Generate PKCE code_verifier and code_challenge.
+
+    Returns:
+        Tuple of (code_verifier, code_challenge)
+    """
+    # Generate random 32-byte code verifier (43 chars base64url)
+    code_verifier = secrets.token_urlsafe(32)
+
+    # Create SHA256 hash, then base64url encode (no padding)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    return code_verifier, code_challenge
 
 _SUCCESS_HTML = """\
 <!DOCTYPE html>
@@ -79,6 +113,18 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
         params = parse_qs(parsed.query)
         code = params.get("code", [None])[0]
+        state = params.get("state", [None])[0]
+
+        # Verify state parameter (CSRF protection)
+        if state != self.server.expected_state:
+            logger.warning(f"State mismatch: expected {self.server.expected_state}, got {state}")
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(_ERROR_HTML.encode())
+            self.server.auth_error = "state_mismatch"
+            self.server.callback_received.set()
+            return
 
         if code:
             self.send_response(200)
@@ -106,9 +152,17 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 class BrowserAuthFlow:
     """Manages the browser-based authorization flow.
 
-    1. Starts a local HTTP server on a random port
-    2. Opens the browser to the authorize URL
-    3. Waits for the callback with the authorization code
+    Security features:
+    - State parameter for CSRF protection
+    - PKCE (Proof Key for Code Exchange) for public client security
+
+    Flow:
+    1. Generate state and PKCE code_verifier/code_challenge
+    2. Start a local HTTP server on a random port
+    3. Open the browser to the authorize URL with state and code_challenge
+    4. Wait for the callback with the authorization code
+    5. Verify state parameter matches
+    6. Return code and code_verifier for token exchange
     """
 
     TIMEOUT_SECONDS = 300  # 5 minutes
@@ -124,16 +178,21 @@ class BrowserAuthFlow:
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
-    def start(self) -> Optional[str]:
+    def start(self) -> AuthFlowResult:
         """Run the full auth flow and return the authorization code.
 
         Returns:
-            Authorization code string on success, None on failure/timeout.
+            AuthFlowResult with code and code_verifier on success.
         """
+        # Generate security tokens
+        state = secrets.token_urlsafe(32)
+        code_verifier, code_challenge = _generate_pkce_pair()
+
         # Create server on random port
         self._server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
         self._server.auth_code = None
         self._server.auth_error = None
+        self._server.expected_state = state
         self._server.callback_received = threading.Event()
 
         port = self._server.server_address[1]
@@ -143,9 +202,16 @@ class BrowserAuthFlow:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
-        # Open browser
-        authorize_url = f"{self._authorize_url_base}?callback_port={port}"
-        logger.info(f"Opening browser for authorization: {authorize_url}")
+        # Open browser with state and PKCE challenge
+        authorize_url = (
+            f"{self._authorize_url_base}"
+            f"?callback_port={port}"
+            f"&state={state}"
+            f"&code_challenge={code_challenge}"
+            f"&code_challenge_method=S256"
+        )
+        logger.info(f"Opening browser for authorization")
+        logger.debug(f"Authorize URL: {authorize_url}")
         webbrowser.open(authorize_url)
 
         # Wait for callback
@@ -156,11 +222,15 @@ class BrowserAuthFlow:
 
         if not got_response:
             logger.warning("Authorization timed out (no callback received)")
-            return None
+            return AuthFlowResult(success=False, error="timeout")
 
         if self._server.auth_code:
-            logger.info("Authorization code received")
-            return self._server.auth_code
+            logger.info("Authorization code received (state verified)")
+            return AuthFlowResult(
+                success=True,
+                code=self._server.auth_code,
+                code_verifier=code_verifier,
+            )
 
         logger.warning(f"Authorization failed: {self._server.auth_error}")
-        return None
+        return AuthFlowResult(success=False, error=self._server.auth_error)

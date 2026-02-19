@@ -211,12 +211,15 @@ class BetterFlowClient:
             except BetterFlowClientError:
                 return False
 
-    def exchange_code(self, code: str, device_name: str) -> AuthResult:
+    def exchange_code(
+        self, code: str, device_name: str, code_verifier: Optional[str] = None
+    ) -> AuthResult:
         """Exchange an authorization code for a Sanctum token.
 
         Args:
             code: 64-char authorization code from browser flow
             device_name: Name for this device token
+            code_verifier: PKCE code verifier (if PKCE was used in auth flow)
 
         Returns:
             AuthResult with api_token on success
@@ -227,17 +230,21 @@ class BetterFlowClient:
             "Content-Type": "application/json",
             "User-Agent": "BetterFlow-Sync/1.0.0",
         }
+        device_info = DeviceInfo.collect()
+        payload = {
+            "code": code,
+            "device_name": device_name,
+            "platform": device_info.platform_key,
+            "os_version": platform.release(),
+            "machine_id": device_info.machine_id,
+            "agent_version": AGENT_VERSION,
+        }
+        if code_verifier:
+            payload["code_verifier"] = code_verifier
         try:
             response = self._session.post(
                 url,
-                json={
-                    "code": code,
-                    "device_name": device_name,
-                    "platform": DeviceInfo.collect().platform_key,
-                    "os_version": platform.release(),
-                    "machine_id": DeviceInfo.collect().machine_id,
-                    "agent_version": AGENT_VERSION,
-                },
+                json=payload,
                 headers=headers,
                 timeout=self.timeout,
             )

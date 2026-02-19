@@ -130,21 +130,28 @@ class LoginManager:
         Opens the browser to BetterFlow authorize page, waits for callback,
         then exchanges the code for a Sanctum token.
 
+        Security: Uses state parameter (CSRF) and PKCE for secure auth flow.
+
         Returns:
             LoginState with result
         """
         authorize_url = f"{self.bf.web_base_url}/sync/auth/authorize"
         flow = BrowserAuthFlow(authorize_url)
 
-        logger.info("Starting browser auth flow...")
-        code = flow.start()
+        logger.info("Starting browser auth flow (with PKCE)...")
+        auth_result = flow.start()
 
-        if not code:
-            return LoginState(logged_in=False, error="Authorization was cancelled or timed out")
+        if not auth_result.success:
+            return LoginState(
+                logged_in=False,
+                error=auth_result.error or "Authorization was cancelled or timed out",
+            )
 
-        # Exchange code for token
+        # Exchange code for token (with PKCE code_verifier)
         device_name = f"sync:{platform.node()}"
-        result = self.bf.exchange_code(code, device_name)
+        result = self.bf.exchange_code(
+            auth_result.code, device_name, auth_result.code_verifier
+        )
 
         if not result.success:
             return LoginState(logged_in=False, error=result.error)

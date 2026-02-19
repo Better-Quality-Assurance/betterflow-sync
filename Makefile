@@ -65,6 +65,7 @@ dmg: build-mac
 		--app-drop-link 450 185 \
 		"dist/BetterFlow Sync.dmg" \
 		"dist/BetterFlow Sync.app"
+	rm -f "dist/BetterFlow Sync"
 
 # Development server (auto-reload)
 dev:
