@@ -286,9 +286,15 @@ class BetterFlowClient:
                 headers=headers,
                 timeout=self.timeout,
             )
-            if response.status_code == 401:
-                data = response.json()
-                return AuthResult(success=False, error=data.get("message", "Invalid code"))
+            # Handle error responses with JSON body
+            if response.status_code in (400, 401, 403):
+                try:
+                    data = response.json()
+                    error_msg = data.get("message", data.get("error", "Authentication failed"))
+                except ValueError:
+                    error_msg = f"HTTP {response.status_code}"
+                return AuthResult(success=False, error=error_msg)
+
             response.raise_for_status()
             data = response.json()
             user = data.get("user", {})
@@ -303,8 +309,10 @@ class BetterFlowClient:
             return AuthResult(success=False, error="Cannot connect to BetterFlow")
         except requests.exceptions.Timeout:
             return AuthResult(success=False, error="Request timed out")
-        except Exception as e:
-            return AuthResult(success=False, error=str(e))
+        except requests.exceptions.HTTPError as e:
+            return AuthResult(success=False, error=f"HTTP error: {e.response.status_code}")
+        except (KeyError, ValueError) as e:
+            return AuthResult(success=False, error=f"Invalid response: {e}")
 
     def register(
         self, email: str, password: str, device_info: Optional[DeviceInfo] = None

@@ -7,7 +7,12 @@ from typing import Optional, Callable
 
 from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
-from ..sync.bf_client import BetterFlowClient, AuthResult
+from ..sync.bf_client import (
+    BetterFlowClient,
+    AuthResult,
+    BetterFlowClientError,
+    BetterFlowAuthError,
+)
 
 __all__ = ["LoginManager", "LoginState"]
 
@@ -77,10 +82,14 @@ class LoginManager:
             if self._on_login_callback:
                 self._on_login_callback(state)
             return state
-        except Exception as e:
-            logger.warning(f"Auto-login failed: {e}")
+        except BetterFlowAuthError as e:
+            logger.warning(f"Auto-login failed (auth): {e}")
             self.bf.clear_credentials()
             return LoginState(logged_in=False, error="Stored credentials are invalid")
+        except BetterFlowClientError as e:
+            logger.warning(f"Auto-login failed (network): {e}")
+            # Don't clear credentials on network error - might be temporary
+            return LoginState(logged_in=False, error=f"Cannot verify credentials: {e}")
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.
