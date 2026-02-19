@@ -149,11 +149,13 @@ class TrayIcon:
 
         items.append(Item("─" * 20, None, enabled=False))
 
+        logged_in = self._user_email is not None
+
         # Pause/Resume
         if self._paused:
-            items.append(Item("Resume Tracking", self._handle_resume))
+            items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
         else:
-            items.append(Item("Pause Tracking", self._handle_pause))
+            items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
         # Actions
         items.append(Item("Preferences", pystray.Menu(
@@ -183,8 +185,8 @@ class TrayIcon:
             ),
             Item("─" * 15, None, enabled=False),
             Item("Open Config File", self._handle_open_config),
-        )))
-        items.append(Item("View Dashboard", self._handle_dashboard))
+        ), enabled=logged_in))
+        items.append(Item("View Dashboard", self._handle_dashboard, enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 

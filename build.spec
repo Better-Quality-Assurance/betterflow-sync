@@ -85,17 +85,12 @@ if is_mac:
     exe = EXE(
         pyz,
         a.scripts,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
-        [],
+        exclude_binaries=True,
         name="BetterFlow Sync",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
         upx=True,
-        upx_exclude=[],
-        runtime_tmpdir=None,
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=True,
@@ -105,8 +100,18 @@ if is_mac:
         icon=str(resources_dir / "icon.icns") if (resources_dir / "icon.icns").exists() else None,
     )
 
-    app = BUNDLE(
+    coll = COLLECT(
         exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        name="BetterFlowSync",
+    )
+
+    app = BUNDLE(
+        coll,
         name="BetterFlow Sync.app",
         icon=str(resources_dir / "icon.icns") if (resources_dir / "icon.icns").exists() else None,
         bundle_identifier="co.betterqa.betterflow-sync",
@@ -134,8 +139,6 @@ elif is_windows:
         bootloader_ignore_signals=False,
         strip=False,
         upx=True,
-        upx_exclude=[],
-        runtime_tmpdir=None,
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,

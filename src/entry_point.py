@@ -277,6 +277,9 @@ class BetterFlowSyncApp:
         # Stop bundled ActivityWatch
         self.aw_manager.stop()
 
+        # Release single-instance lock
+        _release_lock()
+
         logger.info("Shutdown complete")
 
 
@@ -290,6 +293,21 @@ def _acquire_lock() -> bool:
         Config.get_config_dir(), ".betterflow-sync.lock"
     )
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+    # Check for stale PID first
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r") as f:
+                old_pid = int(f.read().strip())
+            # Check if that process is still alive
+            os.kill(old_pid, 0)  # signal 0 = check existence
+            # Process exists — another instance is running
+            print(f"BetterFlow Sync is already running (PID {old_pid}).")
+            return False
+        except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
+            # PID is stale or unreadable — safe to take over
+            pass
+
     _lock_file = open(lock_path, "w")
     try:
         fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -300,6 +318,20 @@ def _acquire_lock() -> bool:
         _lock_file.close()
         _lock_file = None
         return False
+
+
+def _release_lock() -> None:
+    """Release the single-instance lock."""
+    global _lock_file
+    if _lock_file:
+        try:
+            lock_path = _lock_file.name
+            fcntl.flock(_lock_file, fcntl.LOCK_UN)
+            _lock_file.close()
+            os.unlink(lock_path)
+        except Exception:
+            pass
+        _lock_file = None
 
 
 def main() -> None:
