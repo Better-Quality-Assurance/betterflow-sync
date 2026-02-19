@@ -1,24 +1,25 @@
 """Entry point for PyInstaller bundle."""
 
-import sys
 import os
+import sys
 
-# Add the src directory to path for absolute imports
-if getattr(sys, 'frozen', False):
-    # Running as compiled
-    bundle_dir = sys._MEIPASS
-    sys.path.insert(0, bundle_dir)
+# Set up import path before any project imports
+# This must be done inline since we can't import compat until paths are set
+if getattr(sys, "frozen", False):
+    bundle_dir = sys._MEIPASS  # type: ignore
+    if bundle_dir not in sys.path:
+        sys.path.insert(0, bundle_dir)
 else:
-    # Running in development
     src_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, src_dir)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
 
 # Now import and run the app
 from config import Config, setup_logging
 from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
 from auth import KeychainManager, LoginManager
 from ui.tray import TrayIcon, TrayState
-from ui.preferences import show_login_window, show_preferences_window
+from ui.preferences import show_preferences_window
 
 import logging
 import signal
@@ -87,19 +88,19 @@ class BetterFlowSyncApp:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-        # Try auto-login
+        # Try auto-login first (keychain)
         login_state = self.login_manager.try_auto_login()
 
         if not login_state.logged_in:
-            # Show login window
-            self._show_login()
-            # Check if we logged in
-            if not self.login_manager.is_logged_in():
-                logger.info("Login cancelled, exiting")
-                return
+            # Need browser auth
+            login_state = self.login_manager.login_via_browser()
+
+        if not login_state.logged_in:
+            logger.error("Not logged in - exiting")
+            return
 
         # Update tray with user info
-        self.tray.set_user(self.login_manager.get_current_user())
+        self.tray.set_user(login_state.user_email, login_state.user_name)
 
         # Start sync scheduler
         self._start_sync_loop()
@@ -143,7 +144,12 @@ class BetterFlowSyncApp:
 
             # Update tray
             if stats.success:
-                if stats.events_queued > 0:
+                # Check queue capacity first (takes priority over queued state)
+                if self.queue.is_near_capacity():
+                    pct = int(self.queue.capacity_percent() * 100)
+                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
+                    logger.warning(f"Offline queue at {pct}% capacity")
+                elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
                 else:
                     self.tray.set_state(TrayState.SYNCING)
@@ -179,17 +185,6 @@ class BetterFlowSyncApp:
     def _format_time(self, dt: datetime) -> str:
         """Format time for display."""
         return dt.strftime("%H:%M")
-
-    def _show_login(self) -> None:
-        """Show login window."""
-
-        def on_login(email: str, password: str) -> bool:
-            state = self.login_manager.login(email, password)
-            if state.logged_in:
-                self.tray.set_user(email)
-            return state.logged_in
-
-        show_login_window(on_login)
 
     def _on_pause(self) -> None:
         """Handle pause action."""
@@ -231,11 +226,22 @@ class BetterFlowSyncApp:
         self.tray.set_user(None)
         logger.info("Logged out")
 
-        # Show login window
-        self._show_login()
+        # Stop sync loop
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
 
-        if not self.login_manager.is_logged_in():
-            self._on_quit()
+        # Re-login via browser
+        self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+
+        def do_relogin():
+            state = self.login_manager.login_via_browser()
+            if state.logged_in:
+                self.tray.set_user(state.user_email, state.user_name)
+                self._start_sync_loop()
+            else:
+                self._on_quit()
+
+        threading.Thread(target=do_relogin, daemon=True).start()
 
     def _on_quit(self) -> None:
         """Handle quit action."""

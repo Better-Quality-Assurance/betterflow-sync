@@ -137,7 +137,12 @@ class BetterFlowSyncApp:
 
             # Update tray
             if stats.success:
-                if stats.events_queued > 0:
+                # Check queue capacity first (takes priority over queued state)
+                if self.queue.is_near_capacity():
+                    pct = int(self.queue.capacity_percent() * 100)
+                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
+                    logger.warning(f"Offline queue at {pct}% capacity")
+                elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
                 else:
                     self.tray.set_state(TrayState.SYNCING)

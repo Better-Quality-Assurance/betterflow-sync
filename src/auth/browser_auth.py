@@ -19,6 +19,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
+__all__ = ["BrowserAuthFlow", "AuthFlowResult"]
+
 logger = logging.getLogger(__name__)
 
 

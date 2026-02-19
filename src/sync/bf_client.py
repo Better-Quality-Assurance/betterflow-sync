@@ -5,13 +5,22 @@ import json
 import logging
 import platform
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 
 from ..config import DEFAULT_API_URL
+from .retry import RetryConfig, retry_with_backoff, RetryExhausted
+
+__all__ = [
+    "BetterFlowClient",
+    "BetterFlowClientError",
+    "BetterFlowAuthError",
+    "DeviceInfo",
+    "AuthResult",
+    "SyncResult",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +87,23 @@ class BetterFlowAuthError(BetterFlowClientError):
     pass
 
 
+class _TransientError(Exception):
+    """Internal: Marks an error as transient/retryable."""
+
+    pass
+
+
 class BetterFlowClient:
     """Client for syncing events to BetterFlow server."""
+
+    # Default retry configuration for transient network failures
+    DEFAULT_RETRY_CONFIG = RetryConfig(
+        max_retries=3,
+        base_delay=1.0,
+        max_delay=30.0,
+        exponential_base=2.0,
+        jitter=True,
+    )
 
     def __init__(
         self,
@@ -88,6 +112,7 @@ class BetterFlowClient:
         device_id: Optional[str] = None,
         compress: bool = True,
         timeout: int = 30,
+        retry_config: Optional[RetryConfig] = None,
     ):
         """Initialize BetterFlow client.
 
@@ -97,6 +122,7 @@ class BetterFlowClient:
             device_id: Device ID from registration
             compress: Use gzip compression for event batches
             timeout: Request timeout in seconds
+            retry_config: Configuration for retry with exponential backoff
         """
         self.api_url = api_url.rstrip("/")
         self._web_base_url: Optional[str] = None
@@ -104,13 +130,14 @@ class BetterFlowClient:
         self.device_id = device_id
         self.compress = compress
         self.timeout = timeout
+        self.retry_config = retry_config or self.DEFAULT_RETRY_CONFIG
         self._session = requests.Session()
 
     def _get_headers(self) -> dict:
         """Get request headers."""
         headers = {
             "Accept": "application/json",
-            "User-Agent": f"BetterFlow-Sync/1.0.0",
+            "User-Agent": "BetterFlow-Sync/1.0.0",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -124,8 +151,24 @@ class BetterFlowClient:
         endpoint: str,
         data: Optional[dict] = None,
         compress: bool = False,
+        retry: bool = True,
     ) -> dict:
-        """Make request to BetterFlow API."""
+        """Make request to BetterFlow API.
+
+        Args:
+            method: HTTP method
+            endpoint: API endpoint
+            data: Request data
+            compress: Whether to gzip compress the payload
+            retry: Whether to retry on transient failures (default True)
+
+        Returns:
+            Response data as dict
+
+        Raises:
+            BetterFlowAuthError: For 401/403 responses (not retried)
+            BetterFlowClientError: For other errors
+        """
         url = f"{self.api_url}/{endpoint.lstrip('/')}"
         headers = self._get_headers()
 
@@ -142,30 +185,53 @@ class BetterFlowClient:
             else:
                 kwargs["json"] = data
 
-        try:
-            response = self._session.request(method, url, **kwargs)
-
-            if response.status_code == 401:
-                raise BetterFlowAuthError("Invalid or expired API token")
-            if response.status_code == 403:
-                raise BetterFlowAuthError("Device not authorized")
-
-            response.raise_for_status()
-            return response.json() if response.content else {}
-
-        except requests.exceptions.ConnectionError as e:
-            raise BetterFlowClientError(f"Cannot connect to BetterFlow API") from e
-        except requests.exceptions.Timeout as e:
-            raise BetterFlowClientError(f"Request timed out") from e
-        except requests.exceptions.HTTPError as e:
-            error_detail = ""
+        def do_request() -> dict:
             try:
-                error_detail = e.response.json().get("message", "")
-            except Exception:
-                pass
-            raise BetterFlowClientError(
-                f"API error ({e.response.status_code}): {error_detail or str(e)}"
-            ) from e
+                response = self._session.request(method, url, **kwargs)
+
+                if response.status_code == 401:
+                    raise BetterFlowAuthError("Invalid or expired API token")
+                if response.status_code == 403:
+                    raise BetterFlowAuthError("Device not authorized")
+
+                # Server errors (5xx) are retryable
+                if response.status_code >= 500:
+                    raise _TransientError(f"Server error: {response.status_code}")
+
+                response.raise_for_status()
+                return response.json() if response.content else {}
+
+            except requests.exceptions.ConnectionError:
+                raise _TransientError("Cannot connect to BetterFlow API")
+            except requests.exceptions.Timeout:
+                raise _TransientError("Request timed out")
+            except requests.exceptions.HTTPError as e:
+                error_detail = ""
+                try:
+                    error_detail = e.response.json().get("message", "")
+                except Exception:
+                    pass
+                raise BetterFlowClientError(
+                    f"API error ({e.response.status_code}): {error_detail or str(e)}"
+                ) from e
+
+        if retry:
+            try:
+                return retry_with_backoff(
+                    do_request,
+                    config=self.retry_config,
+                    retryable_exceptions=(_TransientError,),
+                )
+            except RetryExhausted as e:
+                # Convert to client error after exhausting retries
+                if e.last_error:
+                    raise BetterFlowClientError(str(e.last_error)) from e.last_error
+                raise BetterFlowClientError("Request failed after retries") from e
+        else:
+            try:
+                return do_request()
+            except _TransientError as e:
+                raise BetterFlowClientError(str(e)) from e
 
     @property
     def web_base_url(self) -> str:
@@ -181,12 +247,12 @@ class BetterFlowClient:
     def is_reachable(self) -> bool:
         """Check if BetterFlow API is reachable."""
         try:
-            self._request("GET", "health")
+            self._request("GET", "health", retry=False)
             return True
         except BetterFlowClientError:
             # Try the status endpoint as fallback
             try:
-                self._request("GET", "events/status")
+                self._request("GET", "events/status", retry=False)
                 return True
             except BetterFlowClientError:
                 return False
@@ -245,6 +311,10 @@ class BetterFlowClient:
     ) -> AuthResult:
         """Register this device with BetterFlow.
 
+        DEPRECATED: Use exchange_code() with browser OAuth flow instead.
+        This method sends passwords over the network which is less secure
+        than the browser-based OAuth flow with PKCE.
+
         Args:
             email: User's BetterFlow email
             password: User's BetterFlow password
@@ -253,6 +323,12 @@ class BetterFlowClient:
         Returns:
             AuthResult with device_id and api_token on success
         """
+        import warnings
+        warnings.warn(
+            "register() is deprecated. Use browser OAuth flow with exchange_code() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if device_info is None:
             device_info = DeviceInfo.collect()
 
