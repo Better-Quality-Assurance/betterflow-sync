@@ -57,13 +57,13 @@ def _get_install_dir() -> str:
 
 
 def _get_db_dir() -> str:
-    """Get directory for tracker database storage."""
+    """Get sqlite file path for tracker database storage."""
     if platform.system() == "Darwin":
         base = os.path.expanduser("~/Library/Application Support/BetterFlow Sync")
     else:
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
         base = os.path.join(base, "BetterQA", "BetterFlow Sync")
-    return os.path.join(base, "data", "aw-db")
+    return os.path.join(base, "data", "aw-db.sqlite")
 
 
 def _binaries_present(directory: str) -> bool:
@@ -315,9 +315,9 @@ class AWManager:
                 if self.aw_port != 5600:
                     args.extend(["--port", str(self.aw_port)])
                 # Redirect database to BetterFlow's app support directory
-                db_dir = _get_db_dir()
-                os.makedirs(db_dir, exist_ok=True)
-                args.extend(["--dbpath", db_dir])
+                db_path = _get_db_dir()
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+                args.extend(["--dbpath", db_path])
 
             proc = subprocess.Popen(args, **kwargs)
             self._processes[name] = proc

@@ -390,6 +390,8 @@ class TrayIcon:
         hours_today: Optional[str] = None,
         last_sync: Optional[str] = None,
         queue_size: Optional[int] = None,
+        events_today: Optional[int] = None,
+        **_kwargs,
     ) -> None:
         """Update statistics shown in menu.
 
@@ -397,7 +399,18 @@ class TrayIcon:
             hours_today: Formatted hours string (e.g. "4h 24m")
             last_sync: Last sync time string
             queue_size: Number of events in offline queue
+            events_today: Backward-compatible alias from older callers
         """
+        # Backward compatibility for older builds that pass events_today
+        if hours_today is None and events_today is not None:
+            try:
+                total_seconds = int(events_today)
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                hours_today = f"{hours}h {minutes}m"
+            except (TypeError, ValueError):
+                pass
+
         if hours_today is not None:
             self._hours_today = hours_today
         if last_sync is not None:

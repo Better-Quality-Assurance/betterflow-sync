@@ -54,6 +54,8 @@ hiddenimports = [
     "ui",
     "ui.tray",
     "ui.preferences",
+    "ui.permissions",
+    "ui.setup_wizard",
     "aw_manager",
 ]
 
@@ -123,6 +125,7 @@ if is_mac:
             "LSUIElement": True,  # Hide from dock (menu bar app)
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",
+            "NSRequiresAquaSystemAppearance": True,
             "NSAppleEventsUsageDescription": "BetterFlow Sync needs this to track your active applications for time tracking.",
         },
     )

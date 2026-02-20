@@ -67,6 +67,7 @@ class BetterFlowSyncApp:
 
         # Tray icon
         self.tray = TrayIcon(
+            on_login=self._on_login,
             on_pause=self._on_pause,
             on_resume=self._on_resume,
             on_preferences=self._on_preferences,
@@ -106,28 +107,23 @@ class BetterFlowSyncApp:
         else:
             state = self.login_manager.try_auto_login()
 
-        if not state.logged_in:
-            # Need browser auth
-            state = self.login_manager.login_via_browser()
-
-        if not state.logged_in:
-            logger.error("Not logged in — exiting")
-            return
-
-        # Set user on tray
-        self.tray.set_user(state.user_email, state.user_name)
-
-        # Fetch server config (privacy settings, sync intervals, category rules)
-        self.sync_engine.fetch_server_config()
-
-        # Fetch projects and set on tray
-        self._fetch_projects()
-
         # Start bundled ActivityWatch
         self.aw_manager.start()
 
-        # Start sync loop
-        self._start_sync_loop()
+        if state.logged_in:
+            # Set user on tray
+            self.tray.set_user(state.user_email, state.user_name)
+
+            # Fetch server config (privacy settings, sync intervals, category rules)
+            self.sync_engine.fetch_server_config()
+
+            # Fetch projects and set on tray
+            self._fetch_projects()
+
+            # Start sync loop
+            self._start_sync_loop()
+        else:
+            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         # Start tray icon (blocking)
         self._running = True
@@ -220,6 +216,22 @@ class BetterFlowSyncApp:
     def _format_time(self, dt: datetime) -> str:
         """Format time for display."""
         return dt.strftime("%H:%M")
+
+    def _on_login(self) -> None:
+        """Handle explicit login action from tray."""
+        def do_browser_login():
+            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+            state = self.login_manager.login_via_browser()
+            if state.logged_in:
+                self.tray.set_user(state.user_email, state.user_name)
+                self.sync_engine.fetch_server_config()
+                self._fetch_projects()
+                if not self.scheduler.running:
+                    self._start_sync_loop()
+            else:
+                self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
+
+        threading.Thread(target=do_browser_login, daemon=True).start()
 
     def _on_pause(self) -> None:
         """Handle pause action."""

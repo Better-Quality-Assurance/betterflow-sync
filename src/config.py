@@ -24,7 +24,7 @@ APP_NAME = "BetterFlow Sync"
 APP_AUTHOR = "BetterQA"
 
 # API endpoints
-DEFAULT_API_URL = "http://localhost:8001/api/agent"
+DEFAULT_API_URL = "https://app.betterflow.eu/api/agent"
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
 
 # ActivityWatch defaults
@@ -140,6 +140,10 @@ class Config:
         aw_data = data.pop("aw", {})
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
+
+        # Migrate legacy local default to production API URL.
+        if data.get("api_url") == "http://localhost:8001/api/agent":
+            data["api_url"] = DEFAULT_API_URL
 
         return cls(
             aw=AWSettings(**aw_data) if aw_data else AWSettings(),
