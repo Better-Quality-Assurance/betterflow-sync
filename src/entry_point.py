@@ -1,17 +1,18 @@
 """Entry point for PyInstaller bundle."""
 
-import sys
 import os
+import sys
 
-# Add the src directory to path for absolute imports
-if getattr(sys, 'frozen', False):
-    # Running as compiled
-    bundle_dir = sys._MEIPASS
-    sys.path.insert(0, bundle_dir)
+# Set up import path before any project imports
+# This must be done inline since we can't import compat until paths are set
+if getattr(sys, "frozen", False):
+    bundle_dir = sys._MEIPASS  # type: ignore
+    if bundle_dir not in sys.path:
+        sys.path.insert(0, bundle_dir)
 else:
-    # Running in development
     src_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, src_dir)
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
 
 # Now import and run the app
 from config import Config, setup_logging
@@ -154,7 +155,12 @@ class BetterFlowSyncApp:
 
             # Update tray
             if stats.success:
-                if stats.events_queued > 0:
+                # Check queue capacity first (takes priority over queued state)
+                if self.queue.is_near_capacity():
+                    pct = int(self.queue.capacity_percent() * 100)
+                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
+                    logger.warning(f"Offline queue at {pct}% capacity")
+                elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
                 else:
                     self.tray.set_state(TrayState.SYNCING)

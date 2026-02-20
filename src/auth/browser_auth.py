@@ -8,8 +8,6 @@ Security features:
 - PKCE (Proof Key for Code Exchange) for public client security
 """
 
-import base64
-import hashlib
 import logging
 import secrets
 import threading
@@ -17,7 +15,11 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
+
+from .pkce import generate_pkce_pair
+
+__all__ = ["BrowserAuthFlow", "AuthFlowResult"]
 
 logger = logging.getLogger(__name__)
 
@@ -30,22 +32,6 @@ class AuthFlowResult:
     code: Optional[str] = None
     code_verifier: Optional[str] = None  # For PKCE token exchange
     error: Optional[str] = None
-
-
-def _generate_pkce_pair() -> tuple[str, str]:
-    """Generate PKCE code_verifier and code_challenge.
-
-    Returns:
-        Tuple of (code_verifier, code_challenge)
-    """
-    # Generate random 32-byte code verifier (43 chars base64url)
-    code_verifier = secrets.token_urlsafe(32)
-
-    # Create SHA256 hash, then base64url encode (no padding)
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-
-    return code_verifier, code_challenge
 
 _SUCCESS_HTML = """\
 <!DOCTYPE html>
@@ -117,7 +103,8 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
         # Verify state parameter (CSRF protection)
         if state != self.server.expected_state:
-            logger.warning(f"State mismatch: expected {self.server.expected_state}, got {state}")
+            # Don't log actual state values (security tokens)
+            logger.warning("State parameter mismatch - possible CSRF attempt")
             self.send_response(400)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -186,7 +173,7 @@ class BrowserAuthFlow:
         """
         # Generate security tokens
         state = secrets.token_urlsafe(32)
-        code_verifier, code_challenge = _generate_pkce_pair()
+        code_verifier, code_challenge = generate_pkce_pair()
 
         # Create server on random port
         self._server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
@@ -202,35 +189,38 @@ class BrowserAuthFlow:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
-        # Open browser with state and PKCE challenge
-        authorize_url = (
-            f"{self._authorize_url_base}"
-            f"?callback_port={port}"
-            f"&state={state}"
-            f"&code_challenge={code_challenge}"
-            f"&code_challenge_method=S256"
-        )
-        logger.info(f"Opening browser for authorization")
-        logger.debug(f"Authorize URL: {authorize_url}")
-        webbrowser.open(authorize_url)
-
-        # Wait for callback
-        got_response = self._server.callback_received.wait(timeout=self.TIMEOUT_SECONDS)
-
-        # Shut down server
-        self._server.shutdown()
-
-        if not got_response:
-            logger.warning("Authorization timed out (no callback received)")
-            return AuthFlowResult(success=False, error="timeout")
-
-        if self._server.auth_code:
-            logger.info("Authorization code received (state verified)")
-            return AuthFlowResult(
-                success=True,
-                code=self._server.auth_code,
-                code_verifier=code_verifier,
+        try:
+            # Open browser with state and PKCE challenge (URL-encoded for safety)
+            authorize_url = (
+                f"{self._authorize_url_base}"
+                f"?callback_port={port}"
+                f"&state={quote(state, safe='')}"
+                f"&code_challenge={quote(code_challenge, safe='')}"
+                f"&code_challenge_method=S256"
             )
+            logger.info("Opening browser for authorization")
+            logger.debug(f"Authorize URL: {authorize_url}")
+            webbrowser.open(authorize_url)
 
-        logger.warning(f"Authorization failed: {self._server.auth_error}")
-        return AuthFlowResult(success=False, error=self._server.auth_error)
+            # Wait for callback
+            got_response = self._server.callback_received.wait(timeout=self.TIMEOUT_SECONDS)
+
+            if not got_response:
+                logger.warning("Authorization timed out (no callback received)")
+                return AuthFlowResult(success=False, error="timeout")
+
+            if self._server.auth_code:
+                logger.info("Authorization code received (state verified)")
+                return AuthFlowResult(
+                    success=True,
+                    code=self._server.auth_code,
+                    code_verifier=code_verifier,
+                )
+
+            logger.warning(f"Authorization failed: {self._server.auth_error}")
+            return AuthFlowResult(success=False, error=self._server.auth_error)
+        finally:
+            # Always shut down server and clean up thread
+            self._server.shutdown()
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)  # Wait up to 2s for thread to finish

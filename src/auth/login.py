@@ -7,7 +7,14 @@ from typing import Optional, Callable
 
 from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
-from sync.bf_client import BetterFlowClient, DeviceInfo, AuthResult
+from ..sync.bf_client import (
+    BetterFlowClient,
+    AuthResult,
+    BetterFlowClientError,
+    BetterFlowAuthError,
+)
+
+__all__ = ["LoginManager", "LoginState"]
 
 logger = logging.getLogger(__name__)
 
@@ -75,54 +82,14 @@ class LoginManager:
             if self._on_login_callback:
                 self._on_login_callback(state)
             return state
-        except Exception as e:
-            logger.warning(f"Auto-login failed: {e}")
+        except BetterFlowAuthError as e:
+            logger.warning(f"Auto-login failed (auth): {e}")
             self.bf.clear_credentials()
             return LoginState(logged_in=False, error="Stored credentials are invalid")
-
-    def login(self, email: str, password: str) -> LoginState:
-        """Log in with email and password.
-
-        Args:
-            email: User's email
-            password: User's password
-
-        Returns:
-            LoginState with result
-        """
-        # Collect device info
-        device_info = DeviceInfo.collect()
-
-        # Register device
-        result = self.bf.register(email, password, device_info)
-
-        if not result.success:
-            return LoginState(logged_in=False, error=result.error)
-
-        # Store credentials
-        credentials = StoredCredentials(
-            api_token=result.api_token,
-            device_id=result.device_id,
-            user_email=email,
-        )
-
-        if not self.keychain.store(credentials):
-            logger.warning("Failed to store credentials in keychain")
-
-        # Set credentials on client
-        self.bf.set_credentials(result.api_token, result.device_id)
-
-        state = LoginState(
-            logged_in=True,
-            user_email=email,
-            device_id=result.device_id,
-        )
-        logger.info(f"Login successful for {email}")
-
-        if self._on_login_callback:
-            self._on_login_callback(state)
-
-        return state
+        except BetterFlowClientError as e:
+            logger.warning(f"Auto-login failed (network): {e}")
+            # Don't clear credentials on network error - might be temporary
+            return LoginState(logged_in=False, error=f"Cannot verify credentials: {e}")
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.

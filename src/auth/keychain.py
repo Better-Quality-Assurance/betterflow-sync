@@ -8,6 +8,8 @@ from typing import Optional
 import keyring
 from keyring.errors import KeyringError
 
+__all__ = ["KeychainManager", "StoredCredentials"]
+
 logger = logging.getLogger(__name__)
 
 SERVICE_NAME = "BetterFlow Sync"

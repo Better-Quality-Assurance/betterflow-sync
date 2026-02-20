@@ -22,6 +22,8 @@ def _hide_from_dock() -> None:
 
 from PIL import Image, ImageDraw
 
+__all__ = ["TrayIcon", "TrayState", "STATE_COLORS", "create_icon_image"]
+
 try:
     import pystray
     from pystray import MenuItem as Item
@@ -37,6 +39,7 @@ class TrayState(Enum):
 
     SYNCING = "syncing"  # Green - connected and active
     QUEUED = "queued"  # Yellow - offline, events queued
+    QUEUE_WARNING = "queue_warning"  # Orange - queue approaching capacity
     ERROR = "error"  # Red - auth failed or AW not running
     PAUSED = "paused"  # Gray - user paused tracking
     STARTING = "starting"  # Blue - starting up
@@ -47,6 +50,7 @@ class TrayState(Enum):
 STATE_COLORS = {
     TrayState.SYNCING: "#22c55e",  # Green
     TrayState.QUEUED: "#eab308",  # Yellow
+    TrayState.QUEUE_WARNING: "#f97316",  # Orange - queue nearing capacity
     TrayState.ERROR: "#ef4444",  # Red
     TrayState.PAUSED: "#9ca3af",  # Gray
     TrayState.STARTING: "#3b82f6",  # Blue
@@ -207,6 +211,8 @@ class TrayIcon:
             return "Status: Syncing ✓"
         elif self._state == TrayState.QUEUED:
             return "Status: Offline (queuing)"
+        elif self._state == TrayState.QUEUE_WARNING:
+            return "Status: Queue nearly full!"
         elif self._state == TrayState.ERROR:
             return f"Status: {self._status_text}"
         elif self._state == TrayState.PAUSED:

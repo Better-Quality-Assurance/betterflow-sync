@@ -8,6 +8,16 @@ from typing import Optional
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
+__all__ = [
+    "Config",
+    "PrivacySettings",
+    "SyncSettings",
+    "AWSettings",
+    "setup_logging",
+    "DEFAULT_API_URL",
+    "MAX_QUEUE_SIZE",
+]
+
 logger = logging.getLogger(__name__)
 
 APP_NAME = "BetterFlow Sync"

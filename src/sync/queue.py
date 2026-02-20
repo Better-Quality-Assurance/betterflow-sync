@@ -12,6 +12,8 @@ from typing import Iterator, Optional
 
 from config import Config, MAX_QUEUE_SIZE
 
+__all__ = ["OfflineQueue", "QueuedEvent"]
+
 logger = logging.getLogger(__name__)
 
 
@@ -254,6 +256,21 @@ class OfflineQueue:
     def is_empty(self) -> bool:
         """Check if queue is empty."""
         return self.size() == 0
+
+    def capacity_percent(self) -> float:
+        """Get current queue capacity as a percentage (0.0 to 1.0)."""
+        return self.size() / self.max_size
+
+    def is_near_capacity(self, threshold: float = 0.8) -> bool:
+        """Check if queue is approaching capacity.
+
+        Args:
+            threshold: Capacity threshold (default 80%)
+
+        Returns:
+            True if queue is at or above threshold
+        """
+        return self.capacity_percent() >= threshold
 
     def clear(self) -> int:
         """Clear all events from the queue."""

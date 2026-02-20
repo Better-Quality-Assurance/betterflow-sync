@@ -175,3 +175,50 @@ class TestOfflineQueue:
 
         self.queue.enqueue([{"timestamp": "2026-02-18T10:00:00Z", "data": {}}])
         assert self.queue.is_empty() is False
+
+    def test_capacity_percent_empty(self):
+        """Test capacity_percent returns 0 for empty queue."""
+        assert self.queue.capacity_percent() == 0.0
+
+    def test_capacity_percent_partial(self):
+        """Test capacity_percent with partial fill."""
+        # Queue max_size is 100, add 25 events
+        events = [{"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {}} for i in range(25)]
+        self.queue.enqueue(events)
+
+        assert self.queue.capacity_percent() == 0.25
+
+    def test_capacity_percent_full(self):
+        """Test capacity_percent at max capacity."""
+        # Queue max_size is 100, fill completely
+        events = [{"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {}} for i in range(100)]
+        self.queue.enqueue(events)
+
+        assert self.queue.capacity_percent() == 1.0
+
+    def test_is_near_capacity_false(self):
+        """Test is_near_capacity returns False below threshold."""
+        # Add 50 events (50% capacity)
+        events = [{"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {}} for i in range(50)]
+        self.queue.enqueue(events)
+
+        assert self.queue.is_near_capacity() is False
+        assert self.queue.is_near_capacity(threshold=0.8) is False
+
+    def test_is_near_capacity_true(self):
+        """Test is_near_capacity returns True at/above threshold."""
+        # Add 80 events (80% capacity)
+        events = [{"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {}} for i in range(80)]
+        self.queue.enqueue(events)
+
+        assert self.queue.is_near_capacity() is True
+        assert self.queue.is_near_capacity(threshold=0.8) is True
+
+    def test_is_near_capacity_custom_threshold(self):
+        """Test is_near_capacity with custom threshold."""
+        # Add 50 events (50% capacity)
+        events = [{"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {}} for i in range(50)]
+        self.queue.enqueue(events)
+
+        assert self.queue.is_near_capacity(threshold=0.5) is True
+        assert self.queue.is_near_capacity(threshold=0.6) is False
