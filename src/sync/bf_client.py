@@ -9,9 +9,14 @@ from typing import Optional
 
 import requests
 
-from ..config import DEFAULT_API_URL
-from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
-from .retry import RetryConfig
+try:
+    from ..config import DEFAULT_API_URL
+    from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from .retry import RetryConfig
+except ImportError:
+    from config import DEFAULT_API_URL
+    from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from sync.retry import RetryConfig
 
 __all__ = [
     "BetterFlowClient",
@@ -289,8 +294,37 @@ class BetterFlowClient(BaseApiClient):
         Returns server commands (pause/deregister) and config update flag.
         """
         return self._request(
-            "POST", "heartbeat", data={"agent_version": agent_version}
+            "POST", "heartbeat", data={
+                "agent_version": agent_version,
+                "timezone": self._detect_timezone(),
+            }
         )
+
+    @staticmethod
+    def _detect_timezone() -> str:
+        """Detect local IANA timezone name, falling back to UTC offset."""
+        import os
+        from datetime import datetime, timezone as tz
+
+        # macOS/Linux: read /etc/localtime symlink
+        try:
+            link = os.readlink("/etc/localtime")
+            # e.g., /var/db/timezone/zoneinfo/Europe/Bucharest
+            if "zoneinfo/" in link:
+                return link.split("zoneinfo/")[1]
+        except (OSError, IndexError):
+            pass
+
+        # Windows: use tzlocal if available
+        try:
+            from tzlocal import get_localzone
+            return str(get_localzone())
+        except ImportError:
+            pass
+
+        # Fallback: UTC offset like "+03:00"
+        offset = datetime.now(tz.utc).astimezone().strftime("%z")  # "+0300"
+        return f"{offset[:3]}:{offset[3:]}"  # "+03:00"
 
     def get_status(self) -> dict:
         """Get sync status."""

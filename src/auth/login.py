@@ -7,12 +7,21 @@ from typing import Optional, Callable
 
 from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
-from ..sync.bf_client import (
-    BetterFlowClient,
-    AuthResult,
-    BetterFlowClientError,
-    BetterFlowAuthError,
-)
+
+try:
+    from ..sync.bf_client import (
+        BetterFlowClient,
+        AuthResult,
+        BetterFlowClientError,
+        BetterFlowAuthError,
+    )
+except ImportError:
+    from sync.bf_client import (
+        BetterFlowClient,
+        AuthResult,
+        BetterFlowClientError,
+        BetterFlowAuthError,
+    )
 
 __all__ = ["LoginManager", "LoginState"]
 

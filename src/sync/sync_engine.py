@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import Config, PrivacySettings
-from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT
+from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
 from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
 from .queue import OfflineQueue
 
@@ -196,19 +196,19 @@ class SyncEngine:
         if app and app in privacy.exclude_apps:
             return None
 
-        # Skip very short events (< 1 second)
-        if event.duration < 1:
+        # Skip very short events (< 0.5 second — those that round to 0)
+        if event.duration < 0.5:
             return None
 
         # Build data object
         data = {}
 
-        if bucket_type == BUCKET_TYPE_WINDOW:
+        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             data["app"] = app
-            data["title"] = self._process_title(app, event.title, privacy)
+            data["title"] = event.title
             if event.url:
-                data["url"] = self._process_url(event.url, privacy)
-        elif bucket_type == BUCKET_TYPE_AFK:
+                data["url"] = event.url
+        elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection

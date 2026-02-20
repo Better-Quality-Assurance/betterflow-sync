@@ -11,8 +11,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ActivityWatch bucket types we care about
-BUCKET_TYPE_WINDOW = "aw-watcher-window"
-BUCKET_TYPE_AFK = "aw-watcher-afk"
+# aw-server-rust uses "aw-watcher-window" / "aw-watcher-afk"
+# aw-server (Python) uses "currentwindow" / "afkstatus"
+BUCKET_TYPE_WINDOW = "currentwindow"
+BUCKET_TYPE_WINDOW_ALT = "aw-watcher-window"
+BUCKET_TYPE_AFK = "afkstatus"
+BUCKET_TYPE_AFK_ALT = "aw-watcher-afk"
 BUCKET_TYPE_WEB = "aw-watcher-web"
 BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
 
@@ -195,12 +199,12 @@ class AWClient:
     def get_window_buckets(self) -> list[AWBucket]:
         """Get all window watcher buckets."""
         buckets = self.get_buckets()
-        return [b for b in buckets.values() if b.type == BUCKET_TYPE_WINDOW]
+        return [b for b in buckets.values() if b.type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT)]
 
     def get_afk_buckets(self) -> list[AWBucket]:
         """Get all AFK watcher buckets."""
         buckets = self.get_buckets()
-        return [b for b in buckets.values() if b.type == BUCKET_TYPE_AFK]
+        return [b for b in buckets.values() if b.type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)]
 
     def get_web_buckets(self) -> list[AWBucket]:
         """Get all web watcher buckets."""
