@@ -24,7 +24,7 @@ APP_NAME = "BetterFlow Sync"
 APP_AUTHOR = "BetterQA"
 
 # API endpoints
-DEFAULT_API_URL = "https://betterflow.eu/api/agent"
+DEFAULT_API_URL = "http://localhost:8001/api/agent"
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
 
 # ActivityWatch defaults
@@ -96,6 +96,7 @@ class Config:
     aw: AWSettings = field(default_factory=AWSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
     debug_mode: bool = False

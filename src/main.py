@@ -86,8 +86,25 @@ class BetterFlowSyncApp:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-        # Try auto-login first (keychain)
-        state = self.login_manager.try_auto_login()
+        # First-run setup wizard
+        wizard_login_state = None
+        if not self.config.setup_complete:
+            from .ui.setup_wizard import show_setup_wizard
+
+            result = show_setup_wizard(self.config, self.login_manager)
+            if not result.completed:
+                logger.info("Setup wizard cancelled — exiting")
+                return
+            self.config.setup_complete = True
+            self.config.save()
+            if result.logged_in and result.login_state:
+                wizard_login_state = result.login_state
+
+        # Try auto-login first (keychain), unless wizard already logged in
+        if wizard_login_state and wizard_login_state.logged_in:
+            state = wizard_login_state
+        else:
+            state = self.login_manager.try_auto_login()
 
         if not state.logged_in:
             # Need browser auth
