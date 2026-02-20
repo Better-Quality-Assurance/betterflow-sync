@@ -5,10 +5,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from config import Config, PrivacySettings
-from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
-from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
-from .queue import OfflineQueue
+try:
+    from ..config import Config, PrivacySettings
+    from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
+    from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
+    from .queue import OfflineQueue
+except ImportError:
+    from config import Config, PrivacySettings
+    from sync.aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
+    from sync.bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
+    from sync.queue import OfflineQueue
 
 logger = logging.getLogger(__name__)
 

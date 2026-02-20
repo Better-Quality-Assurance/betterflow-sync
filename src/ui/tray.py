@@ -117,7 +117,7 @@ class TrayIcon:
         self._state = TrayState.STARTING
         self._paused = False
         self._status_text = "Starting..."
-        self._events_today = 0
+        self._hours_today = "0h 0m"
         self._last_sync = "Never"
         self._queue_size = 0
         self._user_email: Optional[str] = None
@@ -137,9 +137,13 @@ class TrayIcon:
         """Create the tray menu."""
         items = []
 
-        # User name at top
-        if self._user_name:
-            items.append(Item(self._user_name, None, enabled=False))
+        # User identity at top
+        if self._user_email:
+            if self._user_name and self._user_name != self._user_email:
+                label = f"{self._user_name} ({self._user_email})"
+            else:
+                label = self._user_email
+            items.append(Item(label, None, enabled=False))
 
         # Status line
         items.append(Item(self._get_status_line(), None, enabled=False))
@@ -147,7 +151,7 @@ class TrayIcon:
 
         # Stats
         items.append(Item(f"Last sync: {self._last_sync}", None, enabled=False))
-        items.append(Item(f"Events today: {self._events_today:,}", None, enabled=False))
+        items.append(Item(f"Hours today: {self._hours_today}", None, enabled=False))
         if self._queue_size > 0:
             items.append(Item(f"Queued: {self._queue_size:,}", None, enabled=False))
 
@@ -208,17 +212,17 @@ class TrayIcon:
     def _get_status_line(self) -> str:
         """Get the status line text."""
         if self._state == TrayState.SYNCING:
-            return "Status: Syncing ✓"
+            return "Status: Active"
         elif self._state == TrayState.QUEUED:
-            return "Status: Offline (queuing)"
+            return "Status: Offline"
         elif self._state == TrayState.QUEUE_WARNING:
-            return "Status: Queue nearly full!"
+            return "Status: Offline (queue full)"
         elif self._state == TrayState.ERROR:
-            return f"Status: {self._status_text}"
+            return "Status: Error"
         elif self._state == TrayState.PAUSED:
             return "Status: Paused"
         elif self._state == TrayState.WAITING_AUTH:
-            return "Status: Waiting for browser login..."
+            return "Status: Waiting for login..."
         else:
             return "Status: Starting..."
 
@@ -317,19 +321,19 @@ class TrayIcon:
 
     def update_stats(
         self,
-        events_today: Optional[int] = None,
+        hours_today: Optional[str] = None,
         last_sync: Optional[str] = None,
         queue_size: Optional[int] = None,
     ) -> None:
         """Update statistics shown in menu.
 
         Args:
-            events_today: Number of events synced today
+            hours_today: Formatted hours string (e.g. "4h 24m")
             last_sync: Last sync time string
             queue_size: Number of events in offline queue
         """
-        if events_today is not None:
-            self._events_today = events_today
+        if hours_today is not None:
+            self._hours_today = hours_today
         if last_sync is not None:
             self._last_sync = last_sync
         if queue_size is not None:

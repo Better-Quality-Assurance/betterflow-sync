@@ -76,8 +76,6 @@ class BetterFlowSyncApp:
 
         # State
         self._running = False
-        self._events_today = 0
-        self._events_today_date: Optional[datetime] = None
         self._shutdown_event = threading.Event()
 
     def run(self) -> None:
@@ -164,10 +162,10 @@ class BetterFlowSyncApp:
             else:
                 self.tray.set_state(TrayState.ERROR, stats.errors[0] if stats.errors else "Sync failed")
 
-            # Update stats
-            self._update_events_today(stats.events_sent)
+            # Update stats — fetch hours from API
+            hours_today = self._fetch_hours_today()
             self.tray.update_stats(
-                events_today=self._events_today,
+                hours_today=hours_today,
                 last_sync=self._format_time(datetime.now()),
                 queue_size=self.queue.size(),
             )
@@ -182,13 +180,16 @@ class BetterFlowSyncApp:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
 
-    def _update_events_today(self, new_events: int) -> None:
-        """Update events today counter."""
-        today = datetime.now().date()
-        if self._events_today_date != today:
-            self._events_today = 0
-            self._events_today_date = today
-        self._events_today += new_events
+    def _fetch_hours_today(self) -> str:
+        """Fetch today's tracked hours from API."""
+        try:
+            status = self.bf.get_status()
+            total_seconds = status.get("data", {}).get("today_summary", {}).get("total_seconds", 0)
+            hours = int(total_seconds) // 3600
+            minutes = (int(total_seconds) % 3600) // 60
+            return f"{hours}h {minutes}m"
+        except Exception:
+            return self._hours_today_cache if hasattr(self, '_hours_today_cache') else "0h 0m"
 
     def _format_time(self, dt: datetime) -> str:
         """Format time for display."""

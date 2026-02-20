@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
-from config import Config, MAX_QUEUE_SIZE
+try:
+    from ..config import Config, MAX_QUEUE_SIZE
+except ImportError:
+    from config import Config, MAX_QUEUE_SIZE
 
 __all__ = ["OfflineQueue", "QueuedEvent"]
 

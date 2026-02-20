@@ -5,7 +5,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Callable, Optional
 
-from config import Config
+try:
+    from ..config import Config
+except ImportError:
+    from config import Config
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,10 @@ import logging
 from typing import Optional
 from urllib.parse import urlparse
 
-from config import PrivacySettings
+try:
+    from ..config import PrivacySettings
+except ImportError:
+    from config import PrivacySettings
 
 logger = logging.getLogger(__name__)
 
