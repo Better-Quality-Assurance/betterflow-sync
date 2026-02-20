@@ -50,6 +50,8 @@ class SyncEngine:
         self.queue = queue
         self.config = config
         self._paused = False
+        self._private_mode = False
+        self._current_project: Optional[dict] = None
         self._session_active = False
         self._config_fetched = False
         self._heartbeat_count = 0
@@ -74,6 +76,24 @@ class SyncEngine:
     def is_paused(self) -> bool:
         return self._paused
 
+    def set_private_mode(self, enabled: bool) -> None:
+        """Enable/disable private time (no events recorded)."""
+        self._private_mode = enabled
+        if enabled and self._session_active:
+            try:
+                self.bf.end_session("private_time")
+                self._session_active = False
+            except BetterFlowClientError:
+                pass
+
+    @property
+    def is_private(self) -> bool:
+        return self._private_mode
+
+    def set_current_project(self, project: Optional[dict]) -> None:
+        """Set the current project for event tagging."""
+        self._current_project = project
+
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
         try:
@@ -96,7 +116,7 @@ class SyncEngine:
         """
         stats = SyncStats()
 
-        if self._paused:
+        if self._paused or self._private_mode:
             return stats
 
         # Fetch server config on first successful sync
@@ -222,13 +242,19 @@ class SyncEngine:
             data["clicks"] = event.clicks
             data["scrolls"] = event.scrolls
 
-        return {
+        result = {
             "id": event.id,
             "timestamp": event.timestamp.isoformat(),
             "duration": round(event.duration, 2),
             "bucket_type": bucket_type,
             "data": data,
         }
+
+        # Tag with current project if set
+        if self._current_project:
+            result["project_id"] = self._current_project["id"]
+
+        return result
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""

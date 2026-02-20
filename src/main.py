@@ -72,6 +72,8 @@ class BetterFlowSyncApp:
             on_preferences=self._on_preferences,
             on_logout=self._on_logout,
             on_quit=self._on_quit,
+            on_project_change=self._on_project_change,
+            on_private_toggle=self._on_private_toggle,
         )
 
         # State
@@ -100,6 +102,9 @@ class BetterFlowSyncApp:
 
         # Fetch server config (privacy settings, sync intervals, category rules)
         self.sync_engine.fetch_server_config()
+
+        # Fetch projects and set on tray
+        self._fetch_projects()
 
         # Start bundled ActivityWatch
         self.aw_manager.start()
@@ -136,6 +141,10 @@ class BetterFlowSyncApp:
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         try:
+            # Skip sync entirely during private time
+            if self.sync_engine.is_private:
+                return
+
             # Health-check managed AW processes, restart if crashed
             if self.aw_manager.is_managing:
                 self.aw_manager.restart_if_needed()
@@ -206,6 +215,33 @@ class BetterFlowSyncApp:
         self.sync_engine.resume()
         self.tray.set_paused(False)
         logger.info("Tracking resumed")
+
+    def _on_project_change(self, project: Optional[dict]) -> None:
+        """Handle project switch from tray."""
+        if project:
+            logger.info(f"Switched to project: {project['name']}")
+        else:
+            logger.info("Cleared project selection")
+        self.sync_engine.set_current_project(project)
+
+    def _on_private_toggle(self, private: bool) -> None:
+        """Handle private time toggle."""
+        if private:
+            logger.info("Private time started — recording paused")
+            self.sync_engine.set_private_mode(True)
+        else:
+            logger.info("Private time ended — recording resumed")
+            self.sync_engine.set_private_mode(False)
+
+    def _fetch_projects(self) -> None:
+        """Fetch available projects from API and set on tray."""
+        try:
+            response = self.bf.get_projects()
+            projects = response.get("projects", [])
+            self.tray.set_projects(projects)
+            logger.info(f"Loaded {len(projects)} projects")
+        except Exception as e:
+            logger.warning(f"Failed to fetch projects: {e}")
 
     def _on_preferences(self) -> None:
         """Handle preferences action."""

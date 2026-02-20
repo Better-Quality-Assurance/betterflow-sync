@@ -42,6 +42,7 @@ class TrayState(Enum):
     QUEUE_WARNING = "queue_warning"  # Orange - queue approaching capacity
     ERROR = "error"  # Red - auth failed or AW not running
     PAUSED = "paused"  # Gray - user paused tracking
+    PRIVATE = "private"  # Dark gray - private time, nothing recorded
     STARTING = "starting"  # Blue - starting up
     WAITING_AUTH = "waiting_auth"  # Amber - waiting for browser login
 
@@ -53,6 +54,7 @@ STATE_COLORS = {
     TrayState.QUEUE_WARNING: "#f97316",  # Orange - queue nearing capacity
     TrayState.ERROR: "#ef4444",  # Red
     TrayState.PAUSED: "#9ca3af",  # Gray
+    TrayState.PRIVATE: "#6b7280",  # Dark gray - private time
     TrayState.STARTING: "#3b82f6",  # Blue
     TrayState.WAITING_AUTH: "#f59e0b",  # Amber
 }
@@ -93,6 +95,8 @@ class TrayIcon:
         on_preferences: Optional[Callable[[], None]] = None,
         on_logout: Optional[Callable[[], None]] = None,
         on_quit: Optional[Callable[[], None]] = None,
+        on_project_change: Optional[Callable[[Optional[dict]], None]] = None,
+        on_private_toggle: Optional[Callable[[bool], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -103,6 +107,8 @@ class TrayIcon:
             on_preferences: Callback when preferences is clicked
             on_logout: Callback when sign out is clicked
             on_quit: Callback when quit is clicked
+            on_project_change: Callback when project is switched (receives project dict or None)
+            on_private_toggle: Callback when private time is toggled (receives bool)
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -113,15 +119,22 @@ class TrayIcon:
         self._on_preferences = on_preferences  # callback(key, value) for setting changes
         self._on_logout = on_logout
         self._on_quit = on_quit
+        self._on_project_change = on_project_change
+        self._on_private_toggle = on_private_toggle
 
         self._state = TrayState.STARTING
         self._paused = False
+        self._private_mode = False
         self._status_text = "Starting..."
         self._hours_today = "0h 0m"
         self._last_sync = "Never"
         self._queue_size = 0
         self._user_email: Optional[str] = None
         self._user_name: Optional[str] = None
+
+        # Project state
+        self._projects: list[dict] = []  # [{id, name}, ...]
+        self._current_project: Optional[dict] = None  # {id, name}
 
         # Preferences state
         self._sync_interval: int = 60
@@ -147,6 +160,13 @@ class TrayIcon:
 
         # Status line
         items.append(Item(self._get_status_line(), None, enabled=False))
+
+        # Project line
+        if self._current_project:
+            items.append(Item(f"Project: {self._current_project['name']}", None, enabled=False))
+        elif self._projects:
+            items.append(Item("Project: None", None, enabled=False))
+
         items.append(Item("─" * 20, None, enabled=False))
 
         # Stats
@@ -159,11 +179,35 @@ class TrayIcon:
 
         logged_in = self._user_email is not None
 
-        # Pause/Resume
-        if self._paused:
-            items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
+        # Private Time toggle
+        if self._private_mode:
+            items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
         else:
-            items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
+            items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
+
+        # Pause/Resume (only show when not in private mode)
+        if not self._private_mode:
+            if self._paused:
+                items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
+            else:
+                items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
+
+        # Switch Project submenu
+        if self._projects:
+            project_items = []
+            # "None" option to clear project
+            project_items.append(Item(
+                "None",
+                self._make_project_handler(None),
+                checked=lambda item: self._current_project is None,
+            ))
+            for proj in self._projects:
+                project_items.append(Item(
+                    proj["name"],
+                    self._make_project_handler(proj),
+                    checked=lambda item, p=proj: self._current_project is not None and self._current_project["id"] == p["id"],
+                ))
+            items.append(Item("Switch Project", pystray.Menu(*project_items), enabled=logged_in))
 
         # Actions
         items.append(Item("Preferences", pystray.Menu(
@@ -211,7 +255,9 @@ class TrayIcon:
 
     def _get_status_line(self) -> str:
         """Get the status line text."""
-        if self._state == TrayState.SYNCING:
+        if self._private_mode:
+            return "Status: Private Time"
+        elif self._state == TrayState.SYNCING:
             return "Status: Active"
         elif self._state == TrayState.QUEUED:
             return "Status: Offline"
@@ -240,6 +286,26 @@ class TrayIcon:
         """Handle resume menu click."""
         if self._on_resume:
             self._on_resume()
+
+    def _handle_private_toggle(self, icon, item) -> None:
+        """Handle private time toggle."""
+        self._private_mode = not self._private_mode
+        if self._private_mode:
+            self.set_state(TrayState.PRIVATE)
+        else:
+            self.set_state(TrayState.SYNCING)
+        if self._on_private_toggle:
+            self._on_private_toggle(self._private_mode)
+        self._update_menu()
+
+    def _make_project_handler(self, project: Optional[dict]):
+        """Create a handler for switching projects."""
+        def handler(icon, item):
+            self._current_project = project
+            if self._on_project_change:
+                self._on_project_change(project)
+            self._update_menu()
+        return handler
 
     def _handle_preferences(self, icon, item) -> None:
         """Handle preferences menu click."""
@@ -344,6 +410,13 @@ class TrayIcon:
         """Set current user info."""
         self._user_email = email
         self._user_name = name
+        self._update_menu()
+
+    def set_projects(self, projects: list[dict], current_project: Optional[dict] = None) -> None:
+        """Set available projects and current selection."""
+        self._projects = projects
+        if current_project:
+            self._current_project = current_project
         self._update_menu()
 
     def _update_icon(self) -> None:
