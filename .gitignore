@@ -59,8 +59,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# ActivityWatch binaries (downloaded during build)
-resources/activitywatch/
+# Tracker binaries (downloaded during build)
+resources/trackers/
 
 # Keep resources placeholder
 !resources/.gitkeep

@@ -21,15 +21,15 @@ datas = [
     (str(resources_dir), "resources"),
 ]
 
-# ActivityWatch binaries (included as binaries to preserve execute permissions)
+# Tracker binaries (included as binaries to preserve execute permissions)
 aw_platform = "darwin" if is_mac else "windows"
-aw_dir = resources_dir / "activitywatch" / aw_platform
+aw_dir = resources_dir / "trackers" / aw_platform
 aw_binaries = []
 if aw_dir.exists():
     for binary in aw_dir.iterdir():
         if binary.is_file():
             aw_binaries.append(
-                (str(binary), f"resources/activitywatch/{aw_platform}")
+                (str(binary), f"resources/trackers/{aw_platform}")
             )
 
 # Hidden imports for pystray, keyring backends, and our modules
@@ -123,6 +123,7 @@ if is_mac:
             "LSUIElement": True,  # Hide from dock (menu bar app)
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",
+            "NSAppleEventsUsageDescription": "BetterFlow Sync needs this to track your active applications for time tracking.",
         },
     )
 

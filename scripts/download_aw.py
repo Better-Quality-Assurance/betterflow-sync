@@ -1,4 +1,4 @@
-"""Download ActivityWatch binaries from GitHub releases."""
+"""Download ActivityWatch binaries from GitHub releases and rename for white-labeling."""
 
 import os
 import platform
@@ -12,12 +12,15 @@ import zipfile
 
 AW_VERSION = "v0.13.2"
 
-# Binaries we need (headless components only, no aw-qt)
-AW_BINARIES = [
-    "aw-server-rust",
-    "aw-watcher-window",
-    "aw-watcher-afk",
-]
+# Original AW binary names (what's in the zip) -> branded names
+AW_TO_BF_NAMES = {
+    "aw-server-rust": "bf-data-service",
+    "aw-watcher-window": "bf-window-tracker",
+    "aw-watcher-afk": "bf-idle-tracker",
+}
+
+# Branded names (what we check for on disk)
+BF_BINARIES = list(AW_TO_BF_NAMES.values())
 
 # GitHub release URLs
 RELEASE_BASE = (
@@ -30,7 +33,7 @@ RELEASE_ASSETS = {
 
 # Output directory relative to project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_BASE = os.path.join(PROJECT_ROOT, "resources", "activitywatch")
+OUTPUT_BASE = os.path.join(PROJECT_ROOT, "resources", "trackers")
 
 
 def get_platform() -> str:
@@ -51,9 +54,9 @@ def get_output_dir(plat: str) -> str:
 
 
 def binaries_exist(output_dir: str, plat: str) -> bool:
-    """Check if all required binaries already exist."""
+    """Check if all required binaries already exist (with branded names)."""
     ext = ".exe" if plat == "windows" else ""
-    for name in AW_BINARIES:
+    for name in BF_BINARIES:
         path = os.path.join(output_dir, name + ext)
         if not os.path.exists(path):
             return False
@@ -61,7 +64,7 @@ def binaries_exist(output_dir: str, plat: str) -> bool:
 
 
 def download_release(plat: str) -> str:
-    """Download AW release zip to a temp file. Returns path to zip."""
+    """Download release zip to a temp file. Returns path to zip."""
     asset = RELEASE_ASSETS[plat]
     url = f"{RELEASE_BASE}/{asset}"
     print(f"Downloading {url} ...")
@@ -75,25 +78,28 @@ def download_release(plat: str) -> str:
 
 
 def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
-    """Extract only the needed binaries from the release zip."""
+    """Extract needed binaries from the release zip and rename to branded names."""
     ext = ".exe" if plat == "windows" else ""
-    needed = {name + ext for name in AW_BINARIES}
+    # Build set of original names to look for in the archive
+    original_names = {name + ext for name in AW_TO_BF_NAMES.keys()}
 
     os.makedirs(output_dir, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             basename = os.path.basename(info.filename)
-            if basename in needed:
-                print(f"  Extracting {basename}")
-                # Extract to flat directory (no nested folders)
-                target = os.path.join(output_dir, basename)
+            if basename in original_names:
+                # Map original name to branded name
+                original_stem = basename.replace(ext, "") if ext else basename
+                new_name = AW_TO_BF_NAMES[original_stem] + ext
+                target = os.path.join(output_dir, new_name)
+                print(f"  Extracting {basename} -> {new_name}")
                 with zf.open(info) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
-                needed.discard(basename)
+                original_names.discard(basename)
 
-    if needed:
-        print(f"WARNING: Missing binaries in archive: {needed}")
+    if original_names:
+        print(f"WARNING: Missing binaries in archive: {original_names}")
 
 
 def fix_permissions(output_dir: str, plat: str) -> None:
@@ -101,7 +107,7 @@ def fix_permissions(output_dir: str, plat: str) -> None:
     if plat != "darwin":
         return
 
-    for name in AW_BINARIES:
+    for name in BF_BINARIES:
         path = os.path.join(output_dir, name)
         if os.path.exists(path):
             # Make executable
@@ -117,11 +123,11 @@ def fix_permissions(output_dir: str, plat: str) -> None:
 
 
 def main() -> None:
-    """Download AW binaries for the current platform."""
+    """Download tracker binaries for the current platform."""
     plat = get_platform()
     output_dir = get_output_dir(plat)
 
-    print(f"ActivityWatch {AW_VERSION} — platform: {plat}")
+    print(f"BetterFlow Tracker Components {AW_VERSION} — platform: {plat}")
     print(f"Output: {output_dir}")
     print()
 

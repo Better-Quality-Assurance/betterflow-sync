@@ -32,9 +32,9 @@ clean:
 download-aw:
 	python scripts/download_aw.py
 
-# Clean ActivityWatch binaries
+# Clean tracker binaries
 clean-aw:
-	rm -rf resources/activitywatch/
+	rm -rf resources/trackers/
 
 # Build for current platform
 build: download-aw
