@@ -16,6 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 try:
     from .config import Config, setup_logging
     from .sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
+    from .sync.http_client import BetterFlowAuthError
     from .auth import KeychainManager, LoginManager
     from .ui.tray import TrayIcon, TrayState
     from .ui.preferences import show_preferences_window
@@ -23,6 +24,7 @@ try:
 except ImportError:
     from config import Config, setup_logging
     from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
+    from sync.http_client import BetterFlowAuthError
     from auth import KeychainManager, LoginManager
     from ui.tray import TrayIcon, TrayState
     from ui.preferences import show_preferences_window
@@ -206,6 +208,10 @@ class BetterFlowSyncApp:
                     f"{stats.events_queued} queued, {stats.events_filtered} filtered"
                 )
 
+        except BetterFlowAuthError as e:
+            logger.warning(f"Auth error during sync: {e} — triggering re-login")
+            self.tray.set_state(TrayState.WAITING_AUTH, "Session expired, re-login required")
+            self._on_login()
         except Exception as e:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
