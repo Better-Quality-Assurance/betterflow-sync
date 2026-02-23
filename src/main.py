@@ -1,7 +1,10 @@
 """BetterFlow Sync - Main entry point."""
 
+import fcntl
 import logging
+import os
 import signal
+import sys
 import threading
 from datetime import datetime
 from typing import Optional
@@ -358,11 +361,56 @@ class BetterFlowSyncApp:
         # Stop bundled ActivityWatch
         self.aw_manager.stop()
 
+        # Release single-instance lock
+        _release_lock()
+
         logger.info("Shutdown complete")
+
+
+_lock_file = None
+
+
+def _acquire_lock() -> bool:
+    """Ensure only one instance is running. Returns True if lock acquired."""
+    global _lock_file
+    lock_path = os.path.join(
+        Config.get_config_dir(), ".betterflow-sync.lock"
+    )
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    _lock_file = open(lock_path, "a+")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.seek(0)
+        _lock_file.truncate(0)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+        return True
+    except OSError:
+        _lock_file.close()
+        _lock_file = None
+        return False
+
+
+def _release_lock() -> None:
+    """Release the single-instance lock."""
+    global _lock_file
+    if _lock_file:
+        try:
+            lock_path = _lock_file.name
+            fcntl.flock(_lock_file, fcntl.LOCK_UN)
+            _lock_file.close()
+            os.unlink(lock_path)
+        except Exception:
+            pass
+        _lock_file = None
 
 
 def main() -> None:
     """Main entry point."""
+    if not _acquire_lock():
+        print("BetterFlow Sync is already running.")
+        sys.exit(0)
+
     app = BetterFlowSyncApp()
     app.run()
 
