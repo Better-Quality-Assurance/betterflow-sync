@@ -45,14 +45,56 @@ class PrivacySettings:
     hash_titles: bool = True  # Hash window titles by default
     title_allowlist: list[str] = field(
         default_factory=lambda: [
+            # IDEs and code editors
             "Visual Studio Code",
+            "Code",
+            "Cursor",
             "PyCharm",
             "IntelliJ IDEA",
             "WebStorm",
+            "PhpStorm",
+            "GoLand",
+            "CLion",
+            "Rider",
+            "RubyMine",
+            "DataGrip",
+            "RustRover",
+            "Fleet",
+            "Android Studio",
+            "Xcode",
+            "Visual Studio",
+            "Sublime Text",
+            "Nova",
+            "BBEdit",
+            "Zed",
+            "Vim",
+            "Neovim",
+            "nvim",
+            "Eclipse",
+            # Terminals
             "Terminal",
             "iTerm2",
+            "iTerm",
             "Windows Terminal",
-            "Cursor",
+            "PowerShell",
+            "Command Prompt",
+            "Warp",
+            "Alacritty",
+            "Kitty",
+            "WezTerm",
+            "Hyper",
+            # API and database tools
+            "Postman",
+            "Insomnia",
+            "DBeaver",
+            "TablePlus",
+            "pgAdmin",
+            "MongoDB Compass",
+            "Redis Insight",
+            # Design tools
+            "Figma",
+            "Sketch",
+            "Adobe XD",
         ]
     )
     domain_only_urls: bool = True  # Strip URLs to domain only
