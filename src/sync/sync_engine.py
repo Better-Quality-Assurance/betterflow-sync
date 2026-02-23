@@ -181,20 +181,29 @@ class SyncEngine:
     def _sync_bucket(
         self, bucket_id: str, bucket_type: str, stats: SyncStats
     ) -> list[dict]:
-        """Sync events from a single bucket."""
+        """Sync events from a single bucket.
+
+        ActivityWatch extends the duration of the current (most recent) event
+        via heartbeats.  If we only fetch events *after* the checkpoint we miss
+        that growing duration.  To fix this we look back a short overlap window
+        before the checkpoint so recently-synced events whose duration has
+        grown are re-sent with the updated value.  The backend uses the AW
+        event id to upsert, so the duration is simply patched in place.
+        """
         # Get checkpoint
         checkpoint = self.queue.get_checkpoint(bucket_id)
         if checkpoint is None:
             # First sync - start from 24 hours ago
             checkpoint = datetime.now(timezone.utc) - timedelta(hours=24)
+            lookback_start = checkpoint
         else:
-            # AW start parameter is inclusive; advance slightly to avoid
-            # re-sending the same terminal event every sync cycle.
-            checkpoint = checkpoint + timedelta(milliseconds=1)
+            # Look back 2 minutes before checkpoint to catch events whose
+            # duration grew since we last synced them.
+            lookback_start = checkpoint - timedelta(minutes=2)
 
-        # Get new events
+        # Get events (including the overlap window)
         events = self.aw.get_events_since(
-            bucket_id, checkpoint, limit=self.config.sync.batch_size
+            bucket_id, lookback_start, limit=self.config.sync.batch_size
         )
         stats.events_fetched += len(events)
 
@@ -266,6 +275,7 @@ class SyncEngine:
             "id": event.id,
             "timestamp": event.timestamp.isoformat(),
             "duration": round(event.duration, 2),
+            "bucket_id": bucket_id,
             "bucket_type": bucket_type,
             "data": data,
         }
