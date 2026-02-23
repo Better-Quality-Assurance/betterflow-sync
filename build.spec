@@ -26,11 +26,11 @@ aw_platform = "darwin" if is_mac else "windows"
 aw_dir = resources_dir / "trackers" / aw_platform
 aw_binaries = []
 if aw_dir.exists():
-    for binary in aw_dir.iterdir():
+    for binary in aw_dir.rglob("*"):
         if binary.is_file():
-            aw_binaries.append(
-                (str(binary), f"resources/trackers/{aw_platform}")
-            )
+            rel_parent = binary.relative_to(aw_dir).parent
+            target_dir = Path("resources/trackers") / aw_platform / rel_parent
+            aw_binaries.append((str(binary), str(target_dir)))
 
 # Hidden imports for pystray, keyring backends, and our modules
 hiddenimports = [

@@ -54,13 +54,30 @@ def get_output_dir(plat: str) -> str:
 
 
 def binaries_exist(output_dir: str, plat: str) -> bool:
-    """Check if all required binaries already exist (with branded names)."""
-    ext = ".exe" if plat == "windows" else ""
+    """Check if all required binaries already exist (flat or bundled layout)."""
     for name in BF_BINARIES:
-        path = os.path.join(output_dir, name + ext)
-        if not os.path.exists(path):
+        if resolve_binary_path(output_dir, name, plat) is None:
             return False
     return True
+
+
+def resolve_binary_path(output_dir: str, name: str, plat: str) -> str | None:
+    """Resolve component launcher path (flat or bundled)."""
+    ext = ".exe" if plat == "windows" else ""
+
+    flat = os.path.join(output_dir, name + ext)
+    if os.path.isfile(flat):
+        if plat == "darwin" and name in {"bf-window-tracker", "bf-idle-tracker"}:
+            if os.path.exists(os.path.join(output_dir, "Python")):
+                return flat
+            return None
+        return flat
+
+    bundled = os.path.join(output_dir, name, name + ext)
+    if os.path.isfile(bundled):
+        return bundled
+
+    return None
 
 
 def download_release(plat: str) -> str:
@@ -78,28 +95,51 @@ def download_release(plat: str) -> str:
 
 
 def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
-    """Extract needed binaries from the release zip and rename to branded names."""
+    """Extract component runtime directories and rename launchers to branded names."""
     ext = ".exe" if plat == "windows" else ""
-    # Build set of original names to look for in the archive
-    original_names = {name + ext for name in AW_TO_BF_NAMES.keys()}
 
     os.makedirs(output_dir, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
+        launchers: dict[str, str] = {}
         for info in zf.infolist():
             basename = os.path.basename(info.filename)
-            if basename in original_names:
-                # Map original name to branded name
-                original_stem = basename.replace(ext, "") if ext else basename
-                new_name = AW_TO_BF_NAMES[original_stem] + ext
-                target = os.path.join(output_dir, new_name)
-                print(f"  Extracting {basename} -> {new_name}")
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                original_names.discard(basename)
+            original_stem = basename.replace(ext, "") if ext else basename
+            if original_stem in AW_TO_BF_NAMES and not info.is_dir():
+                launchers[original_stem] = info.filename
 
-    if original_names:
-        print(f"WARNING: Missing binaries in archive: {original_names}")
+        missing = [name for name in AW_TO_BF_NAMES.keys() if name not in launchers]
+        if missing:
+            print(f"WARNING: Missing binaries in archive: {missing}")
+            return
+
+        for original_name, launcher_path in launchers.items():
+            branded_name = AW_TO_BF_NAMES[original_name]
+            component_root = os.path.dirname(launcher_path)
+            prefix = (component_root + "/") if component_root else ""
+            target_root = os.path.join(output_dir, branded_name)
+
+            if os.path.isdir(target_root):
+                shutil.rmtree(target_root)
+            os.makedirs(target_root, exist_ok=True)
+
+            print(f"  Extracting runtime {original_name} -> {branded_name}/")
+            for member in zf.infolist():
+                if member.is_dir():
+                    continue
+                if prefix and not member.filename.startswith(prefix):
+                    continue
+                if not prefix and member.filename != launcher_path:
+                    continue
+
+                rel_name = member.filename[len(prefix):] if prefix else os.path.basename(member.filename)
+                if os.path.basename(member.filename) == os.path.basename(launcher_path):
+                    rel_name = branded_name + ext
+
+                target = os.path.join(target_root, rel_name)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
 
 
 def fix_permissions(output_dir: str, plat: str) -> None:
@@ -107,19 +147,17 @@ def fix_permissions(output_dir: str, plat: str) -> None:
     if plat != "darwin":
         return
 
-    for name in BF_BINARIES:
-        path = os.path.join(output_dir, name)
-        if os.path.exists(path):
-            # Make executable
-            st = os.stat(path)
-            os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-            # Strip quarantine attribute (prevents Gatekeeper blocks)
+    for root, _, files in os.walk(output_dir):
+        for file_name in files:
+            path = os.path.join(root, file_name)
+            if os.path.basename(path).startswith("bf-"):
+                st = os.stat(path)
+                os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                print(f"  Fixed permissions: {path}")
             subprocess.run(
                 ["xattr", "-d", "com.apple.quarantine", path],
                 capture_output=True,
             )
-            print(f"  Fixed permissions: {name}")
 
 
 def main() -> None:

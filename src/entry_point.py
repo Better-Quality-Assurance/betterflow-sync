@@ -43,6 +43,7 @@ class BetterFlowSyncApp:
         setup_logging(self.config.debug_mode)
 
         logger.info("BetterFlow Sync starting...")
+        logger.info(f"Using API URL: {self.config.api_url}")
 
         # Initialize AW process manager
         self.aw_manager = AWManager(aw_port=self.config.aw.port)
@@ -317,24 +318,13 @@ def _acquire_lock() -> bool:
         Config.get_config_dir(), ".betterflow-sync.lock"
     )
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-
-    # Check for stale PID first
-    if os.path.exists(lock_path):
-        try:
-            with open(lock_path, "r") as f:
-                old_pid = int(f.read().strip())
-            # Check if that process is still alive
-            os.kill(old_pid, 0)  # signal 0 = check existence
-            # Process exists — another instance is running
-            print(f"BetterFlow Sync is already running (PID {old_pid}).")
-            return False
-        except (ValueError, ProcessLookupError, PermissionError, FileNotFoundError):
-            # PID is stale or unreadable — safe to take over
-            pass
-
-    _lock_file = open(lock_path, "w")
+    # Use advisory file lock as the source of truth; PID checks can false-positive
+    # when PIDs are reused after crashes/restarts.
+    _lock_file = open(lock_path, "a+")
     try:
         fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file.seek(0)
+        _lock_file.truncate(0)
         _lock_file.write(str(os.getpid()))
         _lock_file.flush()
         return True

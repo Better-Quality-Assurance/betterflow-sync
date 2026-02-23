@@ -4,15 +4,16 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 try:
     from ..config import Config, PrivacySettings
-    from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
+    from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
     from .queue import OfflineQueue
 except ImportError:
     from config import Config, PrivacySettings
-    from sync.aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_INPUT
+    from sync.aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from sync.bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
     from sync.queue import OfflineQueue
 
@@ -140,6 +141,7 @@ class SyncEngine:
         # Get buckets to sync
         try:
             window_buckets = self.aw.get_window_buckets()
+            web_buckets = self.aw.get_web_buckets()
             afk_buckets = self.aw.get_afk_buckets()
             input_buckets = self.aw.get_input_buckets()
         except AWClientError as e:
@@ -148,7 +150,7 @@ class SyncEngine:
 
         # Sync each bucket (including input for fraud detection)
         all_events = []
-        for bucket in window_buckets + afk_buckets + input_buckets:
+        for bucket in window_buckets + web_buckets + afk_buckets + input_buckets:
             try:
                 events = self._sync_bucket(bucket.id, bucket.type, stats)
                 all_events.extend(events)
@@ -181,6 +183,10 @@ class SyncEngine:
         if checkpoint is None:
             # First sync - start from 24 hours ago
             checkpoint = datetime.now(timezone.utc) - timedelta(hours=24)
+        else:
+            # AW start parameter is inclusive; advance slightly to avoid
+            # re-sending the same terminal event every sync cycle.
+            checkpoint = checkpoint + timedelta(milliseconds=1)
 
         # Get new events
         events = self.aw.get_events_since(
@@ -229,11 +235,21 @@ class SyncEngine:
         # Build data object
         data = {}
 
-        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
+        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
             data["app"] = app
             data["title"] = event.title
             if event.url:
-                data["url"] = event.url
+                if privacy.collect_full_urls:
+                    data["url"] = event.url
+                elif privacy.domain_only_urls:
+                    domain = self._extract_domain(event.url)
+                    if domain:
+                        data["url"] = domain
+                else:
+                    data["url"] = event.url
+
+                if privacy.collect_page_category:
+                    data["page_category"] = self._infer_page_category(event.url, event.title)
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
         elif bucket_type == BUCKET_TYPE_INPUT:
@@ -255,6 +271,32 @@ class SyncEngine:
             result["project_id"] = self._current_project["id"]
 
         return result
+
+    @staticmethod
+    def _extract_domain(url: str) -> Optional[str]:
+        """Extract domain from URL safely."""
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _infer_page_category(url: Optional[str], title: Optional[str]) -> str:
+        """Infer a coarse page category from URL/title."""
+        haystack = f"{url or ''} {title or ''}".lower()
+        patterns = {
+            "code": ["github", "gitlab", "bitbucket", "repo", "pull request", "merge request"],
+            "review": ["review", "diff", "changes"],
+            "documentation": ["docs", "confluence", "notion", "wiki"],
+            "communication": ["mail", "inbox", "slack", "teams", "chat", "meet"],
+            "planning": ["jira", "asana", "trello", "linear", "backlog", "sprint"],
+            "design": ["figma", "miro", "canva", "adobe"],
+        }
+        for category, keywords in patterns.items():
+            if any(keyword in haystack for keyword in keywords):
+                return category
+        return "other"
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""

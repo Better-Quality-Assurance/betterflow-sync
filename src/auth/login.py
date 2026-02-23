@@ -112,6 +112,7 @@ class LoginManager:
             LoginState with result
         """
         authorize_url = f"{self.bf.web_base_url}/sync/auth/authorize"
+        logger.info(f"Using authorize URL: {authorize_url}")
         flow = BrowserAuthFlow(authorize_url)
 
         logger.info("Starting browser auth flow (with PKCE)...")

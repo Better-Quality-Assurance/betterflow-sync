@@ -24,7 +24,7 @@ APP_NAME = "BetterFlow Sync"
 APP_AUTHOR = "BetterQA"
 
 # API endpoints
-DEFAULT_API_URL = "https://app.betterflow.eu/api/agent"
+DEFAULT_API_URL = "http://127.0.0.1:8001/api/agent"
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
 
 # ActivityWatch defaults
@@ -56,6 +56,8 @@ class PrivacySettings:
         ]
     )
     domain_only_urls: bool = True  # Strip URLs to domain only
+    collect_full_urls: bool = False  # Collect full URLs (sensitive, opt-in)
+    collect_page_category: bool = True  # Include coarse page category classification
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",
@@ -141,8 +143,14 @@ class Config:
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
 
-        # Migrate legacy local default to production API URL.
-        if data.get("api_url") == "http://localhost:8001/api/agent":
+        # Normalize legacy localhost URLs to current local backend default.
+        # Keeps old installs from sticking to port 8000 after local backend moved.
+        api_url = data.get("api_url")
+        if api_url in {
+            "http://localhost:8000/api/agent",
+            "http://127.0.0.1:8000/api/agent",
+            "http://localhost:8001/api/agent",
+        }:
             data["api_url"] = DEFAULT_API_URL
 
         return cls(
@@ -181,6 +189,13 @@ class Config:
             if "track_browser_domains" in privacy:
                 # Server tracks domains = we extract domain only
                 self.privacy.domain_only_urls = privacy["track_browser_domains"]
+            if "collect_full_urls" in privacy:
+                self.privacy.collect_full_urls = bool(privacy["collect_full_urls"])
+
+        if "collection" in server_config:
+            collection = server_config["collection"]
+            if "collect_page_category" in collection:
+                self.privacy.collect_page_category = bool(collection["collect_page_category"])
 
         if "sync" in server_config:
             sync = server_config["sync"]

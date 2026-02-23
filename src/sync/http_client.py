@@ -100,6 +100,12 @@ class BaseApiClient:
         if self._web_base_url:
             return self._web_base_url
         parsed = urlparse(self.api_url)
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        # In some local setups, localhost is routed differently than 127.0.0.1.
+        # Force loopback IP for local dev auth URLs.
+        if host == "localhost":
+            return f"{parsed.scheme}://127.0.0.1{port}"
         return f"{parsed.scheme}://{parsed.netloc}"
 
     def _get_headers(self) -> dict:

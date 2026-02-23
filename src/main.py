@@ -37,6 +37,7 @@ class BetterFlowSyncApp:
         setup_logging(self.config.debug_mode)
 
         logger.info("BetterFlow Sync starting...")
+        logger.info(f"Using API URL: {self.config.api_url}")
 
         # Initialize AW process manager
         self.aw_manager = AWManager(aw_port=self.config.aw.port)

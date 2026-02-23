@@ -68,11 +68,29 @@ def _get_db_dir() -> str:
 
 def _binaries_present(directory: str) -> bool:
     """Check if all required tracker binaries exist in directory."""
+    return all(_resolve_binary_path(directory, name) is not None for name in ALL_COMPONENTS)
+
+
+def _resolve_binary_path(directory: str, name: str) -> Optional[str]:
+    """Resolve component binary path (supports both flat and bundled layouts)."""
     ext = ".exe" if platform.system() == "Windows" else ""
-    return all(
-        os.path.exists(os.path.join(directory, name + ext))
-        for name in ALL_COMPONENTS
-    )
+
+    # Legacy flat layout: trackers/darwin/bf-window-tracker
+    flat = os.path.join(directory, name + ext)
+    if os.path.isfile(flat):
+        # On macOS, watcher binaries need adjacent runtime files in flat mode.
+        if platform.system() == "Darwin" and name in BF_WATCHERS:
+            if os.path.exists(os.path.join(directory, "Python")):
+                return flat
+            return None
+        return flat
+
+    # Bundled layout: trackers/darwin/bf-window-tracker/bf-window-tracker
+    bundled = os.path.join(directory, name, name + ext)
+    if os.path.isfile(bundled):
+        return bundled
+
+    return None
 
 
 def _download_aw_binaries(install_dir: str) -> bool:
@@ -95,37 +113,73 @@ def _download_aw_binaries(install_dir: str) -> bool:
         logger.info(f"Downloaded {size_mb:.1f} MB, extracting binaries...")
 
         ext = ".exe" if plat == "windows" else ""
-        # We need to find original AW names in the archive
-        original_names = {name + ext for name in AW_TO_BF_NAMES.keys()}
+        # Find full paths to component launchers in the archive.
+        launchers: dict[str, str] = {}
 
         os.makedirs(install_dir, exist_ok=True)
 
         with zipfile.ZipFile(tmp_zip, "r") as zf:
             for info in zf.infolist():
                 basename = os.path.basename(info.filename)
-                if basename in original_names:
-                    # Extract with original name first
-                    original_name = basename.replace(ext, "") if ext else basename
-                    new_name = AW_TO_BF_NAMES[original_name] + ext
-                    target = os.path.join(install_dir, new_name)
-                    with zf.open(info) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    logger.info(f"  Extracted {basename} -> {new_name}")
-                    original_names.discard(basename)
+                original_name = basename.replace(ext, "") if ext else basename
+                if original_name in AW_TO_BF_NAMES and not info.is_dir():
+                    launchers[original_name] = info.filename
 
-        if original_names:
-            logger.error(f"Missing binaries in archive: {original_names}")
+            missing = [name for name in AW_TO_BF_NAMES.keys() if name not in launchers]
+            if missing:
+                logger.error(f"Missing binaries in archive: {missing}")
+                return False
+
+            # Extract full component runtime directories for watchers.
+            for original_name, launcher_path in launchers.items():
+                branded_name = AW_TO_BF_NAMES[original_name]
+                base_dir = os.path.dirname(launcher_path)
+                target_root = os.path.join(install_dir, branded_name)
+
+                if os.path.isdir(target_root):
+                    shutil.rmtree(target_root)
+                os.makedirs(target_root, exist_ok=True)
+
+                prefix = (base_dir + "/") if base_dir else ""
+                extracted_any = False
+                for member in zf.infolist():
+                    if member.is_dir():
+                        continue
+                    if prefix and not member.filename.startswith(prefix):
+                        continue
+                    if not prefix and member.filename != launcher_path:
+                        continue
+
+                    rel_name = member.filename[len(prefix):] if prefix else os.path.basename(member.filename)
+                    source_base = os.path.basename(member.filename)
+                    if source_base == os.path.basename(launcher_path):
+                        rel_name = branded_name + ext
+
+                    target_path = os.path.join(target_root, rel_name)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with zf.open(member) as src, open(target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    extracted_any = True
+
+                if not extracted_any:
+                    logger.error(f"Failed to extract runtime for {original_name}")
+                    return False
+                logger.info(f"  Extracted {original_name} runtime -> {branded_name}/")
+
+        if not _binaries_present(install_dir):
+            logger.error("Tracker extraction incomplete after install")
             return False
 
         # macOS: fix permissions + strip quarantine
         if plat == "darwin":
-            for name in ALL_COMPONENTS:
-                path = os.path.join(install_dir, name)
-                if os.path.exists(path):
-                    st = os.stat(path)
-                    os.chmod(
-                        path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
-                    )
+            for root, _, files in os.walk(install_dir):
+                for file_name in files:
+                    path = os.path.join(root, file_name)
+                    if os.path.basename(path).startswith("bf-"):
+                        st = os.stat(path)
+                        os.chmod(
+                            path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+                        )
                     subprocess.run(
                         ["xattr", "-d", "com.apple.quarantine", path],
                         capture_output=True,
@@ -149,6 +203,8 @@ class AWManager:
         self.aw_port = aw_port
         self._processes: dict[str, subprocess.Popen] = {}
         self._using_external = False
+        # Components intentionally disabled for this app session.
+        self._disabled_components: set[str] = set()
 
     @property
     def is_managing(self) -> bool:
@@ -190,9 +246,12 @@ class AWManager:
                 self.stop()
                 return False
 
-        # Always start watchers if they're not already running
+        # Always start managed watchers to avoid stale process-name detection.
         for watcher in BF_WATCHERS:
-            if not self._is_process_running(watcher):
+            if watcher in self._disabled_components:
+                continue
+            existing = self._processes.get(watcher)
+            if not existing or existing.poll() is not None:
                 self._start_component(watcher, binaries_dir)
 
         logger.info("Tracker components started")
@@ -242,6 +301,8 @@ class AWManager:
             return False
 
         for name, proc in self._processes.items():
+            if name in self._disabled_components:
+                continue
             if proc.poll() is not None:
                 logger.warning(f"{name} has exited (code {proc.returncode})")
                 return False
@@ -266,6 +327,8 @@ class AWManager:
 
         restarted = False
         for name, proc in list(self._processes.items()):
+            if name in self._disabled_components:
+                continue
             if proc.poll() is not None:
                 logger.info(
                     f"Restarting {name} (exited with code {proc.returncode})"
@@ -283,11 +346,10 @@ class AWManager:
 
     def _start_component(self, name: str, binaries_dir: str) -> bool:
         """Start a single tracker component."""
-        ext = ".exe" if platform.system() == "Windows" else ""
-        binary_path = os.path.join(binaries_dir, name + ext)
+        binary_path = _resolve_binary_path(binaries_dir, name)
 
-        if not os.path.exists(binary_path):
-            logger.error(f"Binary not found: {binary_path}")
+        if not binary_path:
+            logger.error(f"Binary not found for component: {name} in {binaries_dir}")
             return False
 
         try:
@@ -301,6 +363,9 @@ class AWManager:
             # Platform-specific: prevent dock icon on macOS
             if platform.system() == "Darwin":
                 env["LSBackgroundOnly"] = "1"
+                # Watchers with bundled runtime expect execution from their own dir.
+                if name in BF_WATCHERS:
+                    kwargs["cwd"] = os.path.dirname(binary_path)
 
             # Platform-specific: prevent console window on Windows
             if platform.system() == "Windows":
@@ -309,6 +374,13 @@ class AWManager:
                 kwargs["startupinfo"] = startupinfo
 
             args = [binary_path]
+            if platform.system() == "Darwin" and name == "bf-window-tracker":
+                # Default to JXA to avoid repeated Accessibility prompts from the
+                # Swift strategy in unsigned/dev builds.
+                strategy = os.environ.get("BETTERFLOW_WINDOW_STRATEGY", "jxa").strip().lower()
+                if strategy not in {"jxa", "applescript", "swift"}:
+                    strategy = "jxa"
+                args.extend(["--strategy", strategy])
 
             # Pass port and dbpath to server
             if name == BF_SERVER:
