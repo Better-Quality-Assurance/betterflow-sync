@@ -199,8 +199,9 @@ def _download_aw_binaries(install_dir: str) -> bool:
 class AWManager:
     """Manages lifecycle of bundled tracker processes."""
 
-    def __init__(self, aw_port: int = 5600):
+    def __init__(self, aw_port: int = 5600, afk_timeout: int = 600):
         self.aw_port = aw_port
+        self.afk_timeout = afk_timeout  # seconds
         self._processes: dict[str, subprocess.Popen] = {}
         self._using_external = False
         # Components intentionally disabled for this app session.
@@ -344,6 +345,28 @@ class AWManager:
 
         return self.check_health()
 
+    def set_afk_timeout(self, seconds: int) -> None:
+        """Update AFK timeout and restart idle tracker if running."""
+        if seconds == self.afk_timeout:
+            return
+
+        self.afk_timeout = seconds
+        logger.info(f"AFK timeout updated to {seconds}s")
+
+        # Restart idle tracker if it's currently running
+        proc = self._processes.get("bf-idle-tracker")
+        if proc and proc.poll() is None:
+            logger.info("Restarting bf-idle-tracker with new timeout")
+            proc.terminate()
+            try:
+                proc.wait(timeout=SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+            binaries_dir = self._get_binaries_dir()
+            if binaries_dir:
+                self._start_component("bf-idle-tracker", binaries_dir)
+
     def _start_component(self, name: str, binaries_dir: str) -> bool:
         """Start a single tracker component."""
         binary_path = _resolve_binary_path(binaries_dir, name)
@@ -381,6 +404,10 @@ class AWManager:
                 if strategy not in {"jxa", "applescript", "swift"}:
                     strategy = "jxa"
                 args.extend(["--strategy", strategy])
+
+            # Pass AFK timeout to idle tracker
+            if name == "bf-idle-tracker":
+                args.extend(["--timeout", str(self.afk_timeout)])
 
             # Pass port and dbpath to server
             if name == BF_SERVER:

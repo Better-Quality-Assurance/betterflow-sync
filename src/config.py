@@ -83,6 +83,7 @@ class AWSettings:
 
     host: str = DEFAULT_AW_HOST
     port: int = DEFAULT_AW_PORT
+    afk_timeout_minutes: int = 10
 
     @property
     def base_url(self) -> str:
@@ -196,6 +197,13 @@ class Config:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
                 self.privacy.collect_page_category = bool(collection["collect_page_category"])
+
+        if "tracking" in server_config:
+            tracking = server_config["tracking"]
+            if "afk_timeout_minutes" in tracking:
+                val = tracking["afk_timeout_minutes"]
+                if val in (10, 20, 30):
+                    self.aw.afk_timeout_minutes = val
 
         if "sync" in server_config:
             sync = server_config["sync"]

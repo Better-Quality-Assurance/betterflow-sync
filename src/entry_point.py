@@ -46,7 +46,10 @@ class BetterFlowSyncApp:
         logger.info(f"Using API URL: {self.config.api_url}")
 
         # Initialize AW process manager
-        self.aw_manager = AWManager(aw_port=self.config.aw.port)
+        self.aw_manager = AWManager(
+            aw_port=self.config.aw.port,
+            afk_timeout=self.config.aw.afk_timeout_minutes * 60,
+        )
 
         # Initialize components
         self.aw = AWClient(
@@ -65,6 +68,7 @@ class BetterFlowSyncApp:
             bf=self.bf,
             queue=self.queue,
             config=self.config,
+            on_config_updated=self._on_config_updated,
         )
 
         self.login_manager = LoginManager(self.bf, self.keychain)
@@ -136,6 +140,10 @@ class BetterFlowSyncApp:
         """Fetch server config and begin sync loop (AW already started in run())."""
         self.sync_engine.fetch_server_config()
         self._start_sync_loop()
+
+    def _on_config_updated(self) -> None:
+        """Handle server config update — apply AFK timeout to AWManager."""
+        self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
 
     def _start_sync_loop(self) -> None:
         """Start the sync scheduler."""

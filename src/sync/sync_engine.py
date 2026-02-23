@@ -45,11 +45,13 @@ class SyncEngine:
         bf: BetterFlowClient,
         queue: OfflineQueue,
         config: Config,
+        on_config_updated: Optional[callable] = None,
     ):
         self.aw = aw
         self.bf = bf
         self.queue = queue
         self.config = config
+        self._on_config_updated = on_config_updated
         self._paused = False
         self._private_mode = False
         self._current_project: Optional[dict] = None
@@ -102,6 +104,8 @@ class SyncEngine:
             self.config.update_from_server(server_config)
             self._config_fetched = True
             logger.info("Server configuration applied")
+            if self._on_config_updated:
+                self._on_config_updated()
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
 
