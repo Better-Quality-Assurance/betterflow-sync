@@ -476,25 +476,31 @@ class AWManager:
                 return False
 
     def _get_binaries_dir(self) -> Optional[str]:
-        """Resolve path to tracker binaries directory."""
+        """Resolve path to tracker binaries directory.
+
+        Priority: persistent install dir > dev path > PyInstaller bundle.
+        This order ensures that binaries with existing macOS Accessibility
+        permission are preferred over freshly-bundled copies that would
+        require the user to re-grant permission.
+        """
         plat = _get_platform_key()
 
-        # PyInstaller frozen bundle
-        if getattr(sys, "frozen", False):
-            base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
-            if os.path.isdir(base) and _binaries_present(base):
-                return base
-
-        # Persistent install directory (auto-downloaded)
+        # Persistent install directory (auto-downloaded, permissions survive updates)
         install_dir = _get_install_dir()
         if os.path.isdir(install_dir) and _binaries_present(install_dir):
             return install_dir
 
-        # Development: relative to project root
+        # Development: relative to project root (already has permissions)
         src_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(src_dir)
         dev_path = os.path.join(project_root, "resources", "trackers", plat)
         if os.path.isdir(dev_path) and _binaries_present(dev_path):
             return dev_path
+
+        # PyInstaller frozen bundle (last resort — may need new permission grant)
+        if getattr(sys, "frozen", False):
+            base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
+            if os.path.isdir(base) and _binaries_present(base):
+                return base
 
         return None
