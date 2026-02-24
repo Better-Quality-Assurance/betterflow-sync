@@ -413,58 +413,67 @@ class BetterFlowSyncApp:
         # Stop bundled ActivityWatch
         self.aw_manager.stop()
 
-        # Release single-instance lock
-        _release_lock()
-
         logger.info("Shutdown complete")
 
 
-_lock_file = None
+class SingleInstanceLock:
+    """File-based single-instance lock using advisory locking."""
 
+    def __init__(self):
+        self._file = None
+        self._path = os.path.join(
+            Config.get_config_dir(), ".betterflow-sync.lock"
+        )
 
-def _acquire_lock() -> bool:
-    """Ensure only one instance is running. Returns True if lock acquired."""
-    global _lock_file
-    lock_path = os.path.join(
-        Config.get_config_dir(), ".betterflow-sync.lock"
-    )
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    _lock_file = open(lock_path, "a+")
-    try:
-        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_file.seek(0)
-        _lock_file.truncate(0)
-        _lock_file.write(str(os.getpid()))
-        _lock_file.flush()
-        return True
-    except OSError:
-        _lock_file.close()
-        _lock_file = None
+    def acquire(self) -> bool:
+        """Try to acquire the lock. Returns True on success."""
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        self._file = open(self._path, "a+")
+        try:
+            fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._file.seek(0)
+            self._file.truncate(0)
+            self._file.write(str(os.getpid()))
+            self._file.flush()
+            return True
+        except OSError:
+            self._file.close()
+            self._file = None
+            return False
+
+    def release(self) -> None:
+        """Release the lock and clean up."""
+        if self._file:
+            try:
+                fcntl.flock(self._file, fcntl.LOCK_UN)
+                self._file.close()
+                os.unlink(self._path)
+            except OSError:
+                pass
+            self._file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
         return False
 
 
-def _release_lock() -> None:
-    """Release the single-instance lock."""
-    global _lock_file
-    if _lock_file:
-        try:
-            lock_path = _lock_file.name
-            fcntl.flock(_lock_file, fcntl.LOCK_UN)
-            _lock_file.close()
-            os.unlink(lock_path)
-        except Exception:
-            pass
-        _lock_file = None
+_instance_lock = SingleInstanceLock()
 
 
 def main() -> None:
     """Main entry point."""
-    if not _acquire_lock():
+    if not _instance_lock.acquire():
         print("BetterFlow Sync is already running.")
         sys.exit(0)
 
-    app = BetterFlowSyncApp()
-    app.run()
+    try:
+        app = BetterFlowSyncApp()
+        app.run()
+    finally:
+        _instance_lock.release()
 
 
 if __name__ == "__main__":
