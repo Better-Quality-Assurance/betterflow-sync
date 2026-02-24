@@ -21,6 +21,7 @@ try:
     from .ui.tray import TrayIcon, TrayState
     from .ui.preferences import show_preferences_window
     from .aw_manager import AWManager
+    from .system_events import start_system_event_listener
 except ImportError:
     from config import Config, setup_logging
     from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
@@ -29,6 +30,7 @@ except ImportError:
     from ui.tray import TrayIcon, TrayState
     from ui.preferences import show_preferences_window
     from aw_manager import AWManager
+    from system_events import start_system_event_listener
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,14 @@ class BetterFlowSyncApp:
             self._start_sync_loop()
         else:
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+
+        # Start system event listeners (sleep/wake, shutdown, network)
+        start_system_event_listener(
+            on_sleep=self._on_system_sleep,
+            on_wake=self._on_system_wake,
+            on_shutdown=self._on_system_shutdown,
+            on_network_change=self._on_network_change,
+        )
 
         # Start tray icon (blocking)
         self._running = True
@@ -275,6 +285,37 @@ class BetterFlowSyncApp:
         else:
             logger.info("Private time ended — recording resumed")
             self.sync_engine.set_private_mode(False)
+
+    def _on_system_sleep(self) -> None:
+        """Handle system sleep / lid close."""
+        self.sync_engine.pause()
+        self.tray.set_state(TrayState.PAUSED, "Sleeping")
+        logger.info("Tracking paused (system sleep)")
+
+    def _on_system_wake(self) -> None:
+        """Handle system wake from sleep."""
+        self.sync_engine.resume()
+        self.tray.set_state(TrayState.SYNCING)
+        logger.info("Tracking resumed (system wake)")
+
+        # Trigger immediate catch-up sync
+        if self.scheduler.running:
+            self.scheduler.add_job(self._do_sync, id="wake_sync", replace_existing=True)
+
+    def _on_system_shutdown(self) -> None:
+        """Handle system shutdown / restart."""
+        logger.info("System shutdown detected — shutting down")
+        self._shutdown()
+
+    def _on_network_change(self, is_online: bool) -> None:
+        """Handle network connectivity change."""
+        if is_online:
+            logger.info("Network back online — triggering sync to flush queue")
+            if self.scheduler.running:
+                self.scheduler.add_job(self._do_sync, id="network_sync", replace_existing=True)
+        else:
+            logger.info("Network offline")
+            self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_config_updated(self) -> None:
         """Handle server config update — apply AFK timeout to AWManager."""
