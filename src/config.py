@@ -24,7 +24,7 @@ APP_NAME = "BetterFlow Sync"
 APP_AUTHOR = "BetterQA"
 
 # API endpoints
-DEFAULT_API_URL = "http://127.0.0.1:8001/api/agent"
+DEFAULT_API_URL = "https://app.betterflow.eu/api/agent"
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
 
 # ActivityWatch defaults
@@ -186,13 +186,13 @@ class Config:
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
 
-        # Normalize legacy localhost URLs to current local backend default.
-        # Keeps old installs from sticking to port 8000 after local backend moved.
+        # Migrate legacy localhost URLs to production endpoint.
         api_url = data.get("api_url")
         if api_url in {
             "http://localhost:8000/api/agent",
             "http://127.0.0.1:8000/api/agent",
             "http://localhost:8001/api/agent",
+            "http://127.0.0.1:8001/api/agent",
         }:
             data["api_url"] = DEFAULT_API_URL
 
