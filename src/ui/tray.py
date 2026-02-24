@@ -223,17 +223,17 @@ class TrayIcon:
             ),
             Item(
                 "Hash Window Titles",
-                self._handle_toggle_hash_titles,
+                self._make_toggle_handler("_hash_titles", "hash_titles"),
                 checked=lambda item: self._hash_titles,
             ),
             Item(
                 "Domain Only URLs",
-                self._handle_toggle_domain_only,
+                self._make_toggle_handler("_domain_only_urls", "domain_only_urls"),
                 checked=lambda item: self._domain_only_urls,
             ),
             Item(
                 "Debug Mode",
-                self._handle_toggle_debug,
+                self._make_toggle_handler("_debug_mode", "debug_mode"),
                 checked=lambda item: self._debug_mode,
             ),
             Item("─" * 15, None, enabled=False),
@@ -332,20 +332,14 @@ class TrayIcon:
             self._update_menu()
         return handler
 
-    def _handle_toggle_hash_titles(self, icon, item) -> None:
-        self._hash_titles = not self._hash_titles
-        if self._on_preferences:
-            self._on_preferences("hash_titles", self._hash_titles)
-
-    def _handle_toggle_domain_only(self, icon, item) -> None:
-        self._domain_only_urls = not self._domain_only_urls
-        if self._on_preferences:
-            self._on_preferences("domain_only_urls", self._domain_only_urls)
-
-    def _handle_toggle_debug(self, icon, item) -> None:
-        self._debug_mode = not self._debug_mode
-        if self._on_preferences:
-            self._on_preferences("debug_mode", self._debug_mode)
+    def _make_toggle_handler(self, attr: str, key: str):
+        """Create a handler that toggles a boolean preference."""
+        def handler(icon, item):
+            new_value = not getattr(self, attr)
+            setattr(self, attr, new_value)
+            if self._on_preferences:
+                self._on_preferences(key, new_value)
+        return handler
 
     def _handle_open_config(self, icon, item) -> None:
         if self._config_file_path:
