@@ -62,5 +62,8 @@ Thumbs.db
 # Tracker binaries (downloaded during build)
 resources/trackers/
 
+# Plans (local only)
+plans.md
+
 # Keep resources placeholder
 !resources/.gitkeep

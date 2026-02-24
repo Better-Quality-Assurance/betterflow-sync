@@ -102,7 +102,10 @@ class BetterFlowSyncApp:
         # First-run setup wizard
         wizard_login_state = None
         if not self.config.setup_complete:
-            from .ui.setup_wizard import show_setup_wizard
+            try:
+                from .ui.setup_wizard import show_setup_wizard
+            except ImportError:
+                from ui.setup_wizard import show_setup_wizard
 
             result = show_setup_wizard(self.config, self.login_manager)
             if not result.completed:
