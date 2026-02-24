@@ -29,6 +29,7 @@ class SyncStats:
     events_sent: int = 0
     events_queued: int = 0
     buckets_synced: int = 0
+    gaps_filled: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -152,9 +153,31 @@ class SyncEngine:
             stats.errors.append(f"Failed to get buckets: {e}")
             return stats
 
-        # Sync each bucket (including input for fraud detection)
+        # Sync window buckets with gap-filling
         all_events = []
-        for bucket in window_buckets + web_buckets + afk_buckets + input_buckets:
+        for bucket in window_buckets:
+            try:
+                raw_events, _ = self._fetch_bucket_events(bucket.id, stats)
+                if raw_events:
+                    # Fetch AFK data covering the same time range
+                    earliest = raw_events[0].timestamp
+                    latest_ev = raw_events[-1]
+                    latest_end = latest_ev.timestamp + timedelta(seconds=latest_ev.duration)
+                    afk_events = self._get_afk_events_for_range(earliest, latest_end)
+
+                    filled = self._fill_window_gaps(raw_events, afk_events)
+                    stats.gaps_filled += filled
+
+                    transformed = self._transform_and_checkpoint(
+                        raw_events, bucket.id, bucket.type, stats
+                    )
+                    all_events.extend(transformed)
+                stats.buckets_synced += 1
+            except AWClientError as e:
+                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+
+        # Sync non-window buckets normally
+        for bucket in web_buckets + afk_buckets + input_buckets:
             try:
                 events = self._sync_bucket(bucket.id, bucket.type, stats)
                 all_events.extend(events)
@@ -178,6 +201,51 @@ class SyncEngine:
 
         return stats
 
+    def _fetch_bucket_events(
+        self, bucket_id: str, stats: SyncStats
+    ) -> tuple[list[AWEvent], datetime]:
+        """Fetch events from a bucket with lookback window.
+
+        Returns (events, lookback_start) — events sorted oldest-first.
+        """
+        checkpoint = self.queue.get_checkpoint(bucket_id)
+        if checkpoint is None:
+            checkpoint = datetime.now(timezone.utc) - timedelta(hours=24)
+            lookback_start = checkpoint
+        else:
+            lookback_start = checkpoint - timedelta(minutes=2)
+
+        events = self.aw.get_events_since(
+            bucket_id, lookback_start, limit=self.config.sync.batch_size
+        )
+        stats.events_fetched += len(events)
+
+        # AW returns newest-first; sort oldest-first for gap-filling
+        events.sort(key=lambda e: e.timestamp)
+        return events, lookback_start
+
+    def _transform_and_checkpoint(
+        self,
+        events: list[AWEvent],
+        bucket_id: str,
+        bucket_type: str,
+        stats: SyncStats,
+    ) -> list[dict]:
+        """Transform events to BetterFlow format and update checkpoint."""
+        transformed = []
+        for event in events:
+            transformed_event = self._transform_event(event, bucket_id, bucket_type)
+            if transformed_event:
+                transformed.append(transformed_event)
+            else:
+                stats.events_filtered += 1
+
+        if events:
+            newest = max(events, key=lambda e: e.timestamp)
+            self.queue.set_checkpoint(bucket_id, newest.timestamp, newest.id)
+
+        return transformed
+
     def _sync_bucket(
         self, bucket_id: str, bucket_type: str, stats: SyncStats
     ) -> list[dict]:
@@ -190,41 +258,110 @@ class SyncEngine:
         grown are re-sent with the updated value.  The backend uses the AW
         event id to upsert, so the duration is simply patched in place.
         """
-        # Get checkpoint
-        checkpoint = self.queue.get_checkpoint(bucket_id)
-        if checkpoint is None:
-            # First sync - start from 24 hours ago
-            checkpoint = datetime.now(timezone.utc) - timedelta(hours=24)
-            lookback_start = checkpoint
-        else:
-            # Look back 2 minutes before checkpoint to catch events whose
-            # duration grew since we last synced them.
-            lookback_start = checkpoint - timedelta(minutes=2)
-
-        # Get events (including the overlap window)
-        events = self.aw.get_events_since(
-            bucket_id, lookback_start, limit=self.config.sync.batch_size
-        )
-        stats.events_fetched += len(events)
-
+        events, _ = self._fetch_bucket_events(bucket_id, stats)
         if not events:
             return []
+        return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
 
-        # Transform events — include bucket_id and pass raw data
-        transformed = []
-        for event in events:
-            transformed_event = self._transform_event(event, bucket_id, bucket_type)
-            if transformed_event:
-                transformed.append(transformed_event)
-            else:
-                stats.events_filtered += 1
+    def _get_afk_events_for_range(
+        self, start: datetime, end: datetime
+    ) -> list[AWEvent]:
+        """Fetch AFK events covering [start, end] from all AFK buckets."""
+        try:
+            afk_buckets = self.aw.get_afk_buckets()
+        except AWClientError:
+            return []
 
-        # Update checkpoint to newest event
-        if events:
-            newest = max(events, key=lambda e: e.timestamp)
-            self.queue.set_checkpoint(bucket_id, newest.timestamp, newest.id)
+        all_afk: list[AWEvent] = []
+        for bucket in afk_buckets:
+            try:
+                events = self.aw.get_events(
+                    bucket.id, start=start, end=end, limit=5000
+                )
+                all_afk.extend(events)
+            except AWClientError:
+                pass
 
-        return transformed
+        all_afk.sort(key=lambda e: e.timestamp)
+        return all_afk
+
+    @staticmethod
+    def _is_active_during(
+        start: datetime, end: datetime, afk_events: list[AWEvent]
+    ) -> bool:
+        """Check that the entire [start, end) interval is covered by not-afk.
+
+        Walks AFK events chronologically.  Returns False if any portion of the
+        interval is not covered by a ``not-afk`` event.
+        """
+        if not afk_events:
+            return False
+
+        cursor = start
+        for ev in afk_events:
+            ev_start = ev.timestamp
+            ev_end = ev.timestamp + timedelta(seconds=ev.duration)
+
+            # Skip events that end before our cursor
+            if ev_end <= cursor:
+                continue
+            # If this event starts after the cursor, there's an uncovered gap
+            if ev_start > cursor:
+                return False
+            # Event must be not-afk to count as active
+            if ev.status != "not-afk":
+                return False
+            # Advance cursor to the end of this event
+            cursor = ev_end
+            if cursor >= end:
+                return True
+
+        # If we exhausted events without reaching ``end``, gap is uncovered
+        return cursor >= end
+
+    def _fill_window_gaps(
+        self,
+        window_events: list[AWEvent],
+        afk_events: list[AWEvent],
+        max_gap_seconds: float = 300.0,
+    ) -> int:
+        """Extend window event durations to cover gaps confirmed by AFK data.
+
+        Mutates ``window_events`` in-place (sorted oldest-first).
+        Returns count of gaps filled.
+        """
+        if len(window_events) < 2 or not afk_events:
+            return 0
+
+        filled = 0
+        for i in range(len(window_events) - 1):
+            current = window_events[i]
+            next_ev = window_events[i + 1]
+
+            current_end = current.timestamp + timedelta(seconds=current.duration)
+            gap_seconds = (next_ev.timestamp - current_end).total_seconds()
+
+            # Skip negligible or too-large gaps
+            if gap_seconds < 2.0 or gap_seconds > max_gap_seconds:
+                continue
+
+            # Don't fill across app switches
+            if current.app != next_ev.app:
+                continue
+
+            # Verify user was active during the entire gap
+            if not self._is_active_during(current_end, next_ev.timestamp, afk_events):
+                continue
+
+            old_duration = current.duration
+            current.duration = (next_ev.timestamp - current.timestamp).total_seconds()
+            filled += 1
+            logger.info(
+                f"Filling {gap_seconds:.1f}s window gap: event {current.id} "
+                f"({current.app}) duration {old_duration:.1f}s -> {current.duration:.1f}s"
+            )
+
+        return filled
 
     def _transform_event(
         self, event: AWEvent, bucket_id: str, bucket_type: str

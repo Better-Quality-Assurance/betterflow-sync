@@ -213,9 +213,11 @@ class BetterFlowSyncApp:
             )
 
             if stats.events_sent > 0 or stats.events_queued > 0:
+                gaps_info = f", {stats.gaps_filled} gaps filled" if stats.gaps_filled > 0 else ""
                 logger.info(
                     f"Sync complete: {stats.events_sent} sent, "
                     f"{stats.events_queued} queued, {stats.events_filtered} filtered"
+                    f"{gaps_info}"
                 )
 
         except BetterFlowAuthError as e:

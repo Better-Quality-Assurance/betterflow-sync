@@ -397,6 +397,8 @@ class AWManager:
                 kwargs["startupinfo"] = startupinfo
 
             args = [binary_path]
+            if name == "bf-window-tracker":
+                args.extend(["--poll-time", "1.0"])
             if platform.system() == "Darwin" and name == "bf-window-tracker":
                 # Default to JXA to avoid repeated Accessibility prompts from the
                 # Swift strategy in unsigned/dev builds.
