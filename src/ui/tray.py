@@ -142,6 +142,7 @@ class TrayIcon:
         self._domain_only_urls: bool = True
         self._debug_mode: bool = False
         self._config_file_path: Optional[str] = None
+        self._dashboard_url: str = "https://app.betterflow.eu/dashboard"
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
@@ -309,7 +310,7 @@ class TrayIcon:
 
     def _handle_dashboard(self, icon, item) -> None:
         """Open dashboard in browser."""
-        webbrowser.open("https://betterflow.eu/dashboard")
+        webbrowser.open(self._dashboard_url)
 
     def _handle_logout(self, icon, item) -> None:
         """Handle sign out menu click."""
@@ -358,6 +359,10 @@ class TrayIcon:
         self._domain_only_urls = config.privacy.domain_only_urls
         self._debug_mode = config.debug_mode
         self._config_file_path = str(config.get_config_file())
+        # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
+        from urllib.parse import urlparse
+        parsed = urlparse(config.api_url)
+        self._dashboard_url = f"{parsed.scheme}://{parsed.netloc}/dashboard"
         self._update_menu()
 
     def set_state(self, state: TrayState, status_text: Optional[str] = None) -> None:

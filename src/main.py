@@ -86,6 +86,7 @@ class BetterFlowSyncApp:
             on_project_change=self._on_project_change,
             on_private_toggle=self._on_private_toggle,
         )
+        self.tray.set_config(self.config)
 
         # State
         self._running = False
