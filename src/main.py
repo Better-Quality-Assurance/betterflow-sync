@@ -19,7 +19,6 @@ try:
     from .sync.http_client import BetterFlowAuthError
     from .auth import KeychainManager, LoginManager
     from .ui.tray import TrayIcon, TrayState
-    from .ui.preferences import show_preferences_window
     from .aw_manager import AWManager
     from .system_events import start_system_event_listener
 except ImportError:
@@ -28,7 +27,6 @@ except ImportError:
     from sync.http_client import BetterFlowAuthError
     from auth import KeychainManager, LoginManager
     from ui.tray import TrayIcon, TrayState
-    from ui.preferences import show_preferences_window
     from aw_manager import AWManager
     from system_events import start_system_event_listener
 
@@ -336,27 +334,25 @@ class BetterFlowSyncApp:
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 
-    def _on_preferences(self) -> None:
-        """Handle preferences action."""
-
-        def on_save(config: Config) -> None:
-            self.config = config
-            config.save()
-
-            # Update sync interval if changed
+    def _on_preferences(self, key: str, value) -> None:
+        """Handle a preference change from tray menu."""
+        if key == "sync_interval":
+            self.config.sync.interval_seconds = value
             if self.scheduler.running:
                 self.scheduler.reschedule_job(
                     "sync_job",
-                    trigger=IntervalTrigger(seconds=config.sync.interval_seconds),
+                    trigger=IntervalTrigger(seconds=value),
                 )
+        elif key == "hash_titles":
+            self.config.privacy.hash_titles = value
+        elif key == "domain_only_urls":
+            self.config.privacy.domain_only_urls = value
+        elif key == "debug_mode":
+            self.config.debug_mode = value
+            setup_logging(value)
 
-            logger.info("Preferences saved")
-
-        # Show in new thread to not block tray
-        threading.Thread(
-            target=lambda: show_preferences_window(self.config, on_save),
-            daemon=True,
-        ).start()
+        self.config.save()
+        logger.info(f"Preference changed: {key} = {value}")
 
     def _on_logout(self) -> None:
         """Handle logout action."""

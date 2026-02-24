@@ -92,7 +92,7 @@ class TrayIcon:
         on_login: Optional[Callable[[], None]] = None,
         on_pause: Optional[Callable[[], None]] = None,
         on_resume: Optional[Callable[[], None]] = None,
-        on_preferences: Optional[Callable[[], None]] = None,
+        on_preferences: Optional[Callable[[str, object], None]] = None,
         on_logout: Optional[Callable[[], None]] = None,
         on_quit: Optional[Callable[[], None]] = None,
         on_project_change: Optional[Callable[[Optional[dict]], None]] = None,
@@ -306,11 +306,6 @@ class TrayIcon:
                 self._on_project_change(project)
             self._update_menu()
         return handler
-
-    def _handle_preferences(self, icon, item) -> None:
-        """Handle preferences menu click."""
-        if self._on_preferences:
-            self._on_preferences()
 
     def _handle_dashboard(self, icon, item) -> None:
         """Open dashboard in browser."""
