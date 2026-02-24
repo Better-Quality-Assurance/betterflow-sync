@@ -1,5 +1,6 @@
 """Manage bundled tracker processes (ActivityWatch components, white-labeled)."""
 
+import json
 import logging
 import os
 import platform
@@ -12,6 +13,7 @@ import time
 import urllib.request
 import urllib.error
 import zipfile
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ AW_TO_BF_NAMES = {
 
 STARTUP_TIMEOUT = 10  # seconds to wait for server to be ready
 SHUTDOWN_TIMEOUT = 5  # seconds before force-killing
+STALE_THRESHOLD = 120  # seconds with no new events before force-restarting watcher
 
 
 def _get_platform_key() -> str:
@@ -206,6 +209,7 @@ class AWManager:
         self._using_external = False
         # Components intentionally disabled for this app session.
         self._disabled_components: set[str] = set()
+        self._stale_restart_count: int = 0
 
     @property
     def is_managing(self) -> bool:
@@ -310,7 +314,7 @@ class AWManager:
         return True
 
     def restart_if_needed(self) -> bool:
-        """Restart crashed components. Returns True if tracker is healthy."""
+        """Restart crashed or stalled components. Returns True if tracker is healthy."""
         if self._using_external:
             if self._port_in_use():
                 return True
@@ -335,6 +339,30 @@ class AWManager:
                     f"Restarting {name} (exited with code {proc.returncode})"
                 )
                 self._start_component(name, binaries_dir)
+                restarted = True
+
+        # Detect stalled window tracker (process alive but no new events)
+        watcher = "bf-window-tracker"
+        if (
+            watcher not in self._disabled_components
+            and watcher in self._processes
+            and self._processes[watcher].poll() is None
+        ):
+            age = self._get_latest_window_event_age()
+            if age is not None and age > STALE_THRESHOLD:
+                self._stale_restart_count += 1
+                logger.warning(
+                    f"{watcher} stale: no new events for {age:.0f}s "
+                    f"(threshold {STALE_THRESHOLD}s, "
+                    f"restart #{self._stale_restart_count})"
+                )
+                proc = self._processes[watcher]
+                proc.terminate()
+                try:
+                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                self._start_component(watcher, binaries_dir)
                 restarted = True
 
         # If server was restarted, wait for it
@@ -476,6 +504,28 @@ class AWManager:
                 return True
             except (ConnectionRefusedError, OSError):
                 return False
+
+    def _get_latest_window_event_age(self) -> Optional[float]:
+        """Return seconds since the most recent window event, or None on error."""
+        try:
+            url = (
+                f"http://localhost:{self.aw_port}/api/0/buckets/"
+                f"aw-watcher-window_{platform.node()}/events?limit=1"
+            )
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                events = json.loads(resp.read())
+            if not events:
+                return None
+            # Timestamp format: "2026-02-24T13:31:24.123456+00:00" or "...Z"
+            ts_str = events[0]["timestamp"]
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            duration = events[0].get("duration", 0)
+            event_end = ts.timestamp() + duration
+            age = time.time() - event_end
+            return max(0, age)
+        except Exception:
+            return None
 
     def _get_binaries_dir(self) -> Optional[str]:
         """Resolve path to tracker binaries directory.

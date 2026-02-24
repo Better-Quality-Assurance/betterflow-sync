@@ -35,8 +35,6 @@ TEXT_MUTED = "#a8badf"
 SUCCESS_COLOR = "#37d67a"
 ERROR_COLOR = "#ff5a7a"
 BTN_TEXT = "#ffffff"
-STEP_ACTIVE = "#00d2ff"
-STEP_INACTIVE = "#50618d"
 
 
 @dataclass
@@ -193,31 +191,11 @@ class SetupWizard:
         """Return content bounds; the window itself is the only card surface."""
         return 56, 34, WINDOW_WIDTH - 56, WINDOW_HEIGHT - 34
 
-    def _draw_step_indicator(self, step: int) -> None:
-        """Render wizard step chips."""
-        labels = ["Welcome", "Connect", "Done"]
-        start_x = WINDOW_WIDTH // 2 - 128
-        y = 66
-        for idx, label in enumerate(labels, start=1):
-            is_active = idx <= step
-            color = STEP_ACTIVE if is_active else STEP_INACTIVE
-            fg = "#0a1328" if is_active else "#ccd7f5"
-            chip_x = start_x + (idx - 1) * 128
-            self._canvas.create_rectangle(chip_x, y, chip_x + 106, y + 28, fill=color, outline="")
-            self._canvas.create_text(
-                chip_x + 53,
-                y + 14,
-                text=label,
-                font=("Avenir Next", 10, "bold"),
-                fill=fg,
-            )
-
-    def _draw_scene(self, step: int, title: str, subtitle: str) -> int:
+    def _draw_scene(self, title: str, subtitle: str) -> int:
         """Shared wizard scene shell. Returns content center x."""
         self._clear()
         self._draw_background()
         self._draw_card_shell()
-        self._draw_step_indicator(step)
         cx = WINDOW_WIDTH // 2
         self._canvas.create_text(
             cx, 126,
@@ -238,7 +216,6 @@ class SetupWizard:
     def _show_welcome(self) -> None:
         """Show the welcome screen."""
         cx = self._draw_scene(
-            step=1,
             title="Welcome to BetterFlow Sync",
             subtitle="Install local tracking and connect your BetterFlow account",
         )
@@ -288,7 +265,6 @@ class SetupWizard:
     def _start_login(self) -> None:
         """Show signing in state and open browser."""
         cx = self._draw_scene(
-            step=2,
             title="Installing and Connecting",
             subtitle="Preparing local services and opening secure browser sign-in",
         )
@@ -383,7 +359,6 @@ class SetupWizard:
     def _show_error(self, error: str) -> None:
         """Show error state with retry."""
         cx = self._draw_scene(
-            step=2,
             title="Connection Problem",
             subtitle="We could not complete setup",
         )
@@ -415,7 +390,6 @@ class SetupWizard:
     def _show_success(self, email: str) -> None:
         """Show success screen."""
         cx = self._draw_scene(
-            step=3,
             title="You’re All Set",
             subtitle="BetterFlow Sync is ready to run",
         )
