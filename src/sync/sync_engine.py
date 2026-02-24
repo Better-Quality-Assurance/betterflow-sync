@@ -134,12 +134,11 @@ class SyncEngine:
             stats.errors.append("ActivityWatch is not running")
             return stats
 
-        # Start session if needed
+        # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)
         if not self._session_active:
             try:
-                if self.bf.is_reachable():
-                    self.bf.start_session()
-                    self._session_active = True
+                self.bf.start_session()
+                self._session_active = True
             except BetterFlowClientError as e:
                 logger.warning(f"Failed to start session: {e}")
 
