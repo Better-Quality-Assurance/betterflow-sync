@@ -97,39 +97,45 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        params = parse_qs(parsed.query)
-        code = params.get("code", [None])[0]
-        state = params.get("state", [None])[0]
+        # Only process the first callback; ignore subsequent requests.
+        with self.server.lock:
+            if self.server.callback_received.is_set():
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(_SUCCESS_HTML.encode())
+                return
 
-        # Verify state parameter (CSRF protection)
-        if state != self.server.expected_state:
-            # Don't log actual state values (security tokens)
-            logger.warning("State parameter mismatch - possible CSRF attempt")
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(_ERROR_HTML.encode())
-            self.server.auth_error = "state_mismatch"
+            params = parse_qs(parsed.query)
+            code = params.get("code", [None])[0]
+            state = params.get("state", [None])[0]
+
+            # Verify state parameter (CSRF protection)
+            if not state or state != self.server.expected_state:
+                logger.warning("State parameter mismatch - possible CSRF attempt")
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(_ERROR_HTML.encode())
+                self.server.auth_error = "state_mismatch"
+                self.server.callback_received.set()
+                return
+
+            if code:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(_SUCCESS_HTML.encode())
+                self.server.auth_code = code
+            else:
+                error = params.get("error", ["unknown"])[0]
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(_ERROR_HTML.encode())
+                self.server.auth_error = error
+
             self.server.callback_received.set()
-            return
-
-        if code:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(_SUCCESS_HTML.encode())
-            # Store the code on the server instance
-            self.server.auth_code = code
-        else:
-            error = params.get("error", ["unknown"])[0]
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(_ERROR_HTML.encode())
-            self.server.auth_error = error
-
-        # Signal that we received a response
-        self.server.callback_received.set()
 
     def log_message(self, format, *args):
         """Suppress default HTTP server logs."""
@@ -177,6 +183,7 @@ class BrowserAuthFlow:
 
         # Create server on random port
         self._server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        self._server.lock = threading.Lock()
         self._server.auth_code = None
         self._server.auth_error = None
         self._server.expected_state = state
@@ -199,7 +206,6 @@ class BrowserAuthFlow:
                 f"&code_challenge_method=S256"
             )
             logger.info("Opening browser for authorization")
-            logger.debug(f"Authorize URL: {authorize_url}")
             webbrowser.open(authorize_url)
 
             # Wait for callback
