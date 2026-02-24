@@ -87,7 +87,7 @@ class KeychainManager:
         except KeyringError as e:
             logger.error(f"Failed to load credentials: {e}")
             return None
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.error(f"Invalid credential format: {e}")
             return None
 
