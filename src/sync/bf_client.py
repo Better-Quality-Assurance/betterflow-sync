@@ -177,7 +177,7 @@ class BetterFlowClient(BaseApiClient):
                 try:
                     data = response.json()
                     msg = data.get("message", data.get("error", "Authentication failed"))
-                except (ValueError, Exception):
+                except Exception:
                     msg = response.text or response.reason or f"HTTP {response.status_code}"
                 return AuthResult(success=False, error=msg)
             response.raise_for_status()

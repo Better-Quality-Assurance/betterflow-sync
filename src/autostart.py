@@ -25,7 +25,7 @@ def set_auto_start(enabled: bool) -> bool:
             logger.warning(f"Auto-start not supported on {system}")
             return False
     except Exception as e:
-        logger.error(f"Failed to {'enable' if enabled else 'disable'} auto-start: {e}")
+        logger.warning(f"Failed to {'enable' if enabled else 'disable'} auto-start: {e}")
         return False
 
 

@@ -5,7 +5,10 @@ import platform
 import threading
 import webbrowser
 from enum import Enum
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, TypedDict
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 
 def _hide_from_dock() -> None:
@@ -22,7 +25,14 @@ def _hide_from_dock() -> None:
 
 from PIL import Image, ImageDraw
 
-__all__ = ["TrayIcon", "TrayState", "STATE_COLORS", "create_icon_image"]
+__all__ = ["TrayIcon", "TrayState", "STATE_COLORS", "create_icon_image", "ProjectDict"]
+
+
+class ProjectDict(TypedDict):
+    """Typed project dictionary from the API."""
+
+    id: int
+    name: str
 
 try:
     import pystray
@@ -95,7 +105,7 @@ class TrayIcon:
         on_preferences: Optional[Callable[[str, object], None]] = None,
         on_logout: Optional[Callable[[], None]] = None,
         on_quit: Optional[Callable[[], None]] = None,
-        on_project_change: Optional[Callable[[Optional[dict]], None]] = None,
+        on_project_change: Optional[Callable[[Optional[ProjectDict]], None]] = None,
         on_private_toggle: Optional[Callable[[bool], None]] = None,
     ):
         """Initialize tray icon.
@@ -133,8 +143,8 @@ class TrayIcon:
         self._user_name: Optional[str] = None
 
         # Project state
-        self._projects: list[dict] = []  # [{id, name}, ...]
-        self._current_project: Optional[dict] = None  # {id, name}
+        self._projects: list[ProjectDict] = []
+        self._current_project: Optional[ProjectDict] = None
 
         # Preferences state
         self._sync_interval: int = 60
@@ -305,7 +315,7 @@ class TrayIcon:
             self._on_private_toggle(self._private_mode)
         self._update_menu()
 
-    def _make_project_handler(self, project: Optional[dict]):
+    def _make_project_handler(self, project: Optional[ProjectDict]) -> Callable:
         """Create a handler for switching projects."""
         def handler(icon, item):
             self._current_project = project
@@ -329,7 +339,7 @@ class TrayIcon:
             self._on_quit()
         self.stop()
 
-    def _make_interval_handler(self, seconds: int):
+    def _make_interval_handler(self, seconds: int) -> Callable:
         """Create a handler for setting sync interval."""
         def handler(icon, item):
             self._sync_interval = seconds
@@ -338,7 +348,7 @@ class TrayIcon:
             self._update_menu()
         return handler
 
-    def _make_toggle_handler(self, attr: str, key: str):
+    def _make_toggle_handler(self, attr: str, key: str) -> Callable:
         """Create a handler that toggles a boolean preference."""
         def handler(icon, item):
             new_value = not getattr(self, attr)
@@ -352,7 +362,7 @@ class TrayIcon:
             import subprocess
             subprocess.Popen(["open", self._config_file_path])
 
-    def set_config(self, config) -> None:
+    def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
         self._sync_interval = config.sync.interval_seconds
         self._hash_titles = config.privacy.hash_titles
@@ -426,7 +436,7 @@ class TrayIcon:
         self._user_name = name
         self._update_menu()
 
-    def set_projects(self, projects: list[dict], current_project: Optional[dict] = None) -> None:
+    def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:
         """Set available projects and current selection."""
         self._projects = projects
         if current_project:
