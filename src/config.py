@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,7 @@ __all__ = [
     "AWSettings",
     "setup_logging",
     "DEFAULT_API_URL",
+    "DEFAULT_WEB_BASE_URL",
     "MAX_QUEUE_SIZE",
 ]
 
@@ -23,8 +25,53 @@ logger = logging.getLogger(__name__)
 APP_NAME = "BetterFlow Sync"
 APP_AUTHOR = "BetterQA"
 
+
+def _load_dotenv() -> None:
+    """Load environment variables from a local .env file (if present)."""
+    candidates: list[Path] = []
+    if os.getenv("BETTERFLOW_SYNC_ENV_FILE"):
+        candidates.append(Path(os.environ["BETTERFLOW_SYNC_ENV_FILE"]).expanduser())
+
+    # Installed app runtime config location.
+    candidates.append(Path(user_config_dir(APP_NAME, APP_AUTHOR)) / ".env")
+
+    # Prefer a .env in current working directory, then project root in source runs.
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path(__file__).resolve().parents[1] / ".env")
+
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.exists() or not resolved.is_file():
+            continue
+
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if not key:
+                        continue
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                        value = value[1:-1]
+                    os.environ.setdefault(key, value)
+            return
+        except Exception as e:
+            logger.warning(f"Failed loading .env file at {resolved}: {e}")
+
+
+_load_dotenv()
+
 # API endpoints
-DEFAULT_API_URL = "https://app.betterflow.eu/api/agent"
+DEFAULT_API_URL = os.getenv("BETTERFLOW_API_URL", "https://app.betterflow.eu/api/agent").rstrip("/")
+DEFAULT_WEB_BASE_URL = os.getenv("BETTERFLOW_WEB_BASE_URL")
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
 
 # ActivityWatch defaults
@@ -174,7 +221,17 @@ class Config:
             try:
                 with open(config_file, "r") as f:
                     data = json.load(f)
-                return cls._from_dict(data)
+                original_api_url = data.get("api_url")
+                config = cls._from_dict(data)
+
+                # Persist API URL migrations so subsequent runs use the normalized value.
+                if original_api_url != config.api_url:
+                    try:
+                        config.save()
+                    except Exception as e:
+                        logger.warning(f"Failed to persist migrated config: {e}")
+
+                return config
             except Exception as e:
                 logger.warning(f"Failed to load config: {e}, using defaults")
         return cls()
@@ -182,6 +239,11 @@ class Config:
     @classmethod
     def _from_dict(cls, data: dict) -> "Config":
         """Create Config from dictionary."""
+        # Explicit runtime override (e.g. local backend for installed app).
+        env_api_url = os.getenv("BETTERFLOW_API_URL")
+        if env_api_url:
+            data["api_url"] = env_api_url.rstrip("/")
+
         aw_data = data.pop("aw", {})
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})

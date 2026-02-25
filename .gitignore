@@ -49,6 +49,9 @@ htmlcov/
 
 # Local config
 config.json
+.env
+.env.*
+!.env.example
 *.db
 
 # Logs

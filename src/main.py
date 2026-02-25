@@ -91,6 +91,9 @@ class BetterFlowSyncApp:
         # State
         self._running = False
         self._shutdown_event = threading.Event()
+        self._logged_in = False
+        self._hours_today_seconds = 0
+        self._hours_today_cache = "0h 0m"
 
     def run(self) -> None:
         """Run the application."""
@@ -125,6 +128,7 @@ class BetterFlowSyncApp:
         self.aw_manager.start()
 
         if state.logged_in:
+            self._logged_in = True
             # Set user on tray
             self.tray.set_user(state.user_email, state.user_name)
 
@@ -137,6 +141,7 @@ class BetterFlowSyncApp:
             # Start sync loop
             self._start_sync_loop()
         else:
+            self._logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         # Start system event listeners (sleep/wake, shutdown, network)
@@ -166,6 +171,13 @@ class BetterFlowSyncApp:
             self._do_sync,
             trigger=IntervalTrigger(seconds=self.config.sync.interval_seconds),
             id="sync_job",
+            replace_existing=True,
+        )
+        # Keep tray "Hours today" fresh even with longer sync intervals.
+        self.scheduler.add_job(
+            self._refresh_hours_today,
+            trigger=IntervalTrigger(seconds=60),
+            id="tray_time_job",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -234,29 +246,54 @@ class BetterFlowSyncApp:
         """Fetch today's tracked hours from API."""
         try:
             status = self.bf.get_status()
-            total_seconds = status.get("data", {}).get("today_summary", {}).get("total_seconds", 0)
-            hours = int(total_seconds) // 3600
-            minutes = (int(total_seconds) % 3600) // 60
-            return f"{hours}h {minutes}m"
+            total_seconds = int(status.get("data", {}).get("today_summary", {}).get("total_seconds", 0))
+            self._hours_today_seconds = max(0, total_seconds)
+            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            return self._hours_today_cache
         except Exception:
-            return self._hours_today_cache if hasattr(self, '_hours_today_cache') else "0h 0m"
+            return self._hours_today_cache
+
+    def _refresh_hours_today(self) -> None:
+        """Increment tray hours locally every minute while tracking is active."""
+        try:
+            if not self._logged_in:
+                return
+            if self.sync_engine.is_paused or self.sync_engine.is_private:
+                return
+            if not self.aw.is_running():
+                return
+
+            self._hours_today_seconds += 60
+            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            self.tray.update_stats(hours_today=self._hours_today_cache)
+        except Exception as e:
+            logger.debug(f"Failed to refresh tray hours: {e}")
 
     def _format_time(self, dt: datetime) -> str:
         """Format time for display."""
         return dt.strftime("%H:%M")
 
+    def _format_hours(self, total_seconds: int) -> str:
+        """Format accumulated seconds as `Xh Ym` for tray display."""
+        hours = int(total_seconds) // 3600
+        minutes = (int(total_seconds) % 3600) // 60
+        return f"{hours}h {minutes}m"
+
     def _on_login(self) -> None:
         """Handle explicit login action from tray."""
         def do_browser_login():
+            self._logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
             state = self.login_manager.login_via_browser()
             if state.logged_in:
+                self._logged_in = True
                 self.tray.set_user(state.user_email, state.user_name)
                 self.sync_engine.fetch_server_config()
                 self._fetch_projects()
                 if not self.scheduler.running:
                     self._start_sync_loop()
             else:
+                self._logged_in = False
                 self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
 
         threading.Thread(target=do_browser_login, daemon=True).start()
@@ -358,6 +395,7 @@ class BetterFlowSyncApp:
     def _on_logout(self) -> None:
         """Handle logout action."""
         self.login_manager.logout()
+        self._logged_in = False
         self.tray.set_user(None)
         logger.info("Logged out")
 
@@ -371,9 +409,11 @@ class BetterFlowSyncApp:
         def do_relogin():
             state = self.login_manager.login_via_browser()
             if state.logged_in:
+                self._logged_in = True
                 self.tray.set_user(state.user_email, state.user_name)
                 self._start_sync_loop()
             else:
+                self._logged_in = False
                 self._on_quit()
 
         threading.Thread(target=do_relogin, daemon=True).start()

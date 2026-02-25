@@ -3,6 +3,7 @@
 import gzip
 import json
 import logging
+import os
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -63,6 +64,7 @@ class BaseApiClient:
     def __init__(
         self,
         api_url: str,
+        web_base_url: Optional[str] = None,
         token: Optional[str] = None,
         device_id: Optional[str] = None,
         compress: bool = True,
@@ -74,6 +76,7 @@ class BaseApiClient:
 
         Args:
             api_url: BetterFlow API base URL
+            web_base_url: Optional explicit web app base URL (for browser auth)
             token: API token for authentication
             device_id: Device ID from registration
             compress: Use gzip compression for payloads
@@ -82,7 +85,17 @@ class BaseApiClient:
             session: Optional requests session (for dependency injection/testing)
         """
         self.api_url = api_url.rstrip("/")
-        self._web_base_url: Optional[str] = None
+        parsed_api = urlparse(self.api_url)
+        api_host = parsed_api.hostname or ""
+        env_web_base = os.getenv("BETTERFLOW_WEB_BASE_URL")
+
+        explicit_web_base = web_base_url
+        if explicit_web_base is None and env_web_base and api_host in {"localhost", "127.0.0.1"}:
+            explicit_web_base = env_web_base
+
+        self._web_base_url: Optional[str] = (
+            explicit_web_base.rstrip("/") if explicit_web_base else None
+        )
         self.token = token
         self.device_id = device_id
         self.compress = compress
