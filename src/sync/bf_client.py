@@ -3,7 +3,6 @@
 import hashlib
 import logging
 import platform
-import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -198,45 +197,6 @@ class BetterFlowClient(BaseApiClient):
             return AuthResult(success=False, error=f"HTTP error: {e.response.status_code}")
         except (KeyError, ValueError) as e:
             return AuthResult(success=False, error=f"Invalid response: {e}")
-
-    def register(
-        self, email: str, password: str, device_info: Optional[DeviceInfo] = None
-    ) -> AuthResult:
-        """Register this device with BetterFlow.
-
-        DEPRECATED: Use exchange_code() with browser OAuth flow instead.
-        """
-        warnings.warn(
-            "register() is deprecated. Use browser OAuth flow with exchange_code() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if device_info is None:
-            device_info = DeviceInfo.collect()
-
-        try:
-            response = self._request(
-                "POST",
-                "register",
-                data={
-                    "email": email,
-                    "password": password,
-                    "device_name": device_info.device_name,
-                    "machine_id": device_info.machine_id,
-                    "platform": device_info.platform_key,
-                    "os_version": device_info.os_version,
-                    "agent_version": device_info.agent_version,
-                },
-            )
-            return AuthResult(
-                success=True,
-                device_id=str(response.get("device_id", "")),
-                api_token=response.get("api_token"),
-            )
-        except BetterFlowAuthError as e:
-            return AuthResult(success=False, error=str(e))
-        except BetterFlowClientError as e:
-            return AuthResult(success=False, error=str(e))
 
     def revoke(self) -> bool:
         """Revoke this device's token."""
