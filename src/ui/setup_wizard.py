@@ -5,6 +5,7 @@ Runs only when config.setup_complete is False.
 """
 
 import logging
+import platform
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -23,8 +24,13 @@ logger = logging.getLogger(__name__)
 WINDOW_WIDTH = 720
 WINDOW_HEIGHT = 520
 
-# Typography
-FONT_FAMILY = "Avenir Next"
+# Typography — platform-conditional font family
+if platform.system() == "Darwin":
+    FONT_FAMILY = "Avenir Next"
+elif platform.system() == "Windows":
+    FONT_FAMILY = "Segoe UI"
+else:
+    FONT_FAMILY = "sans-serif"
 FONT_TITLE = (FONT_FAMILY, 30, "bold")
 FONT_SUBTITLE = (FONT_FAMILY, 13)
 FONT_BODY = (FONT_FAMILY, 12)
