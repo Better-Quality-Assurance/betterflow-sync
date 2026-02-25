@@ -465,7 +465,7 @@ class SyncEngine:
         batch_size = self.config.sync.batch_size
         batches = [events[i : i + batch_size] for i in range(0, len(events), batch_size)]
 
-        for batch in batches:
+        for i, batch in enumerate(batches):
             try:
                 result = self.bf.send_events(batch)
                 if result.success:
@@ -477,7 +477,10 @@ class SyncEngine:
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
-                # Auth error - don't queue, need to re-authenticate
+                # Queue remaining unsent batches before re-raising
+                for remaining in batches[i:]:
+                    self.queue.enqueue(remaining)
+                    stats.events_queued += len(remaining)
                 stats.errors.append(f"Authentication error: {e}")
                 raise
             except BetterFlowClientError:
