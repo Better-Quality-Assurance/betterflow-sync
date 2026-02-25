@@ -69,7 +69,8 @@ def _load_dotenv() -> None:
             logger.warning(f"Failed loading .env file at {resolved}: {e}")
 
 
-_load_dotenv()
+if "pytest" not in sys.modules:
+    _load_dotenv()
 
 # API endpoints
 DEFAULT_API_URL = os.getenv("BETTERFLOW_API_URL", "https://app.betterflow.eu/api/agent").rstrip("/")
