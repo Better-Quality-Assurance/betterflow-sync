@@ -275,6 +275,16 @@ class Config:
             json.dump(data, f, indent=2)
         logger.info(f"Config saved to {config_file}")
 
+    @staticmethod
+    def _to_bool(value) -> bool:
+        """Coerce a server config value to bool safely.
+
+        Handles strings like "false", "0", "no" that bool() gets wrong.
+        """
+        if isinstance(value, str):
+            return value.lower() not in ("false", "0", "no", "")
+        return bool(value)
+
     def update_from_server(self, server_config: dict) -> None:
         """Update local config from server response.
 
@@ -288,19 +298,19 @@ class Config:
         if "privacy" in server_config:
             privacy = server_config["privacy"]
             if "hash_window_titles" in privacy:
-                self.privacy.hash_titles = privacy["hash_window_titles"]
+                self.privacy.hash_titles = self._to_bool(privacy["hash_window_titles"])
             if "title_allowlist" in privacy:
                 self.privacy.title_allowlist = privacy["title_allowlist"]
             if "track_browser_domains" in privacy:
                 # Server tracks domains = we extract domain only
-                self.privacy.domain_only_urls = privacy["track_browser_domains"]
+                self.privacy.domain_only_urls = self._to_bool(privacy["track_browser_domains"])
             if "collect_full_urls" in privacy:
-                self.privacy.collect_full_urls = bool(privacy["collect_full_urls"])
+                self.privacy.collect_full_urls = self._to_bool(privacy["collect_full_urls"])
 
         if "collection" in server_config:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
-                self.privacy.collect_page_category = bool(collection["collect_page_category"])
+                self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])
 
         if "tracking" in server_config:
             tracking = server_config["tracking"]
