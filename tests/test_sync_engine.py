@@ -19,6 +19,9 @@ class TestSyncEngine:
         self.queue = Mock()
         self.config = Config()
 
+        # bf.get_config returns a dict for server config updates
+        self.bf.get_config.return_value = {}
+
         self.engine = SyncEngine(
             aw=self.aw,
             bf=self.bf,

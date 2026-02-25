@@ -5,6 +5,7 @@ import json
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 
+import requests.exceptions
 import responses
 from responses import matchers
 
@@ -65,7 +66,7 @@ class TestBetterFlowClient:
     def test_init_defaults(self):
         """Test default initialization."""
         client = BetterFlowClient()
-        assert client.api_url == "https://betterflow.eu/api/agent"
+        assert client.api_url == "https://app.betterflow.eu/api/agent"
         assert client.token is None
         assert client.device_id is None
         assert client.compress is True
@@ -133,7 +134,7 @@ class TestBetterFlowClient:
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/health",
-            body=Exception("Not found"),
+            body=requests.exceptions.ConnectionError("Not found"),
         )
         responses.add(
             responses.GET,
@@ -150,12 +151,12 @@ class TestBetterFlowClient:
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/health",
-            body=Exception("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/events/status",
-            body=Exception("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
         assert self.client.is_reachable() is False
@@ -192,7 +193,7 @@ class TestBetterFlowClient:
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/test",
-            body=ConnectionError("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
         with pytest.raises(BetterFlowClientError, match="Cannot connect"):
@@ -321,7 +322,7 @@ class TestBetterFlowClient:
         responses.add(
             responses.POST,
             "https://betterflow.eu/api/agent/events/batch",
-            body=ConnectionError("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
         events = [{"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}]
@@ -395,47 +396,13 @@ class TestBetterFlowClient:
         responses.add(
             responses.POST,
             "https://betterflow.eu/api/v1/sync/auth/token",
-            body=ConnectionError("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
         result = self.client.exchange_code(code="code", device_name="device")
 
         assert result.success is False
         assert "connect" in result.error.lower()
-
-    @responses.activate
-    def test_register_success(self):
-        """Test successful device registration."""
-        responses.add(
-            responses.POST,
-            "https://betterflow.eu/api/agent/register",
-            json={"device_id": "new-device-123", "api_token": "new-token-456"},
-            status=200,
-        )
-
-        result = self.client.register(
-            email="user@example.com",
-            password="password123",
-            device_info=DeviceInfo.collect(),
-        )
-
-        assert result.success is True
-        assert result.device_id == "new-device-123"
-        assert result.api_token == "new-token-456"
-
-    @responses.activate
-    def test_register_invalid_credentials(self):
-        """Test registration with invalid credentials."""
-        responses.add(
-            responses.POST,
-            "https://betterflow.eu/api/agent/register",
-            json={"error": "Invalid credentials"},
-            status=401,
-        )
-
-        result = self.client.register(email="bad@example.com", password="wrong")
-
-        assert result.success is False
 
     @responses.activate
     def test_revoke_success(self):
@@ -457,7 +424,7 @@ class TestBetterFlowClient:
         responses.add(
             responses.POST,
             "https://betterflow.eu/api/agent/revoke",
-            body=Exception("Network error"),
+            body=requests.exceptions.ConnectionError("Network error"),
         )
 
         result = self.client.revoke()
@@ -662,7 +629,7 @@ class TestRetryBehavior:
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/test",
-            body=ConnectionError("Connection refused"),
+            body=requests.exceptions.ConnectionError("Connection refused"),
         )
         responses.add(
             responses.GET,

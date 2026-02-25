@@ -29,7 +29,7 @@ class TestPKCEGeneration:
 
     def test_generate_pkce_pair_verifier_length(self):
         """Test verifier has expected length (43 chars base64url)."""
-        verifier, _ = _generate_pkce_pair()
+        verifier, _ = generate_pkce_pair()
 
         # secrets.token_urlsafe(32) produces 43 characters
         assert len(verifier) == 43
