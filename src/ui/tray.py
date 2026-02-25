@@ -1,6 +1,7 @@
 """System tray icon and menu."""
 
 import logging
+import os
 import platform
 import threading
 import webbrowser
@@ -372,7 +373,12 @@ class TrayIcon:
     def _handle_open_config(self, icon, item) -> None:
         if self.model.config_file_path:
             import subprocess
-            subprocess.Popen(["open", self.model.config_file_path])
+            if platform.system() == "Windows":
+                os.startfile(self.model.config_file_path)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", self.model.config_file_path])
+            else:
+                subprocess.Popen(["xdg-open", self.model.config_file_path])
 
     def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
