@@ -1,6 +1,5 @@
 """BetterFlow Sync - Main entry point."""
 
-import fcntl
 import logging
 import os
 import signal
@@ -539,7 +538,12 @@ class SingleInstanceLock:
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         self._file = open(self._path, "a+")  # noqa: SIM115
         try:
-            fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._file.seek(0)
             self._file.truncate(0)
             self._file.write(str(os.getpid()))
@@ -554,7 +558,15 @@ class SingleInstanceLock:
         """Release the lock and clean up."""
         if self._file:
             try:
-                fcntl.flock(self._file, fcntl.LOCK_UN)
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(self._file, fcntl.LOCK_UN)
                 self._file.close()
                 os.unlink(self._path)
             except OSError:
