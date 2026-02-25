@@ -63,7 +63,9 @@ class SyncEngine:
         self._heartbeat_interval = 5
 
     def pause(self) -> None:
-        """Pause syncing."""
+        """Pause syncing and drop buffered events until resume."""
+        if not self._paused:
+            self._advance_checkpoints_to_now("pause")
         self._paused = True
         if self._session_active:
             try:
@@ -82,6 +84,8 @@ class SyncEngine:
 
     def set_private_mode(self, enabled: bool) -> None:
         """Enable/disable private time (no events recorded)."""
+        if enabled and not self._private_mode:
+            self._advance_checkpoints_to_now("private_time")
         self._private_mode = enabled
         if enabled and self._session_active:
             try:
@@ -518,9 +522,11 @@ class SyncEngine:
                 cmd_type = cmd.get("type")
                 if cmd_type == "pause":
                     logger.info(f"Server requested pause: {cmd.get('reason')}")
+                    self._advance_checkpoints_to_now("server_pause")
                     self._paused = True
                 elif cmd_type == "deregister":
                     logger.warning(f"Device revoked: {cmd.get('reason')}")
+                    self._advance_checkpoints_to_now("server_deregister")
                     self._paused = True
 
             # Re-fetch config if server says it changed
@@ -546,6 +552,37 @@ class SyncEngine:
             "buckets_tracked": len(checkpoints),
             "last_sync": max(checkpoints.values()).isoformat() if checkpoints else None,
         }
+
+    def _advance_checkpoints_to_now(self, reason: str) -> None:
+        """Fast-forward all known watcher checkpoints to now.
+
+        This prevents buffered events collected while paused/private from being
+        uploaded when syncing resumes.
+        """
+        now = datetime.now(timezone.utc)
+        bucket_ids: set[str] = set()
+
+        def _collect(fetcher) -> None:
+            try:
+                for bucket in fetcher():
+                    bucket_ids.add(bucket.id)
+            except (AWClientError, TypeError, AttributeError):
+                pass
+
+        _collect(self.aw.get_window_buckets)
+        _collect(self.aw.get_web_buckets)
+        _collect(self.aw.get_afk_buckets)
+        _collect(self.aw.get_input_buckets)
+
+        if not bucket_ids:
+            return
+
+        for bucket_id in bucket_ids:
+            self.queue.set_checkpoint(bucket_id, now)
+
+        logger.info(
+            f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
+        )
 
     def shutdown(self) -> None:
         """Shutdown the sync engine gracefully."""

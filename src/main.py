@@ -94,6 +94,7 @@ class BetterFlowSyncApp:
         self._logged_in = False
         self._hours_today_seconds = 0
         self._hours_today_cache = "0h 0m"
+        self._paused_by_network = False
 
     def run(self) -> None:
         """Run the application."""
@@ -192,6 +193,12 @@ class BetterFlowSyncApp:
             if self.sync_engine.is_private:
                 return
 
+            # Keep offline state stable and avoid flipping tray back to active.
+            if self._paused_by_network:
+                self.tray.set_state(TrayState.QUEUED, "Offline")
+                self.tray.update_stats(queue_size=self.queue.size())
+                return
+
             # Health-check managed AW processes, restart if crashed
             if self.aw_manager.is_managing:
                 self.aw_manager.restart_if_needed()
@@ -258,6 +265,8 @@ class BetterFlowSyncApp:
         try:
             if not self._logged_in:
                 return
+            if self._paused_by_network:
+                return
             if self.sync_engine.is_paused or self.sync_engine.is_private:
                 return
             if not self.aw.is_running():
@@ -300,12 +309,14 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
+        self._paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
         """Handle resume action."""
+        self._paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
         logger.info("Tracking resumed")
@@ -329,6 +340,7 @@ class BetterFlowSyncApp:
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
+        self._paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
         logger.info("Tracking paused (system sleep)")
@@ -352,10 +364,15 @@ class BetterFlowSyncApp:
         """Handle network connectivity change."""
         if is_online:
             logger.info("Network back online — triggering sync to flush queue")
+            if self._paused_by_network:
+                self.sync_engine.resume()
+                self._paused_by_network = False
             if self.scheduler.running:
                 self.scheduler.add_job(self._do_sync, id="network_sync", replace_existing=True)
         else:
-            logger.info("Network offline")
+            logger.info("Network offline — pausing sync immediately")
+            self.sync_engine.pause()
+            self._paused_by_network = True
             self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_config_updated(self) -> None:

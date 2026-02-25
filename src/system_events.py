@@ -264,7 +264,7 @@ def _start_windows_listener(
 def _start_network_poller(
     on_change: Callable,
     host: str = "api.betterflow.app",
-    interval: int = 15,
+    interval: int = 5,
 ) -> None:
     """Poll network connectivity and fire callback on state changes."""
     state = {"online": None}  # None = unknown
