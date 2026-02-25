@@ -89,6 +89,7 @@ class BetterFlowSyncApp:
         self.tray.set_config(self.config)
 
         # State
+        self._shutdown_done = False
         self._running = False
         self._shutdown_event = threading.Event()
         self._logged_in = False
@@ -455,7 +456,10 @@ class BetterFlowSyncApp:
         self.tray.stop()
 
     def _shutdown(self) -> None:
-        """Shutdown the application."""
+        """Shutdown the application. Safe to call multiple times."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         logger.info("Shutting down...")
         self._running = False
 
@@ -475,6 +479,12 @@ class BetterFlowSyncApp:
         self.aw_manager.stop()
 
         logger.info("Shutdown complete")
+
+    def __enter__(self) -> "BetterFlowSyncApp":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._shutdown()
 
 
 class SingleInstanceLock:
@@ -531,8 +541,8 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        app = BetterFlowSyncApp()
-        app.run()
+        with BetterFlowSyncApp() as app:
+            app.run()
     finally:
         _instance_lock.release()
 

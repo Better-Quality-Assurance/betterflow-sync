@@ -242,8 +242,15 @@ class BaseApiClient:
 
     def close(self) -> None:
         """Close the session if we own it."""
-        if self._owns_session:
+        if self._owns_session and self._session is not None:
             self._session.close()
+            self._session = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> "BaseApiClient":
         return self
