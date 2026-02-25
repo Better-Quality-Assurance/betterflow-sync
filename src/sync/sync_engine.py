@@ -8,14 +8,14 @@ from urllib.parse import urlparse
 
 try:
     from ..config import Config, PrivacySettings
-    from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
-    from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
-    from .queue import OfflineQueue
+    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from .bf_client import BetterFlowClientError, BetterFlowAuthError
+    from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
 except ImportError:
     from config import Config, PrivacySettings
-    from sync.aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
-    from sync.bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
-    from sync.queue import OfflineQueue
+    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
+    from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +37,19 @@ class SyncStats:
         return len(self.errors) == 0
 
 
+MAX_APP_LENGTH = 256
+MAX_TITLE_LENGTH = 1024
+MAX_URL_LENGTH = 2048
+
+
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow."""
 
     def __init__(
         self,
-        aw: AWClient,
-        bf: BetterFlowClient,
-        queue: OfflineQueue,
+        aw: AWClientProtocol,
+        bf: BFClientProtocol,
+        queue: OfflineQueueProtocol,
         config: Config,
         on_config_updated: Optional[callable] = None,
     ):
@@ -63,7 +68,9 @@ class SyncEngine:
         self._heartbeat_interval = 5
 
     def pause(self) -> None:
-        """Pause syncing."""
+        """Pause syncing and drop buffered events until resume."""
+        if not self._paused:
+            self._advance_checkpoints_to_now("pause")
         self._paused = True
         if self._session_active:
             try:
@@ -82,6 +89,8 @@ class SyncEngine:
 
     def set_private_mode(self, enabled: bool) -> None:
         """Enable/disable private time (no events recorded)."""
+        if enabled and not self._private_mode:
+            self._advance_checkpoints_to_now("private_time")
         self._private_mode = enabled
         if enabled and self._session_active:
             try:
@@ -385,17 +394,19 @@ class SyncEngine:
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            data["app"] = app
-            data["title"] = event.title
+            data["app"] = app[:MAX_APP_LENGTH] if app else app
+            title = event.title
+            data["title"] = title[:MAX_TITLE_LENGTH] if title else title
             if event.url:
+                url = event.url
                 if privacy.collect_full_urls:
-                    data["url"] = event.url
+                    data["url"] = url[:MAX_URL_LENGTH]
                 elif privacy.domain_only_urls:
-                    domain = self._extract_domain(event.url)
+                    domain = self._extract_domain(url)
                     if domain:
-                        data["url"] = domain
+                        data["url"] = domain[:MAX_URL_LENGTH]
                 else:
-                    data["url"] = event.url
+                    data["url"] = url[:MAX_URL_LENGTH]
 
                 if privacy.collect_page_category:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
@@ -518,9 +529,11 @@ class SyncEngine:
                 cmd_type = cmd.get("type")
                 if cmd_type == "pause":
                     logger.info(f"Server requested pause: {cmd.get('reason')}")
+                    self._advance_checkpoints_to_now("server_pause")
                     self._paused = True
                 elif cmd_type == "deregister":
                     logger.warning(f"Device revoked: {cmd.get('reason')}")
+                    self._advance_checkpoints_to_now("server_deregister")
                     self._paused = True
 
             # Re-fetch config if server says it changed
@@ -546,6 +559,37 @@ class SyncEngine:
             "buckets_tracked": len(checkpoints),
             "last_sync": max(checkpoints.values()).isoformat() if checkpoints else None,
         }
+
+    def _advance_checkpoints_to_now(self, reason: str) -> None:
+        """Fast-forward all known watcher checkpoints to now.
+
+        This prevents buffered events collected while paused/private from being
+        uploaded when syncing resumes.
+        """
+        now = datetime.now(timezone.utc)
+        bucket_ids: set[str] = set()
+
+        def _collect(fetcher) -> None:
+            try:
+                for bucket in fetcher():
+                    bucket_ids.add(bucket.id)
+            except (AWClientError, TypeError, AttributeError):
+                pass
+
+        _collect(self.aw.get_window_buckets)
+        _collect(self.aw.get_web_buckets)
+        _collect(self.aw.get_afk_buckets)
+        _collect(self.aw.get_input_buckets)
+
+        if not bucket_ids:
+            return
+
+        for bucket_id in bucket_ids:
+            self.queue.set_checkpoint(bucket_id, now)
+
+        logger.info(
+            f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
+        )
 
     def shutdown(self) -> None:
         """Shutdown the sync engine gracefully."""

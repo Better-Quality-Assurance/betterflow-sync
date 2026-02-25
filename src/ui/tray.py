@@ -5,7 +5,12 @@ import platform
 import threading
 import webbrowser
 from enum import Enum
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, TypedDict
+
+from PIL import Image, ImageDraw
+
+if TYPE_CHECKING:
+    from ..config import Config
 
 
 def _hide_from_dock() -> None:
@@ -14,15 +19,53 @@ def _hide_from_dock() -> None:
         return
     try:
         import AppKit
-        NSApp = AppKit.NSApplication.sharedApplication()
+        ns_app = AppKit.NSApplication.sharedApplication()
         # NSApplicationActivationPolicyAccessory = 1 (no Dock icon)
-        NSApp.setActivationPolicy_(1)
+        ns_app.setActivationPolicy_(1)
     except Exception:
         pass
 
-from PIL import Image, ImageDraw
+__all__ = ["TrayIcon", "TrayState", "TrayModel", "STATE_COLORS", "create_icon_image", "ProjectDict"]
 
-__all__ = ["TrayIcon", "TrayState", "STATE_COLORS", "create_icon_image"]
+
+class ProjectDict(TypedDict):
+    """Typed project dictionary from the API."""
+
+    id: int
+    name: str
+
+
+class TrayModel:
+    """Observable state model for the tray icon.
+
+    Holds all display state (user info, stats, preferences, projects).
+    TrayIcon reads from this for rendering; external code mutates it
+    through public methods on TrayIcon which delegate here.
+    """
+
+    def __init__(self) -> None:
+        self.state: TrayState = TrayState.STARTING
+        self.paused: bool = False
+        self.private_mode: bool = False
+        self.status_text: str = "Starting..."
+        self.hours_today: str = "0h 0m"
+        self.last_sync: str = "Never"
+        self.queue_size: int = 0
+        self.user_email: Optional[str] = None
+        self.user_name: Optional[str] = None
+
+        # Projects
+        self.projects: list[ProjectDict] = []
+        self.current_project: Optional[ProjectDict] = None
+
+        # Preferences
+        self.sync_interval: int = 60
+        self.hash_titles: bool = True
+        self.domain_only_urls: bool = True
+        self.debug_mode: bool = False
+        self.auto_start: bool = False
+        self.config_file_path: Optional[str] = None
+        self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
 
 try:
     import pystray
@@ -95,7 +138,7 @@ class TrayIcon:
         on_preferences: Optional[Callable[[str, object], None]] = None,
         on_logout: Optional[Callable[[], None]] = None,
         on_quit: Optional[Callable[[], None]] = None,
-        on_project_change: Optional[Callable[[Optional[dict]], None]] = None,
+        on_project_change: Optional[Callable[[Optional[ProjectDict]], None]] = None,
         on_private_toggle: Optional[Callable[[bool], None]] = None,
     ):
         """Initialize tray icon.
@@ -122,27 +165,7 @@ class TrayIcon:
         self._on_project_change = on_project_change
         self._on_private_toggle = on_private_toggle
 
-        self._state = TrayState.STARTING
-        self._paused = False
-        self._private_mode = False
-        self._status_text = "Starting..."
-        self._hours_today = "0h 0m"
-        self._last_sync = "Never"
-        self._queue_size = 0
-        self._user_email: Optional[str] = None
-        self._user_name: Optional[str] = None
-
-        # Project state
-        self._projects: list[dict] = []  # [{id, name}, ...]
-        self._current_project: Optional[dict] = None  # {id, name}
-
-        # Preferences state
-        self._sync_interval: int = 60
-        self._hash_titles: bool = True
-        self._domain_only_urls: bool = True
-        self._debug_mode: bool = False
-        self._config_file_path: Optional[str] = None
-        self._dashboard_url: str = "https://app.betterflow.eu/dashboard"
+        self.model = TrayModel()
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
@@ -152,61 +175,61 @@ class TrayIcon:
         items = []
 
         # User identity at top
-        if self._user_email:
-            if self._user_name and self._user_name != self._user_email:
-                label = f"{self._user_name} ({self._user_email})"
+        if self.model.user_email:
+            if self.model.user_name and self.model.user_name != self.model.user_email:
+                label = f"{self.model.user_name} ({self.model.user_email})"
             else:
-                label = self._user_email
+                label = self.model.user_email
             items.append(Item(label, None, enabled=False))
 
         # Status line
         items.append(Item(self._get_status_line(), None, enabled=False))
 
         # Project line
-        if self._current_project:
-            items.append(Item(f"Project: {self._current_project['name']}", None, enabled=False))
-        elif self._projects:
+        if self.model.current_project:
+            items.append(Item(f"Project: {self.model.current_project['name']}", None, enabled=False))
+        elif self.model.projects:
             items.append(Item("Project: None", None, enabled=False))
 
         items.append(Item("─" * 20, None, enabled=False))
 
         # Stats
-        items.append(Item(f"Last sync: {self._last_sync}", None, enabled=False))
-        items.append(Item(f"Hours today: {self._hours_today}", None, enabled=False))
-        if self._queue_size > 0:
-            items.append(Item(f"Queued: {self._queue_size:,}", None, enabled=False))
+        items.append(Item(f"Last sync: {self.model.last_sync}", None, enabled=False))
+        items.append(Item(f"Hours today: {self.model.hours_today}", None, enabled=False))
+        if self.model.queue_size > 0:
+            items.append(Item(f"Queued: {self.model.queue_size:,}", None, enabled=False))
 
         items.append(Item("─" * 20, None, enabled=False))
 
-        logged_in = self._user_email is not None
+        logged_in = self.model.user_email is not None
 
         # Private Time toggle
-        if self._private_mode:
+        if self.model.private_mode:
             items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
         else:
             items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
 
         # Pause/Resume (only show when not in private mode)
-        if not self._private_mode:
-            if self._paused:
+        if not self.model.private_mode:
+            if self.model.paused:
                 items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
             else:
                 items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
         # Switch Project submenu
-        if self._projects:
+        if self.model.projects:
             project_items = []
             # "None" option to clear project
             project_items.append(Item(
                 "None",
                 self._make_project_handler(None),
-                checked=lambda item: self._current_project is None,
+                checked=lambda item: self.model.current_project is None,
             ))
-            for proj in self._projects:
+            for proj in self.model.projects:
                 project_items.append(Item(
                     proj["name"],
                     self._make_project_handler(proj),
-                    checked=lambda item, p=proj: self._current_project is not None and self._current_project["id"] == p["id"],
+                    checked=lambda item, p=proj: self.model.current_project is not None and self.model.current_project["id"] == p["id"],
                 ))
             items.append(Item("Switch Project", pystray.Menu(*project_items), enabled=logged_in))
 
@@ -215,26 +238,31 @@ class TrayIcon:
             Item(
                 "Sync Interval",
                 pystray.Menu(
-                    Item("30s", self._make_interval_handler(30), checked=lambda item: self._sync_interval == 30),
-                    Item("60s", self._make_interval_handler(60), checked=lambda item: self._sync_interval == 60),
-                    Item("120s", self._make_interval_handler(120), checked=lambda item: self._sync_interval == 120),
-                    Item("300s", self._make_interval_handler(300), checked=lambda item: self._sync_interval == 300),
+                    Item("30s", self._make_interval_handler(30), checked=lambda item: self.model.sync_interval == 30),
+                    Item("60s", self._make_interval_handler(60), checked=lambda item: self.model.sync_interval == 60),
+                    Item("120s", self._make_interval_handler(120), checked=lambda item: self.model.sync_interval == 120),
+                    Item("300s", self._make_interval_handler(300), checked=lambda item: self.model.sync_interval == 300),
                 ),
             ),
             Item(
                 "Hash Window Titles",
-                self._make_toggle_handler("_hash_titles", "hash_titles"),
-                checked=lambda item: self._hash_titles,
+                self._make_toggle_handler("hash_titles", "hash_titles"),
+                checked=lambda item: self.model.hash_titles,
             ),
             Item(
                 "Domain Only URLs",
-                self._make_toggle_handler("_domain_only_urls", "domain_only_urls"),
-                checked=lambda item: self._domain_only_urls,
+                self._make_toggle_handler("domain_only_urls", "domain_only_urls"),
+                checked=lambda item: self.model.domain_only_urls,
             ),
             Item(
                 "Debug Mode",
-                self._make_toggle_handler("_debug_mode", "debug_mode"),
-                checked=lambda item: self._debug_mode,
+                self._make_toggle_handler("debug_mode", "debug_mode"),
+                checked=lambda item: self.model.debug_mode,
+            ),
+            Item(
+                "Launch at Login",
+                self._make_toggle_handler("auto_start", "auto_start"),
+                checked=lambda item: self.model.auto_start,
             ),
             Item("─" * 15, None, enabled=False),
             Item("Open Config File", self._handle_open_config),
@@ -244,7 +272,7 @@ class TrayIcon:
         items.append(Item("─" * 20, None, enabled=False))
 
         # Account
-        if self._user_email:
+        if self.model.user_email:
             items.append(Item("Sign Out", self._handle_logout))
         else:
             items.append(Item("Login", self._handle_login))
@@ -256,19 +284,19 @@ class TrayIcon:
 
     def _get_status_line(self) -> str:
         """Get the status line text."""
-        if self._private_mode:
+        if self.model.private_mode:
             return "Status: Private Time"
-        elif self._state == TrayState.SYNCING:
+        elif self.model.state == TrayState.SYNCING:
             return "Status: Active"
-        elif self._state == TrayState.QUEUED:
+        elif self.model.state == TrayState.QUEUED:
             return "Status: Offline"
-        elif self._state == TrayState.QUEUE_WARNING:
+        elif self.model.state == TrayState.QUEUE_WARNING:
             return "Status: Offline (queue full)"
-        elif self._state == TrayState.ERROR:
+        elif self.model.state == TrayState.ERROR:
             return "Status: Error"
-        elif self._state == TrayState.PAUSED:
+        elif self.model.state == TrayState.PAUSED:
             return "Status: Paused"
-        elif self._state == TrayState.WAITING_AUTH:
+        elif self.model.state == TrayState.WAITING_AUTH:
             return "Status: Waiting for login..."
         else:
             return "Status: Starting..."
@@ -290,19 +318,19 @@ class TrayIcon:
 
     def _handle_private_toggle(self, icon, item) -> None:
         """Handle private time toggle."""
-        self._private_mode = not self._private_mode
-        if self._private_mode:
+        self.model.private_mode = not self.model.private_mode
+        if self.model.private_mode:
             self.set_state(TrayState.PRIVATE)
         else:
             self.set_state(TrayState.SYNCING)
         if self._on_private_toggle:
-            self._on_private_toggle(self._private_mode)
+            self._on_private_toggle(self.model.private_mode)
         self._update_menu()
 
-    def _make_project_handler(self, project: Optional[dict]):
+    def _make_project_handler(self, project: Optional[ProjectDict]) -> Callable:
         """Create a handler for switching projects."""
         def handler(icon, item):
-            self._current_project = project
+            self.model.current_project = project
             if self._on_project_change:
                 self._on_project_change(project)
             self._update_menu()
@@ -310,7 +338,7 @@ class TrayIcon:
 
     def _handle_dashboard(self, icon, item) -> None:
         """Open dashboard in browser."""
-        webbrowser.open(self._dashboard_url)
+        webbrowser.open(self.model.dashboard_url)
 
     def _handle_logout(self, icon, item) -> None:
         """Handle sign out menu click."""
@@ -323,40 +351,41 @@ class TrayIcon:
             self._on_quit()
         self.stop()
 
-    def _make_interval_handler(self, seconds: int):
+    def _make_interval_handler(self, seconds: int) -> Callable:
         """Create a handler for setting sync interval."""
         def handler(icon, item):
-            self._sync_interval = seconds
+            self.model.sync_interval = seconds
             if self._on_preferences:
                 self._on_preferences("sync_interval", seconds)
             self._update_menu()
         return handler
 
-    def _make_toggle_handler(self, attr: str, key: str):
+    def _make_toggle_handler(self, attr: str, key: str) -> Callable:
         """Create a handler that toggles a boolean preference."""
         def handler(icon, item):
-            new_value = not getattr(self, attr)
-            setattr(self, attr, new_value)
+            new_value = not getattr(self.model, attr)
+            setattr(self.model, attr, new_value)
             if self._on_preferences:
                 self._on_preferences(key, new_value)
         return handler
 
     def _handle_open_config(self, icon, item) -> None:
-        if self._config_file_path:
+        if self.model.config_file_path:
             import subprocess
-            subprocess.Popen(["open", self._config_file_path])
+            subprocess.Popen(["open", self.model.config_file_path])
 
-    def set_config(self, config) -> None:
+    def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
-        self._sync_interval = config.sync.interval_seconds
-        self._hash_titles = config.privacy.hash_titles
-        self._domain_only_urls = config.privacy.domain_only_urls
-        self._debug_mode = config.debug_mode
-        self._config_file_path = str(config.get_config_file())
+        self.model.sync_interval = config.sync.interval_seconds
+        self.model.hash_titles = config.privacy.hash_titles
+        self.model.domain_only_urls = config.privacy.domain_only_urls
+        self.model.debug_mode = config.debug_mode
+        self.model.auto_start = config.auto_start
+        self.model.config_file_path = str(config.get_config_file())
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)
-        self._dashboard_url = f"{parsed.scheme}://{parsed.netloc}/dashboard"
+        self.model.dashboard_url = f"{parsed.scheme}://{parsed.netloc}/dashboard"
         self._update_menu()
 
     def set_state(self, state: TrayState, status_text: Optional[str] = None) -> None:
@@ -366,14 +395,14 @@ class TrayIcon:
             state: New state
             status_text: Optional status message for error state
         """
-        self._state = state
+        self.model.state = state
         if status_text:
-            self._status_text = status_text
+            self.model.status_text = status_text
         self._update_icon()
 
     def set_paused(self, paused: bool) -> None:
         """Set paused state."""
-        self._paused = paused
+        self.model.paused = paused
         if paused:
             self.set_state(TrayState.PAUSED)
         else:
@@ -406,30 +435,30 @@ class TrayIcon:
                 pass
 
         if hours_today is not None:
-            self._hours_today = hours_today
+            self.model.hours_today = hours_today
         if last_sync is not None:
-            self._last_sync = last_sync
+            self.model.last_sync = last_sync
         if queue_size is not None:
-            self._queue_size = queue_size
+            self.model.queue_size = queue_size
         self._update_menu()
 
     def set_user(self, email: Optional[str], name: Optional[str] = None) -> None:
         """Set current user info."""
-        self._user_email = email
-        self._user_name = name
+        self.model.user_email = email
+        self.model.user_name = name
         self._update_menu()
 
-    def set_projects(self, projects: list[dict], current_project: Optional[dict] = None) -> None:
+    def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:
         """Set available projects and current selection."""
-        self._projects = projects
+        self.model.projects = projects
         if current_project:
-            self._current_project = current_project
+            self.model.current_project = current_project
         self._update_menu()
 
     def _update_icon(self) -> None:
         """Update the tray icon image and menu."""
         if self._icon:
-            color = STATE_COLORS.get(self._state, STATE_COLORS[TrayState.STARTING])
+            color = STATE_COLORS.get(self.model.state, STATE_COLORS[TrayState.STARTING])
             self._icon.icon = create_icon_image(color)
             self._icon.menu = self._create_menu()
 
@@ -443,7 +472,7 @@ class TrayIcon:
         if self._icon is not None:
             return
 
-        color = STATE_COLORS[self._state]
+        color = STATE_COLORS[self.model.state]
         self._icon = pystray.Icon(
             "BetterFlow Sync",
             create_icon_image(color),
@@ -467,7 +496,7 @@ class TrayIcon:
         """Run the tray icon in the main thread (blocking)."""
         _hide_from_dock()
         if self._icon is None:
-            color = STATE_COLORS[self._state]
+            color = STATE_COLORS[self.model.state]
             self._icon = pystray.Icon(
                 "BetterFlow Sync",
                 create_icon_image(color),

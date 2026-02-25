@@ -70,7 +70,7 @@ class KeychainManager:
             logger.info(f"Credentials stored for {credentials.user_email}")
             return True
         except KeyringError as e:
-            logger.error(f"Failed to store credentials: {e}")
+            logger.warning(f"Failed to store credentials: {e}")
             return False
 
     def load(self) -> Optional[StoredCredentials]:
@@ -85,10 +85,10 @@ class KeychainManager:
                 return StoredCredentials.from_json(data)
             return None
         except KeyringError as e:
-            logger.error(f"Failed to load credentials: {e}")
+            logger.warning(f"Failed to load credentials: {e}")
             return None
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.error(f"Invalid credential format: {e}")
+            logger.warning(f"Invalid credential format: {e}")
             return None
 
     def delete(self) -> bool:
@@ -105,7 +105,7 @@ class KeychainManager:
             # Password didn't exist
             return True
         except KeyringError as e:
-            logger.error(f"Failed to delete credentials: {e}")
+            logger.warning(f"Failed to delete credentials: {e}")
             return False
 
     def has_credentials(self) -> bool:

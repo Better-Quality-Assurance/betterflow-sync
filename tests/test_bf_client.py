@@ -98,6 +98,22 @@ class TestBetterFlowClient:
         assert client.web_base_url == "https://staging.betterflow.eu"
         client.close()
 
+    def test_web_base_url_override(self):
+        """Test explicit web base URL override."""
+        client = BetterFlowClient(
+            api_url="http://127.0.0.1:8001/api/agent",
+            web_base_url="https://app.betterflow.eu",
+        )
+        assert client.web_base_url == "https://app.betterflow.eu"
+        client.close()
+
+    def test_web_base_url_from_env(self):
+        """Test web base URL override via environment."""
+        with patch.dict("os.environ", {"BETTERFLOW_WEB_BASE_URL": "https://app.betterflow.eu"}):
+            client = BetterFlowClient(api_url="http://127.0.0.1:8001/api/agent")
+            assert client.web_base_url == "https://app.betterflow.eu"
+            client.close()
+
     @responses.activate
     def test_is_reachable_true(self):
         """Test is_reachable when server responds."""

@@ -103,6 +103,7 @@ class BetterFlowClient(BaseApiClient):
     def __init__(
         self,
         api_url: str = DEFAULT_API_URL,
+        web_base_url: Optional[str] = None,
         token: Optional[str] = None,
         device_id: Optional[str] = None,
         compress: bool = True,
@@ -113,6 +114,7 @@ class BetterFlowClient(BaseApiClient):
 
         Args:
             api_url: BetterFlow API base URL
+            web_base_url: Optional explicit web app base URL (for browser auth)
             token: API token for authentication
             device_id: Device ID from registration
             compress: Use gzip compression for event batches
@@ -121,6 +123,7 @@ class BetterFlowClient(BaseApiClient):
         """
         super().__init__(
             api_url=api_url,
+            web_base_url=web_base_url,
             token=token,
             device_id=device_id,
             compress=compress,
@@ -174,7 +177,7 @@ class BetterFlowClient(BaseApiClient):
                 try:
                     data = response.json()
                     msg = data.get("message", data.get("error", "Authentication failed"))
-                except (ValueError, Exception):
+                except Exception:
                     msg = response.text or response.reason or f"HTTP {response.status_code}"
                 return AuthResult(success=False, error=msg)
             response.raise_for_status()

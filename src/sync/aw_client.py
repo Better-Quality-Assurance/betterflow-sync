@@ -235,7 +235,15 @@ class AWClient:
 
     def close(self) -> None:
         """Close the session."""
-        self._session.close()
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> "AWClient":
         return self

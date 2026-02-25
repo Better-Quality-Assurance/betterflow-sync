@@ -48,6 +48,7 @@ hiddenimports = [
     "sync.queue",
     "sync.privacy",
     "sync.retry",
+    "sync.protocols",
     "auth",
     "auth.keychain",
     "auth.login",
@@ -57,6 +58,7 @@ hiddenimports = [
     "ui.permissions",
     "ui.setup_wizard",
     "aw_manager",
+    "autostart",
 ]
 
 a = Analysis(

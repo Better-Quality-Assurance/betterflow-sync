@@ -192,6 +192,17 @@ Configuration is stored in:
 
 Credentials are stored securely in your system keychain.
 
+### Environment Overrides (`.env`)
+
+For development, you can define endpoint overrides in a local `.env` file (see `.env.example`):
+
+- `BETTERFLOW_API_URL` - Agent sync API endpoint
+- `BETTERFLOW_WEB_BASE_URL` - Web app base used for browser auth and dashboard links
+
+Example split setup:
+- `BETTERFLOW_API_URL=http://127.0.0.1:8001/api/agent`
+- `BETTERFLOW_WEB_BASE_URL=https://app.betterflow.eu`
+
 ## Troubleshooting
 
 ### ActivityWatch not detected

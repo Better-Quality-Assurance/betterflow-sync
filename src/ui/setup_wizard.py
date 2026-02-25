@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 WINDOW_WIDTH = 720
 WINDOW_HEIGHT = 520
 
+# Typography
+FONT_FAMILY = "Avenir Next"
+FONT_TITLE = (FONT_FAMILY, 30, "bold")
+FONT_SUBTITLE = (FONT_FAMILY, 13)
+FONT_BODY = (FONT_FAMILY, 12)
+FONT_SMALL = (FONT_FAMILY, 11)
+FONT_BUTTON = (FONT_FAMILY, 13, "bold")
+
+# Layout
+BTN_HEIGHT = 46
+BTN_BORDER_RADIUS = 13
+SPINNER_RADIUS = 30
+SPINNER_FRAME_MS = 24
+
 # Colors
 BG_COLOR = "#0a1022"
 CARD_COLOR = "#0f1936"
@@ -55,6 +69,8 @@ class SetupWizard:
         self._result = SetupResult()
         self._window: Optional[tk.Tk] = None
         self._login_state: Optional[LoginState] = None
+        self._closing = False
+        self._spinner_after_id: Optional[str] = None
         self._button_id = itertools.count(1)
 
     def show(self) -> SetupResult:
@@ -103,38 +119,39 @@ class SetupWizard:
     def _clear(self) -> None:
         """Clear all canvas items and widgets."""
         # Stop any pending spinner callback before clearing canvas items.
-        if hasattr(self, "_spinner_after_id"):
+        if self._spinner_after_id is not None:
             try:
                 self._window.after_cancel(self._spinner_after_id)
             except tk.TclError:
                 pass
-            delattr(self, "_spinner_after_id")
+            self._spinner_after_id = None
         self._canvas.configure(cursor="")
         self._canvas.delete("all")
         for widget in self._canvas.winfo_children():
             widget.destroy()
 
     def _on_close(self) -> None:
-        """Handle window close."""
+        """Handle window close — cancel any in-progress login."""
+        self._closing = True
         self._result = SetupResult(completed=False)
+        self._login_manager.cancel_login()
         self._window.destroy()
 
-    def _make_button(self, text, command, x, y, width=248, primary=True):
+    def _make_button(self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True) -> str:
         """Create a cross-platform canvas button (macOS tk.Button ignores custom bg)."""
         bg = PRIMARY_COLOR if primary else ACCENT_COLOR
         hover_bg = PRIMARY_HOVER if primary else "#274078"
         border = "#5fdfff" if primary else "#3f588e"
         text_color = "#06243a" if primary else BTN_TEXT
-        height = 46
-        x1, y1 = x - (width // 2), y - (height // 2)
-        x2, y2 = x + (width // 2), y + (height // 2)
+        x1, y1 = x - (width // 2), y - (BTN_HEIGHT // 2)
+        x2, y2 = x + (width // 2), y + (BTN_HEIGHT // 2)
         tag = f"btn_{next(self._button_id)}"
 
         rect_id = self._create_rounded_rect(
-            x1, y1, x2, y2, radius=13, fill=bg, outline=border, width=1, tags=(tag, "btn")
+            x1, y1, x2, y2, radius=BTN_BORDER_RADIUS, fill=bg, outline=border, width=1, tags=(tag, "btn")
         )
         self._canvas.create_text(
-            x, y, text=text, font=("Avenir Next", 13, "bold"), fill=text_color, tags=(tag, "btn")
+            x, y, text=text, font=FONT_BUTTON, fill=text_color, tags=(tag, "btn")
         )
 
         def on_enter(_event):
@@ -152,7 +169,7 @@ class SetupWizard:
         self._canvas.tag_bind(tag, "<Button-1>", lambda _event: self._window.after(1, command))
         return tag
 
-    def _create_rounded_rect(self, x1, y1, x2, y2, radius=10, **kwargs):
+    def _create_rounded_rect(self, x1: int, y1: int, x2: int, y2: int, radius: int = 10, **kwargs) -> int:
         """Draw a rounded rectangle on canvas and return item id."""
         points = [
             x1 + radius, y1,
@@ -200,13 +217,13 @@ class SetupWizard:
         self._canvas.create_text(
             cx, 126,
             text=title,
-            font=("Avenir Next", 30, "bold"),
+            font=FONT_TITLE,
             fill=TEXT_COLOR,
         )
         self._canvas.create_text(
             cx, 160,
             text=subtitle,
-            font=("Avenir Next", 13),
+            font=FONT_SUBTITLE,
             fill=TEXT_MUTED,
         )
         return cx
@@ -234,7 +251,7 @@ class SetupWizard:
         self._canvas.create_text(
             cx, logo_y,
             text="BF",
-            font=("Avenir Next", 26, "bold"),
+            font=(FONT_FAMILY, 26, "bold"),
             fill="#071226",
         )
 
@@ -245,7 +262,7 @@ class SetupWizard:
                 "Runs in your menu bar, captures activity on-device,\n"
                 "and syncs private summaries to BetterFlow."
             ),
-            font=("Avenir Next", 12),
+            font=FONT_BODY,
             fill=TEXT_MUTED,
             justify=tk.CENTER,
         )
@@ -253,7 +270,7 @@ class SetupWizard:
         self._canvas.create_text(
             cx, 384,
             text="The next step opens your browser for secure sign-in.",
-            font=("Avenir Next", 11),
+            font=FONT_SMALL,
             fill="#8fa7d6",
             justify=tk.CENTER,
         )
@@ -277,7 +294,7 @@ class SetupWizard:
         self._status_id = self._canvas.create_text(
             cx, 332,
             text="Your browser is opening now. Complete sign-in there.",
-            font=("Avenir Next", 12),
+            font=FONT_BODY,
             fill=TEXT_MUTED,
             justify=tk.CENTER,
         )
@@ -288,16 +305,21 @@ class SetupWizard:
         # Start login in background
         def do_login():
             state = self._login_manager.login_via_browser()
-            self._window.after(0, lambda: self._on_login_complete(state))
+            if self._closing:
+                return
+            try:
+                self._window.after(0, lambda: self._on_login_complete(state))
+            except tk.TclError:
+                pass
 
         threading.Thread(target=do_login, daemon=True).start()
 
         # Start spinner animation
         self._animate_spinner(cx, 250)
 
-    def _draw_spinner(self, cx, cy):
+    def _draw_spinner(self, cx: int, cy: int) -> None:
         """Draw the spinner arc."""
-        r = 30
+        r = SPINNER_RADIUS
         self._canvas.delete("spinner")
         self._canvas.create_arc(
             cx - r, cy - r, cx + r, cy + r,
@@ -308,7 +330,7 @@ class SetupWizard:
             width=6,
             tags="spinner",
         )
-        # Background ring
+        # Background ring (reuse r from above)
         self._canvas.create_arc(
             cx - r, cy - r, cx + r, cy + r,
             start=0,
@@ -321,14 +343,14 @@ class SetupWizard:
         # Bring spinner to front
         self._canvas.tag_raise("spinner")
 
-    def _animate_spinner(self, cx, cy):
+    def _animate_spinner(self, cx: int, cy: int) -> None:
         """Animate the spinner."""
         if not self._canvas.winfo_exists():
             return
         try:
             self._canvas.delete("spinner")
             self._spinner_angle = (self._spinner_angle + 10) % 360
-            r = 30
+            r = SPINNER_RADIUS
             self._canvas.create_arc(
                 cx - r, cy - r, cx + r, cy + r,
                 start=self._spinner_angle,
@@ -339,7 +361,7 @@ class SetupWizard:
                 tags="spinner",
             )
             self._spinner_after_id = self._window.after(
-                24, lambda: self._animate_spinner(cx, cy)
+                SPINNER_FRAME_MS, lambda: self._animate_spinner(cx, cy)
             )
         except tk.TclError:
             pass
@@ -347,7 +369,7 @@ class SetupWizard:
     def _on_login_complete(self, state: LoginState) -> None:
         """Handle login result."""
         # Stop spinner
-        if hasattr(self, "_spinner_after_id"):
+        if self._spinner_after_id is not None:
             self._window.after_cancel(self._spinner_after_id)
 
         if state.logged_in:
@@ -372,14 +394,14 @@ class SetupWizard:
         self._canvas.create_text(
             cx, 250,
             text="!",
-            font=("Avenir Next", 34, "bold"),
+            font=(FONT_FAMILY, 34, "bold"),
             fill=BTN_TEXT,
         )
 
         self._canvas.create_text(
             cx, 332,
             text=error,
-            font=("Avenir Next", 12),
+            font=FONT_BODY,
             fill=TEXT_MUTED,
         )
 
@@ -403,7 +425,7 @@ class SetupWizard:
         self._canvas.create_text(
             cx, 238,
             text="\u2713",
-            font=("Avenir Next", 33, "bold"),
+            font=(FONT_FAMILY, 33, "bold"),
             fill=BTN_TEXT,
         )
 
@@ -412,7 +434,7 @@ class SetupWizard:
             self._canvas.create_text(
                 cx, 304,
                 text=f"Signed in as {email}",
-                font=("Avenir Next", 12, "bold"),
+                font=(FONT_FAMILY, 12, "bold"),
                 fill=SUCCESS_COLOR,
             )
 
@@ -423,7 +445,7 @@ class SetupWizard:
                 "BetterFlow Sync will now run in your menu bar.\n"
                 "It will automatically track and sync your activity."
             ),
-            font=("Avenir Next", 12),
+            font=FONT_BODY,
             fill=TEXT_MUTED,
             justify=tk.CENTER,
         )
