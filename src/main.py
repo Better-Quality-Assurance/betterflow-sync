@@ -65,6 +65,9 @@ class SyncCoordinator:
         self.logged_in = False
         self.paused_by_network = False
 
+        # Optional callback wired by the app for auth-error re-login
+        self._on_auth_error: Optional[callable] = None
+
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
         self._do_sync()
@@ -230,10 +233,6 @@ class SyncCoordinator:
         hours = int(total_seconds) // 3600
         minutes = (int(total_seconds) % 3600) // 60
         return f"{hours}h {minutes}m"
-
-    # Optional callback wired by the app for auth-error re-login
-    _on_auth_error: Optional[callable] = None
-
 
 class BetterFlowSyncApp:
     """Main application orchestrator.
