@@ -6,6 +6,7 @@ from .sync_engine import SyncEngine
 from .queue import OfflineQueue
 from .privacy import PrivacyFilter
 from .retry import RetryConfig, retry_with_backoff, NetworkReachabilityCache
+from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
 
 __all__ = [
     "AWClient",
@@ -16,4 +17,7 @@ __all__ = [
     "RetryConfig",
     "retry_with_backoff",
     "NetworkReachabilityCache",
+    "AWClientProtocol",
+    "BFClientProtocol",
+    "OfflineQueueProtocol",
 ]

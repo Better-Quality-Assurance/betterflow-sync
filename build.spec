@@ -48,6 +48,7 @@ hiddenimports = [
     "sync.queue",
     "sync.privacy",
     "sync.retry",
+    "sync.protocols",
     "auth",
     "auth.keychain",
     "auth.login",

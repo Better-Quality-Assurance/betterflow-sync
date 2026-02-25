@@ -8,14 +8,14 @@ from urllib.parse import urlparse
 
 try:
     from ..config import Config, PrivacySettings
-    from .aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
-    from .bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
-    from .queue import OfflineQueue
+    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from .bf_client import BetterFlowClientError, BetterFlowAuthError
+    from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
 except ImportError:
     from config import Config, PrivacySettings
-    from sync.aw_client import AWClient, AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
-    from sync.bf_client import BetterFlowClient, BetterFlowClientError, BetterFlowAuthError, SyncResult
-    from sync.queue import OfflineQueue
+    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
+    from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +47,9 @@ class SyncEngine:
 
     def __init__(
         self,
-        aw: AWClient,
-        bf: BetterFlowClient,
-        queue: OfflineQueue,
+        aw: AWClientProtocol,
+        bf: BFClientProtocol,
+        queue: OfflineQueueProtocol,
         config: Config,
         on_config_updated: Optional[callable] = None,
     ):
