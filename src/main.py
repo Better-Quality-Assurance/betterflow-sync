@@ -208,6 +208,16 @@ class SyncCoordinator:
             if not self.aw.is_running():
                 return
 
+            # Skip increment if user is currently AFK
+            try:
+                afk_buckets = self.aw.get_afk_buckets()
+                if afk_buckets:
+                    events = self.aw.get_events(afk_buckets[0].id, limit=1)
+                    if events and events[0].status == "afk":
+                        return
+            except Exception:
+                pass  # If AFK check fails, still increment
+
             self._hours_today_seconds += 60
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             self.tray.update_stats(hours_today=self._hours_today_cache)
