@@ -14,27 +14,224 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
 try:
-    from .config import Config, setup_logging
-    from .sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
-    from .sync.http_client import BetterFlowAuthError
     from .auth import KeychainManager, LoginManager
-    from .ui.tray import TrayIcon, TrayState
     from .aw_manager import AWManager
+    from .config import Config, setup_logging
+    from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
+    from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
+    from .ui.tray import TrayIcon, TrayState
 except ImportError:
-    from config import Config, setup_logging
-    from sync import AWClient, BetterFlowClient, SyncEngine, OfflineQueue
-    from sync.http_client import BetterFlowAuthError
     from auth import KeychainManager, LoginManager
-    from ui.tray import TrayIcon, TrayState
     from aw_manager import AWManager
+    from config import Config, setup_logging
+    from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
+    from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
+    from ui.tray import TrayIcon, TrayState
 
 logger = logging.getLogger(__name__)
 
 
+class SyncCoordinator:
+    """Owns the sync scheduler, sync loop, and hours tracking.
+
+    Pulled out of BetterFlowSyncApp so that the app class focuses on
+    lifecycle orchestration and event wiring only.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        aw: AWClient,
+        bf: BetterFlowClient,
+        queue: OfflineQueue,
+        sync_engine: SyncEngine,
+        tray: TrayIcon,
+        aw_manager: AWManager,
+    ) -> None:
+        self.config = config
+        self.aw = aw
+        self.bf = bf
+        self.queue = queue
+        self.sync_engine = sync_engine
+        self.tray = tray
+        self.aw_manager = aw_manager
+
+        self.scheduler = BackgroundScheduler()
+        self._hours_today_seconds = 0
+        self._hours_today_cache = "0h 0m"
+
+        # Flags set by the app layer
+        self.logged_in = False
+        self.paused_by_network = False
+
+    def start(self) -> None:
+        """Run the initial sync and start the periodic scheduler."""
+        self._do_sync()
+
+        self.scheduler.add_job(
+            self._do_sync,
+            trigger=IntervalTrigger(seconds=self.config.sync.interval_seconds),
+            id="sync_job",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self._refresh_hours_today,
+            trigger=IntervalTrigger(seconds=60),
+            id="tray_time_job",
+            replace_existing=True,
+        )
+        self.scheduler.start()
+        logger.info(
+            f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
+        )
+
+    def stop(self) -> None:
+        """Shut down the scheduler if running."""
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+
+    def reschedule(self, interval_seconds: int) -> None:
+        """Change the sync interval on the fly."""
+        if self.scheduler.running:
+            self.scheduler.reschedule_job(
+                "sync_job",
+                trigger=IntervalTrigger(seconds=interval_seconds),
+            )
+
+    def trigger_sync(self, job_id: str = "immediate_sync") -> None:
+        """Schedule a one-off sync (e.g. after wake or network change)."""
+        if self.scheduler.running:
+            self.scheduler.add_job(self._do_sync, id=job_id, replace_existing=True)
+
+    def fetch_projects(self) -> None:
+        """Fetch available projects from API and set on tray."""
+        try:
+            response = self.bf.get_projects()
+            projects = response.get("projects", [])
+            self.tray.set_projects(projects)
+            logger.info(f"Loaded {len(projects)} projects")
+        except Exception as e:
+            logger.warning(f"Failed to fetch projects: {e}")
+
+    # -- internal ---------------------------------------------------------
+
+    def _do_sync(self) -> None:
+        """Perform a sync cycle."""
+        try:
+            if self.sync_engine.is_private:
+                return
+
+            if self.paused_by_network:
+                self.tray.set_state(TrayState.QUEUED, "Offline")
+                self.tray.update_stats(queue_size=self.queue.size())
+                return
+
+            if self.aw_manager.is_managing:
+                self.aw_manager.restart_if_needed()
+
+            if not self.aw.is_running():
+                self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
+                return
+
+            stats = self.sync_engine.sync()
+
+            if stats.success:
+                if self.queue.is_near_capacity():
+                    pct = int(self.queue.capacity_percent() * 100)
+                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
+                    logger.warning(f"Offline queue at {pct}% capacity")
+                elif stats.events_queued > 0:
+                    self.tray.set_state(TrayState.QUEUED)
+                else:
+                    self.tray.set_state(TrayState.SYNCING)
+            else:
+                self.tray.set_state(
+                    TrayState.ERROR,
+                    stats.errors[0] if stats.errors else "Sync failed",
+                )
+
+            hours_today = self._fetch_hours_today()
+            self.tray.update_stats(
+                hours_today=hours_today,
+                last_sync=datetime.now().strftime("%H:%M"),
+                queue_size=self.queue.size(),
+            )
+
+            if stats.events_sent > 0 or stats.events_queued > 0:
+                gaps_info = (
+                    f", {stats.gaps_filled} gaps filled"
+                    if stats.gaps_filled > 0
+                    else ""
+                )
+                logger.info(
+                    f"Sync complete: {stats.events_sent} sent, "
+                    f"{stats.events_queued} queued, {stats.events_filtered} filtered"
+                    f"{gaps_info}"
+                )
+
+        except BetterFlowAuthError as e:
+            logger.warning(f"Auth error during sync: {e} — triggering re-login")
+            self.tray.set_state(
+                TrayState.WAITING_AUTH, "Session expired, re-login required"
+            )
+            if self._on_auth_error:
+                self._on_auth_error()
+        except Exception as e:
+            logger.exception(f"Sync error: {e}")
+            self.tray.set_state(TrayState.ERROR, "Sync error")
+
+    def _fetch_hours_today(self) -> str:
+        """Fetch today's tracked hours from API."""
+        try:
+            status = self.bf.get_status()
+            total_seconds = int(
+                status.get("data", {})
+                .get("today_summary", {})
+                .get("total_seconds", 0)
+            )
+            self._hours_today_seconds = max(0, total_seconds)
+            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            return self._hours_today_cache
+        except Exception:
+            return self._hours_today_cache
+
+    def _refresh_hours_today(self) -> None:
+        """Increment tray hours locally every minute while tracking is active."""
+        try:
+            if not self.logged_in:
+                return
+            if self.paused_by_network:
+                return
+            if self.sync_engine.is_paused or self.sync_engine.is_private:
+                return
+            if not self.aw.is_running():
+                return
+
+            self._hours_today_seconds += 60
+            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            self.tray.update_stats(hours_today=self._hours_today_cache)
+        except Exception as e:
+            logger.debug(f"Failed to refresh tray hours: {e}")
+
+    @staticmethod
+    def _format_hours(total_seconds: int) -> str:
+        """Format accumulated seconds as `Xh Ym` for tray display."""
+        hours = int(total_seconds) // 3600
+        minutes = (int(total_seconds) % 3600) // 60
+        return f"{hours}h {minutes}m"
+
+    # Optional callback wired by the app for auth-error re-login
+    _on_auth_error: Optional[callable] = None
+
+
 class BetterFlowSyncApp:
-    """Main application class."""
+    """Main application orchestrator.
+
+    Wires components together, handles lifecycle (start / shutdown),
+    and routes tray-menu and system events to the appropriate handler.
+    """
 
     def __init__(self):
         """Initialize the application."""
@@ -72,9 +269,6 @@ class BetterFlowSyncApp:
 
         self.login_manager = LoginManager(self.bf, self.keychain)
 
-        # Scheduler for sync loop
-        self.scheduler = BackgroundScheduler()
-
         # Tray icon
         self.tray = TrayIcon(
             on_login=self._on_login,
@@ -88,18 +282,24 @@ class BetterFlowSyncApp:
         )
         self.tray.set_config(self.config)
 
+        # Sync coordinator
+        self.coordinator = SyncCoordinator(
+            config=self.config,
+            aw=self.aw,
+            bf=self.bf,
+            queue=self.queue,
+            sync_engine=self.sync_engine,
+            tray=self.tray,
+            aw_manager=self.aw_manager,
+        )
+        self.coordinator._on_auth_error = self._on_login
+
         # State
         self._shutdown_done = False
-        self._running = False
         self._shutdown_event = threading.Event()
-        self._logged_in = False
-        self._hours_today_seconds = 0
-        self._hours_today_cache = "0h 0m"
-        self._paused_by_network = False
 
     def run(self) -> None:
         """Run the application."""
-        # Register signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
@@ -130,23 +330,16 @@ class BetterFlowSyncApp:
         self.aw_manager.start()
 
         if state.logged_in:
-            self._logged_in = True
-            # Set user on tray
+            self.coordinator.logged_in = True
             self.tray.set_user(state.user_email, state.user_name)
-
-            # Fetch server config (privacy settings, sync intervals, category rules)
             self.sync_engine.fetch_server_config()
-
-            # Fetch projects and set on tray
-            self._fetch_projects()
-
-            # Start sync loop
-            self._start_sync_loop()
+            self.coordinator.fetch_projects()
+            self.coordinator.start()
         else:
-            self._logged_in = False
+            self.coordinator.logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
-        # Start system event listeners (sleep/wake, shutdown, network)
+        # Start system event listeners
         start_system_event_listener(
             on_sleep=self._on_system_sleep,
             on_wake=self._on_system_wake,
@@ -154,170 +347,43 @@ class BetterFlowSyncApp:
             on_network_change=self._on_network_change,
         )
 
-        # Start tray icon (blocking)
-        self._running = True
         logger.info("BetterFlow Sync running")
-
         try:
             self.tray.run_blocking()
         finally:
             self._shutdown()
 
-    def _start_sync_loop(self) -> None:
-        """Start the sync scheduler."""
-        # Initial sync
-        self._do_sync()
-
-        # Schedule periodic sync
-        self.scheduler.add_job(
-            self._do_sync,
-            trigger=IntervalTrigger(seconds=self.config.sync.interval_seconds),
-            id="sync_job",
-            replace_existing=True,
-        )
-        # Keep tray "Hours today" fresh even with longer sync intervals.
-        self.scheduler.add_job(
-            self._refresh_hours_today,
-            trigger=IntervalTrigger(seconds=60),
-            id="tray_time_job",
-            replace_existing=True,
-        )
-        self.scheduler.start()
-        logger.info(
-            f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
-        )
-
-    def _do_sync(self) -> None:
-        """Perform a sync cycle."""
-        try:
-            # Skip sync entirely during private time
-            if self.sync_engine.is_private:
-                return
-
-            # Keep offline state stable and avoid flipping tray back to active.
-            if self._paused_by_network:
-                self.tray.set_state(TrayState.QUEUED, "Offline")
-                self.tray.update_stats(queue_size=self.queue.size())
-                return
-
-            # Health-check managed AW processes, restart if crashed
-            if self.aw_manager.is_managing:
-                self.aw_manager.restart_if_needed()
-
-            # Check AW first
-            if not self.aw.is_running():
-                self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
-                return
-
-            # Sync
-            stats = self.sync_engine.sync()
-
-            # Update tray
-            if stats.success:
-                # Check queue capacity first (takes priority over queued state)
-                if self.queue.is_near_capacity():
-                    pct = int(self.queue.capacity_percent() * 100)
-                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
-                    logger.warning(f"Offline queue at {pct}% capacity")
-                elif stats.events_queued > 0:
-                    self.tray.set_state(TrayState.QUEUED)
-                else:
-                    self.tray.set_state(TrayState.SYNCING)
-            else:
-                self.tray.set_state(TrayState.ERROR, stats.errors[0] if stats.errors else "Sync failed")
-
-            # Update stats — fetch hours from API
-            hours_today = self._fetch_hours_today()
-            self.tray.update_stats(
-                hours_today=hours_today,
-                last_sync=self._format_time(datetime.now()),
-                queue_size=self.queue.size(),
-            )
-
-            if stats.events_sent > 0 or stats.events_queued > 0:
-                gaps_info = f", {stats.gaps_filled} gaps filled" if stats.gaps_filled > 0 else ""
-                logger.info(
-                    f"Sync complete: {stats.events_sent} sent, "
-                    f"{stats.events_queued} queued, {stats.events_filtered} filtered"
-                    f"{gaps_info}"
-                )
-
-        except BetterFlowAuthError as e:
-            logger.warning(f"Auth error during sync: {e} — triggering re-login")
-            self.tray.set_state(TrayState.WAITING_AUTH, "Session expired, re-login required")
-            self._on_login()
-        except Exception as e:
-            logger.exception(f"Sync error: {e}")
-            self.tray.set_state(TrayState.ERROR, "Sync error")
-
-    def _fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API."""
-        try:
-            status = self.bf.get_status()
-            total_seconds = int(status.get("data", {}).get("today_summary", {}).get("total_seconds", 0))
-            self._hours_today_seconds = max(0, total_seconds)
-            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
-            return self._hours_today_cache
-        except Exception:
-            return self._hours_today_cache
-
-    def _refresh_hours_today(self) -> None:
-        """Increment tray hours locally every minute while tracking is active."""
-        try:
-            if not self._logged_in:
-                return
-            if self._paused_by_network:
-                return
-            if self.sync_engine.is_paused or self.sync_engine.is_private:
-                return
-            if not self.aw.is_running():
-                return
-
-            self._hours_today_seconds += 60
-            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
-            self.tray.update_stats(hours_today=self._hours_today_cache)
-        except Exception as e:
-            logger.debug(f"Failed to refresh tray hours: {e}")
-
-    def _format_time(self, dt: datetime) -> str:
-        """Format time for display."""
-        return dt.strftime("%H:%M")
-
-    def _format_hours(self, total_seconds: int) -> str:
-        """Format accumulated seconds as `Xh Ym` for tray display."""
-        hours = int(total_seconds) // 3600
-        minutes = (int(total_seconds) % 3600) // 60
-        return f"{hours}h {minutes}m"
+    # -- Event handlers ---------------------------------------------------
 
     def _on_login(self) -> None:
         """Handle explicit login action from tray."""
         def do_browser_login():
-            self._logged_in = False
+            self.coordinator.logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
             state = self.login_manager.login_via_browser()
             if state.logged_in:
-                self._logged_in = True
+                self.coordinator.logged_in = True
                 self.tray.set_user(state.user_email, state.user_name)
                 self.sync_engine.fetch_server_config()
-                self._fetch_projects()
-                if not self.scheduler.running:
-                    self._start_sync_loop()
+                self.coordinator.fetch_projects()
+                if not self.coordinator.scheduler.running:
+                    self.coordinator.start()
             else:
-                self._logged_in = False
+                self.coordinator.logged_in = False
                 self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
 
         threading.Thread(target=do_browser_login, daemon=True).start()
 
     def _on_pause(self) -> None:
         """Handle pause action."""
-        self._paused_by_network = False
+        self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
         """Handle resume action."""
-        self._paused_by_network = False
+        self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
         logger.info("Tracking resumed")
@@ -341,7 +407,7 @@ class BetterFlowSyncApp:
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
-        self._paused_by_network = False
+        self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
         logger.info("Tracking paused (system sleep)")
@@ -351,10 +417,7 @@ class BetterFlowSyncApp:
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         logger.info("Tracking resumed (system wake)")
-
-        # Trigger immediate catch-up sync
-        if self.scheduler.running:
-            self.scheduler.add_job(self._do_sync, id="wake_sync", replace_existing=True)
+        self.coordinator.trigger_sync("wake_sync")
 
     def _on_system_shutdown(self) -> None:
         """Handle system shutdown / restart."""
@@ -365,40 +428,25 @@ class BetterFlowSyncApp:
         """Handle network connectivity change."""
         if is_online:
             logger.info("Network back online — triggering sync to flush queue")
-            if self._paused_by_network:
+            if self.coordinator.paused_by_network:
                 self.sync_engine.resume()
-                self._paused_by_network = False
-            if self.scheduler.running:
-                self.scheduler.add_job(self._do_sync, id="network_sync", replace_existing=True)
+                self.coordinator.paused_by_network = False
+            self.coordinator.trigger_sync("network_sync")
         else:
             logger.info("Network offline — pausing sync immediately")
             self.sync_engine.pause()
-            self._paused_by_network = True
+            self.coordinator.paused_by_network = True
             self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_config_updated(self) -> None:
         """Handle server config update — apply AFK timeout to AWManager."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
 
-    def _fetch_projects(self) -> None:
-        """Fetch available projects from API and set on tray."""
-        try:
-            response = self.bf.get_projects()
-            projects = response.get("projects", [])
-            self.tray.set_projects(projects)
-            logger.info(f"Loaded {len(projects)} projects")
-        except Exception as e:
-            logger.warning(f"Failed to fetch projects: {e}")
-
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""
         if key == "sync_interval":
             self.config.sync.interval_seconds = value
-            if self.scheduler.running:
-                self.scheduler.reschedule_job(
-                    "sync_job",
-                    trigger=IntervalTrigger(seconds=value),
-                )
+            self.coordinator.reschedule(value)
         elif key == "hash_titles":
             self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
@@ -420,25 +468,22 @@ class BetterFlowSyncApp:
     def _on_logout(self) -> None:
         """Handle logout action."""
         self.login_manager.logout()
-        self._logged_in = False
+        self.coordinator.logged_in = False
         self.tray.set_user(None)
         logger.info("Logged out")
 
-        # Stop sync loop
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
+        self.coordinator.stop()
 
-        # Re-login via browser
         self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         def do_relogin():
             state = self.login_manager.login_via_browser()
             if state.logged_in:
-                self._logged_in = True
+                self.coordinator.logged_in = True
                 self.tray.set_user(state.user_email, state.user_name)
-                self._start_sync_loop()
+                self.coordinator.start()
             else:
-                self._logged_in = False
+                self.coordinator.logged_in = False
                 self._on_quit()
 
         threading.Thread(target=do_relogin, daemon=True).start()
@@ -455,27 +500,20 @@ class BetterFlowSyncApp:
         self._shutdown_event.set()
         self.tray.stop()
 
+    # -- Lifecycle --------------------------------------------------------
+
     def _shutdown(self) -> None:
         """Shutdown the application. Safe to call multiple times."""
         if self._shutdown_done:
             return
         self._shutdown_done = True
         logger.info("Shutting down...")
-        self._running = False
 
-        # Stop scheduler
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-
-        # End sync session
+        self.coordinator.stop()
         self.sync_engine.shutdown()
-
-        # Close connections
         self.aw.close()
         self.bf.close()
         self.queue.close()
-
-        # Stop bundled ActivityWatch
         self.aw_manager.stop()
 
         logger.info("Shutdown complete")
@@ -499,7 +537,7 @@ class SingleInstanceLock:
     def acquire(self) -> bool:
         """Try to acquire the lock. Returns True on success."""
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        self._file = open(self._path, "a+")
+        self._file = open(self._path, "a+")  # noqa: SIM115
         try:
             fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._file.seek(0)
