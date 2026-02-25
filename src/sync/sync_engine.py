@@ -37,6 +37,11 @@ class SyncStats:
         return len(self.errors) == 0
 
 
+MAX_APP_LENGTH = 256
+MAX_TITLE_LENGTH = 1024
+MAX_URL_LENGTH = 2048
+
+
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow."""
 
@@ -389,17 +394,19 @@ class SyncEngine:
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            data["app"] = app
-            data["title"] = event.title
+            data["app"] = app[:MAX_APP_LENGTH] if app else app
+            title = event.title
+            data["title"] = title[:MAX_TITLE_LENGTH] if title else title
             if event.url:
+                url = event.url
                 if privacy.collect_full_urls:
-                    data["url"] = event.url
+                    data["url"] = url[:MAX_URL_LENGTH]
                 elif privacy.domain_only_urls:
-                    domain = self._extract_domain(event.url)
+                    domain = self._extract_domain(url)
                     if domain:
-                        data["url"] = domain
+                        data["url"] = domain[:MAX_URL_LENGTH]
                 else:
-                    data["url"] = event.url
+                    data["url"] = url[:MAX_URL_LENGTH]
 
                 if privacy.collect_page_category:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
