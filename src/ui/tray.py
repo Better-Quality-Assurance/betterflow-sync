@@ -141,6 +141,7 @@ class TrayIcon:
         self._hash_titles: bool = True
         self._domain_only_urls: bool = True
         self._debug_mode: bool = False
+        self._auto_start: bool = False
         self._config_file_path: Optional[str] = None
         self._dashboard_url: str = "https://app.betterflow.eu/dashboard"
 
@@ -235,6 +236,11 @@ class TrayIcon:
                 "Debug Mode",
                 self._make_toggle_handler("_debug_mode", "debug_mode"),
                 checked=lambda item: self._debug_mode,
+            ),
+            Item(
+                "Launch at Login",
+                self._make_toggle_handler("_auto_start", "auto_start"),
+                checked=lambda item: self._auto_start,
             ),
             Item("─" * 15, None, enabled=False),
             Item("Open Config File", self._handle_open_config),
@@ -352,6 +358,7 @@ class TrayIcon:
         self._hash_titles = config.privacy.hash_titles
         self._domain_only_urls = config.privacy.domain_only_urls
         self._debug_mode = config.debug_mode
+        self._auto_start = config.auto_start
         self._config_file_path = str(config.get_config_file())
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse

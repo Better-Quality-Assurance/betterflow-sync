@@ -402,6 +402,13 @@ class BetterFlowSyncApp:
             self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
             self.config.privacy.domain_only_urls = value
+        elif key == "auto_start":
+            try:
+                from .autostart import set_auto_start
+            except ImportError:
+                from autostart import set_auto_start
+            set_auto_start(value)
+            self.config.auto_start = value
         elif key == "debug_mode":
             self.config.debug_mode = value
             setup_logging(value)
