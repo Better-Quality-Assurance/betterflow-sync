@@ -2,10 +2,16 @@
 """PyInstaller spec file for BetterFlow Sync."""
 
 import platform
+import re
 import sys
 from pathlib import Path
 
 block_cipher = None
+
+# Read version from src/__init__.py (single source of truth)
+_version_file = Path(SPECPATH) / "src" / "__init__.py"
+_version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _version_file.read_text())
+APP_VERSION = _version_match.group(1) if _version_match else "0.0.0"
 
 # Determine platform
 is_mac = platform.system() == "Darwin"
@@ -120,8 +126,8 @@ if is_mac:
         info_plist={
             "CFBundleName": "BetterFlow Sync",
             "CFBundleDisplayName": "BetterFlow Sync",
-            "CFBundleVersion": "1.0.0",
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": APP_VERSION,
+            "CFBundleShortVersionString": APP_VERSION,
             "LSUIElement": True,  # Hide from dock (menu bar app)
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",

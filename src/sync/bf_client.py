@@ -9,10 +9,12 @@ from typing import Optional
 import requests
 
 try:
+    from .. import __version__
     from ..config import DEFAULT_API_URL
     from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from .retry import RetryConfig
 except ImportError:
+    from src import __version__
     from config import DEFAULT_API_URL
     from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from sync.retry import RetryConfig
@@ -28,7 +30,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = __version__
 
 
 @dataclass
