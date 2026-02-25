@@ -118,7 +118,7 @@ def _start_macos_power_listener(
 
 def _start_macos_network_listener(
     on_network_change: Callable,
-    host: str = "api.betterflow.app",
+    host: str = "app.betterflow.eu",
 ) -> None:
     """Monitor network reachability on macOS via SystemConfiguration."""
     try:
@@ -277,7 +277,7 @@ def _start_windows_listener(
 
 def _start_network_poller(
     on_change: Callable,
-    host: str = "api.betterflow.app",
+    host: str = "app.betterflow.eu",
     interval: int = 5,
 ) -> None:
     """Poll network connectivity and fire callback on state changes."""
