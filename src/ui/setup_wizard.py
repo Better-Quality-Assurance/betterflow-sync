@@ -55,6 +55,7 @@ class SetupWizard:
         self._result = SetupResult()
         self._window: Optional[tk.Tk] = None
         self._login_state: Optional[LoginState] = None
+        self._closing = False
         self._button_id = itertools.count(1)
 
     def show(self) -> SetupResult:
@@ -115,8 +116,10 @@ class SetupWizard:
             widget.destroy()
 
     def _on_close(self) -> None:
-        """Handle window close."""
+        """Handle window close — cancel any in-progress login."""
+        self._closing = True
         self._result = SetupResult(completed=False)
+        self._login_manager.cancel_login()
         self._window.destroy()
 
     def _make_button(self, text, command, x, y, width=248, primary=True):
@@ -288,7 +291,12 @@ class SetupWizard:
         # Start login in background
         def do_login():
             state = self._login_manager.login_via_browser()
-            self._window.after(0, lambda: self._on_login_complete(state))
+            if self._closing:
+                return
+            try:
+                self._window.after(0, lambda: self._on_login_complete(state))
+            except tk.TclError:
+                pass
 
         threading.Thread(target=do_login, daemon=True).start()
 

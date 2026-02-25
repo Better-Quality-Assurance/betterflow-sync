@@ -57,6 +57,7 @@ class LoginManager:
         self.keychain = keychain or KeychainManager()
         self._on_login_callback: Optional[Callable[[LoginState], None]] = None
         self._on_logout_callback: Optional[Callable[[], None]] = None
+        self._active_flow: Optional[BrowserAuthFlow] = None
 
     def set_login_callback(self, callback: Callable[[LoginState], None]) -> None:
         """Set callback for login state changes."""
@@ -114,9 +115,13 @@ class LoginManager:
         authorize_url = f"{self.bf.web_base_url}/sync/auth/authorize"
         logger.info(f"Using authorize URL: {authorize_url}")
         flow = BrowserAuthFlow(authorize_url)
+        self._active_flow = flow
 
         logger.info("Starting browser auth flow (with PKCE)...")
-        auth_result = flow.start()
+        try:
+            auth_result = flow.start()
+        finally:
+            self._active_flow = None
 
         if not auth_result.success:
             return LoginState(
@@ -183,6 +188,12 @@ class LoginManager:
             self._on_logout_callback()
 
         return True
+
+    def cancel_login(self) -> None:
+        """Cancel any in-progress browser login flow."""
+        flow = self._active_flow
+        if flow is not None:
+            flow.cancel()
 
     def is_logged_in(self) -> bool:
         """Check if user is logged in."""
