@@ -32,13 +32,14 @@ class TestDeviceInfo:
 
     def test_to_dict(self):
         """Test converting to dictionary."""
+        from dataclasses import asdict
         info = DeviceInfo(
             hostname="test-host",
             os_name="Darwin",
             os_version="23.0.0",
             agent_version="1.0.0",
         )
-        result = info.to_dict()
+        result = asdict(info)
 
         assert result["hostname"] == "test-host"
         assert result["os_name"] == "Darwin"
