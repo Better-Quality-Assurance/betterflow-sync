@@ -10,9 +10,9 @@ from http.server import HTTPServer
 from src.auth.browser_auth import (
     BrowserAuthFlow,
     AuthFlowResult,
-    _generate_pkce_pair,
     _CallbackHandler,
 )
+from src.auth.pkce import generate_pkce_pair
 
 
 class TestPKCEGeneration:
@@ -20,7 +20,7 @@ class TestPKCEGeneration:
 
     def test_generate_pkce_pair_returns_tuple(self):
         """Test PKCE pair generation returns verifier and challenge."""
-        verifier, challenge = _generate_pkce_pair()
+        verifier, challenge = generate_pkce_pair()
 
         assert verifier is not None
         assert challenge is not None
@@ -36,7 +36,7 @@ class TestPKCEGeneration:
 
     def test_generate_pkce_pair_challenge_is_sha256(self):
         """Test challenge is SHA-256 hash of verifier."""
-        verifier, challenge = _generate_pkce_pair()
+        verifier, challenge = generate_pkce_pair()
 
         # Manually compute expected challenge
         digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -46,15 +46,15 @@ class TestPKCEGeneration:
 
     def test_generate_pkce_pair_is_unique(self):
         """Test each call generates unique values."""
-        pair1 = _generate_pkce_pair()
-        pair2 = _generate_pkce_pair()
+        pair1 = generate_pkce_pair()
+        pair2 = generate_pkce_pair()
 
         assert pair1[0] != pair2[0]  # Different verifiers
         assert pair1[1] != pair2[1]  # Different challenges
 
     def test_generate_pkce_pair_url_safe(self):
         """Test verifier and challenge are URL-safe."""
-        verifier, challenge = _generate_pkce_pair()
+        verifier, challenge = generate_pkce_pair()
 
         # URL-safe characters only (no +, /, or =)
         for char in ["+", "/", "="]:
@@ -101,6 +101,7 @@ class TestCallbackHandler:
         mock_server.auth_code = None
         mock_server.auth_error = None
         mock_server.callback_received = threading.Event()
+        mock_server.lock = threading.Lock()
 
         # Create mock request
         handler = _CallbackHandler.__new__(_CallbackHandler)
@@ -129,6 +130,7 @@ class TestCallbackHandler:
         mock_server.auth_code = None
         mock_server.auth_error = None
         mock_server.callback_received = threading.Event()
+        mock_server.lock = threading.Lock()
 
         handler = _CallbackHandler.__new__(_CallbackHandler)
         handler.server = mock_server
@@ -156,6 +158,7 @@ class TestCallbackHandler:
         mock_server.auth_code = None
         mock_server.auth_error = None
         mock_server.callback_received = threading.Event()
+        mock_server.lock = threading.Lock()
 
         handler = _CallbackHandler.__new__(_CallbackHandler)
         handler.server = mock_server
