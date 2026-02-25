@@ -1,6 +1,5 @@
 """Tests for sync engine."""
 
-import hashlib
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import Mock, MagicMock, patch
@@ -58,11 +57,11 @@ class TestSyncEngine:
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
-            duration=0.5,  # Less than 1 second
+            duration=0.3,  # Less than 0.5 second threshold
             data={"app": "Test"},
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_WINDOW)
         assert result is None
 
     def test_transform_event_filters_excluded_apps(self):
@@ -74,11 +73,11 @@ class TestSyncEngine:
             data={"app": "1Password"},
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_WINDOW)
         assert result is None
 
-    def test_transform_event_hashes_title(self):
-        """Test that window titles are hashed by default."""
+    def test_transform_event_sends_raw_title(self):
+        """Test that window titles are sent raw (server handles privacy)."""
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
@@ -86,12 +85,11 @@ class TestSyncEngine:
             data={"app": "Firefox", "title": "Secret Document - Mozilla Firefox"},
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_WINDOW)
 
         assert result is not None
-        # Title should be hashed (first 16 chars of SHA-256)
-        expected_hash = hashlib.sha256(b"Secret Document - Mozilla Firefox").hexdigest()[:16]
-        assert result["data"]["title"] == expected_hash
+        # Title should be sent raw — server handles privacy
+        assert result["data"]["title"] == "Secret Document - Mozilla Firefox"
 
     def test_transform_event_allows_raw_title_for_allowlisted_apps(self):
         """Test that allowlisted apps keep raw titles."""
@@ -102,7 +100,7 @@ class TestSyncEngine:
             data={"app": "Visual Studio Code", "title": "main.py - myproject"},
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_WINDOW)
 
         assert result is not None
         assert result["data"]["title"] == "main.py - myproject"
@@ -120,7 +118,7 @@ class TestSyncEngine:
             },
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_WINDOW)
 
         assert result is not None
         assert result["data"]["url"] == "github.com"
@@ -134,7 +132,7 @@ class TestSyncEngine:
             data={"status": "not-afk"},
         )
 
-        result = self.engine._transform_event(event, BUCKET_TYPE_AFK)
+        result = self.engine._transform_event(event, "test-bucket", BUCKET_TYPE_AFK)
 
         assert result is not None
         assert result["data"]["status"] == "not-afk"
@@ -152,27 +150,11 @@ class TestSyncEngine:
         assert status["bf_reachable"] is True
         assert status["queue_size"] == 10
 
-    def test_process_title_with_hashing_disabled(self):
-        """Test that titles are passed through when hashing is disabled."""
-        self.config.privacy.hash_titles = False
-
-        title = self.engine._process_title("Firefox", "My Secret Title", self.config.privacy)
-        assert title == "My Secret Title"
-
-    def test_process_url_full_url_when_disabled(self):
-        """Test that full URLs are kept when domain_only is disabled."""
-        self.config.privacy.domain_only_urls = False
-
-        url = self.engine._process_url(
-            "https://github.com/BetterQA/betterflow", self.config.privacy
-        )
-        assert url == "https://github.com/BetterQA/betterflow"
-
     def test_shutdown_ends_session(self):
         """Test that shutdown ends the active session."""
         self.engine._session_active = True
 
         self.engine.shutdown()
 
-        self.bf.end_session.assert_called_once_with("shutdown")
+        self.bf.end_session.assert_called_once_with("app_quit")
         assert self.engine._session_active is False
