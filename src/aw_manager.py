@@ -30,7 +30,7 @@ RELEASE_BASE = (
 )
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
-    "windows": f"activitywatch-{AW_VERSION}-windows.zip",
+    "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
 }
 
 # Mapping from original AW names to our branded names (used during download/extract)
