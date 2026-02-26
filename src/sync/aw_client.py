@@ -1,6 +1,7 @@
 """ActivityWatch client - reads events from local aw-server."""
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -122,6 +123,9 @@ class AWClient:
         self.base_url = f"http://{host}:{port}/api/0/"
         self.timeout = timeout
         self._session = requests.Session()
+        self._buckets_cache: Optional[dict[str, "AWBucket"]] = None
+        self._buckets_cache_time: float = 0.0
+        self._buckets_cache_ttl: float = 30.0
 
     def _request(self, method: str, endpoint: str, **kwargs) -> dict:
         """Make request to ActivityWatch API."""
@@ -153,13 +157,19 @@ class AWClient:
         """Get server info (version, hostname, etc.)."""
         return self._request("GET", "info")
 
-    def get_buckets(self) -> dict[str, AWBucket]:
-        """Get all buckets."""
+    def get_buckets(self) -> dict[str, "AWBucket"]:
+        """Get all buckets (cached with 30s TTL)."""
+        now = time.monotonic()
+        if self._buckets_cache is not None and (now - self._buckets_cache_time) < self._buckets_cache_ttl:
+            return self._buckets_cache
         response = self._request("GET", "buckets/")
-        return {
+        result = {
             bucket_id: AWBucket.from_dict(bucket_id, data)
             for bucket_id, data in response.items()
         }
+        self._buckets_cache = result
+        self._buckets_cache_time = now
+        return result
 
     def get_bucket(self, bucket_id: str) -> Optional[AWBucket]:
         """Get a specific bucket."""

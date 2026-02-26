@@ -1,6 +1,5 @@
 """BetterFlow Sync - Main entry point."""
 
-import fcntl
 import logging
 import os
 import signal
@@ -65,6 +64,9 @@ class SyncCoordinator:
         # Flags set by the app layer
         self.logged_in = False
         self.paused_by_network = False
+
+        # Optional callback wired by the app for auth-error re-login
+        self._on_auth_error: Optional[callable] = None
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
@@ -209,6 +211,16 @@ class SyncCoordinator:
             if not self.aw.is_running():
                 return
 
+            # Skip increment if user is currently AFK
+            try:
+                afk_buckets = self.aw.get_afk_buckets()
+                if afk_buckets:
+                    events = self.aw.get_events(afk_buckets[0].id, limit=1)
+                    if events and events[0].status == "afk":
+                        return
+            except Exception:
+                pass  # If AFK check fails, still increment
+
             self._hours_today_seconds += 60
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             self.tray.update_stats(hours_today=self._hours_today_cache)
@@ -221,10 +233,6 @@ class SyncCoordinator:
         hours = int(total_seconds) // 3600
         minutes = (int(total_seconds) % 3600) // 60
         return f"{hours}h {minutes}m"
-
-    # Optional callback wired by the app for auth-error re-login
-    _on_auth_error: Optional[callable] = None
-
 
 class BetterFlowSyncApp:
     """Main application orchestrator.
@@ -539,7 +547,12 @@ class SingleInstanceLock:
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         self._file = open(self._path, "a+")  # noqa: SIM115
         try:
-            fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._file.seek(0)
             self._file.truncate(0)
             self._file.write(str(os.getpid()))
@@ -554,7 +567,15 @@ class SingleInstanceLock:
         """Release the lock and clean up."""
         if self._file:
             try:
-                fcntl.flock(self._file, fcntl.LOCK_UN)
+                if sys.platform == "win32":
+                    import msvcrt
+                    try:
+                        msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(self._file, fcntl.LOCK_UN)
                 self._file.close()
                 os.unlink(self._path)
             except OSError:

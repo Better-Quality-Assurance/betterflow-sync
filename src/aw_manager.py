@@ -30,7 +30,7 @@ RELEASE_BASE = (
 )
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
-    "windows": f"activitywatch-{AW_VERSION}-windows.zip",
+    "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
 }
 
 # Mapping from original AW names to our branded names (used during download/extract)
@@ -486,10 +486,17 @@ class AWManager:
     def _is_process_running(self, name: str) -> bool:
         """Check if a process with this name is already running (outside our management)."""
         try:
-            result = subprocess.run(
-                ["pgrep", "-f", name], capture_output=True, text=True
-            )
-            return result.returncode == 0
+            if platform.system() == "Windows":
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {name}.exe"],
+                    capture_output=True, text=True,
+                )
+                return name.lower() in result.stdout.lower()
+            else:
+                result = subprocess.run(
+                    ["pgrep", "-f", name], capture_output=True, text=True
+                )
+                return result.returncode == 0
         except Exception:
             return False
 

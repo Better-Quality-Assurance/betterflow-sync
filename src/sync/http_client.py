@@ -9,6 +9,10 @@ from urllib.parse import urlparse
 
 import requests
 
+try:
+    from .. import __version__
+except ImportError:
+    from src import __version__
 from .retry import RetryConfig, retry_with_backoff, RetryExhausted
 
 __all__ = [
@@ -59,7 +63,7 @@ class BaseApiClient:
         jitter=True,
     )
 
-    USER_AGENT = "BetterFlow-Sync/1.0.0"
+    USER_AGENT = f"BetterFlow-Sync/{__version__}"
 
     def __init__(
         self,

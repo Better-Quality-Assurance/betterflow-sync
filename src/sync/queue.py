@@ -56,13 +56,18 @@ class OfflineQueue:
         self.db_path = db_path
         self.max_size = max_size
         self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
         if not hasattr(self._local, "connection"):
-            self._local.connection = sqlite3.connect(str(self.db_path))
-            self._local.connection.row_factory = sqlite3.Row
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            self._local.connection = conn
+            with self._connections_lock:
+                self._connections.append(conn)
         return self._local.connection
 
     @contextmanager
@@ -343,7 +348,13 @@ class OfflineQueue:
             }
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close all thread-local database connections."""
+        with self._connections_lock:
+            for conn in self._connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._connections.clear()
         if hasattr(self._local, "connection"):
-            self._local.connection.close()
             del self._local.connection

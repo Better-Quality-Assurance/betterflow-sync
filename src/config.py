@@ -3,7 +3,9 @@
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field, asdict
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -67,7 +69,8 @@ def _load_dotenv() -> None:
             logger.warning(f"Failed loading .env file at {resolved}: {e}")
 
 
-_load_dotenv()
+if "pytest" not in sys.modules:
+    _load_dotenv()
 
 # API endpoints
 DEFAULT_API_URL = os.getenv("BETTERFLOW_API_URL", "https://app.betterflow.eu/api/agent").rstrip("/")
@@ -330,22 +333,35 @@ class Config:
 
 
 def setup_logging(debug: bool = False) -> None:
-    """Configure logging."""
+    """Configure logging.
+
+    Safe to call multiple times (e.g. when toggling debug mode at runtime).
+    """
     log_dir = Config.get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "betterflow-sync.log"
 
     level = logging.DEBUG if debug else logging.INFO
     format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    formatter = logging.Formatter(format_str)
 
-    logging.basicConfig(
-        level=level,
-        format=format_str,
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(),
-        ],
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Remove existing handlers to support runtime re-configuration
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        h.close()
+
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
     )
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
 
     # Reduce noise from libraries
     logging.getLogger("urllib3").setLevel(logging.WARNING)
