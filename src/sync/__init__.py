@@ -6,6 +6,8 @@ from .sync_engine import SyncEngine
 from .queue import OfflineQueue
 from .retry import RetryConfig, retry_with_backoff
 from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
+from .activity_analyzer import ActivityAnalyzer, ActivityMetrics, EngagementThresholds
+from .daily_time_tracker import DailyTimeTracker
 
 __all__ = [
     "AWClient",
@@ -17,4 +19,8 @@ __all__ = [
     "AWClientProtocol",
     "BFClientProtocol",
     "OfflineQueueProtocol",
+    "ActivityAnalyzer",
+    "ActivityMetrics",
+    "EngagementThresholds",
+    "DailyTimeTracker",
 ]

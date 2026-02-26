@@ -16,6 +16,7 @@ __all__ = [
     "PrivacySettings",
     "SyncSettings",
     "AWSettings",
+    "EngagementConfig",
     "setup_logging",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
@@ -170,6 +171,22 @@ class SyncSettings:
 
 
 @dataclass
+class EngagementConfig:
+    """Engagement detection settings (server-configurable).
+
+    These thresholds determine what counts as "engaged" work vs "idle-active"
+    (mouse-only activity that may indicate fake activity).
+    """
+
+    sustained_typing_presses: int = 50  # Presses in window = engaged
+    window_changes_min: int = 2  # Task switching = engaged
+    scroll_threshold: int = 10  # Reading behavior = engaged
+    combined_presses_min: int = 10  # For combined signal checks
+    combined_scrolls_min: int = 5  # For combined signal checks
+    window_minutes: int = 5  # Rolling window size in minutes
+
+
+@dataclass
 class AWSettings:
     """ActivityWatch connection settings."""
 
@@ -191,6 +208,7 @@ class Config:
     aw: AWSettings = field(default_factory=AWSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    engagement: EngagementConfig = field(default_factory=EngagementConfig)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -250,6 +268,7 @@ class Config:
         aw_data = data.pop("aw", {})
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
+        engagement_data = data.pop("engagement", {})
 
         # Migrate legacy localhost URLs to production endpoint.
         api_url = data.get("api_url")
@@ -265,6 +284,7 @@ class Config:
             aw=AWSettings(**aw_data) if aw_data else AWSettings(),
             sync=SyncSettings(**sync_data) if sync_data else SyncSettings(),
             privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
+            engagement=EngagementConfig(**engagement_data) if engagement_data else EngagementConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -328,6 +348,21 @@ class Config:
                 self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
+
+        if "engagement" in server_config:
+            eng = server_config["engagement"]
+            if "sustained_typing_presses" in eng:
+                self.engagement.sustained_typing_presses = int(eng["sustained_typing_presses"])
+            if "window_changes_min" in eng:
+                self.engagement.window_changes_min = int(eng["window_changes_min"])
+            if "scroll_threshold" in eng:
+                self.engagement.scroll_threshold = int(eng["scroll_threshold"])
+            if "combined_presses_min" in eng:
+                self.engagement.combined_presses_min = int(eng["combined_presses_min"])
+            if "combined_scrolls_min" in eng:
+                self.engagement.combined_scrolls_min = int(eng["combined_scrolls_min"])
+            if "window_minutes" in eng:
+                self.engagement.window_minutes = max(1, int(eng["window_minutes"]))
 
         self.save()
 

@@ -461,6 +461,24 @@ class TrayIcon:
             self.model.current_project = current_project
         self._update_menu()
 
+    def set_active_time(self, active_time) -> None:
+        """Update tooltip and menu with today's active work time.
+
+        Args:
+            active_time: timedelta with today's active time
+        """
+        total_seconds = int(active_time.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        self._hours_today = f"{hours}h {minutes}m"
+        self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
+        self._update_menu()
+
+    def _update_tooltip(self, tooltip: str) -> None:
+        """Update the tray icon tooltip."""
+        if self._icon:
+            self._icon.title = tooltip
+
     def _update_icon(self) -> None:
         """Update the tray icon image and menu."""
         if self._icon:

@@ -154,9 +154,10 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed",
                 )
 
-            hours_today = self._fetch_hours_today()
+            # Use local active time tracking (more accurate for engaged work)
+            active_time = self.sync_engine.get_today_active_time()
+            self.tray.set_active_time(active_time)
             self.tray.update_stats(
-                hours_today=hours_today,
                 last_sync=datetime.now().strftime("%H:%M"),
                 queue_size=self.queue.size(),
             )
@@ -200,7 +201,7 @@ class SyncCoordinator:
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
-        """Increment tray hours locally every minute while tracking is active."""
+        """Refresh tray hours from local active time tracker."""
         try:
             if not self.logged_in:
                 return
@@ -208,22 +209,10 @@ class SyncCoordinator:
                 return
             if self.sync_engine.is_paused or self.sync_engine.is_private:
                 return
-            if not self.aw.is_running():
-                return
 
-            # Skip increment if user is currently AFK
-            try:
-                afk_buckets = self.aw.get_afk_buckets()
-                if afk_buckets:
-                    events = self.aw.get_events(afk_buckets[0].id, limit=1)
-                    if events and events[0].status == "afk":
-                        return
-            except Exception:
-                pass  # If AFK check fails, still increment
-
-            self._hours_today_seconds += 60
-            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
-            self.tray.update_stats(hours_today=self._hours_today_cache)
+            # Use local active time tracker (already handles engagement detection)
+            active_time = self.sync_engine.get_today_active_time()
+            self.tray.set_active_time(active_time)
         except Exception as e:
             logger.debug(f"Failed to refresh tray hours: {e}")
 
