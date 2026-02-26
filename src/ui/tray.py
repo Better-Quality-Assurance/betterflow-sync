@@ -68,6 +68,12 @@ class TrayModel:
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
 
+        # Reminder preferences
+        self.break_reminders_enabled: bool = True
+        self.break_interval_hours: int = 2
+        self.private_reminders_enabled: bool = True
+        self.private_interval_minutes: int = 20
+
 try:
     import pystray
     from pystray import MenuItem as Item
@@ -266,6 +272,44 @@ class TrayIcon:
                 checked=lambda item: self.model.auto_start,
             ),
             Item("─" * 15, None, enabled=False),
+            Item(
+                "Break Reminders",
+                pystray.Menu(
+                    Item(
+                        "Enabled",
+                        self._make_toggle_handler("break_reminders_enabled", "break_reminders_enabled"),
+                        checked=lambda item: self.model.break_reminders_enabled,
+                    ),
+                    Item(
+                        "Interval",
+                        pystray.Menu(
+                            Item("1 hour", self._make_break_interval_handler(1), checked=lambda item: self.model.break_interval_hours == 1),
+                            Item("2 hours", self._make_break_interval_handler(2), checked=lambda item: self.model.break_interval_hours == 2),
+                            Item("3 hours", self._make_break_interval_handler(3), checked=lambda item: self.model.break_interval_hours == 3),
+                            Item("4 hours", self._make_break_interval_handler(4), checked=lambda item: self.model.break_interval_hours == 4),
+                        ),
+                    ),
+                ),
+            ),
+            Item(
+                "Private Time Reminders",
+                pystray.Menu(
+                    Item(
+                        "Enabled",
+                        self._make_toggle_handler("private_reminders_enabled", "private_reminders_enabled"),
+                        checked=lambda item: self.model.private_reminders_enabled,
+                    ),
+                    Item(
+                        "Interval",
+                        pystray.Menu(
+                            Item("10 minutes", self._make_private_interval_handler(10), checked=lambda item: self.model.private_interval_minutes == 10),
+                            Item("20 minutes", self._make_private_interval_handler(20), checked=lambda item: self.model.private_interval_minutes == 20),
+                            Item("30 minutes", self._make_private_interval_handler(30), checked=lambda item: self.model.private_interval_minutes == 30),
+                        ),
+                    ),
+                ),
+            ),
+            Item("─" * 15, None, enabled=False),
             Item("Open Config File", self._handle_open_config),
         ), enabled=logged_in))
         items.append(Item("View Dashboard", self._handle_dashboard, enabled=logged_in))
@@ -370,6 +414,24 @@ class TrayIcon:
                 self._on_preferences(key, new_value)
         return handler
 
+    def _make_break_interval_handler(self, hours: int) -> Callable:
+        """Create a handler for setting break reminder interval."""
+        def handler(icon, item):
+            self.model.break_interval_hours = hours
+            if self._on_preferences:
+                self._on_preferences("break_interval_hours", hours)
+            self._update_menu()
+        return handler
+
+    def _make_private_interval_handler(self, minutes: int) -> Callable:
+        """Create a handler for setting private time reminder interval."""
+        def handler(icon, item):
+            self.model.private_interval_minutes = minutes
+            if self._on_preferences:
+                self._on_preferences("private_interval_minutes", minutes)
+            self._update_menu()
+        return handler
+
     def _handle_open_config(self, icon, item) -> None:
         if self.model.config_file_path:
             import subprocess
@@ -388,6 +450,10 @@ class TrayIcon:
         self.model.debug_mode = config.debug_mode
         self.model.auto_start = config.auto_start
         self.model.config_file_path = str(config.get_config_file())
+        self.model.break_reminders_enabled = config.reminders.break_reminders_enabled
+        self.model.break_interval_hours = config.reminders.break_interval_hours
+        self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
+        self.model.private_interval_minutes = config.reminders.private_interval_minutes
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)

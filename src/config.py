@@ -16,6 +16,7 @@ __all__ = [
     "PrivacySettings",
     "SyncSettings",
     "AWSettings",
+    "ReminderSettings",
     "setup_logging",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
@@ -183,6 +184,16 @@ class AWSettings:
 
 
 @dataclass
+class ReminderSettings:
+    """Reminder notification settings."""
+
+    break_reminders_enabled: bool = True
+    break_interval_hours: int = 2  # 1, 2, 3, or 4
+    private_reminders_enabled: bool = True
+    private_interval_minutes: int = 20  # 10, 20, or 30
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -191,6 +202,7 @@ class Config:
     aw: AWSettings = field(default_factory=AWSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    reminders: ReminderSettings = field(default_factory=ReminderSettings)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -250,6 +262,7 @@ class Config:
         aw_data = data.pop("aw", {})
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
+        reminders_data = data.pop("reminders", {})
 
         # Migrate legacy localhost URLs to production endpoint.
         api_url = data.get("api_url")
@@ -265,6 +278,7 @@ class Config:
             aw=AWSettings(**aw_data) if aw_data else AWSettings(),
             sync=SyncSettings(**sync_data) if sync_data else SyncSettings(),
             privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
+            reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 

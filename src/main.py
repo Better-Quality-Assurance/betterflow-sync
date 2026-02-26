@@ -16,6 +16,7 @@ try:
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
+    from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
@@ -24,6 +25,7 @@ except ImportError:
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
     from config import Config, setup_logging
+    from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
@@ -48,6 +50,7 @@ class SyncCoordinator:
         sync_engine: SyncEngine,
         tray: TrayIcon,
         aw_manager: AWManager,
+        reminder_manager: Optional[ReminderManager] = None,
     ) -> None:
         self.config = config
         self.aw = aw
@@ -56,6 +59,7 @@ class SyncCoordinator:
         self.sync_engine = sync_engine
         self.tray = tray
         self.aw_manager = aw_manager
+        self.reminder_manager = reminder_manager
 
         self.scheduler = BackgroundScheduler()
         self._hours_today_seconds = 0
@@ -84,6 +88,13 @@ class SyncCoordinator:
             id="tray_time_job",
             replace_existing=True,
         )
+        if self.reminder_manager:
+            self.scheduler.add_job(
+                self.reminder_manager.check,
+                trigger=IntervalTrigger(seconds=60),
+                id="reminder_check_job",
+                replace_existing=True,
+            )
         self.scheduler.start()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -193,7 +204,10 @@ class SyncCoordinator:
                 .get("today_summary", {})
                 .get("total_seconds", 0)
             )
-            self._hours_today_seconds = max(0, total_seconds)
+            # Avoid UI regressions if backend summary is temporarily stale.
+            server_seconds = max(0, total_seconds)
+            if server_seconds >= self._hours_today_seconds:
+                self._hours_today_seconds = server_seconds
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             return self._hours_today_cache
         except Exception:
@@ -290,6 +304,9 @@ class BetterFlowSyncApp:
         )
         self.tray.set_config(self.config)
 
+        # Reminder manager
+        self.reminder_manager = ReminderManager(self.config.reminders)
+
         # Sync coordinator
         self.coordinator = SyncCoordinator(
             config=self.config,
@@ -299,6 +316,7 @@ class BetterFlowSyncApp:
             sync_engine=self.sync_engine,
             tray=self.tray,
             aw_manager=self.aw_manager,
+            reminder_manager=self.reminder_manager,
         )
         self.coordinator._on_auth_error = self._on_login
 
@@ -387,6 +405,7 @@ class BetterFlowSyncApp:
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
+        self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
@@ -394,6 +413,7 @@ class BetterFlowSyncApp:
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
+        self.reminder_manager.on_tracking_started()
         logger.info("Tracking resumed")
 
     def _on_project_change(self, project: Optional[dict]) -> None:
@@ -409,21 +429,27 @@ class BetterFlowSyncApp:
         if private:
             logger.info("Private time started — recording paused")
             self.sync_engine.set_private_mode(True)
+            self.reminder_manager.on_tracking_stopped()
+            self.reminder_manager.on_private_started()
         else:
             logger.info("Private time ended — recording resumed")
             self.sync_engine.set_private_mode(False)
+            self.reminder_manager.on_private_ended()
+            self.reminder_manager.on_tracking_started()
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
+        self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused (system sleep)")
 
     def _on_system_wake(self) -> None:
         """Handle system wake from sleep."""
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
+        self.reminder_manager.on_tracking_started()
         logger.info("Tracking resumed (system wake)")
         self.coordinator.trigger_sync("wake_sync")
 
@@ -469,6 +495,18 @@ class BetterFlowSyncApp:
         elif key == "debug_mode":
             self.config.debug_mode = value
             setup_logging(value)
+        elif key == "break_reminders_enabled":
+            self.config.reminders.break_reminders_enabled = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "break_interval_hours":
+            self.config.reminders.break_interval_hours = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "private_reminders_enabled":
+            self.config.reminders.private_reminders_enabled = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "private_interval_minutes":
+            self.config.reminders.private_interval_minutes = value
+            self.reminder_manager.update_settings(self.config.reminders)
 
         self.config.save()
         logger.info(f"Preference changed: {key} = {value}")
