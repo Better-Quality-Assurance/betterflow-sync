@@ -60,12 +60,14 @@ class SyncEngine:
         queue: OfflineQueueProtocol,
         config: Config,
         on_config_updated: Optional[callable] = None,
+        display_tracker=None,
     ):
         self.aw = aw
         self.bf = bf
         self.queue = queue
         self.config = config
         self._on_config_updated = on_config_updated
+        self._display_tracker = display_tracker
         self._paused = False
         self._private_mode = False
         self._private_start: Optional[datetime] = None
@@ -88,6 +90,10 @@ class SyncEngine:
         # we only re-send if the duration actually changed.
         self._sent_cache: dict[tuple[str, int], float] = {}
         self._SENT_CACHE_MAX = 10_000
+
+        # App category cache — avoids SQLite lookups on every event.
+        # Populated lazily; invalidated when categories are refreshed.
+        self._category_cache: Optional[dict[str, str]] = None
 
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
@@ -132,6 +138,16 @@ class SyncEngine:
     def set_current_project(self, project: Optional[dict]) -> None:
         """Set the current project for event tagging."""
         self._current_project = project
+
+    def invalidate_category_cache(self) -> None:
+        """Clear the in-memory category cache so next lookup re-reads from DB."""
+        self._category_cache = None
+
+    def _get_category(self, app_name: str) -> Optional[str]:
+        """Look up category for an app, using in-memory cache."""
+        if self._category_cache is None:
+            self._category_cache = self.queue.get_all_categories()
+        return self._category_cache.get(app_name)
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -454,6 +470,22 @@ class SyncEngine:
 
                 if privacy.collect_page_category:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
+
+            if app and privacy.auto_categorize:
+                category = self._get_category(app)
+                if category:
+                    data["app_category"] = category
+
+            if self._display_tracker is not None and privacy.track_display_info:
+                ds = self._display_tracker.state
+                if ds.monitor_name is not None:
+                    data["monitor_name"] = ds.monitor_name
+                if ds.monitor_index is not None:
+                    data["monitor_index"] = ds.monitor_index
+                if ds.desktop_id is not None:
+                    data["desktop_id"] = ds.desktop_id
+                if ds.desktop_index is not None:
+                    data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
             # Send AFK periods as "break" bucket_type for chart display

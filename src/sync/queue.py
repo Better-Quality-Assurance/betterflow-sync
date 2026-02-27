@@ -136,6 +136,18 @@ class OfflineQueue:
                 """
             )
 
+            # App category mappings (synced from server, user-overridable)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_categories (
+                    app_name TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'server',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
     def enqueue(self, events: list[dict]) -> int:
         """Add events to the queue.
 
@@ -388,6 +400,91 @@ class OfflineQueue:
                 row["bucket_id"]: datetime.fromisoformat(row["last_timestamp"])
                 for row in cursor.fetchall()
             }
+
+    # App category management
+
+    def get_category(self, app_name: str) -> Optional[str]:
+        """Get the category for an app.
+
+        Args:
+            app_name: Application name
+
+        Returns:
+            Category string, or None if not mapped
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT category FROM app_categories WHERE app_name = ?",
+                (app_name,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def get_all_categories(self) -> dict[str, str]:
+        """Get all app-to-category mappings.
+
+        Returns:
+            Dict mapping app_name -> category
+        """
+        with self._cursor() as cursor:
+            cursor.execute("SELECT app_name, category FROM app_categories")
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def set_category(
+        self, app_name: str, category: str, source: str = "server"
+    ) -> None:
+        """Set or update a single app category.
+
+        Args:
+            app_name: Application name
+            category: Category string
+            source: 'server' or 'user'
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO app_categories (app_name, category, source, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(app_name) DO UPDATE SET
+                    category = excluded.category,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (app_name, category, source, now),
+            )
+
+    def sync_categories(self, mappings: dict[str, str]) -> None:
+        """Bulk replace server-sourced categories, preserving user overrides.
+
+        Args:
+            mappings: Dict mapping app_name -> category from server
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            # Remove old server categories not in the new mapping
+            cursor.execute(
+                "DELETE FROM app_categories WHERE source = 'server'"
+            )
+            # Insert new server categories
+            if mappings:
+                cursor.executemany(
+                    """
+                    INSERT INTO app_categories (app_name, category, source, updated_at)
+                    VALUES (?, ?, 'server', ?)
+                    ON CONFLICT(app_name) DO UPDATE SET
+                        category = CASE
+                            WHEN app_categories.source = 'user' THEN app_categories.category
+                            ELSE excluded.category
+                        END,
+                        source = CASE
+                            WHEN app_categories.source = 'user' THEN 'user'
+                            ELSE 'server'
+                        END,
+                        updated_at = excluded.updated_at
+                    """,
+                    [(app, cat, now) for app, cat in mappings.items()],
+                )
 
     def close(self) -> None:
         """Close all thread-local database connections."""

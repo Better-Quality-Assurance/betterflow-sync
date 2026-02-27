@@ -152,6 +152,8 @@ class PrivacySettings:
     domain_only_urls: bool = True  # Strip URLs to domain only
     collect_full_urls: bool = False  # Collect full URLs (sensitive, opt-in)
     collect_page_category: bool = True  # Include coarse page category classification
+    auto_categorize: bool = True  # Enrich events with app_category from server mappings
+    track_display_info: bool = False  # Track monitor name and virtual desktop
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",
@@ -341,6 +343,10 @@ class Config:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
                 self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])
+            if "auto_categorize" in collection:
+                self.privacy.auto_categorize = self._to_bool(collection["auto_categorize"])
+            if "track_display_info" in collection:
+                self.privacy.track_display_info = self._to_bool(collection["track_display_info"])
 
         if "tracking" in server_config:
             tracking = server_config["tracking"]
