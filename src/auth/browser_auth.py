@@ -9,13 +9,14 @@ Security features:
 """
 
 import logging
+import os
 import secrets
 import threading
 import webbrowser
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 from .pkce import generate_pkce_pair
 
@@ -86,6 +87,40 @@ _ERROR_HTML = """\
 """
 
 
+def _normalize_state(value: Optional[str]) -> str:
+    """Normalize callback `state` values for robust comparison."""
+    if value is None:
+        return ""
+
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1]
+
+    normalized = unquote(normalized).strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1]
+
+    return normalized
+
+
+def _allow_state_mismatch() -> bool:
+    """Opt-in local-dev bypass for strict state matching."""
+    return os.getenv("BETTERFLOW_ALLOW_STATE_MISMATCH", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler that captures the authorization callback."""
 
@@ -111,7 +146,23 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             state = params.get("state", [None])[0]
 
             # Verify state parameter (CSRF protection)
-            if not state or state != self.server.expected_state:
+            state_ok = _normalize_state(state) == _normalize_state(
+                self.server.expected_state
+            )
+            if not state_ok:
+                if code and _allow_state_mismatch():
+                    logger.warning(
+                        "State mismatch bypassed because "
+                        "BETTERFLOW_ALLOW_STATE_MISMATCH is enabled"
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(_SUCCESS_HTML.encode())
+                    self.server.auth_code = code
+                    self.server.callback_received.set()
+                    return
+
                 logger.warning("State parameter mismatch - possible CSRF attempt")
                 self.send_response(400)
                 self.send_header("Content-Type", "text/html")

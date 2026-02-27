@@ -301,6 +301,7 @@ class BetterFlowSyncApp:
             on_quit=self._on_quit,
             on_project_change=self._on_project_change,
             on_private_toggle=self._on_private_toggle,
+            on_sync_now=self._on_sync_now,
         )
         self.tray.set_config(self.config)
 
@@ -436,6 +437,11 @@ class BetterFlowSyncApp:
             self.sync_engine.set_private_mode(False)
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
+
+    def _on_sync_now(self) -> None:
+        """Handle sync now action from tray."""
+        logger.info("Manual sync triggered")
+        self.coordinator.trigger_sync()
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
