@@ -60,6 +60,7 @@ class SyncEngine:
         self._on_config_updated = on_config_updated
         self._paused = False
         self._private_mode = False
+        self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
         self._session_active = False
         self._config_fetched = False
@@ -91,6 +92,10 @@ class SyncEngine:
         """Enable/disable private time (no events recorded)."""
         if enabled and not self._private_mode:
             self._advance_checkpoints_to_now("private_time")
+            self._private_start = datetime.now(timezone.utc)
+        elif not enabled and self._private_mode and self._private_start:
+            self._send_private_time_event()
+            self._private_start = None
         self._private_mode = enabled
         if enabled and self._session_active:
             try:
@@ -412,6 +417,9 @@ class SyncEngine:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
+            # Send AFK periods as "break" bucket_type for chart display
+            if event.status == "afk":
+                bucket_type = "break"
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection
             data["presses"] = event.presses
@@ -458,6 +466,29 @@ class SyncEngine:
             if any(keyword in haystack for keyword in keywords):
                 return category
         return "other"
+
+    def _send_private_time_event(self) -> None:
+        """Send a private_time event covering the private mode duration."""
+        if not self._private_start:
+            return
+        now = datetime.now(timezone.utc)
+        duration = (now - self._private_start).total_seconds()
+        if duration < 1:
+            return
+        event = {
+            "timestamp": self._private_start.isoformat(),
+            "duration": round(duration, 2),
+            "bucket_type": "private_time",
+            "data": {"status": "private"},
+        }
+        if self._current_project:
+            event["project_id"] = self._current_project["id"]
+        try:
+            self.bf.send_events([event])
+            logger.info(f"Sent private_time event ({duration:.0f}s)")
+        except BetterFlowClientError as e:
+            logger.warning(f"Failed to send private_time event: {e}")
+            self.queue.enqueue([event])
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""

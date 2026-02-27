@@ -195,6 +195,7 @@ class TrayIcon:
             items.append(Item(label, None, enabled=False))
 
         items.append(Item(f"App status: {self._get_status_text()}", None, enabled=False))
+        items.append(Item(f"Hours today: {self.model.hours_today}", None, enabled=False))
 
         # ── Dashboard & Project Manager links ───────────────
         items.append(Item("Show My Dashboard", self._handle_show_dashboard, enabled=logged_in))
