@@ -532,6 +532,7 @@ class BetterFlowSyncApp:
         if self.config.check_updates:
             check_for_update(
                 __version__.__version__,
+                channel=self.config.update_channel,
                 callback=self._on_update_available,
             )
 
@@ -786,6 +787,13 @@ class BetterFlowSyncApp:
         elif key == "private_interval_minutes":
             self.config.reminders.private_interval_minutes = value
             self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "update_channel":
+            self.config.update_channel = value
+            check_for_update(
+                __version__.__version__,
+                channel=value,
+                callback=self._on_update_available,
+            )
         elif key == "screenshots_enabled":
             self.config.screenshots.enabled = value
             self.coordinator.start_screenshot_job()

@@ -68,6 +68,7 @@ class TrayModel:
         self.domain_only_urls: bool = True
         self.debug_mode: bool = False
         self.auto_start: bool = False
+        self.update_channel: str = "stable"
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
         self.company_name: Optional[str] = None
@@ -370,6 +371,14 @@ class TrayIcon:
                 checked=lambda item: self.model.auto_start,
             ),
             Item(
+                "Update Channel",
+                pystray.Menu(
+                    Item("Stable", self._make_channel_handler("stable"), checked=lambda item: self.model.update_channel == "stable"),
+                    Item("Beta", self._make_channel_handler("beta"), checked=lambda item: self.model.update_channel == "beta"),
+                    Item("Canary", self._make_channel_handler("canary"), checked=lambda item: self.model.update_channel == "canary"),
+                ),
+            ),
+            Item(
                 "Screenshots",
                 pystray.Menu(
                     Item(
@@ -555,6 +564,15 @@ class TrayIcon:
             self._update_menu()
         return handler
 
+    def _make_channel_handler(self, channel: str) -> Callable:
+        """Create a handler for switching update channel."""
+        def handler(icon, item):
+            self.model.update_channel = channel
+            if self._on_preferences:
+                self._on_preferences("update_channel", channel)
+            self._update_menu()
+        return handler
+
     def _make_screenshot_handler(self, enabled: bool, interval: int = 0) -> Callable:
         """Create a handler for screenshot interval radio selection."""
         def handler(icon, item):
@@ -597,6 +615,7 @@ class TrayIcon:
         self.model.break_interval_hours = config.reminders.break_interval_hours
         self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
         self.model.private_interval_minutes = config.reminders.private_interval_minutes
+        self.model.update_channel = config.update_channel
         self.model.screenshots_enabled = config.screenshots.enabled
         self.model.screenshot_interval = config.screenshots.interval_seconds
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
