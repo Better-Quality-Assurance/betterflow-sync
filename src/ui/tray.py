@@ -50,6 +50,9 @@ class TrayModel:
         self.private_mode: bool = False
         self.status_text: str = "Starting..."
         self.hours_today: str = "0h 0m"
+        self.hours_this_week: str = "---"
+        self.hours_this_month: str = "---"
+        self.daily_avg_this_week: str = "---"
         self.last_sync: str = "Never"
         self.queue_size: int = 0
         self.user_email: Optional[str] = None
@@ -74,6 +77,12 @@ class TrayModel:
         self.break_interval_hours: int = 2
         self.private_reminders_enabled: bool = True
         self.private_interval_minutes: int = 20
+
+        # Categorization
+        self.auto_categorize: bool = True
+
+        # Display tracking
+        self.track_display_info: bool = False
 
         # Screenshot preferences
         self.screenshots_enabled: bool = False
@@ -203,6 +212,11 @@ class TrayIcon:
 
         items.append(Item(f"App status: {self._get_status_text()}", None, enabled=False))
         items.append(Item(f"Hours today: {self.model.hours_today}", None, enabled=False))
+        items.append(Item("Trends", pystray.Menu(
+            Item(f"Hours this week: {self.model.hours_this_week}", None, enabled=False),
+            Item(f"Hours this month: {self.model.hours_this_month}", None, enabled=False),
+            Item(f"Daily avg this week: {self.model.daily_avg_this_week}", None, enabled=False),
+        ), enabled=logged_in))
 
         # ── Dashboard & Project Manager links ───────────────
         items.append(Item("Show My Dashboard", self._handle_show_dashboard, enabled=logged_in))
@@ -334,6 +348,16 @@ class TrayIcon:
                 "Domain Only URLs",
                 self._make_toggle_handler("domain_only_urls", "domain_only_urls"),
                 checked=lambda item: self.model.domain_only_urls,
+            ),
+            Item(
+                "Auto-Categorize Apps",
+                self._make_toggle_handler("auto_categorize", "auto_categorize"),
+                checked=lambda item: self.model.auto_categorize,
+            ),
+            Item(
+                "Track Display Info",
+                self._make_toggle_handler("track_display_info", "track_display_info"),
+                checked=lambda item: self.model.track_display_info,
             ),
             Item(
                 "Debug Mode",
@@ -564,6 +588,8 @@ class TrayIcon:
         self.model.sync_interval = config.sync.interval_seconds
         self.model.hash_titles = config.privacy.hash_titles
         self.model.domain_only_urls = config.privacy.domain_only_urls
+        self.model.auto_categorize = config.privacy.auto_categorize
+        self.model.track_display_info = config.privacy.track_display_info
         self.model.debug_mode = config.debug_mode
         self.model.auto_start = config.auto_start
         self.model.config_file_path = str(config.get_config_file())
@@ -605,6 +631,9 @@ class TrayIcon:
         last_sync: Optional[str] = None,
         queue_size: Optional[int] = None,
         events_today: Optional[int] = None,
+        hours_this_week: Optional[str] = None,
+        hours_this_month: Optional[str] = None,
+        daily_avg_this_week: Optional[str] = None,
         **_kwargs,
     ) -> None:
         """Update statistics shown in menu.
@@ -614,6 +643,9 @@ class TrayIcon:
             last_sync: Last sync time string
             queue_size: Number of events in offline queue
             events_today: Backward-compatible alias from older callers
+            hours_this_week: Formatted weekly hours string
+            hours_this_month: Formatted monthly hours string
+            daily_avg_this_week: Formatted daily average string
         """
         # Backward compatibility for older builds that pass events_today
         if hours_today is None and events_today is not None:
@@ -631,6 +663,12 @@ class TrayIcon:
             self.model.last_sync = last_sync
         if queue_size is not None:
             self.model.queue_size = queue_size
+        if hours_this_week is not None:
+            self.model.hours_this_week = hours_this_week
+        if hours_this_month is not None:
+            self.model.hours_this_month = hours_this_month
+        if daily_avg_this_week is not None:
+            self.model.daily_avg_this_week = daily_avg_this_week
         self._update_menu()
 
     def set_user(self, email: Optional[str], name: Optional[str] = None) -> None:

@@ -297,6 +297,10 @@ class BetterFlowClient(BaseApiClient):
         """Get sync status."""
         return self._request("GET", "events/status")
 
+    def get_trends(self) -> dict:
+        """Get weekly/monthly trend summaries."""
+        return self._request("GET", "events/trends")
+
     # =========================================================================
     # Screenshots
     # =========================================================================
@@ -338,6 +342,14 @@ class BetterFlowClient(BaseApiClient):
     def get_projects(self) -> list[dict]:
         """Get list of projects for app mapping."""
         return self._request("GET", "projects")
+
+    def get_categories(self) -> dict:
+        """Get app-to-category mappings from server.
+
+        Returns:
+            Dict with "categories" key mapping app names to categories.
+        """
+        return self._request("GET", "categories")
 
     def update_project_mapping(self, app_name: str, project_id: int) -> dict:
         """Update app to project mapping.

@@ -19,6 +19,7 @@ try:
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
+    from .display_info import start_display_tracker
     from .reminders import ReminderManager
     from .screenshots import capture as capture_screenshot
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -31,6 +32,7 @@ except ImportError:
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
     from config import Config, setup_logging
+    from display_info import start_display_tracker
     from reminders import ReminderManager
     from screenshots import capture as capture_screenshot
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -73,6 +75,11 @@ class SyncCoordinator:
         self._hours_today_seconds = 0
         self._hours_today_cache = "0h 0m"
         self._last_tick: Optional[datetime] = None
+        self._trends_cache: dict[str, str] = {
+            "hours_this_week": "---",
+            "hours_this_month": "---",
+            "daily_avg_this_week": "---",
+        }
 
         # Flags set by the app layer
         self.logged_in = False
@@ -84,6 +91,7 @@ class SyncCoordinator:
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
         self._do_sync()
+        self._fetch_trends()
 
         self.scheduler.add_job(
             self._do_sync,
@@ -109,6 +117,20 @@ class SyncCoordinator:
             self._expire_old_queue_events,
             trigger=IntervalTrigger(hours=24),
             id="queue_expire_job",
+            replace_existing=True,
+        )
+        # Refresh app categories every 6 hours
+        self.scheduler.add_job(
+            self.fetch_categories,
+            trigger=IntervalTrigger(hours=6),
+            id="category_refresh_job",
+            replace_existing=True,
+        )
+        # Refresh weekly/monthly trends every 30 minutes
+        self.scheduler.add_job(
+            self._fetch_trends,
+            trigger=IntervalTrigger(minutes=30),
+            id="trends_refresh_job",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -145,6 +167,17 @@ class SyncCoordinator:
             logger.info(f"Loaded {len(projects)} projects")
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
+
+    def fetch_categories(self) -> None:
+        """Fetch app-to-category mappings from server and sync to local DB."""
+        try:
+            response = self.bf.get_categories()
+            mappings = response.get("categories", {})
+            self.queue.sync_categories(mappings)
+            self.sync_engine.invalidate_category_cache()
+            logger.info(f"Synced {len(mappings)} app categories")
+        except Exception as e:
+            logger.warning(f"Failed to fetch categories: {e}")
 
     # -- internal ---------------------------------------------------------
 
@@ -280,6 +313,31 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Failed to refresh tray hours: {e}")
 
+    def _fetch_trends(self) -> None:
+        """Fetch weekly/monthly trend data from server."""
+        try:
+            if not self.logged_in:
+                return
+            response = self.bf.get_trends()
+            data = response.get("data", {})
+            self._trends_cache = {
+                "hours_this_week": self._format_hours(int(data.get("week_total_seconds", 0))),
+                "hours_this_month": self._format_hours(int(data.get("month_total_seconds", 0))),
+                "daily_avg_this_week": self._format_hours(int(data.get("week_daily_avg_seconds", 0))),
+            }
+            self.tray.update_stats(**self._trends_cache)
+        except Exception as e:
+            logger.debug(f"Failed to fetch trends: {e}")
+
+    def reset_trends(self) -> None:
+        """Reset cached trends to placeholder values."""
+        self._trends_cache = {
+            "hours_this_week": "---",
+            "hours_this_month": "---",
+            "daily_avg_this_week": "---",
+        }
+        self.tray.update_stats(**self._trends_cache)
+
     def _expire_old_queue_events(self) -> None:
         """Remove queue events older than 30 days."""
         try:
@@ -368,6 +426,7 @@ class BetterFlowSyncApp:
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
+        self.display_tracker = start_display_tracker()
 
         self.sync_engine = SyncEngine(
             aw=self.aw,
@@ -375,6 +434,7 @@ class BetterFlowSyncApp:
             queue=self.queue,
             config=self.config,
             on_config_updated=self._on_config_updated,
+            display_tracker=self.display_tracker,
         )
 
         self.login_manager = LoginManager(self.bf, self.keychain)
@@ -450,6 +510,7 @@ class BetterFlowSyncApp:
             self.tray.set_user(state.user_email, state.user_name)
             self.sync_engine.fetch_server_config()
             self.coordinator.fetch_projects()
+            self.coordinator.fetch_categories()
             self._check_stale_session()
             self._check_accessibility_permission()
             self.coordinator.start()
@@ -552,6 +613,7 @@ class BetterFlowSyncApp:
                 self.tray.set_user(state.user_email, state.user_name)
                 self.sync_engine.fetch_server_config()
                 self.coordinator.fetch_projects()
+                self.coordinator.fetch_categories()
                 if not self.coordinator.scheduler.running:
                     self.coordinator.start()
             else:
@@ -698,6 +760,10 @@ class BetterFlowSyncApp:
             self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
             self.config.privacy.domain_only_urls = value
+        elif key == "auto_categorize":
+            self.config.privacy.auto_categorize = value
+        elif key == "track_display_info":
+            self.config.privacy.track_display_info = value
         elif key == "auto_start":
             try:
                 from .autostart import set_auto_start
@@ -736,6 +802,7 @@ class BetterFlowSyncApp:
         self.sync_engine.shutdown()
         self.login_manager.logout()
         self.coordinator.logged_in = False
+        self.coordinator.reset_trends()
         self.tray.set_user(None)
         logger.info("Logged out")
 
@@ -778,6 +845,7 @@ class BetterFlowSyncApp:
 
         self.coordinator.stop()
         self.sync_engine.shutdown()
+        self.display_tracker.stop()
         self.aw.close()
         self.bf.close()
         self.queue.close()
