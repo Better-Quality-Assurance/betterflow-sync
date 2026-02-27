@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -298,6 +298,29 @@ class OfflineQueue:
             True if queue is at or above threshold
         """
         return self.capacity_percent() >= threshold
+
+    def expire_old(self, max_age_days: int = 30) -> int:
+        """Remove events older than max_age_days.
+
+        Args:
+            max_age_days: Maximum age in days
+
+        Returns:
+            Number of events removed
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM queued_events
+                WHERE created_at < ?
+                """,
+                (cutoff.isoformat(),),
+            )
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"Expired {count} queue events older than {max_age_days} days")
+            return count
 
     def clear(self) -> int:
         """Clear all events from the queue."""

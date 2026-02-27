@@ -5,7 +5,9 @@ import os
 import signal
 import sys
 import threading
+import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,6 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
 try:
+    from . import __version__
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
@@ -21,7 +24,9 @@ try:
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
     from .ui.tray import TrayIcon, TrayState
+    from .update_checker import check_for_update
 except ImportError:
+    from src import __version__
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
     from config import Config, setup_logging
@@ -30,6 +35,7 @@ except ImportError:
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
     from ui.tray import TrayIcon, TrayState
+    from update_checker import check_for_update
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,13 @@ class SyncCoordinator:
                 id="reminder_check_job",
                 replace_existing=True,
             )
+        # Expire stale queue events daily
+        self.scheduler.add_job(
+            self._expire_old_queue_events,
+            trigger=IntervalTrigger(hours=24),
+            id="queue_expire_job",
+            replace_existing=True,
+        )
         self.scheduler.start()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -263,6 +276,13 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Failed to refresh tray hours: {e}")
 
+    def _expire_old_queue_events(self) -> None:
+        """Remove queue events older than 30 days."""
+        try:
+            self.queue.expire_old(max_age_days=30)
+        except Exception as e:
+            logger.debug(f"Failed to expire old queue events: {e}")
+
     @staticmethod
     def _format_hours(total_seconds: int) -> str:
         """Format accumulated seconds as `Xh Ym` for tray display."""
@@ -324,6 +344,7 @@ class BetterFlowSyncApp:
             on_project_change=self._on_project_change,
             on_private_toggle=self._on_private_toggle,
             on_sync_now=self._on_sync_now,
+            on_export_logs=self._on_export_logs,
         )
         self.tray.set_config(self.config)
 
@@ -383,6 +404,8 @@ class BetterFlowSyncApp:
             self.tray.set_user(state.user_email, state.user_name)
             self.sync_engine.fetch_server_config()
             self.coordinator.fetch_projects()
+            self._check_stale_session()
+            self._check_accessibility_permission()
             self.coordinator.start()
         else:
             self.coordinator.logged_in = False
@@ -394,7 +417,16 @@ class BetterFlowSyncApp:
             on_wake=self._on_system_wake,
             on_shutdown=self._on_system_shutdown,
             on_network_change=self._on_network_change,
+            on_screen_lock=self._on_screen_lock,
+            on_screen_unlock=self._on_screen_unlock,
         )
+
+        # Check for updates in background
+        if self.config.check_updates:
+            check_for_update(
+                __version__.__version__,
+                callback=self._on_update_available,
+            )
 
         logger.info("BetterFlow Sync running")
         try:
@@ -403,6 +435,65 @@ class BetterFlowSyncApp:
             self._shutdown()
 
     # -- Event handlers ---------------------------------------------------
+
+    def _check_accessibility_permission(self) -> None:
+        """On macOS, check if ActivityWatch can read window titles.
+
+        If no window buckets are found after AW is running, it likely means
+        Accessibility permission hasn't been granted to aw-watcher-window.
+        """
+        if sys.platform != "darwin":
+            return
+        try:
+            import time
+            time.sleep(3)  # Give AW a moment to start watchers
+            window_buckets = self.aw.get_window_buckets()
+            if not window_buckets:
+                logger.warning(
+                    "No window tracking detected — ActivityWatch may need "
+                    "Accessibility permission in System Settings > Privacy & Security"
+                )
+                try:
+                    from .notifications import show_notification
+                except ImportError:
+                    from notifications import show_notification
+                show_notification(
+                    "BetterFlow Sync",
+                    "Grant Accessibility permission to ActivityWatch in "
+                    "System Settings > Privacy & Security for window tracking.",
+                )
+        except Exception as e:
+            logger.debug(f"Accessibility check failed: {e}")
+
+    def _on_update_available(self, version: str, url: str) -> None:
+        """Handle update available notification."""
+        logger.info(f"Update available: v{version} — {url}")
+        try:
+            from .notifications import show_notification
+        except ImportError:
+            from notifications import show_notification
+        show_notification(
+            "BetterFlow Sync Update",
+            f"Version {version} is available. Click to download.",
+        )
+
+    def _check_stale_session(self) -> None:
+        """Check if previous session is still active on server (forgot to clock out)."""
+        try:
+            status = self.bf.get_status()
+            session = status.get("data", {}).get("active_session")
+            if session and session.get("is_active"):
+                started = session.get("started_at", "unknown")
+                logger.warning(
+                    f"Stale session detected (started {started}) — "
+                    "ending previous session before starting new one"
+                )
+                try:
+                    self.bf.end_session("crash_recovery")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Stale session check failed: {e}")
 
     def _on_login(self) -> None:
         """Handle explicit login action from tray."""
@@ -486,6 +577,19 @@ class BetterFlowSyncApp:
         logger.info("System shutdown detected — shutting down")
         self._shutdown()
 
+    def _on_screen_lock(self) -> None:
+        """Handle screen lock — treat as AFK."""
+        logger.info("Screen locked — pausing tracking")
+        self.sync_engine.pause()
+        self.tray.set_state(TrayState.PAUSED, "Screen locked")
+
+    def _on_screen_unlock(self) -> None:
+        """Handle screen unlock — resume tracking."""
+        logger.info("Screen unlocked — resuming tracking")
+        self.sync_engine.resume()
+        self.tray.set_state(TrayState.SYNCING)
+        self.coordinator.trigger_sync("unlock_sync")
+
     def _on_network_change(self, is_online: bool) -> None:
         """Handle network connectivity change."""
         if is_online:
@@ -499,6 +603,41 @@ class BetterFlowSyncApp:
             self.sync_engine.pause()
             self.coordinator.paused_by_network = True
             self.tray.set_state(TrayState.QUEUED, "Offline")
+
+    def _on_export_logs(self) -> None:
+        """Export logs and redacted config to a zip file on the Desktop."""
+        try:
+            log_dir = Config.get_log_dir()
+            desktop = Path.home() / "Desktop"
+            if not desktop.exists():
+                desktop = Path.home()
+            zip_path = desktop / f"betterflow-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Add log files
+                for log_file in log_dir.glob("*.log*"):
+                    zf.write(log_file, f"logs/{log_file.name}")
+
+                # Add redacted config
+                config_file = Config.get_config_file()
+                if config_file.exists():
+                    import json
+                    with open(config_file) as f:
+                        cfg = json.load(f)
+                    # Redact sensitive fields
+                    cfg.pop("device_id", None)
+                    zf.writestr("config-redacted.json", json.dumps(cfg, indent=2))
+
+            logger.info(f"Logs exported to {zip_path}")
+
+            # Open the containing folder
+            import subprocess
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(zip_path)])
+            elif sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", str(zip_path)])
+        except Exception as e:
+            logger.error(f"Failed to export logs: {e}")
 
     def _on_config_updated(self) -> None:
         """Handle server config update — apply AFK timeout to AWManager."""

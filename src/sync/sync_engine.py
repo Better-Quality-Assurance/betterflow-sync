@@ -80,6 +80,9 @@ class SyncEngine:
         self._queue_consecutive_failures = 0
         self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
 
+        # Clock skew: track server-vs-local time offset (seconds, positive = server ahead)
+        self._server_time_offset: Optional[float] = None
+
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates —
         # we only re-send if the duration actually changed.
@@ -546,9 +549,17 @@ class SyncEngine:
                 if result.success:
                     stats.events_sent += result.events_synced
                 else:
-                    # Queue failed events
-                    self.queue.enqueue(batch)
-                    stats.events_queued += len(batch)
+                    # Partial batch: only re-queue events the server didn't accept
+                    if result.accepted_ids:
+                        accepted_set = set(result.accepted_ids)
+                        failed = [e for e in batch if e.get("id") not in accepted_set]
+                        stats.events_sent += len(result.accepted_ids)
+                        if failed:
+                            self.queue.enqueue(failed)
+                            stats.events_queued += len(failed)
+                    else:
+                        self.queue.enqueue(batch)
+                        stats.events_queued += len(batch)
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
@@ -593,6 +604,19 @@ class SyncEngine:
                     stats.events_sent += result.events_synced
                     processed += len(events)
                     self._queue_consecutive_failures = 0
+                elif result.accepted_ids:
+                    # Partial success: remove accepted, increment retry on rest
+                    accepted_set = set(result.accepted_ids)
+                    succeeded_ids = [eid for eid, ev in zip(event_ids, events)
+                                     if ev.get("id") in accepted_set]
+                    failed_ids = [eid for eid in event_ids if eid not in succeeded_ids]
+                    if succeeded_ids:
+                        self.queue.remove(succeeded_ids)
+                        stats.events_sent += len(succeeded_ids)
+                    if failed_ids:
+                        self.queue.increment_retry(failed_ids)
+                    self._queue_consecutive_failures = 0
+                    processed += len(succeeded_ids)
                 else:
                     self.queue.increment_retry(event_ids)
                     self._apply_queue_backoff()
@@ -634,6 +658,21 @@ class SyncEngine:
                 logger.warning(
                     f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
                 )
+
+            # Clock skew detection: compare server time with local time
+            server_time_str = response.get("server_time")
+            if server_time_str:
+                try:
+                    server_time = datetime.fromisoformat(server_time_str)
+                    local_time = datetime.now(timezone.utc)
+                    self._server_time_offset = (server_time - local_time).total_seconds()
+                    if abs(self._server_time_offset) > 300:
+                        logger.warning(
+                            f"Clock skew detected: server time differs by "
+                            f"{self._server_time_offset:.0f}s — timestamps may be inaccurate"
+                        )
+                except (ValueError, TypeError):
+                    pass
 
             # Re-fetch config if server says it changed
             if response.get("config_updated"):

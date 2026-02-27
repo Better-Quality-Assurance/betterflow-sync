@@ -149,6 +149,7 @@ class TrayIcon:
         on_project_change: Optional[Callable[[Optional[ProjectDict]], None]] = None,
         on_private_toggle: Optional[Callable[[bool], None]] = None,
         on_sync_now: Optional[Callable[[], None]] = None,
+        on_export_logs: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -162,6 +163,7 @@ class TrayIcon:
             on_project_change: Callback when project is switched (receives project dict or None)
             on_private_toggle: Callback when private time is toggled (receives bool)
             on_sync_now: Callback to trigger an immediate sync
+            on_export_logs: Callback to export logs to a zip file
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -175,6 +177,7 @@ class TrayIcon:
         self._on_project_change = on_project_change
         self._on_private_toggle = on_private_toggle
         self._on_sync_now = on_sync_now
+        self._on_export_logs = on_export_logs
 
         self.model = TrayModel()
 
@@ -298,6 +301,15 @@ class TrayIcon:
 
         items.append(Item("─" * 20, None, enabled=False))
 
+        # ── Diagnostics submenu ─────────────────────────────
+        diag_items = [
+            Item(f"ActivityWatch: {'Running' if self._check_aw_status() else 'Not running'}", None, enabled=False),
+            Item(f"API: {'Connected' if self._check_api_status() else 'Unreachable'}", None, enabled=False),
+            Item(f"Queue: {self.model.queue_size} events", None, enabled=False),
+            Item(f"Last sync: {self.model.last_sync}", None, enabled=False),
+        ]
+        items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
+
         # ── Preferences submenu ─────────────────────────────
         items.append(Item("Preferences", pystray.Menu(
             Item(
@@ -329,6 +341,7 @@ class TrayIcon:
                 self._make_toggle_handler("auto_start", "auto_start"),
                 checked=lambda item: self.model.auto_start,
             ),
+            Item("Export Logs", self._handle_export_logs),
             Item("Open Config File", self._handle_open_config),
         ), enabled=logged_in))
 
@@ -363,6 +376,16 @@ class TrayIcon:
             return "Waiting for login..."
         else:
             return "Starting..."
+
+    # -- Diagnostics helpers --------------------------------------------------
+
+    def _check_aw_status(self) -> bool:
+        """Check if ActivityWatch is reachable (best-effort, non-blocking)."""
+        return self.model.state not in (TrayState.ERROR, TrayState.STARTING, TrayState.WAITING_AUTH)
+
+    def _check_api_status(self) -> bool:
+        """Check if BetterFlow API is reachable (best-effort, non-blocking)."""
+        return self.model.state not in (TrayState.QUEUED, TrayState.QUEUE_WARNING, TrayState.ERROR)
 
     # -- Menu action handlers ------------------------------------------------
 
@@ -478,6 +501,11 @@ class TrayIcon:
                     self._on_preferences("private_interval_minutes", minutes)
             self._update_menu()
         return handler
+
+    def _handle_export_logs(self, icon, item) -> None:
+        """Handle export logs menu click."""
+        if self._on_export_logs:
+            self._on_export_logs()
 
     def _handle_open_config(self, icon, item) -> None:
         if self.model.config_file_path:

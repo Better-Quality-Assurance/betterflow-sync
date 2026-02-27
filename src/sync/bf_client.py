@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -89,6 +89,7 @@ class SyncResult:
     events_synced: int = 0
     events_queued: int = 0
     error: Optional[str] = None
+    accepted_ids: list[int] = field(default_factory=list)
 
 
 class BetterFlowClient(BaseApiClient):
@@ -235,6 +236,7 @@ class BetterFlowClient(BaseApiClient):
                 success=True,
                 events_synced=response.get("processed", len(events)),
                 events_queued=response.get("failed", 0),
+                accepted_ids=response.get("accepted_ids", []),
             )
         except BetterFlowAuthError as e:
             return SyncResult(success=False, error=str(e))
