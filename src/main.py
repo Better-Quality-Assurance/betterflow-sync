@@ -64,6 +64,7 @@ class SyncCoordinator:
         self.scheduler = BackgroundScheduler()
         self._hours_today_seconds = 0
         self._hours_today_cache = "0h 0m"
+        self._last_tick: Optional[datetime] = None
 
         # Flags set by the app layer
         self.logged_in = False
@@ -145,6 +146,10 @@ class SyncCoordinator:
                 self.aw_manager.restart_if_needed()
 
             if not self.aw.is_running():
+                if self.aw_manager.is_managing:
+                    logger.warning("ActivityWatch not responding — attempting restart")
+                    self.aw_manager.stop()
+                    self.aw_manager.start()
                 self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
                 return
 
@@ -214,7 +219,11 @@ class SyncCoordinator:
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
-        """Increment tray hours locally every minute while tracking is active."""
+        """Increment tray hours locally every minute while tracking is active.
+
+        Detects large time jumps (DST, sleep) and re-fetches server hours
+        instead of blindly incrementing.
+        """
         try:
             if not self.logged_in:
                 return
@@ -224,6 +233,19 @@ class SyncCoordinator:
                 return
             if not self.aw.is_running():
                 return
+
+            now = datetime.now()
+
+            # Detect large time jump (> 5 min since last tick = DST or wake)
+            if self._last_tick is not None:
+                delta = abs((now - self._last_tick).total_seconds())
+                if delta > 300:
+                    logger.info(f"Time jump detected ({delta:.0f}s) — re-fetching hours from server")
+                    self._last_tick = now
+                    hours = self._fetch_hours_today()
+                    self.tray.update_stats(hours_today=hours)
+                    return
+            self._last_tick = now
 
             # Skip increment if user is currently AFK
             try:
@@ -519,6 +541,8 @@ class BetterFlowSyncApp:
 
     def _on_logout(self) -> None:
         """Handle logout action."""
+        # End server session before stopping
+        self.sync_engine.shutdown()
         self.login_manager.logout()
         self.coordinator.logged_in = False
         self.tray.set_user(None)

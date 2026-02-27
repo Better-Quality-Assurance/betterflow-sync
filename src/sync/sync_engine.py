@@ -7,6 +7,14 @@ from typing import Optional
 from urllib.parse import urlparse
 
 try:
+    from ..__init__ import __version__ as AGENT_VERSION
+except ImportError:
+    try:
+        from __init__ import __version__ as AGENT_VERSION
+    except ImportError:
+        AGENT_VERSION = "0.0.0"
+
+try:
     from ..config import Config, PrivacySettings
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
@@ -67,6 +75,10 @@ class SyncEngine:
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
+
+        # Queue retry backoff
+        self._queue_consecutive_failures = 0
+        self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates —
@@ -450,10 +462,18 @@ class SyncEngine:
             data["clicks"] = event.clicks
             data["scrolls"] = event.scrolls
 
+        # Clamp future timestamps and reject negative durations
+        now = datetime.now(timezone.utc)
+        timestamp = event.timestamp
+        if timestamp > now + timedelta(minutes=1):
+            logger.warning(f"Clamping future timestamp {timestamp} to now")
+            timestamp = now
+        duration = max(0, round(event.duration, 2))
+
         result = {
             "id": event.id,
-            "timestamp": event.timestamp.isoformat(),
-            "duration": round(event.duration, 2),
+            "timestamp": timestamp.isoformat(),
+            "duration": duration,
             "bucket_id": bucket_id,
             "bucket_type": bucket_type,
             "data": data,
@@ -544,9 +564,14 @@ class SyncEngine:
                 stats.events_queued += len(batch)
 
     def _process_queue(self, stats: SyncStats) -> None:
-        """Process offline queue."""
+        """Process offline queue with exponential backoff."""
         # Remove events that exceeded retry limit
         self.queue.remove_failed(max_retries=5)
+
+        # Skip queue processing if in backoff period
+        now = datetime.now(timezone.utc)
+        if now < self._queue_backoff_until:
+            return
 
         # Process queue in batches
         batch_size = self.config.sync.batch_size
@@ -567,14 +592,23 @@ class SyncEngine:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
                     processed += len(events)
+                    self._queue_consecutive_failures = 0
                 else:
-                    # Increment retry count
                     self.queue.increment_retry(event_ids)
+                    self._apply_queue_backoff()
                     break
             except BetterFlowClientError:
-                # Still offline
                 self.queue.increment_retry(event_ids)
+                self._apply_queue_backoff()
                 break
+
+    def _apply_queue_backoff(self) -> None:
+        """Apply exponential backoff for queue processing failures."""
+        self._queue_consecutive_failures += 1
+        # 60s, 120s, 240s, 480s, max 600s (10 min)
+        delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
+        self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
 
     def _send_heartbeat(self) -> None:
         """Send heartbeat to server and process commands."""
@@ -594,12 +628,29 @@ class SyncEngine:
                     self._advance_checkpoints_to_now("server_deregister")
                     self._paused = True
 
+            # Version compatibility check
+            min_version = response.get("minimum_agent_version")
+            if min_version and self._version_below(AGENT_VERSION, min_version):
+                logger.warning(
+                    f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
+                )
+
             # Re-fetch config if server says it changed
             if response.get("config_updated"):
                 self.fetch_server_config()
 
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
+
+    @staticmethod
+    def _version_below(current: str, minimum: str) -> bool:
+        """Compare semver-style version strings."""
+        try:
+            cur = tuple(int(x) for x in current.split(".")[:3])
+            min_ = tuple(int(x) for x in minimum.split(".")[:3])
+            return cur < min_
+        except (ValueError, AttributeError):
+            return False
 
     def get_status(self) -> dict:
         """Get current sync status."""

@@ -88,7 +88,26 @@ class OfflineQueue:
         """Initialize the database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Integrity check — reset on corruption
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            conn.close()
+            if result[0] != "ok":
+                logger.error(f"SQLite integrity check failed: {result[0]} — resetting database")
+                backup = self.db_path.with_suffix(".db.corrupt")
+                self.db_path.rename(backup)
+        except sqlite3.DatabaseError as e:
+            logger.error(f"SQLite corruption detected: {e} — resetting database")
+            backup = self.db_path.with_suffix(".db.corrupt")
+            try:
+                self.db_path.rename(backup)
+            except OSError:
+                self.db_path.unlink(missing_ok=True)
+
         with self._cursor() as cursor:
+            # Enable WAL mode for crash resilience
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS queued_events (
