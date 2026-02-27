@@ -68,6 +68,12 @@ class SyncEngine:
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
 
+        # Dedup: track (bucket_id, event_id) pairs already sent this session.
+        # The lookback window re-fetches recent events for duration updates —
+        # we only re-send if the duration actually changed.
+        self._sent_cache: dict[tuple[str, int], float] = {}
+        self._SENT_CACHE_MAX = 10_000
+
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
         if not self._paused:
@@ -244,14 +250,32 @@ class SyncEngine:
         bucket_type: str,
         stats: SyncStats,
     ) -> list[dict]:
-        """Transform events to BetterFlow format and update checkpoint."""
+        """Transform events to BetterFlow format and update checkpoint.
+
+        Skips events already sent with unchanged duration (dedup).
+        Re-sends if duration has grown (heartbeat extension).
+        """
         transformed = []
         for event in events:
+            # Dedup: skip if already sent with same duration
+            cache_key = (bucket_id, event.id)
+            prev_duration = self._sent_cache.get(cache_key)
+            if prev_duration is not None and abs(event.duration - prev_duration) < 0.5:
+                stats.events_filtered += 1
+                continue
+
             transformed_event = self._transform_event(event, bucket_id, bucket_type)
             if transformed_event:
                 transformed.append(transformed_event)
+                self._sent_cache[cache_key] = event.duration
             else:
                 stats.events_filtered += 1
+
+        # Evict oldest entries if cache grows too large
+        if len(self._sent_cache) > self._SENT_CACHE_MAX:
+            excess = len(self._sent_cache) - self._SENT_CACHE_MAX
+            for key in list(self._sent_cache)[:excess]:
+                del self._sent_cache[key]
 
         if events:
             newest = max(events, key=lambda e: e.timestamp)
