@@ -20,6 +20,7 @@ try:
     from .aw_manager import AWManager
     from .config import Config, setup_logging
     from .reminders import ReminderManager
+    from .screenshots import capture as capture_screenshot
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
@@ -31,6 +32,7 @@ except ImportError:
     from aw_manager import AWManager
     from config import Config, setup_logging
     from reminders import ReminderManager
+    from screenshots import capture as capture_screenshot
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
@@ -110,6 +112,8 @@ class SyncCoordinator:
             replace_existing=True,
         )
         self.scheduler.start()
+        # Start screenshot job after scheduler is running
+        self.start_screenshot_job()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
         )
@@ -282,6 +286,48 @@ class SyncCoordinator:
             self.queue.expire_old(max_age_days=30)
         except Exception as e:
             logger.debug(f"Failed to expire old queue events: {e}")
+
+    # -- Screenshots ----------------------------------------------------------
+
+    def start_screenshot_job(self) -> None:
+        """Start (or restart) the periodic screenshot capture job."""
+        if not self.config.screenshots.enabled:
+            self.stop_screenshot_job()
+            return
+
+        interval = self.config.screenshots.interval_seconds
+        self.scheduler.add_job(
+            self._do_screenshot,
+            trigger=IntervalTrigger(seconds=interval),
+            id="screenshot_job",
+            replace_existing=True,
+        )
+        logger.info(f"Screenshot job started (interval: {interval}s)")
+
+    def stop_screenshot_job(self) -> None:
+        """Remove the screenshot job if it exists."""
+        try:
+            self.scheduler.remove_job("screenshot_job")
+            logger.info("Screenshot job stopped")
+        except Exception:
+            pass  # Job doesn't exist — nothing to do
+
+    def _do_screenshot(self) -> None:
+        """Capture and upload a screenshot if conditions allow."""
+        try:
+            if not self.logged_in:
+                return
+            if self.sync_engine.is_paused or self.sync_engine.is_private:
+                return
+            if self.paused_by_network:
+                return
+            if not self.config.screenshots.enabled:
+                return
+
+            shot = capture_screenshot(quality=self.config.screenshots.quality)
+            self.bf.upload_screenshot(shot.image_bytes, shot.filename, shot.timestamp)
+        except Exception as e:
+            logger.warning(f"Screenshot capture/upload failed: {e}")
 
     @staticmethod
     def _format_hours(total_seconds: int) -> str:
@@ -674,6 +720,12 @@ class BetterFlowSyncApp:
         elif key == "private_interval_minutes":
             self.config.reminders.private_interval_minutes = value
             self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "screenshots_enabled":
+            self.config.screenshots.enabled = value
+            self.coordinator.start_screenshot_job()
+        elif key == "screenshot_interval":
+            self.config.screenshots.interval_seconds = value
+            self.coordinator.start_screenshot_job()
 
         self.config.save()
         logger.info(f"Preference changed: {key} = {value}")

@@ -17,6 +17,7 @@ __all__ = [
     "SyncSettings",
     "AWSettings",
     "ReminderSettings",
+    "ScreenshotSettings",
     "setup_logging",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
@@ -194,6 +195,15 @@ class ReminderSettings:
 
 
 @dataclass
+class ScreenshotSettings:
+    """Screenshot capture settings."""
+
+    enabled: bool = False
+    interval_seconds: int = 300  # 5 min default
+    quality: int = 80  # JPEG quality (1-100)
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -203,6 +213,7 @@ class Config:
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     reminders: ReminderSettings = field(default_factory=ReminderSettings)
+    screenshots: ScreenshotSettings = field(default_factory=ScreenshotSettings)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -263,6 +274,7 @@ class Config:
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
         reminders_data = data.pop("reminders", {})
+        screenshots_data = data.pop("screenshots", {})
 
         # Migrate legacy localhost URLs to production endpoint.
         api_url = data.get("api_url")
@@ -279,6 +291,7 @@ class Config:
             sync=SyncSettings(**sync_data) if sync_data else SyncSettings(),
             privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
             reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
+            screenshots=ScreenshotSettings(**screenshots_data) if screenshots_data else ScreenshotSettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -342,6 +355,15 @@ class Config:
                 self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
+
+        if "screenshots" in server_config:
+            ss = server_config["screenshots"]
+            if "enabled" in ss:
+                self.screenshots.enabled = self._to_bool(ss["enabled"])
+            if "interval_seconds" in ss:
+                self.screenshots.interval_seconds = max(60, int(ss["interval_seconds"]))
+            if "quality" in ss:
+                self.screenshots.quality = max(10, min(100, int(ss["quality"])))
 
         self.save()
 

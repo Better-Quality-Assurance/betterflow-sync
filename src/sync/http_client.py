@@ -142,6 +142,7 @@ class BaseApiClient:
         method: str,
         endpoint: str,
         data: Optional[dict] = None,
+        files: Optional[dict] = None,
         compress: bool = False,
         retry: bool = True,
     ) -> dict:
@@ -150,7 +151,8 @@ class BaseApiClient:
         Args:
             method: HTTP method
             endpoint: API endpoint (relative to api_url)
-            data: Request data
+            data: Request data (sent as JSON, or as form fields when files is set)
+            files: Files for multipart upload, e.g. {"file": ("name", bytes, "mime")}
             compress: Whether to gzip compress the payload
             retry: Whether to retry on transient failures
 
@@ -165,7 +167,14 @@ class BaseApiClient:
         headers = self._get_headers()
         kwargs: dict = {"timeout": self.timeout, "headers": headers}
 
-        if data:
+        if files:
+            # Multipart upload — data goes as form fields, not JSON
+            kwargs["files"] = files
+            if data:
+                kwargs["data"] = data
+            # Remove Accept: application/json so requests sets multipart headers
+            headers.pop("Content-Type", None)
+        elif data:
             if compress and self.compress:
                 json_data = json.dumps(data).encode("utf-8")
                 compressed = gzip.compress(json_data)

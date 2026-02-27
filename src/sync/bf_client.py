@@ -298,6 +298,36 @@ class BetterFlowClient(BaseApiClient):
         return self._request("GET", "events/status")
 
     # =========================================================================
+    # Screenshots
+    # =========================================================================
+
+    def upload_screenshot(self, image_bytes: bytes, filename: str, timestamp: str) -> bool:
+        """Upload a screenshot to BetterFlow.
+
+        Args:
+            image_bytes: JPEG image data.
+            filename: Suggested filename (e.g. screenshot_20260227_143000.jpg).
+            timestamp: ISO-8601 UTC capture timestamp.
+
+        Returns:
+            True on success, False on failure.
+        """
+        try:
+            self._request(
+                "POST",
+                "screenshots/upload",
+                data={"timestamp": timestamp},
+                files={"file": (filename, image_bytes, "image/jpeg")},
+            )
+            logger.info(f"Screenshot uploaded: {filename}")
+            return True
+        except BetterFlowAuthError:
+            raise
+        except BetterFlowClientError as e:
+            logger.warning(f"Screenshot upload failed: {e}")
+            return False
+
+    # =========================================================================
     # Configuration
     # =========================================================================
 
