@@ -58,6 +58,7 @@ run:
 dmg: build-mac
 	create-dmg \
 		--volname "BetterFlow Sync" \
+		--volicon "resources/icon.icns" \
 		--window-pos 200 120 \
 		--window-size 600 400 \
 		--icon-size 100 \
@@ -66,6 +67,13 @@ dmg: build-mac
 		"dist/BetterFlow Sync.dmg" \
 		"dist/BetterFlow Sync.app"
 	rm -f "dist/BetterFlow Sync"
+	@# Set custom file icon on the DMG so it shows BetterFlow logo in Finder
+	python3 -c "\
+	import Cocoa, os; \
+	ws = Cocoa.NSWorkspace.sharedWorkspace(); \
+	img = Cocoa.NSImage.alloc().initWithContentsOfFile_(os.path.abspath('resources/icon.png')); \
+	ws.setIcon_forFile_options_(img, os.path.abspath('dist/BetterFlow Sync.dmg'), 0); \
+	print('Custom icon set on DMG')"
 
 # Development server (auto-reload)
 dev:
