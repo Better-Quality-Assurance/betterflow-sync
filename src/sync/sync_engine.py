@@ -19,11 +19,15 @@ try:
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
+    from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
+    from .daily_time_tracker import DailyTimeTracker
 except ImportError:
     from config import Config, PrivacySettings
     from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
+    from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
+    from sync.daily_time_tracker import DailyTimeTracker
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,8 @@ class SyncEngine:
         config: Config,
         on_config_updated: Optional[callable] = None,
         display_tracker=None,
+        activity_analyzer: Optional[ActivityAnalyzer] = None,
+        time_tracker: Optional[DailyTimeTracker] = None,
     ):
         self.aw = aw
         self.bf = bf
@@ -94,6 +100,24 @@ class SyncEngine:
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
         self._category_cache: Optional[dict[str, str]] = None
+
+        # Activity analysis for fraud detection (DIP)
+        self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
+            thresholds=self._create_engagement_thresholds()
+        )
+        self._time_tracker = time_tracker or DailyTimeTracker()
+
+    def _create_engagement_thresholds(self) -> EngagementThresholds:
+        """Create EngagementThresholds from config."""
+        eng = self.config.engagement
+        return EngagementThresholds(
+            sustained_typing_presses=eng.sustained_typing_presses,
+            window_changes_min=eng.window_changes_min,
+            scroll_threshold=eng.scroll_threshold,
+            combined_presses_min=eng.combined_presses_min,
+            combined_scrolls_min=eng.combined_scrolls_min,
+            window_minutes=eng.window_minutes,
+        )
 
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
@@ -156,6 +180,12 @@ class SyncEngine:
             self.config.update_from_server(server_config)
             self._config_fetched = True
             logger.info("Server configuration applied")
+
+            # Update activity analyzer thresholds from new config
+            self._activity_analyzer.update_thresholds(
+                self._create_engagement_thresholds()
+            )
+
             if self._on_config_updated:
                 self._on_config_updated()
         except BetterFlowClientError as e:
@@ -202,6 +232,22 @@ class SyncEngine:
         except AWClientError as e:
             stats.errors.append(f"Failed to get buckets: {e}")
             return stats
+
+        # Fetch input events for activity analysis before processing window events
+        # Use 2x engagement window to ensure coverage for rolling window calculations
+        input_lookback_minutes = self.config.engagement.window_minutes * 2
+        input_events_for_analysis: list[AWEvent] = []
+        for bucket in input_buckets:
+            try:
+                events = self.aw.get_events_since(
+                    bucket.id,
+                    datetime.now(timezone.utc) - timedelta(minutes=input_lookback_minutes),
+                    limit=1000,
+                )
+                input_events_for_analysis.extend(events)
+            except AWClientError:
+                pass
+        self._activity_analyzer.add_input_events(input_events_for_analysis)
 
         # Sync window buckets with gap-filling
         all_events = []
@@ -286,6 +332,10 @@ class SyncEngine:
         Skips events already sent with unchanged duration (dedup).
         Re-sends if duration has grown (heartbeat extension).
         """
+        # Feed window events to activity analyzer for window change detection
+        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
+            self._activity_analyzer.add_window_events(events)
+
         transformed = []
         for event in events:
             # Dedup: skip if already sent with same duration
@@ -517,6 +567,19 @@ class SyncEngine:
         # Tag with current project if set
         if self._current_project:
             result["project_id"] = self._current_project["id"]
+
+        # Add activity classification for window events (fraud detection)
+        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+            activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
+            activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
+
+            result["activity_state"] = activity_state
+            result["activity_metrics"] = activity_metrics.to_dict()
+
+            # Track active time (only "active" events count)
+            if activity_state == "active":
+                event_date = event.timestamp.astimezone().date()
+                self._time_tracker.add_active_time(event.duration, event_date)
 
         return result
 
@@ -771,6 +834,13 @@ class SyncEngine:
             f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
         )
 
+    def get_today_active_time(self) -> timedelta:
+        """Get cumulative active work time for today.
+
+        Only "active" events (engaged work) count toward this total.
+        """
+        return self._time_tracker.get_today_active_time()
+
     def shutdown(self) -> None:
         """Shutdown the sync engine gracefully."""
         if self._session_active:
@@ -779,3 +849,6 @@ class SyncEngine:
             except BetterFlowClientError:
                 pass
             self._session_active = False
+
+        # Close time tracker
+        self._time_tracker.close()
