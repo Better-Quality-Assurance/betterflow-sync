@@ -85,9 +85,6 @@ class TrayModel:
         # Display tracking
         self.track_display_info: bool = False
 
-        # Screenshot preferences
-        self.screenshots_enabled: bool = False
-        self.screenshot_interval: int = 300  # seconds
 
 try:
     import pystray
@@ -378,31 +375,6 @@ class TrayIcon:
                     Item("Canary", self._make_channel_handler("canary"), checked=lambda item: self.model.update_channel == "canary"),
                 ),
             ),
-            Item(
-                "Screenshots",
-                pystray.Menu(
-                    Item(
-                        "Disabled",
-                        self._make_screenshot_handler(enabled=False),
-                        checked=lambda item: not self.model.screenshots_enabled,
-                    ),
-                    Item(
-                        "Every 1 min",
-                        self._make_screenshot_handler(enabled=True, interval=60),
-                        checked=lambda item: self.model.screenshots_enabled and self.model.screenshot_interval == 60,
-                    ),
-                    Item(
-                        "Every 5 min",
-                        self._make_screenshot_handler(enabled=True, interval=300),
-                        checked=lambda item: self.model.screenshots_enabled and self.model.screenshot_interval == 300,
-                    ),
-                    Item(
-                        "Every 10 min",
-                        self._make_screenshot_handler(enabled=True, interval=600),
-                        checked=lambda item: self.model.screenshots_enabled and self.model.screenshot_interval == 600,
-                    ),
-                ),
-            ),
             Item("Export Logs", self._handle_export_logs),
             Item("Open Config File", self._handle_open_config),
         ), enabled=logged_in))
@@ -573,19 +545,6 @@ class TrayIcon:
             self._update_menu()
         return handler
 
-    def _make_screenshot_handler(self, enabled: bool, interval: int = 0) -> Callable:
-        """Create a handler for screenshot interval radio selection."""
-        def handler(icon, item):
-            self.model.screenshots_enabled = enabled
-            if self._on_preferences:
-                self._on_preferences("screenshots_enabled", enabled)
-            if enabled and interval:
-                self.model.screenshot_interval = interval
-                if self._on_preferences:
-                    self._on_preferences("screenshot_interval", interval)
-            self._update_menu()
-        return handler
-
     def _handle_export_logs(self, icon, item) -> None:
         """Handle export logs menu click."""
         if self._on_export_logs:
@@ -616,8 +575,6 @@ class TrayIcon:
         self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
         self.model.private_interval_minutes = config.reminders.private_interval_minutes
         self.model.update_channel = config.update_channel
-        self.model.screenshots_enabled = config.screenshots.enabled
-        self.model.screenshot_interval = config.screenshots.interval_seconds
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)
