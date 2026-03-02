@@ -1,33 +1,148 @@
-# BetterFlow Sync — Improvement Plan
+# BetterFlow Sync — Install & Run Guide
 
-## Critical (data loss / tracking accuracy)
+## Prerequisites
 
-- [x] **1. No event deduplication** — if sync restarts mid-batch, same events get sent twice. Fix: use AW event ID + bucket_id as composite dedup key; verify server upsert in response.
-- [x] **2. No DST transition handling** — clock jump can double-count or skip an hour. Fix: detect system time jump via delta check; reset hourly cache on large jumps.
-- [x] **3. No clock skew detection** — AW time vs system time drift breaks checkpoints. Fix: compare server time from heartbeat response; warn if > 5min skew.
-- [x] **4. No exponential backoff on queue retry** — failed queue retries hammer the server every 60s. Fix: implement per-event retry delay with exponential backoff + jitter.
-- [x] **5. No SQLite corruption recovery** — corrupted queue.db makes app unusable. Fix: enable WAL mode; add integrity check on startup; auto-reset on corruption.
-- [x] **6. No session cleanup on logout** — `end_session()` never called before logout, orphaned sessions on server. Fix: call `end_session()` in `_on_logout` before stopping coordinator.
-- [x] **7. No AW crash recovery** — if ActivityWatch dies, tray shows ERROR indefinitely until manual restart. Fix: AWManager should auto-restart the full suite when `is_running()` returns False.
-- [x] **8. No partial batch failure handling** — server accepts 8/10 events, client retries all 10 = duplicates. Fix: server returns accepted event IDs; client only re-queues failures.
-- [x] **9. No version compatibility check** — old client + new server API = silent data loss. Fix: heartbeat response includes `minimum_agent_version`; app warns/blocks if outdated.
-- [x] **10. No event timestamp validation** — future timestamp advances checkpoint, skipping current events. Fix: clamp event timestamps to now(); warn on large skew.
+- **Python 3.10+**
+- **ActivityWatch** installed and running — download from https://activitywatch.net/
+- **BetterFlow account** — sign up at https://betterflow.eu
 
-## Important (reliability / UX)
+## 1. Clone the Repository
 
-- [x] **11. No auto-update mechanism** — users stuck on old versions forever. Fix: check for updates via GitHub releases API; prompt user to download.
-- [x] **12. No screen lock detection** — locked screen doesn't trigger AFK on some systems. Fix: add OS-level lock/unlock detection (macOS distributed notifications, Windows WTS events).
-- [x] **13. No "forgot to clock out" warning** — if app crashes, session stays active on server. Fix: on startup, check if last session is still active; warn user.
-- [x] **14. No diagnostics panel** — user can't check AW health, API connectivity, token validity, queue status. Fix: add "Diagnostics" submenu in tray with live status checks.
-- [x] **15. No log export** — users must manually find log files to share for debugging. Fix: add "Export Logs" in Preferences; zip logs + redacted config.
-- [x] **16. No macOS Accessibility permission request** in setup wizard — first sync silently fails. Fix: check/request permission in wizard step.
-- [x] **17. No daily summary in tray** — just hours, no top apps or productivity breakdown. Fix: hours today shown in tray header.
-- [x] **18. Queue age limit missing** — stale events sit in queue for weeks, never expire. Fix: auto-expire queue items older than 30 days.
+```bash
+git clone https://github.com/Better-Quality-Assurance/betterflow-sync.git
+cd betterflow-sync
+```
 
-## Nice-to-have (polish / advanced)
+## 2. Create a Virtual Environment
 
-- [x] **19. Screenshot capability** (anti-fraud, compliance). Fix: togglable screenshots at configurable intervals; encrypted upload.
-- [x] **20. Client-side app categorization database**. Fix: maintain local category DB; sync from server; allow overrides.
-- [x] **21. Multi-monitor / virtual desktop awareness**. Fix: requires AW enhancement; agent could tag current desktop/space.
-- [x] **22. Weekly/monthly trends in tray**. Fix: cache weekly summary; show in tray submenu.
-- [x] **23. Beta/canary update channel**. Fix: add update channel setting; check beta endpoint.
+```bash
+python3 -m venv venv
+source venv/bin/activate        # macOS / Linux
+# venv\Scripts\activate          # Windows
+```
+
+## 3. Install Dependencies
+
+```bash
+# Production only
+pip install -r requirements.txt
+
+# Development (includes tests, linter, PyInstaller)
+pip install -r requirements-dev.txt
+```
+
+## 4. (Optional) Configure Environment Overrides
+
+Copy the example file and edit as needed:
+
+```bash
+cp .env.example .env
+```
+
+Available overrides:
+
+| Variable | Description | Default |
+|---|---|---|
+| `BETTERFLOW_API_URL` | Agent sync API endpoint | `https://app.betterflow.eu/api/agent` |
+| `BETTERFLOW_WEB_BASE_URL` | Web app base URL (for auth & dashboard links) | derived from API URL |
+| `BETTERFLOW_SYNC_ENV_FILE` | Explicit path to a `.env` file | — |
+
+Example for local backend development:
+
+```env
+BETTERFLOW_API_URL=http://127.0.0.1:8001/api/agent
+BETTERFLOW_WEB_BASE_URL=https://app.betterflow.eu
+```
+
+## 5. Run the App
+
+```bash
+# Standard run
+python3 -m src.main
+
+# Or via Makefile
+make run
+```
+
+On first launch a **setup wizard** will appear. After that the app runs in your **system tray** — there is no main window.
+
+## 6. Sign In
+
+1. The app opens your browser to the BetterFlow login page.
+2. Authorize the device.
+3. The tray icon turns green once syncing starts.
+
+## Tray Icon Status Colors
+
+| Color | Meaning |
+|---|---|
+| Green | Connected and syncing |
+| Yellow | Offline — events queued locally |
+| Orange | Offline — queue nearing capacity |
+| Red | Error (auth failure or ActivityWatch not running) |
+| Gray | Paused |
+| Dark gray | Private time — nothing recorded |
+| Blue | Starting up |
+| Amber | Waiting for browser login |
+
+## Running Tests
+
+```bash
+make test
+# or directly
+pytest tests/ -v --cov=src --cov-report=term-missing
+```
+
+## Linting & Formatting
+
+```bash
+make lint       # check with ruff
+make format     # auto-format with ruff
+```
+
+## Building for Distribution
+
+### macOS
+
+```bash
+make build-mac          # creates dist/BetterFlow Sync.app
+make dmg                # creates dist/BetterFlow Sync.dmg (requires create-dmg)
+```
+
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build-windows.ps1
+# or manually:
+pyinstaller build.spec --clean
+```
+
+## Configuration Files
+
+| File | Location (macOS) | Location (Windows) |
+|---|---|---|
+| Config | `~/Library/Application Support/BetterFlow Sync/config.json` | `%APPDATA%\BetterQA\BetterFlow Sync\config.json` |
+| Logs | `~/Library/Logs/BetterFlow Sync/betterflow-sync.log` | `%APPDATA%\BetterQA\BetterFlow Sync\Logs\betterflow-sync.log` |
+| Queue DB | `~/Library/Application Support/BetterFlow Sync/offline_queue.db` | `%APPDATA%\BetterQA\BetterFlow Sync\offline_queue.db` |
+| Credentials | System keychain (Keychain Access) | Windows Credential Manager |
+
+## Troubleshooting
+
+### ActivityWatch not detected
+
+1. Make sure `aw-server` is running on port 5600.
+2. Visit http://localhost:5600 in your browser to verify.
+3. Ensure `aw-watcher-window` is running.
+4. On macOS, grant **Accessibility** permission to ActivityWatch in System Settings > Privacy & Security.
+
+### Sync not working
+
+1. Check the tray icon color for a quick status indicator.
+2. Open the log file (see table above) for detailed errors.
+3. Use **Quick Menu > Sync Now** in the tray to force a sync.
+
+### Login issues
+
+1. Verify your credentials at https://betterflow.eu.
+2. Check your internet connection.
+3. Try **Log Out** then sign back in from the tray menu.
