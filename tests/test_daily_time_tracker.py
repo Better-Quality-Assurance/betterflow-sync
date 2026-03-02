@@ -23,8 +23,11 @@ class TestDailyTimeTracker:
     def teardown_method(self):
         """Clean up after tests."""
         self.tracker.close()
-        if self.db_path.exists():
-            self.db_path.unlink()
+        try:
+            if self.db_path.exists():
+                self.db_path.unlink()
+        except PermissionError:
+            pass  # Windows: per-thread SQLite connections may still hold the file
 
     def test_initial_time_is_zero(self):
         """Initial active time should be zero."""
