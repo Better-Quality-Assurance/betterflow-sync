@@ -7,6 +7,14 @@ from typing import Optional
 from urllib.parse import urlparse
 
 try:
+    from ..__init__ import __version__ as AGENT_VERSION
+except ImportError:
+    try:
+        from __init__ import __version__ as AGENT_VERSION
+    except ImportError:
+        AGENT_VERSION = "0.0.0"
+
+try:
     from ..config import Config, PrivacySettings
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
@@ -56,6 +64,7 @@ class SyncEngine:
         queue: OfflineQueueProtocol,
         config: Config,
         on_config_updated: Optional[callable] = None,
+        display_tracker=None,
         activity_analyzer: Optional[ActivityAnalyzer] = None,
         time_tracker: Optional[DailyTimeTracker] = None,
     ):
@@ -64,14 +73,33 @@ class SyncEngine:
         self.queue = queue
         self.config = config
         self._on_config_updated = on_config_updated
+        self._display_tracker = display_tracker
         self._paused = False
         self._private_mode = False
+        self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
         self._session_active = False
         self._config_fetched = False
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
+
+        # Queue retry backoff
+        self._queue_consecutive_failures = 0
+        self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
+
+        # Clock skew: track server-vs-local time offset (seconds, positive = server ahead)
+        self._server_time_offset: Optional[float] = None
+
+        # Dedup: track (bucket_id, event_id) pairs already sent this session.
+        # The lookback window re-fetches recent events for duration updates —
+        # we only re-send if the duration actually changed.
+        self._sent_cache: dict[tuple[str, int], float] = {}
+        self._SENT_CACHE_MAX = 10_000
+
+        # App category cache — avoids SQLite lookups on every event.
+        # Populated lazily; invalidated when categories are refreshed.
+        self._category_cache: Optional[dict[str, str]] = None
 
         # Activity analysis for fraud detection (DIP)
         self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
@@ -115,6 +143,10 @@ class SyncEngine:
         """Enable/disable private time (no events recorded)."""
         if enabled and not self._private_mode:
             self._advance_checkpoints_to_now("private_time")
+            self._private_start = datetime.now(timezone.utc)
+        elif not enabled and self._private_mode and self._private_start:
+            self._send_private_time_event()
+            self._private_start = None
         self._private_mode = enabled
         if enabled and self._session_active:
             try:
@@ -130,6 +162,16 @@ class SyncEngine:
     def set_current_project(self, project: Optional[dict]) -> None:
         """Set the current project for event tagging."""
         self._current_project = project
+
+    def invalidate_category_cache(self) -> None:
+        """Clear the in-memory category cache so next lookup re-reads from DB."""
+        self._category_cache = None
+
+    def _get_category(self, app_name: str) -> Optional[str]:
+        """Look up category for an app, using in-memory cache."""
+        if self._category_cache is None:
+            self._category_cache = self.queue.get_all_categories()
+        return self._category_cache.get(app_name)
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -285,18 +327,36 @@ class SyncEngine:
         bucket_type: str,
         stats: SyncStats,
     ) -> list[dict]:
-        """Transform events to BetterFlow format and update checkpoint."""
+        """Transform events to BetterFlow format and update checkpoint.
+
+        Skips events already sent with unchanged duration (dedup).
+        Re-sends if duration has grown (heartbeat extension).
+        """
         # Feed window events to activity analyzer for window change detection
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             self._activity_analyzer.add_window_events(events)
 
         transformed = []
         for event in events:
+            # Dedup: skip if already sent with same duration
+            cache_key = (bucket_id, event.id)
+            prev_duration = self._sent_cache.get(cache_key)
+            if prev_duration is not None and abs(event.duration - prev_duration) < 0.5:
+                stats.events_filtered += 1
+                continue
+
             transformed_event = self._transform_event(event, bucket_id, bucket_type)
             if transformed_event:
                 transformed.append(transformed_event)
+                self._sent_cache[cache_key] = event.duration
             else:
                 stats.events_filtered += 1
+
+        # Evict oldest entries if cache grows too large
+        if len(self._sent_cache) > self._SENT_CACHE_MAX:
+            excess = len(self._sent_cache) - self._SENT_CACHE_MAX
+            for key in list(self._sent_cache)[:excess]:
+                del self._sent_cache[key]
 
         if events:
             newest = max(events, key=lambda e: e.timestamp)
@@ -460,18 +520,45 @@ class SyncEngine:
 
                 if privacy.collect_page_category:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
+
+            if app and privacy.auto_categorize:
+                category = self._get_category(app)
+                if category:
+                    data["app_category"] = category
+
+            if self._display_tracker is not None and privacy.track_display_info:
+                ds = self._display_tracker.state
+                if ds.monitor_name is not None:
+                    data["monitor_name"] = ds.monitor_name
+                if ds.monitor_index is not None:
+                    data["monitor_index"] = ds.monitor_index
+                if ds.desktop_id is not None:
+                    data["desktop_id"] = ds.desktop_id
+                if ds.desktop_index is not None:
+                    data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
+            # Send AFK periods as "break" bucket_type for chart display
+            if event.status == "afk":
+                bucket_type = "break"
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection
             data["presses"] = event.presses
             data["clicks"] = event.clicks
             data["scrolls"] = event.scrolls
 
+        # Clamp future timestamps and reject negative durations
+        now = datetime.now(timezone.utc)
+        timestamp = event.timestamp
+        if timestamp > now + timedelta(minutes=1):
+            logger.warning(f"Clamping future timestamp {timestamp} to now")
+            timestamp = now
+        duration = max(0, round(event.duration, 2))
+
         result = {
             "id": event.id,
-            "timestamp": event.timestamp.isoformat(),
-            "duration": round(event.duration, 2),
+            "timestamp": timestamp.isoformat(),
+            "duration": duration,
             "bucket_id": bucket_id,
             "bucket_type": bucket_type,
             "data": data,
@@ -522,6 +609,29 @@ class SyncEngine:
                 return category
         return "other"
 
+    def _send_private_time_event(self) -> None:
+        """Send a private_time event covering the private mode duration."""
+        if not self._private_start:
+            return
+        now = datetime.now(timezone.utc)
+        duration = (now - self._private_start).total_seconds()
+        if duration < 1:
+            return
+        event = {
+            "timestamp": self._private_start.isoformat(),
+            "duration": round(duration, 2),
+            "bucket_type": "private_time",
+            "data": {"status": "private"},
+        }
+        if self._current_project:
+            event["project_id"] = self._current_project["id"]
+        try:
+            self.bf.send_events([event])
+            logger.info(f"Sent private_time event ({duration:.0f}s)")
+        except BetterFlowClientError as e:
+            logger.warning(f"Failed to send private_time event: {e}")
+            self.queue.enqueue([event])
+
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""
         # Batch events
@@ -534,9 +644,17 @@ class SyncEngine:
                 if result.success:
                     stats.events_sent += result.events_synced
                 else:
-                    # Queue failed events
-                    self.queue.enqueue(batch)
-                    stats.events_queued += len(batch)
+                    # Partial batch: only re-queue events the server didn't accept
+                    if result.accepted_ids:
+                        accepted_set = set(result.accepted_ids)
+                        failed = [e for e in batch if e.get("id") not in accepted_set]
+                        stats.events_sent += len(result.accepted_ids)
+                        if failed:
+                            self.queue.enqueue(failed)
+                            stats.events_queued += len(failed)
+                    else:
+                        self.queue.enqueue(batch)
+                        stats.events_queued += len(batch)
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
@@ -552,9 +670,14 @@ class SyncEngine:
                 stats.events_queued += len(batch)
 
     def _process_queue(self, stats: SyncStats) -> None:
-        """Process offline queue."""
+        """Process offline queue with exponential backoff."""
         # Remove events that exceeded retry limit
         self.queue.remove_failed(max_retries=5)
+
+        # Skip queue processing if in backoff period
+        now = datetime.now(timezone.utc)
+        if now < self._queue_backoff_until:
+            return
 
         # Process queue in batches
         batch_size = self.config.sync.batch_size
@@ -575,14 +698,36 @@ class SyncEngine:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
                     processed += len(events)
+                    self._queue_consecutive_failures = 0
+                elif result.accepted_ids:
+                    # Partial success: remove accepted, increment retry on rest
+                    accepted_set = set(result.accepted_ids)
+                    succeeded_ids = [eid for eid, ev in zip(event_ids, events)
+                                     if ev.get("id") in accepted_set]
+                    failed_ids = [eid for eid in event_ids if eid not in succeeded_ids]
+                    if succeeded_ids:
+                        self.queue.remove(succeeded_ids)
+                        stats.events_sent += len(succeeded_ids)
+                    if failed_ids:
+                        self.queue.increment_retry(failed_ids)
+                    self._queue_consecutive_failures = 0
+                    processed += len(succeeded_ids)
                 else:
-                    # Increment retry count
                     self.queue.increment_retry(event_ids)
+                    self._apply_queue_backoff()
                     break
             except BetterFlowClientError:
-                # Still offline
                 self.queue.increment_retry(event_ids)
+                self._apply_queue_backoff()
                 break
+
+    def _apply_queue_backoff(self) -> None:
+        """Apply exponential backoff for queue processing failures."""
+        self._queue_consecutive_failures += 1
+        # 60s, 120s, 240s, 480s, max 600s (10 min)
+        delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
+        self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
 
     def _send_heartbeat(self) -> None:
         """Send heartbeat to server and process commands."""
@@ -602,12 +747,44 @@ class SyncEngine:
                     self._advance_checkpoints_to_now("server_deregister")
                     self._paused = True
 
+            # Version compatibility check
+            min_version = response.get("minimum_agent_version")
+            if min_version and self._version_below(AGENT_VERSION, min_version):
+                logger.warning(
+                    f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
+                )
+
+            # Clock skew detection: compare server time with local time
+            server_time_str = response.get("server_time")
+            if server_time_str:
+                try:
+                    server_time = datetime.fromisoformat(server_time_str)
+                    local_time = datetime.now(timezone.utc)
+                    self._server_time_offset = (server_time - local_time).total_seconds()
+                    if abs(self._server_time_offset) > 300:
+                        logger.warning(
+                            f"Clock skew detected: server time differs by "
+                            f"{self._server_time_offset:.0f}s — timestamps may be inaccurate"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
             # Re-fetch config if server says it changed
             if response.get("config_updated"):
                 self.fetch_server_config()
 
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
+
+    @staticmethod
+    def _version_below(current: str, minimum: str) -> bool:
+        """Compare semver-style version strings."""
+        try:
+            cur = tuple(int(x) for x in current.split(".")[:3])
+            min_ = tuple(int(x) for x in minimum.split(".")[:3])
+            return cur < min_
+        except (ValueError, AttributeError):
+            return False
 
     def get_status(self) -> dict:
         """Get current sync status."""

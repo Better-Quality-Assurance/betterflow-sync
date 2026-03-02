@@ -50,6 +50,9 @@ class TrayModel:
         self.private_mode: bool = False
         self.status_text: str = "Starting..."
         self.hours_today: str = "0h 0m"
+        self.hours_this_week: str = "---"
+        self.hours_this_month: str = "---"
+        self.daily_avg_this_week: str = "---"
         self.last_sync: str = "Never"
         self.queue_size: int = 0
         self.user_email: Optional[str] = None
@@ -65,8 +68,23 @@ class TrayModel:
         self.domain_only_urls: bool = True
         self.debug_mode: bool = False
         self.auto_start: bool = False
+        self.update_channel: str = "stable"
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
+        self.company_name: Optional[str] = None
+
+        # Reminder preferences
+        self.break_reminders_enabled: bool = True
+        self.break_interval_hours: int = 2
+        self.private_reminders_enabled: bool = True
+        self.private_interval_minutes: int = 20
+
+        # Categorization
+        self.auto_categorize: bool = True
+
+        # Display tracking
+        self.track_display_info: bool = False
+
 
 try:
     import pystray
@@ -141,6 +159,8 @@ class TrayIcon:
         on_quit: Optional[Callable[[], None]] = None,
         on_project_change: Optional[Callable[[Optional[ProjectDict]], None]] = None,
         on_private_toggle: Optional[Callable[[bool], None]] = None,
+        on_sync_now: Optional[Callable[[], None]] = None,
+        on_export_logs: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -153,6 +173,8 @@ class TrayIcon:
             on_quit: Callback when quit is clicked
             on_project_change: Callback when project is switched (receives project dict or None)
             on_private_toggle: Callback when private time is toggled (receives bool)
+            on_sync_now: Callback to trigger an immediate sync
+            on_export_logs: Callback to export logs to a zip file
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -165,6 +187,8 @@ class TrayIcon:
         self._on_quit = on_quit
         self._on_project_change = on_project_change
         self._on_private_toggle = on_private_toggle
+        self._on_sync_now = on_sync_now
+        self._on_export_logs = on_export_logs
 
         self.model = TrayModel()
 
@@ -174,8 +198,9 @@ class TrayIcon:
     def _create_menu(self) -> pystray.Menu:
         """Create the tray menu."""
         items = []
+        logged_in = self.model.user_email is not None
 
-        # User identity at top
+        # ── User identity & status ──────────────────────────
         if self.model.user_email:
             if self.model.user_name and self.model.user_name != self.model.user_email:
                 label = f"{self.model.user_name} ({self.model.user_email})"
@@ -183,58 +208,125 @@ class TrayIcon:
                 label = self.model.user_email
             items.append(Item(label, None, enabled=False))
 
-        # Status line
-        items.append(Item(self._get_status_line(), None, enabled=False))
-
-        # Project line
-        if self.model.current_project:
-            items.append(Item(f"Project: {self.model.current_project['name']}", None, enabled=False))
-        elif self.model.projects:
-            items.append(Item("Project: None", None, enabled=False))
-
-        items.append(Item("─" * 20, None, enabled=False))
-
-        # Stats
-        items.append(Item(f"Last sync: {self.model.last_sync}", None, enabled=False))
+        items.append(Item(f"App status: {self._get_status_text()}", None, enabled=False))
         items.append(Item(f"Hours today: {self.model.hours_today}", None, enabled=False))
-        if self.model.queue_size > 0:
-            items.append(Item(f"Queued: {self.model.queue_size:,}", None, enabled=False))
+        items.append(Item("Trends", pystray.Menu(
+            Item(f"Hours this week: {self.model.hours_this_week}", None, enabled=False),
+            Item(f"Hours this month: {self.model.hours_this_month}", None, enabled=False),
+            Item(f"Daily avg this week: {self.model.daily_avg_this_week}", None, enabled=False),
+        ), enabled=logged_in))
+
+        # ── Dashboard & Project Manager links ───────────────
+        items.append(Item("Show My Dashboard", self._handle_show_dashboard, enabled=logged_in))
+        items.append(Item("Project Manager - Start / Stop / Create", self._handle_project_manager, enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 
-        logged_in = self.model.user_email is not None
+        # ── Running Project ─────────────────────────────────
+        items.append(Item("Running Project", None, enabled=False))
+        if self.model.current_project:
+            items.append(Item(f"  {self.model.current_project['name']}", None, enabled=False))
+            items.append(Item(f"  Stop ({self.model.hours_today})", self._handle_stop_project, enabled=logged_in))
+        else:
+            items.append(Item("  No project selected", None, enabled=False))
 
-        # Private Time toggle
+        items.append(Item("─" * 20, None, enabled=False))
+
+        # ── Recent Projects ─────────────────────────────────
+        if self.model.projects:
+            items.append(Item("Recent Projects", None, enabled=False))
+            for proj in self.model.projects:
+                is_current = (
+                    self.model.current_project is not None
+                    and self.model.current_project["id"] == proj["id"]
+                )
+                items.append(Item(
+                    f"  {proj['name']}",
+                    self._make_project_handler(proj),
+                    checked=lambda item, p=proj: (
+                        self.model.current_project is not None
+                        and self.model.current_project["id"] == p["id"]
+                    ),
+                    enabled=logged_in and not is_current,
+                ))
+            items.append(Item("─" * 20, None, enabled=False))
+
+        # ── Private Time toggle ─────────────────────────────
         if self.model.private_mode:
             items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
         else:
             items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
 
-        # Pause/Resume (only show when not in private mode)
+        # ── Private Time Reminder submenu ───────────────────
+        items.append(Item("Private Time Reminder", pystray.Menu(
+            Item(
+                "Disabled",
+                self._make_private_reminder_handler(enabled=False),
+                checked=lambda item: not self.model.private_reminders_enabled,
+            ),
+            Item(
+                "Every 15 Minutes",
+                self._make_private_reminder_handler(enabled=True, minutes=15),
+                checked=lambda item: self.model.private_reminders_enabled and self.model.private_interval_minutes == 15,
+            ),
+            Item(
+                "Every 35 Minutes",
+                self._make_private_reminder_handler(enabled=True, minutes=35),
+                checked=lambda item: self.model.private_reminders_enabled and self.model.private_interval_minutes == 35,
+            ),
+            Item(
+                "Every 45 Minutes",
+                self._make_private_reminder_handler(enabled=True, minutes=45),
+                checked=lambda item: self.model.private_reminders_enabled and self.model.private_interval_minutes == 45,
+            ),
+        ), enabled=logged_in))
+
+        # ── Break Time Reminder submenu ─────────────────────
+        items.append(Item("Break Time Reminder", pystray.Menu(
+            Item(
+                "Disabled",
+                self._make_break_reminder_handler(enabled=False),
+                checked=lambda item: not self.model.break_reminders_enabled,
+            ),
+            Item(
+                "Every 1 Hour",
+                self._make_break_reminder_handler(enabled=True, hours=1),
+                checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 1,
+            ),
+            Item(
+                "Every 2 Hours",
+                self._make_break_reminder_handler(enabled=True, hours=2),
+                checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 2,
+            ),
+            Item(
+                "Every 3 Hours",
+                self._make_break_reminder_handler(enabled=True, hours=3),
+                checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 3,
+            ),
+        ), enabled=logged_in))
+
+        # ── Quick Menu submenu ──────────────────────────────
+        quick_items = []
         if not self.model.private_mode:
             if self.model.paused:
-                items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
+                quick_items.append(Item("Resume Tracking", self._handle_resume))
             else:
-                items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
+                quick_items.append(Item("Pause Tracking", self._handle_pause))
+        quick_items.append(Item("Sync Now", self._handle_sync_now))
+        items.append(Item("Quick Menu", pystray.Menu(*quick_items), enabled=logged_in))
 
-        # Switch Project submenu
-        if self.model.projects:
-            project_items = []
-            # "None" option to clear project
-            project_items.append(Item(
-                "None",
-                self._make_project_handler(None),
-                checked=lambda item: self.model.current_project is None,
-            ))
-            for proj in self.model.projects:
-                project_items.append(Item(
-                    proj["name"],
-                    self._make_project_handler(proj),
-                    checked=lambda item, p=proj: self.model.current_project is not None and self.model.current_project["id"] == p["id"],
-                ))
-            items.append(Item("Switch Project", pystray.Menu(*project_items), enabled=logged_in))
+        items.append(Item("─" * 20, None, enabled=False))
 
-        # Actions
+        # ── Diagnostics submenu ─────────────────────────────
+        diag_items = [
+            Item(f"ActivityWatch: {'Running' if self._check_aw_status() else 'Not running'}", None, enabled=False),
+            Item(f"API: {'Connected' if self._check_api_status() else 'Unreachable'}", None, enabled=False),
+            Item(f"Queue: {self.model.queue_size} events", None, enabled=False),
+            Item(f"Last sync: {self.model.last_sync}", None, enabled=False),
+        ]
+        items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
+
+        # ── Preferences submenu ─────────────────────────────
         items.append(Item("Preferences", pystray.Menu(
             Item(
                 "Sync Interval",
@@ -256,6 +348,16 @@ class TrayIcon:
                 checked=lambda item: self.model.domain_only_urls,
             ),
             Item(
+                "Auto-Categorize Apps",
+                self._make_toggle_handler("auto_categorize", "auto_categorize"),
+                checked=lambda item: self.model.auto_categorize,
+            ),
+            Item(
+                "Track Display Info",
+                self._make_toggle_handler("track_display_info", "track_display_info"),
+                checked=lambda item: self.model.track_display_info,
+            ),
+            Item(
                 "Debug Mode",
                 self._make_toggle_handler("debug_mode", "debug_mode"),
                 checked=lambda item: self.model.debug_mode,
@@ -265,16 +367,23 @@ class TrayIcon:
                 self._make_toggle_handler("auto_start", "auto_start"),
                 checked=lambda item: self.model.auto_start,
             ),
-            Item("─" * 15, None, enabled=False),
+            Item(
+                "Update Channel",
+                pystray.Menu(
+                    Item("Stable", self._make_channel_handler("stable"), checked=lambda item: self.model.update_channel == "stable"),
+                    Item("Beta", self._make_channel_handler("beta"), checked=lambda item: self.model.update_channel == "beta"),
+                    Item("Canary", self._make_channel_handler("canary"), checked=lambda item: self.model.update_channel == "canary"),
+                ),
+            ),
+            Item("Export Logs", self._handle_export_logs),
             Item("Open Config File", self._handle_open_config),
         ), enabled=logged_in))
-        items.append(Item("View Dashboard", self._handle_dashboard, enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 
-        # Account
+        # ── Account ─────────────────────────────────────────
         if self.model.user_email:
-            items.append(Item("Sign Out", self._handle_logout))
+            items.append(Item("Log Out", self._handle_logout))
         else:
             items.append(Item("Login", self._handle_login))
 
@@ -283,24 +392,36 @@ class TrayIcon:
 
         return pystray.Menu(*items)
 
-    def _get_status_line(self) -> str:
-        """Get the status line text."""
+    def _get_status_text(self) -> str:
+        """Get short status text for the menu."""
         if self.model.private_mode:
-            return "Status: Private Time"
+            return "Private Time"
         elif self.model.state == TrayState.SYNCING:
-            return "Status: Active"
+            return "Active"
         elif self.model.state == TrayState.QUEUED:
-            return "Status: Offline"
+            return "Offline"
         elif self.model.state == TrayState.QUEUE_WARNING:
-            return "Status: Offline (queue full)"
+            return "Offline (queue full)"
         elif self.model.state == TrayState.ERROR:
-            return "Status: Error"
+            return "Error"
         elif self.model.state == TrayState.PAUSED:
-            return "Status: Paused"
+            return "Paused"
         elif self.model.state == TrayState.WAITING_AUTH:
-            return "Status: Waiting for login..."
+            return "Waiting for login..."
         else:
-            return "Status: Starting..."
+            return "Starting..."
+
+    # -- Diagnostics helpers --------------------------------------------------
+
+    def _check_aw_status(self) -> bool:
+        """Check if ActivityWatch is reachable (best-effort, non-blocking)."""
+        return self.model.state not in (TrayState.ERROR, TrayState.STARTING, TrayState.WAITING_AUTH)
+
+    def _check_api_status(self) -> bool:
+        """Check if BetterFlow API is reachable (best-effort, non-blocking)."""
+        return self.model.state not in (TrayState.QUEUED, TrayState.QUEUE_WARNING, TrayState.ERROR)
+
+    # -- Menu action handlers ------------------------------------------------
 
     def _handle_login(self, icon, item) -> None:
         """Handle login menu click."""
@@ -328,8 +449,29 @@ class TrayIcon:
             self._on_private_toggle(self.model.private_mode)
         self._update_menu()
 
+    def _handle_show_dashboard(self, icon, item) -> None:
+        """Open dashboard in browser."""
+        webbrowser.open(self.model.dashboard_url)
+
+    def _handle_project_manager(self, icon, item) -> None:
+        """Open project manager page in browser."""
+        base = self.model.dashboard_url.rsplit("/", 1)[0]
+        webbrowser.open(f"{base}/projects")
+
+    def _handle_stop_project(self, icon, item) -> None:
+        """Clear the currently running project."""
+        self.model.current_project = None
+        if self._on_project_change:
+            self._on_project_change(None)
+        self._update_menu()
+
+    def _handle_sync_now(self, icon, item) -> None:
+        """Trigger an immediate sync."""
+        if self._on_sync_now:
+            self._on_sync_now()
+
     def _make_project_handler(self, project: Optional[ProjectDict]) -> Callable:
-        """Create a handler for switching projects."""
+        """Create a handler for switching to a project."""
         def handler(icon, item):
             self.model.current_project = project
             if self._on_project_change:
@@ -337,12 +479,8 @@ class TrayIcon:
             self._update_menu()
         return handler
 
-    def _handle_dashboard(self, icon, item) -> None:
-        """Open dashboard in browser."""
-        webbrowser.open(self.model.dashboard_url)
-
     def _handle_logout(self, icon, item) -> None:
-        """Handle sign out menu click."""
+        """Handle log out menu click."""
         if self._on_logout:
             self._on_logout()
 
@@ -351,6 +489,8 @@ class TrayIcon:
         if self._on_quit:
             self._on_quit()
         self.stop()
+
+    # -- Preference handlers -------------------------------------------------
 
     def _make_interval_handler(self, seconds: int) -> Callable:
         """Create a handler for setting sync interval."""
@@ -370,6 +510,46 @@ class TrayIcon:
                 self._on_preferences(key, new_value)
         return handler
 
+    def _make_break_reminder_handler(self, enabled: bool, hours: int = 0) -> Callable:
+        """Create a combined handler for break reminder radio selection."""
+        def handler(icon, item):
+            self.model.break_reminders_enabled = enabled
+            if self._on_preferences:
+                self._on_preferences("break_reminders_enabled", enabled)
+            if enabled and hours:
+                self.model.break_interval_hours = hours
+                if self._on_preferences:
+                    self._on_preferences("break_interval_hours", hours)
+            self._update_menu()
+        return handler
+
+    def _make_private_reminder_handler(self, enabled: bool, minutes: int = 0) -> Callable:
+        """Create a combined handler for private time reminder radio selection."""
+        def handler(icon, item):
+            self.model.private_reminders_enabled = enabled
+            if self._on_preferences:
+                self._on_preferences("private_reminders_enabled", enabled)
+            if enabled and minutes:
+                self.model.private_interval_minutes = minutes
+                if self._on_preferences:
+                    self._on_preferences("private_interval_minutes", minutes)
+            self._update_menu()
+        return handler
+
+    def _make_channel_handler(self, channel: str) -> Callable:
+        """Create a handler for switching update channel."""
+        def handler(icon, item):
+            self.model.update_channel = channel
+            if self._on_preferences:
+                self._on_preferences("update_channel", channel)
+            self._update_menu()
+        return handler
+
+    def _handle_export_logs(self, icon, item) -> None:
+        """Handle export logs menu click."""
+        if self._on_export_logs:
+            self._on_export_logs()
+
     def _handle_open_config(self, icon, item) -> None:
         if self.model.config_file_path:
             import subprocess
@@ -385,9 +565,16 @@ class TrayIcon:
         self.model.sync_interval = config.sync.interval_seconds
         self.model.hash_titles = config.privacy.hash_titles
         self.model.domain_only_urls = config.privacy.domain_only_urls
+        self.model.auto_categorize = config.privacy.auto_categorize
+        self.model.track_display_info = config.privacy.track_display_info
         self.model.debug_mode = config.debug_mode
         self.model.auto_start = config.auto_start
         self.model.config_file_path = str(config.get_config_file())
+        self.model.break_reminders_enabled = config.reminders.break_reminders_enabled
+        self.model.break_interval_hours = config.reminders.break_interval_hours
+        self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
+        self.model.private_interval_minutes = config.reminders.private_interval_minutes
+        self.model.update_channel = config.update_channel
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)
@@ -420,6 +607,9 @@ class TrayIcon:
         last_sync: Optional[str] = None,
         queue_size: Optional[int] = None,
         events_today: Optional[int] = None,
+        hours_this_week: Optional[str] = None,
+        hours_this_month: Optional[str] = None,
+        daily_avg_this_week: Optional[str] = None,
         **_kwargs,
     ) -> None:
         """Update statistics shown in menu.
@@ -429,6 +619,9 @@ class TrayIcon:
             last_sync: Last sync time string
             queue_size: Number of events in offline queue
             events_today: Backward-compatible alias from older callers
+            hours_this_week: Formatted weekly hours string
+            hours_this_month: Formatted monthly hours string
+            daily_avg_this_week: Formatted daily average string
         """
         # Backward compatibility for older builds that pass events_today
         if hours_today is None and events_today is not None:
@@ -446,6 +639,12 @@ class TrayIcon:
             self.model.last_sync = last_sync
         if queue_size is not None:
             self.model.queue_size = queue_size
+        if hours_this_week is not None:
+            self.model.hours_this_week = hours_this_week
+        if hours_this_month is not None:
+            self.model.hours_this_month = hours_this_month
+        if daily_avg_this_week is not None:
+            self.model.daily_avg_this_week = daily_avg_this_week
         self._update_menu()
 
     def set_user(self, email: Optional[str], name: Optional[str] = None) -> None:

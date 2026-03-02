@@ -63,6 +63,7 @@ hiddenimports = [
     "ui.setup_wizard",
     "aw_manager",
     "autostart",
+    "display_info",
 ]
 
 a = Analysis(

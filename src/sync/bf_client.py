@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -89,6 +89,7 @@ class SyncResult:
     events_synced: int = 0
     events_queued: int = 0
     error: Optional[str] = None
+    accepted_ids: list[int] = field(default_factory=list)
 
 
 class BetterFlowClient(BaseApiClient):
@@ -235,6 +236,7 @@ class BetterFlowClient(BaseApiClient):
                 success=True,
                 events_synced=response.get("processed", len(events)),
                 events_queued=response.get("failed", 0),
+                accepted_ids=response.get("accepted_ids", []),
             )
         except BetterFlowAuthError as e:
             return SyncResult(success=False, error=str(e))
@@ -295,6 +297,10 @@ class BetterFlowClient(BaseApiClient):
         """Get sync status."""
         return self._request("GET", "events/status")
 
+    def get_trends(self) -> dict:
+        """Get weekly/monthly trend summaries."""
+        return self._request("GET", "events/trends")
+
     # =========================================================================
     # Configuration
     # =========================================================================
@@ -306,6 +312,14 @@ class BetterFlowClient(BaseApiClient):
     def get_projects(self) -> list[dict]:
         """Get list of projects for app mapping."""
         return self._request("GET", "projects")
+
+    def get_categories(self) -> dict:
+        """Get app-to-category mappings from server.
+
+        Returns:
+            Dict with "categories" key mapping app names to categories.
+        """
+        return self._request("GET", "categories")
 
     def update_project_mapping(self, app_name: str, project_id: int) -> dict:
         """Update app to project mapping.

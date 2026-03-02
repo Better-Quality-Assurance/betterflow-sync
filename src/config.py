@@ -16,6 +16,7 @@ __all__ = [
     "PrivacySettings",
     "SyncSettings",
     "AWSettings",
+    "ReminderSettings",
     "EngagementConfig",
     "setup_logging",
     "DEFAULT_API_URL",
@@ -151,6 +152,8 @@ class PrivacySettings:
     domain_only_urls: bool = True  # Strip URLs to domain only
     collect_full_urls: bool = False  # Collect full URLs (sensitive, opt-in)
     collect_page_category: bool = True  # Include coarse page category classification
+    auto_categorize: bool = True  # Enrich events with app_category from server mappings
+    track_display_info: bool = False  # Track monitor name and virtual desktop
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",
@@ -200,6 +203,16 @@ class AWSettings:
 
 
 @dataclass
+class ReminderSettings:
+    """Reminder notification settings."""
+
+    break_reminders_enabled: bool = True
+    break_interval_hours: int = 2  # 1, 2, 3, or 4
+    private_reminders_enabled: bool = True
+    private_interval_minutes: int = 20  # 10, 20, or 30
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -208,10 +221,12 @@ class Config:
     aw: AWSettings = field(default_factory=AWSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    reminders: ReminderSettings = field(default_factory=ReminderSettings)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
+    update_channel: str = "stable"
     debug_mode: bool = False
 
     @classmethod
@@ -268,7 +283,9 @@ class Config:
         aw_data = data.pop("aw", {})
         sync_data = data.pop("sync", {})
         privacy_data = data.pop("privacy", {})
+        reminders_data = data.pop("reminders", {})
         engagement_data = data.pop("engagement", {})
+        data.pop("screenshots", None)
 
         # Migrate legacy localhost URLs to production endpoint.
         api_url = data.get("api_url")
@@ -284,6 +301,7 @@ class Config:
             aw=AWSettings(**aw_data) if aw_data else AWSettings(),
             sync=SyncSettings(**sync_data) if sync_data else SyncSettings(),
             privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
+            reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
             engagement=EngagementConfig(**engagement_data) if engagement_data else EngagementConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
@@ -334,6 +352,10 @@ class Config:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
                 self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])
+            if "auto_categorize" in collection:
+                self.privacy.auto_categorize = self._to_bool(collection["auto_categorize"])
+            if "track_display_info" in collection:
+                self.privacy.track_display_info = self._to_bool(collection["track_display_info"])
 
         if "tracking" in server_config:
             tracking = server_config["tracking"]

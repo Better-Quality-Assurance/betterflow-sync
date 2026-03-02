@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -88,7 +88,26 @@ class OfflineQueue:
         """Initialize the database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Integrity check — reset on corruption
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            conn.close()
+            if result[0] != "ok":
+                logger.error(f"SQLite integrity check failed: {result[0]} — resetting database")
+                backup = self.db_path.with_suffix(".db.corrupt")
+                self.db_path.rename(backup)
+        except sqlite3.DatabaseError as e:
+            logger.error(f"SQLite corruption detected: {e} — resetting database")
+            backup = self.db_path.with_suffix(".db.corrupt")
+            try:
+                self.db_path.rename(backup)
+            except OSError:
+                self.db_path.unlink(missing_ok=True)
+
         with self._cursor() as cursor:
+            # Enable WAL mode for crash resilience
+            cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS queued_events (
@@ -112,6 +131,18 @@ class OfflineQueue:
                     bucket_id TEXT PRIMARY KEY,
                     last_event_id INTEGER,
                     last_timestamp TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            # App category mappings (synced from server, user-overridable)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_categories (
+                    app_name TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'server',
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -280,6 +311,29 @@ class OfflineQueue:
         """
         return self.capacity_percent() >= threshold
 
+    def expire_old(self, max_age_days: int = 30) -> int:
+        """Remove events older than max_age_days.
+
+        Args:
+            max_age_days: Maximum age in days
+
+        Returns:
+            Number of events removed
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM queued_events
+                WHERE created_at < ?
+                """,
+                (cutoff.isoformat(),),
+            )
+            count = cursor.rowcount
+            if count > 0:
+                logger.info(f"Expired {count} queue events older than {max_age_days} days")
+            return count
+
     def clear(self) -> int:
         """Clear all events from the queue."""
         with self._cursor() as cursor:
@@ -346,6 +400,91 @@ class OfflineQueue:
                 row["bucket_id"]: datetime.fromisoformat(row["last_timestamp"])
                 for row in cursor.fetchall()
             }
+
+    # App category management
+
+    def get_category(self, app_name: str) -> Optional[str]:
+        """Get the category for an app.
+
+        Args:
+            app_name: Application name
+
+        Returns:
+            Category string, or None if not mapped
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT category FROM app_categories WHERE app_name = ?",
+                (app_name,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def get_all_categories(self) -> dict[str, str]:
+        """Get all app-to-category mappings.
+
+        Returns:
+            Dict mapping app_name -> category
+        """
+        with self._cursor() as cursor:
+            cursor.execute("SELECT app_name, category FROM app_categories")
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def set_category(
+        self, app_name: str, category: str, source: str = "server"
+    ) -> None:
+        """Set or update a single app category.
+
+        Args:
+            app_name: Application name
+            category: Category string
+            source: 'server' or 'user'
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO app_categories (app_name, category, source, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(app_name) DO UPDATE SET
+                    category = excluded.category,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (app_name, category, source, now),
+            )
+
+    def sync_categories(self, mappings: dict[str, str]) -> None:
+        """Bulk replace server-sourced categories, preserving user overrides.
+
+        Args:
+            mappings: Dict mapping app_name -> category from server
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            # Remove old server categories not in the new mapping
+            cursor.execute(
+                "DELETE FROM app_categories WHERE source = 'server'"
+            )
+            # Insert new server categories
+            if mappings:
+                cursor.executemany(
+                    """
+                    INSERT INTO app_categories (app_name, category, source, updated_at)
+                    VALUES (?, ?, 'server', ?)
+                    ON CONFLICT(app_name) DO UPDATE SET
+                        category = CASE
+                            WHEN app_categories.source = 'user' THEN app_categories.category
+                            ELSE excluded.category
+                        END,
+                        source = CASE
+                            WHEN app_categories.source = 'user' THEN 'user'
+                            ELSE 'server'
+                        END,
+                        updated_at = excluded.updated_at
+                    """,
+                    [(app, cat, now) for app, cat in mappings.items()],
+                )
 
     def close(self) -> None:
         """Close all thread-local database connections."""

@@ -22,6 +22,8 @@ def start_system_event_listener(
     on_wake: Callable,
     on_shutdown: Callable,
     on_network_change: Callable,  # fn(is_online: bool)
+    on_screen_lock: Callable = None,   # fn() — screen locked
+    on_screen_unlock: Callable = None,  # fn() — screen unlocked
 ) -> None:
     """Start platform-specific system event listeners.
 
@@ -30,8 +32,10 @@ def start_system_event_listener(
     if _system == "Darwin":
         _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
         _start_macos_network_listener(on_network_change)
+        if on_screen_lock or on_screen_unlock:
+            _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
     elif _system == "Windows":
-        _start_windows_listener(on_sleep, on_wake, on_shutdown)
+        _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
         _start_network_poller(on_network_change)
     else:
         logger.warning(f"System events not supported on {_system}")
@@ -113,6 +117,53 @@ def _start_macos_power_listener(
 
 
 # ---------------------------------------------------------------------------
+# macOS: Screen lock/unlock detection via distributed notifications
+# ---------------------------------------------------------------------------
+
+def _start_macos_screen_lock_listener(
+    on_lock: Callable = None,
+    on_unlock: Callable = None,
+) -> None:
+    """Detect macOS screen lock/unlock via DistributedNotificationCenter."""
+    try:
+        from Foundation import NSObject, NSDistributedNotificationCenter
+        from PyObjCTools import AppHelper
+    except ImportError:
+        logger.warning("pyobjc not available — screen lock detection disabled")
+        return
+
+    class _LockObserver(NSObject):
+        def handleLock_(self, notification):
+            logger.info("Screen locked — treating as AFK")
+            if on_lock:
+                _safe_call(on_lock)
+
+        def handleUnlock_(self, notification):
+            logger.info("Screen unlocked — user returned")
+            if on_unlock:
+                _safe_call(on_unlock)
+
+    def run_loop():
+        observer = _LockObserver.alloc().init()
+        center = NSDistributedNotificationCenter.defaultCenter()
+
+        center.addObserver_selector_name_object_(
+            observer, "handleLock:",
+            "com.apple.screenIsLocked", None,
+        )
+        center.addObserver_selector_name_object_(
+            observer, "handleUnlock:",
+            "com.apple.screenIsUnlocked", None,
+        )
+
+        logger.debug("macOS screen lock listener started")
+        AppHelper.runConsoleEventLoop()
+
+    thread = threading.Thread(target=run_loop, name="screen-lock-listener", daemon=True)
+    thread.start()
+
+
+# ---------------------------------------------------------------------------
 # macOS: SCNetworkReachability for network changes
 # ---------------------------------------------------------------------------
 
@@ -185,6 +236,8 @@ def _start_windows_listener(
     on_sleep: Callable,
     on_wake: Callable,
     on_shutdown: Callable,
+    on_screen_lock: Callable = None,
+    on_screen_unlock: Callable = None,
 ) -> None:
     """Listen for Windows power and session events via a hidden window."""
     try:
@@ -200,9 +253,13 @@ def _start_windows_listener(
     # Constants
     WM_POWERBROADCAST = 0x0218
     WM_QUERYENDSESSION = 0x0011
+    WM_WTSSESSION_CHANGE = 0x02B1
     WM_DESTROY = 0x0002
     PBT_APMSUSPEND = 0x0004
     PBT_APMRESUMEAUTOMATIC = 0x0012
+    WTS_SESSION_LOCK = 0x7
+    WTS_SESSION_UNLOCK = 0x8
+    NOTIFY_FOR_THIS_SESSION = 0
     HWND_MESSAGE = -3
 
     WNDPROC = ctypes.WINFUNCTYPE(
@@ -217,6 +274,13 @@ def _start_windows_listener(
             elif wparam == PBT_APMRESUMEAUTOMATIC:
                 logger.info("System wake detected — resuming")
                 _safe_call(on_wake)
+        elif msg == WM_WTSSESSION_CHANGE:
+            if wparam == WTS_SESSION_LOCK and on_screen_lock:
+                logger.info("Screen locked — treating as AFK")
+                _safe_call(on_screen_lock)
+            elif wparam == WTS_SESSION_UNLOCK and on_screen_unlock:
+                logger.info("Screen unlocked — user returned")
+                _safe_call(on_screen_unlock)
         elif msg == WM_QUERYENDSESSION:
             logger.info("System shutdown detected")
             _safe_call(on_shutdown)
@@ -259,6 +323,13 @@ def _start_windows_listener(
         if not hwnd:
             logger.warning("Failed to create message window for system events")
             return
+
+        # Register for WTS session notifications (lock/unlock)
+        try:
+            wtsapi32 = ctypes.windll.wtsapi32
+            wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
+        except Exception:
+            logger.debug("WTS session notification registration failed")
 
         logger.debug("Windows system event listener started")
 

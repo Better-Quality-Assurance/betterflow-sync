@@ -5,7 +5,9 @@ import os
 import signal
 import sys
 import threading
+import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,21 +15,29 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
 try:
+    from . import __version__
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
+    from .display_info import start_display_tracker
+    from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
     from .ui.tray import TrayIcon, TrayState
+    from .update_checker import check_for_update
 except ImportError:
+    from src import __version__
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
     from config import Config, setup_logging
+    from display_info import start_display_tracker
+    from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
     from ui.tray import TrayIcon, TrayState
+    from update_checker import check_for_update
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,7 @@ class SyncCoordinator:
         sync_engine: SyncEngine,
         tray: TrayIcon,
         aw_manager: AWManager,
+        reminder_manager: Optional[ReminderManager] = None,
     ) -> None:
         self.config = config
         self.aw = aw
@@ -56,10 +67,17 @@ class SyncCoordinator:
         self.sync_engine = sync_engine
         self.tray = tray
         self.aw_manager = aw_manager
+        self.reminder_manager = reminder_manager
 
         self.scheduler = BackgroundScheduler()
         self._hours_today_seconds = 0
         self._hours_today_cache = "0h 0m"
+        self._last_tick: Optional[datetime] = None
+        self._trends_cache: dict[str, str] = {
+            "hours_this_week": "---",
+            "hours_this_month": "---",
+            "daily_avg_this_week": "---",
+        }
 
         # Flags set by the app layer
         self.logged_in = False
@@ -71,6 +89,7 @@ class SyncCoordinator:
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
         self._do_sync()
+        self._fetch_trends()
 
         self.scheduler.add_job(
             self._do_sync,
@@ -82,6 +101,34 @@ class SyncCoordinator:
             self._refresh_hours_today,
             trigger=IntervalTrigger(seconds=60),
             id="tray_time_job",
+            replace_existing=True,
+        )
+        if self.reminder_manager:
+            self.scheduler.add_job(
+                self.reminder_manager.check,
+                trigger=IntervalTrigger(seconds=60),
+                id="reminder_check_job",
+                replace_existing=True,
+            )
+        # Expire stale queue events daily
+        self.scheduler.add_job(
+            self._expire_old_queue_events,
+            trigger=IntervalTrigger(hours=24),
+            id="queue_expire_job",
+            replace_existing=True,
+        )
+        # Refresh app categories every 6 hours
+        self.scheduler.add_job(
+            self.fetch_categories,
+            trigger=IntervalTrigger(hours=6),
+            id="category_refresh_job",
+            replace_existing=True,
+        )
+        # Refresh weekly/monthly trends every 30 minutes
+        self.scheduler.add_job(
+            self._fetch_trends,
+            trigger=IntervalTrigger(minutes=30),
+            id="trends_refresh_job",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -117,6 +164,17 @@ class SyncCoordinator:
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 
+    def fetch_categories(self) -> None:
+        """Fetch app-to-category mappings from server and sync to local DB."""
+        try:
+            response = self.bf.get_categories()
+            mappings = response.get("categories", {})
+            self.queue.sync_categories(mappings)
+            self.sync_engine.invalidate_category_cache()
+            logger.info(f"Synced {len(mappings)} app categories")
+        except Exception as e:
+            logger.warning(f"Failed to fetch categories: {e}")
+
     # -- internal ---------------------------------------------------------
 
     def _do_sync(self) -> None:
@@ -134,6 +192,10 @@ class SyncCoordinator:
                 self.aw_manager.restart_if_needed()
 
             if not self.aw.is_running():
+                if self.aw_manager.is_managing:
+                    logger.warning("ActivityWatch not responding — attempting restart")
+                    self.aw_manager.stop()
+                    self.aw_manager.start()
                 self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
                 return
 
@@ -194,7 +256,10 @@ class SyncCoordinator:
                 .get("today_summary", {})
                 .get("total_seconds", 0)
             )
-            self._hours_today_seconds = max(0, total_seconds)
+            # Avoid UI regressions if backend summary is temporarily stale.
+            server_seconds = max(0, total_seconds)
+            if server_seconds >= self._hours_today_seconds:
+                self._hours_today_seconds = server_seconds
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             return self._hours_today_cache
         except Exception:
@@ -215,6 +280,38 @@ class SyncCoordinator:
             self.tray.set_active_time(active_time)
         except Exception as e:
             logger.debug(f"Failed to refresh tray hours: {e}")
+
+    def _fetch_trends(self) -> None:
+        """Fetch weekly/monthly trend data from server."""
+        try:
+            if not self.logged_in:
+                return
+            response = self.bf.get_trends()
+            data = response.get("data", {})
+            self._trends_cache = {
+                "hours_this_week": self._format_hours(int(data.get("week_total_seconds", 0))),
+                "hours_this_month": self._format_hours(int(data.get("month_total_seconds", 0))),
+                "daily_avg_this_week": self._format_hours(int(data.get("week_daily_avg_seconds", 0))),
+            }
+            self.tray.update_stats(**self._trends_cache)
+        except Exception as e:
+            logger.debug(f"Failed to fetch trends: {e}")
+
+    def reset_trends(self) -> None:
+        """Reset cached trends to placeholder values."""
+        self._trends_cache = {
+            "hours_this_week": "---",
+            "hours_this_month": "---",
+            "daily_avg_this_week": "---",
+        }
+        self.tray.update_stats(**self._trends_cache)
+
+    def _expire_old_queue_events(self) -> None:
+        """Remove queue events older than 30 days."""
+        try:
+            self.queue.expire_old(max_age_days=30)
+        except Exception as e:
+            logger.debug(f"Failed to expire old queue events: {e}")
 
     @staticmethod
     def _format_hours(total_seconds: int) -> str:
@@ -255,6 +352,7 @@ class BetterFlowSyncApp:
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
+        self.display_tracker = start_display_tracker()
 
         self.sync_engine = SyncEngine(
             aw=self.aw,
@@ -262,6 +360,7 @@ class BetterFlowSyncApp:
             queue=self.queue,
             config=self.config,
             on_config_updated=self._on_config_updated,
+            display_tracker=self.display_tracker,
         )
 
         self.login_manager = LoginManager(self.bf, self.keychain)
@@ -276,8 +375,13 @@ class BetterFlowSyncApp:
             on_quit=self._on_quit,
             on_project_change=self._on_project_change,
             on_private_toggle=self._on_private_toggle,
+            on_sync_now=self._on_sync_now,
+            on_export_logs=self._on_export_logs,
         )
         self.tray.set_config(self.config)
+
+        # Reminder manager
+        self.reminder_manager = ReminderManager(self.config.reminders)
 
         # Sync coordinator
         self.coordinator = SyncCoordinator(
@@ -288,6 +392,7 @@ class BetterFlowSyncApp:
             sync_engine=self.sync_engine,
             tray=self.tray,
             aw_manager=self.aw_manager,
+            reminder_manager=self.reminder_manager,
         )
         self.coordinator._on_auth_error = self._on_login
 
@@ -331,6 +436,9 @@ class BetterFlowSyncApp:
             self.tray.set_user(state.user_email, state.user_name)
             self.sync_engine.fetch_server_config()
             self.coordinator.fetch_projects()
+            self.coordinator.fetch_categories()
+            self._check_stale_session()
+            self._check_accessibility_permission()
             self.coordinator.start()
         else:
             self.coordinator.logged_in = False
@@ -342,7 +450,17 @@ class BetterFlowSyncApp:
             on_wake=self._on_system_wake,
             on_shutdown=self._on_system_shutdown,
             on_network_change=self._on_network_change,
+            on_screen_lock=self._on_screen_lock,
+            on_screen_unlock=self._on_screen_unlock,
         )
+
+        # Check for updates in background
+        if self.config.check_updates:
+            check_for_update(
+                __version__.__version__,
+                channel=self.config.update_channel,
+                callback=self._on_update_available,
+            )
 
         logger.info("BetterFlow Sync running")
         try:
@@ -351,6 +469,65 @@ class BetterFlowSyncApp:
             self._shutdown()
 
     # -- Event handlers ---------------------------------------------------
+
+    def _check_accessibility_permission(self) -> None:
+        """On macOS, check if ActivityWatch can read window titles.
+
+        If no window buckets are found after AW is running, it likely means
+        Accessibility permission hasn't been granted to aw-watcher-window.
+        """
+        if sys.platform != "darwin":
+            return
+        try:
+            import time
+            time.sleep(3)  # Give AW a moment to start watchers
+            window_buckets = self.aw.get_window_buckets()
+            if not window_buckets:
+                logger.warning(
+                    "No window tracking detected — ActivityWatch may need "
+                    "Accessibility permission in System Settings > Privacy & Security"
+                )
+                try:
+                    from .notifications import show_notification
+                except ImportError:
+                    from notifications import show_notification
+                show_notification(
+                    "BetterFlow Sync",
+                    "Grant Accessibility permission to ActivityWatch in "
+                    "System Settings > Privacy & Security for window tracking.",
+                )
+        except Exception as e:
+            logger.debug(f"Accessibility check failed: {e}")
+
+    def _on_update_available(self, version: str, url: str) -> None:
+        """Handle update available notification."""
+        logger.info(f"Update available: v{version} — {url}")
+        try:
+            from .notifications import show_notification
+        except ImportError:
+            from notifications import show_notification
+        show_notification(
+            "BetterFlow Sync Update",
+            f"Version {version} is available. Click to download.",
+        )
+
+    def _check_stale_session(self) -> None:
+        """Check if previous session is still active on server (forgot to clock out)."""
+        try:
+            status = self.bf.get_status()
+            session = status.get("data", {}).get("active_session")
+            if session and session.get("is_active"):
+                started = session.get("started_at", "unknown")
+                logger.warning(
+                    f"Stale session detected (started {started}) — "
+                    "ending previous session before starting new one"
+                )
+                try:
+                    self.bf.end_session("crash_recovery")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Stale session check failed: {e}")
 
     def _on_login(self) -> None:
         """Handle explicit login action from tray."""
@@ -363,6 +540,7 @@ class BetterFlowSyncApp:
                 self.tray.set_user(state.user_email, state.user_name)
                 self.sync_engine.fetch_server_config()
                 self.coordinator.fetch_projects()
+                self.coordinator.fetch_categories()
                 if not self.coordinator.scheduler.running:
                     self.coordinator.start()
             else:
@@ -376,6 +554,7 @@ class BetterFlowSyncApp:
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
+        self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
@@ -383,6 +562,7 @@ class BetterFlowSyncApp:
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
+        self.reminder_manager.on_tracking_started()
         logger.info("Tracking resumed")
 
     def _on_project_change(self, project: Optional[dict]) -> None:
@@ -398,21 +578,32 @@ class BetterFlowSyncApp:
         if private:
             logger.info("Private time started — recording paused")
             self.sync_engine.set_private_mode(True)
+            self.reminder_manager.on_tracking_stopped()
+            self.reminder_manager.on_private_started()
         else:
             logger.info("Private time ended — recording resumed")
             self.sync_engine.set_private_mode(False)
+            self.reminder_manager.on_private_ended()
+            self.reminder_manager.on_tracking_started()
+
+    def _on_sync_now(self) -> None:
+        """Handle sync now action from tray."""
+        logger.info("Manual sync triggered")
+        self.coordinator.trigger_sync()
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
+        self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused (system sleep)")
 
     def _on_system_wake(self) -> None:
         """Handle system wake from sleep."""
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
+        self.reminder_manager.on_tracking_started()
         logger.info("Tracking resumed (system wake)")
         self.coordinator.trigger_sync("wake_sync")
 
@@ -420,6 +611,19 @@ class BetterFlowSyncApp:
         """Handle system shutdown / restart."""
         logger.info("System shutdown detected — shutting down")
         self._shutdown()
+
+    def _on_screen_lock(self) -> None:
+        """Handle screen lock — treat as AFK."""
+        logger.info("Screen locked — pausing tracking")
+        self.sync_engine.pause()
+        self.tray.set_state(TrayState.PAUSED, "Screen locked")
+
+    def _on_screen_unlock(self) -> None:
+        """Handle screen unlock — resume tracking."""
+        logger.info("Screen unlocked — resuming tracking")
+        self.sync_engine.resume()
+        self.tray.set_state(TrayState.SYNCING)
+        self.coordinator.trigger_sync("unlock_sync")
 
     def _on_network_change(self, is_online: bool) -> None:
         """Handle network connectivity change."""
@@ -435,6 +639,41 @@ class BetterFlowSyncApp:
             self.coordinator.paused_by_network = True
             self.tray.set_state(TrayState.QUEUED, "Offline")
 
+    def _on_export_logs(self) -> None:
+        """Export logs and redacted config to a zip file on the Desktop."""
+        try:
+            log_dir = Config.get_log_dir()
+            desktop = Path.home() / "Desktop"
+            if not desktop.exists():
+                desktop = Path.home()
+            zip_path = desktop / f"betterflow-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Add log files
+                for log_file in log_dir.glob("*.log*"):
+                    zf.write(log_file, f"logs/{log_file.name}")
+
+                # Add redacted config
+                config_file = Config.get_config_file()
+                if config_file.exists():
+                    import json
+                    with open(config_file) as f:
+                        cfg = json.load(f)
+                    # Redact sensitive fields
+                    cfg.pop("device_id", None)
+                    zf.writestr("config-redacted.json", json.dumps(cfg, indent=2))
+
+            logger.info(f"Logs exported to {zip_path}")
+
+            # Open the containing folder
+            import subprocess
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(zip_path)])
+            elif sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", str(zip_path)])
+        except Exception as e:
+            logger.error(f"Failed to export logs: {e}")
+
     def _on_config_updated(self) -> None:
         """Handle server config update — apply AFK timeout to AWManager."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
@@ -448,6 +687,10 @@ class BetterFlowSyncApp:
             self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
             self.config.privacy.domain_only_urls = value
+        elif key == "auto_categorize":
+            self.config.privacy.auto_categorize = value
+        elif key == "track_display_info":
+            self.config.privacy.track_display_info = value
         elif key == "auto_start":
             try:
                 from .autostart import set_auto_start
@@ -458,14 +701,35 @@ class BetterFlowSyncApp:
         elif key == "debug_mode":
             self.config.debug_mode = value
             setup_logging(value)
-
+        elif key == "break_reminders_enabled":
+            self.config.reminders.break_reminders_enabled = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "break_interval_hours":
+            self.config.reminders.break_interval_hours = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "private_reminders_enabled":
+            self.config.reminders.private_reminders_enabled = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "private_interval_minutes":
+            self.config.reminders.private_interval_minutes = value
+            self.reminder_manager.update_settings(self.config.reminders)
+        elif key == "update_channel":
+            self.config.update_channel = value
+            check_for_update(
+                __version__.__version__,
+                channel=value,
+                callback=self._on_update_available,
+            )
         self.config.save()
         logger.info(f"Preference changed: {key} = {value}")
 
     def _on_logout(self) -> None:
         """Handle logout action."""
+        # End server session before stopping
+        self.sync_engine.shutdown()
         self.login_manager.logout()
         self.coordinator.logged_in = False
+        self.coordinator.reset_trends()
         self.tray.set_user(None)
         logger.info("Logged out")
 
@@ -508,6 +772,7 @@ class BetterFlowSyncApp:
 
         self.coordinator.stop()
         self.sync_engine.shutdown()
+        self.display_tracker.stop()
         self.aw.close()
         self.bf.close()
         self.queue.close()
