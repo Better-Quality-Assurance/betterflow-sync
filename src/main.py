@@ -15,7 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
 try:
-    from . import __version__
+    from .__init__ import __version__
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
@@ -450,7 +450,7 @@ class BetterFlowSyncApp:
         # Check for updates in background
         if self.config.check_updates:
             check_for_update(
-                __version__.__version__,
+                __version__,
                 channel=self.config.update_channel,
                 callback=self._on_update_available,
             )
@@ -727,7 +727,7 @@ class BetterFlowSyncApp:
         elif key == "update_channel":
             self.config.update_channel = value
             check_for_update(
-                __version__.__version__,
+                __version__,
                 channel=value,
                 callback=self._on_update_available,
             )
