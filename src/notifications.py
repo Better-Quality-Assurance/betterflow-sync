@@ -30,8 +30,8 @@ def send_notification(title: str, message: str, sound: bool = True) -> None:
 def _send_macos(title: str, message: str, sound: bool) -> None:
     """Send notification via osascript on macOS."""
     # Escape double quotes and backslashes for AppleScript string literals.
-    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
-    safe_message = message.replace("\\", "\\\\").replace('"', '\\"')
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+    safe_message = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
 
     sound_clause = ' sound name "default"' if sound else ""
     script = (

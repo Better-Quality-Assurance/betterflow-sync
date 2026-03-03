@@ -2,7 +2,7 @@
 
 import logging
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -16,8 +16,8 @@ UPDATE_CHANNELS = ("stable", "beta", "canary")
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
-    """Parse 'v1.2.3' or '1.2.3' into a comparable tuple."""
-    return tuple(int(x) for x in version.lstrip("v").split(".")[:3])
+    """Parse 'v1.2.3' or '1.2.3-beta.1' into a comparable tuple."""
+    return tuple(int(x) for x in version.lstrip("v").split("-")[0].split(".")[:3])
 
 
 def _matches_channel(release: dict, channel: str) -> bool:
@@ -46,7 +46,7 @@ def _matches_channel(release: dict, channel: str) -> bool:
 def check_for_update(
     current_version: str,
     channel: str = "stable",
-    callback: Optional[callable] = None,
+    callback: Optional[Callable] = None,
 ) -> None:
     """Check GitHub for a newer release (runs in background thread).
 

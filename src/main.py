@@ -8,7 +8,7 @@ import threading
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -84,10 +84,15 @@ class SyncCoordinator:
         self.paused_by_network = False
 
         # Optional callback wired by the app for auth-error re-login
-        self._on_auth_error: Optional[callable] = None
+        self._on_auth_error: Optional[Callable] = None
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
+        # BackgroundScheduler.shutdown() is terminal -- create a fresh one
+        # if the previous scheduler was shut down (e.g. after logout/re-login).
+        if not self.scheduler.running:
+            self.scheduler = BackgroundScheduler()
+
         self._do_sync()
         self._fetch_trends()
 
@@ -247,24 +252,6 @@ class SyncCoordinator:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
 
-    def _fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API."""
-        try:
-            status = self.bf.get_status()
-            total_seconds = int(
-                status.get("data", {})
-                .get("today_summary", {})
-                .get("total_seconds", 0)
-            )
-            # Avoid UI regressions if backend summary is temporarily stale.
-            server_seconds = max(0, total_seconds)
-            if server_seconds >= self._hours_today_seconds:
-                self._hours_today_seconds = server_seconds
-            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
-            return self._hours_today_cache
-        except Exception:
-            return self._hours_today_cache
-
     def _refresh_hours_today(self) -> None:
         """Refresh tray hours from local active time tracker."""
         try:
@@ -399,6 +386,7 @@ class BetterFlowSyncApp:
         # State
         self._shutdown_done = False
         self._shutdown_event = threading.Event()
+        self._user_paused = False
 
     def run(self) -> None:
         """Run the application."""
@@ -488,10 +476,10 @@ class BetterFlowSyncApp:
                     "Accessibility permission in System Settings > Privacy & Security"
                 )
                 try:
-                    from .notifications import show_notification
+                    from .notifications import send_notification
                 except ImportError:
-                    from notifications import show_notification
-                show_notification(
+                    from notifications import send_notification
+                send_notification(
                     "BetterFlow Sync",
                     "Grant Accessibility permission to ActivityWatch in "
                     "System Settings > Privacy & Security for window tracking.",
@@ -503,10 +491,10 @@ class BetterFlowSyncApp:
         """Handle update available notification."""
         logger.info(f"Update available: v{version} — {url}")
         try:
-            from .notifications import show_notification
+            from .notifications import send_notification
         except ImportError:
-            from notifications import show_notification
-        show_notification(
+            from notifications import send_notification
+        send_notification(
             "BetterFlow Sync Update",
             f"Version {version} is available. Click to download.",
         )
@@ -551,6 +539,7 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
+        self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
@@ -559,6 +548,7 @@ class BetterFlowSyncApp:
 
     def _on_resume(self) -> None:
         """Handle resume action."""
+        self._user_paused = False
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
@@ -601,6 +591,9 @@ class BetterFlowSyncApp:
 
     def _on_system_wake(self) -> None:
         """Handle system wake from sleep."""
+        if self._user_paused:
+            logger.info("System wake — staying paused (user-initiated pause active)")
+            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
@@ -617,12 +610,17 @@ class BetterFlowSyncApp:
         logger.info("Screen locked — pausing tracking")
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
+        self.reminder_manager.on_tracking_stopped()
 
     def _on_screen_unlock(self) -> None:
         """Handle screen unlock — resume tracking."""
+        if self._user_paused:
+            logger.info("Screen unlocked — staying paused (user-initiated pause active)")
+            return
         logger.info("Screen unlocked — resuming tracking")
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
+        self.reminder_manager.on_tracking_started()
         self.coordinator.trigger_sync("unlock_sync")
 
     def _on_network_change(self, is_online: bool) -> None:

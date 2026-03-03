@@ -669,7 +669,7 @@ class TrayIcon:
         total_seconds = int(active_time.total_seconds())
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
-        self._hours_today = f"{hours}h {minutes}m"
+        self.model.hours_today = f"{hours}h {minutes}m"
         self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
         self._update_menu()
 
