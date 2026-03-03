@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 _system = platform.system()
 
+# Store observer refs for cleanup (M5)
+_registered_observers: list[tuple] = []  # [(center, observer), ...]
+_observers_lock = threading.Lock()
+
 
 def start_system_event_listener(
     on_sleep: Callable,
@@ -109,8 +113,15 @@ def _start_macos_power_listener(
             "NSWorkspaceWillPowerOffNotification", None,
         )
 
+        # Store refs for cleanup (M5)
+        with _observers_lock:
+            _registered_observers.append((center, observer))
+
         logger.debug("macOS power event listener started")
-        AppHelper.runConsoleEventLoop()
+        try:
+            AppHelper.runConsoleEventLoop()
+        finally:
+            center.removeObserver_(observer)
 
     thread = threading.Thread(target=run_loop, name="system-power-listener", daemon=True)
     thread.start()
@@ -156,8 +167,15 @@ def _start_macos_screen_lock_listener(
             "com.apple.screenIsUnlocked", None,
         )
 
+        # Store refs for cleanup (M5)
+        with _observers_lock:
+            _registered_observers.append((center, observer))
+
         logger.debug("macOS screen lock listener started")
-        AppHelper.runConsoleEventLoop()
+        try:
+            AppHelper.runConsoleEventLoop()
+        finally:
+            center.removeObserver_(observer)
 
     thread = threading.Thread(target=run_loop, name="screen-lock-listener", daemon=True)
     thread.start()
@@ -355,6 +373,8 @@ def _start_network_poller(
     state = {"online": None}  # None = unknown
 
     def poll():
+        # Immediate first check before entering the wait loop (N10)
+        first = True
         while True:
             try:
                 socket.create_connection((host, 443), timeout=5).close()
@@ -366,7 +386,11 @@ def _start_network_poller(
                 status = "online" if online else "offline"
                 logger.info(f"Network change detected — {status}")
                 _safe_call(on_change, online)
+            elif first:
+                # Fire initial state so the app knows network status at startup
+                _safe_call(on_change, online)
             state["online"] = online
+            first = False
 
             threading.Event().wait(interval)
 
@@ -378,6 +402,17 @@ def _start_network_poller(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def cleanup_observers() -> None:
+    """Remove all registered macOS notification observers (M5)."""
+    with _observers_lock:
+        for center, observer in _registered_observers:
+            try:
+                center.removeObserver_(observer)
+            except Exception:
+                pass
+        _registered_observers.clear()
+
 
 def _safe_call(fn: Callable, *args) -> None:
     """Call a function, catching and logging any exceptions."""

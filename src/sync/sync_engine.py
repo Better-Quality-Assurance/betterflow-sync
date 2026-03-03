@@ -1,6 +1,8 @@
 """Sync engine - orchestrates data flow from ActivityWatch to BetterFlow."""
 
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -94,12 +96,14 @@ class SyncEngine:
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates —
         # we only re-send if the duration actually changed.
-        self._sent_cache: dict[tuple[str, int], float] = {}
-        self._SENT_CACHE_MAX = 10_000
+        # Bounded LRU: evicts oldest on every insert once at capacity.
+        self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
+        self._SENT_CACHE_MAX = 5_000
 
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
         self._category_cache: Optional[dict[str, str]] = None
+        self._category_cache_lock = threading.Lock()
 
         # Activity analysis for fraud detection (DIP)
         self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
@@ -165,13 +169,15 @@ class SyncEngine:
 
     def invalidate_category_cache(self) -> None:
         """Clear the in-memory category cache so next lookup re-reads from DB."""
-        self._category_cache = None
+        with self._category_cache_lock:
+            self._category_cache = None
 
     def _get_category(self, app_name: str) -> Optional[str]:
-        """Look up category for an app, using in-memory cache."""
-        if self._category_cache is None:
-            self._category_cache = self.queue.get_all_categories()
-        return self._category_cache.get(app_name)
+        """Look up category for an app, using thread-safe in-memory cache (M3)."""
+        with self._category_cache_lock:
+            if self._category_cache is None:
+                self._category_cache = self.queue.get_all_categories()
+            return self._category_cache.get(app_name)
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -216,12 +222,18 @@ class SyncEngine:
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)
+        # Retry once on transient failure (N13)
         if not self._session_active:
-            try:
-                self.bf.start_session()
-                self._session_active = True
-            except BetterFlowClientError as e:
-                logger.warning(f"Failed to start session: {e}")
+            for attempt in range(2):
+                try:
+                    self.bf.start_session()
+                    self._session_active = True
+                    break
+                except BetterFlowClientError as e:
+                    if attempt == 0:
+                        logger.debug(f"Session start attempt 1 failed: {e}, retrying")
+                    else:
+                        logger.warning(f"Failed to start session after retry: {e}")
 
         # Get buckets to sync
         try:
@@ -251,6 +263,7 @@ class SyncEngine:
 
         # Sync window buckets with gap-filling
         all_events = []
+        pending_checkpoints: list[tuple[str, datetime, Optional[int]]] = []
         for bucket in window_buckets:
             try:
                 raw_events, _ = self._fetch_bucket_events(bucket.id, stats)
@@ -264,10 +277,12 @@ class SyncEngine:
                     filled = self._fill_window_gaps(raw_events, afk_events)
                     stats.gaps_filled += filled
 
-                    transformed = self._transform_and_checkpoint(
+                    transformed, checkpoint = self._transform_and_checkpoint(
                         raw_events, bucket.id, bucket.type, stats
                     )
                     all_events.extend(transformed)
+                    if checkpoint:
+                        pending_checkpoints.append(checkpoint)
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
@@ -275,15 +290,21 @@ class SyncEngine:
         # Sync non-window buckets normally
         for bucket in web_buckets + afk_buckets + input_buckets:
             try:
-                events = self._sync_bucket(bucket.id, bucket.type, stats)
+                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
                 all_events.extend(events)
+                if checkpoint:
+                    pending_checkpoints.append(checkpoint)
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
 
-        # Send events
+        # Send events, then commit checkpoints only on success (N5)
         if all_events:
             self._send_events(all_events, stats)
+        # Commit checkpoints after send (or if nothing to send, still advance)
+        if stats.events_sent > 0 or not all_events:
+            for bucket_id, ts, event_id in pending_checkpoints:
+                self.queue.set_checkpoint(bucket_id, ts, event_id)
 
         # Process offline queue if we're online
         if self.bf.is_reachable() and not self.queue.is_empty():
@@ -326,8 +347,11 @@ class SyncEngine:
         bucket_id: str,
         bucket_type: str,
         stats: SyncStats,
-    ) -> list[dict]:
-        """Transform events to BetterFlow format and update checkpoint.
+    ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
+        """Transform events to BetterFlow format and compute pending checkpoint.
+
+        Returns (transformed_events, pending_checkpoint).
+        The caller must commit the checkpoint AFTER send_events succeeds.
 
         Skips events already sent with unchanged duration (dedup).
         Re-sends if duration has grown (heartbeat extension).
@@ -348,25 +372,24 @@ class SyncEngine:
             transformed_event = self._transform_event(event, bucket_id, bucket_type)
             if transformed_event:
                 transformed.append(transformed_event)
+                # LRU insert: add/move to end, evict oldest if over capacity
                 self._sent_cache[cache_key] = event.duration
+                self._sent_cache.move_to_end(cache_key)
+                if len(self._sent_cache) > self._SENT_CACHE_MAX:
+                    self._sent_cache.popitem(last=False)
             else:
                 stats.events_filtered += 1
 
-        # Evict oldest entries if cache grows too large
-        if len(self._sent_cache) > self._SENT_CACHE_MAX:
-            excess = len(self._sent_cache) - self._SENT_CACHE_MAX
-            for key in list(self._sent_cache)[:excess]:
-                del self._sent_cache[key]
-
+        pending_checkpoint = None
         if events:
             newest = max(events, key=lambda e: e.timestamp)
-            self.queue.set_checkpoint(bucket_id, newest.timestamp, newest.id)
+            pending_checkpoint = (bucket_id, newest.timestamp, newest.id)
 
-        return transformed
+        return transformed, pending_checkpoint
 
     def _sync_bucket(
         self, bucket_id: str, bucket_type: str, stats: SyncStats
-    ) -> list[dict]:
+    ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
         """Sync events from a single bucket.
 
         ActivityWatch extends the duration of the current (most recent) event
@@ -375,10 +398,12 @@ class SyncEngine:
         before the checkpoint so recently-synced events whose duration has
         grown are re-sent with the updated value.  The backend uses the AW
         event id to upsert, so the duration is simply patched in place.
+
+        Returns (transformed_events, pending_checkpoint).
         """
         events, _ = self._fetch_bucket_events(bucket_id, stats)
         if not events:
-            return []
+            return [], None
         return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
 
     def _get_afk_events_for_range(
@@ -653,6 +678,11 @@ class SyncEngine:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
                     else:
+                        # N11: server returned non-success without accepted_ids
+                        logger.warning(
+                            "Server returned partial failure without accepted_ids - "
+                            "re-queuing entire batch"
+                        )
                         self.queue.enqueue(batch)
                         stats.events_queued += len(batch)
                     if result.error:
@@ -844,10 +874,14 @@ class SyncEngine:
     def shutdown(self) -> None:
         """Shutdown the sync engine gracefully."""
         if self._session_active:
-            try:
-                self.bf.end_session("app_quit")
-            except BetterFlowClientError:
-                pass
+            # Retry once on transient failure (N13)
+            for attempt in range(2):
+                try:
+                    self.bf.end_session("app_quit")
+                    break
+                except BetterFlowClientError:
+                    if attempt == 0:
+                        logger.debug("Session end attempt 1 failed, retrying")
             self._session_active = False
 
         # Close time tracker

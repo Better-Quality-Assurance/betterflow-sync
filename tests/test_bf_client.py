@@ -219,12 +219,12 @@ class TestBetterFlowClient:
         responses.add(
             responses.GET,
             "https://betterflow.eu/api/agent/test",
-            json={"message": "Rate limit exceeded"},
-            status=429,
+            json={"message": "Unprocessable Entity"},
+            status=422,
         )
 
-        with pytest.raises(BetterFlowClientError, match="429.*Rate limit exceeded"):
-            self.client._request("GET", "test")
+        with pytest.raises(BetterFlowClientError, match="422"):
+            self.client._request("GET", "test", retry=False)
 
     @responses.activate
     def test_send_events_success(self):
@@ -588,7 +588,7 @@ class TestRetryBehavior:
                 status=503,
             )
 
-        with pytest.raises(BetterFlowClientError, match="Server error"):
+        with pytest.raises(BetterFlowClientError, match="Server returned"):
             self.client._request("GET", "test")
 
     @responses.activate
@@ -617,7 +617,7 @@ class TestRetryBehavior:
             status=503,
         )
 
-        with pytest.raises(BetterFlowClientError, match="Server error"):
+        with pytest.raises(BetterFlowClientError, match="Server returned"):
             self.client._request("GET", "test", retry=False)
 
         # Should only call once

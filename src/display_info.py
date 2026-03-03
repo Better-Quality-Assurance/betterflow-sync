@@ -147,6 +147,8 @@ def _start_macos_tracker() -> DisplayTracker:
     _stop_event = threading.Event()
 
     def _run() -> None:
+        observer = None
+        nc = None
         try:
             observer = _Observer.alloc().init()
             nc = NSWorkspace.sharedWorkspace().notificationCenter()
@@ -178,10 +180,15 @@ def _start_macos_tracker() -> DisplayTracker:
                     NSDate.dateWithTimeIntervalSinceNow_(5.0),
                 )
                 _update_monitor_state()
-
-            nc.removeObserver_(observer)
         except Exception as e:
             logger.debug(f"macOS display tracker run loop failed: {e}")
+        finally:
+            # Ensure observer cleanup even if exception prevents normal shutdown (M6)
+            if nc is not None and observer is not None:
+                try:
+                    nc.removeObserver_(observer)
+                except Exception:
+                    pass
 
     def _stop() -> None:
         _stop_event.set()
@@ -336,11 +343,13 @@ def _start_windows_tracker() -> DisplayTracker:
 
     def _poll() -> None:
         """Poll loop for Windows -- runs every 2s."""
+        com_initialized = False
         try:
             # Initialize COM for this thread
             if _vd_available:
                 try:
                     ctypes.windll.ole32.CoInitialize(None)  # type: ignore[attr-defined]
+                    com_initialized = True
                 except Exception:
                     pass
 
@@ -355,6 +364,13 @@ def _start_windows_tracker() -> DisplayTracker:
                 )
         except Exception as e:
             logger.debug(f"Windows display tracker poll failed: {e}")
+        finally:
+            # Ensure COM cleanup (M6)
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
 
     def _stop() -> None:
         _stop_event.set()

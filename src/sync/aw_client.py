@@ -127,10 +127,10 @@ class AWClient:
         self._buckets_cache_time: float = 0.0
         self._buckets_cache_ttl: float = 30.0
 
-    def _request(self, method: str, endpoint: str, **kwargs) -> dict:
+    def _request(self, method: str, endpoint: str, timeout: Optional[int] = None, **kwargs) -> dict:
         """Make request to ActivityWatch API."""
         url = urljoin(self.base_url, endpoint)
-        kwargs.setdefault("timeout", self.timeout)
+        kwargs["timeout"] = timeout if timeout is not None else self.timeout
 
         try:
             response = self._session.request(method, url, **kwargs)
@@ -146,9 +146,12 @@ class AWClient:
             raise AWClientError(f"Unexpected error: {e}") from e
 
     def is_running(self) -> bool:
-        """Check if ActivityWatch server is running."""
+        """Check if ActivityWatch server is running.
+
+        Uses a shorter timeout (3s) to fail fast on unreachable servers (N6).
+        """
         try:
-            self.get_info()
+            self._request("GET", "info", timeout=3)
             return True
         except AWClientError:
             return False

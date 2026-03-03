@@ -54,9 +54,9 @@ def calculate_delay(
     delay = min(delay, max_delay)
 
     if jitter:
-        # Add +/- 25% jitter
+        # Add 0-25% jitter (always increases, never below base delay) (N15)
         jitter_range = delay * 0.25
-        delay = delay + random.uniform(-jitter_range, jitter_range)
+        delay = delay + random.uniform(0, jitter_range)
 
     return max(0, delay)
 

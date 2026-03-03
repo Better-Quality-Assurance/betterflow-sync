@@ -19,6 +19,29 @@ else:
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
 
+# Warn if running directly from a DMG (macOS).  The mounted disk image
+# can be ejected while the app is running, which causes a SIGBUS crash
+# because the executable's memory-mapped code pages become invalid.
+if getattr(sys, "frozen", False) and sys.platform == "darwin":
+    _exe = os.path.realpath(sys.executable)
+    if _exe.startswith("/Volumes/"):
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            _root = tk.Tk()
+            _root.withdraw()
+            messagebox.showwarning(
+                "BetterFlow Sync",
+                "Please drag BetterFlow Sync to your Applications folder "
+                "before launching.\n\n"
+                "Running from the disk image will cause crashes.",
+            )
+            _root.destroy()
+        except Exception:
+            pass
+        sys.exit(1)
+
 # Now import and run the canonical app from main.py
 from main import main  # noqa: E402
 

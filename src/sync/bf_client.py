@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import platform
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -226,11 +227,16 @@ class BetterFlowClient(BaseApiClient):
             return SyncResult(success=True, events_synced=0)
 
         try:
+            # Idempotency key prevents duplicate processing if the connection
+            # drops after the server processes the batch but before we receive
+            # the response (N1).
+            idempotency_key = str(uuid.uuid4())
             response = self._request(
                 "POST",
                 "events/batch",
                 data={"events": events},
                 compress=True,
+                extra_headers={"X-Idempotency-Key": idempotency_key},
             )
             return SyncResult(
                 success=True,
@@ -255,8 +261,14 @@ class BetterFlowClient(BaseApiClient):
         """
         return self._request("POST", "sessions/end", data={"reason": reason})
 
+    # Lightweight retry for heartbeat (N14): 1 retry, 5s timeout
+    _HEARTBEAT_RETRY = RetryConfig(max_retries=1, base_delay=1.0, max_delay=5.0)
+
     def heartbeat(self, agent_version: str = AGENT_VERSION) -> dict:
         """Send heartbeat to server.
+
+        Uses a shorter timeout (5s) and fewer retries (1) to avoid
+        blocking the sync loop when the server is slow (N14).
 
         Returns server commands (pause/deregister) and config update flag.
         """
@@ -264,7 +276,9 @@ class BetterFlowClient(BaseApiClient):
             "POST", "heartbeat", data={
                 "agent_version": agent_version,
                 "timezone": self._detect_timezone(),
-            }
+            },
+            timeout_override=5,
+            retry_config_override=self._HEARTBEAT_RETRY,
         )
 
     @staticmethod

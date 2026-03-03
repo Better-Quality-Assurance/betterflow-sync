@@ -38,10 +38,17 @@ if aw_dir.exists():
             target_dir = Path("resources/trackers") / aw_platform / rel_parent
             aw_binaries.append((str(binary), str(target_dir)))
 
+# Collect Tcl/Tk data files so tkinter works in the bundle
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+tcl_tk_datas = collect_data_files("tkinter")
+tcl_tk_binaries = collect_dynamic_libs("_tkinter")
+
 # Hidden imports for pystray, keyring backends, and our modules
 hiddenimports = [
     "pystray._darwin" if is_mac else "pystray._win32",
     "keyring.backends.macOS" if is_mac else "keyring.backends.Windows",
+    "tkinter",
+    "_tkinter",
     "PIL._tkinter_finder",
     "apscheduler.triggers.interval",
     "apscheduler.schedulers.background",
@@ -69,8 +76,8 @@ hiddenimports = [
 a = Analysis(
     [str(src_dir / "entry_point.py")],
     pathex=[str(root_dir), str(src_dir)],
-    binaries=aw_binaries,
-    datas=datas,
+    binaries=aw_binaries + tcl_tk_binaries,
+    datas=datas + tcl_tk_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

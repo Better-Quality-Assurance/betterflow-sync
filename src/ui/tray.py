@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import threading
+import time
 import webbrowser
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
@@ -194,6 +195,12 @@ class TrayIcon:
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
+
+        # Menu debounce: rebuild at most once per second
+        self._menu_debounce_interval = 1.0
+        self._menu_last_rebuild: float = 0.0
+        self._menu_pending: bool = False
+        self._menu_lock = threading.Lock()
 
     def _create_menu(self) -> pystray.Menu:
         """Create the tray menu."""
@@ -686,7 +693,28 @@ class TrayIcon:
             self._icon.menu = self._create_menu()
 
     def _update_menu(self) -> None:
-        """Update the tray menu."""
+        """Update the tray menu (debounced: max once per second)."""
+        if not self._icon:
+            return
+        now = time.monotonic()
+        with self._menu_lock:
+            elapsed = now - self._menu_last_rebuild
+            if elapsed >= self._menu_debounce_interval:
+                self._menu_last_rebuild = now
+                self._menu_pending = False
+                self._icon.menu = self._create_menu()
+            elif not self._menu_pending:
+                self._menu_pending = True
+                delay = self._menu_debounce_interval - elapsed
+                timer = threading.Timer(delay, self._flush_menu)
+                timer.daemon = True
+                timer.start()
+
+    def _flush_menu(self) -> None:
+        """Deferred menu rebuild after debounce delay."""
+        with self._menu_lock:
+            self._menu_pending = False
+            self._menu_last_rebuild = time.monotonic()
         if self._icon:
             self._icon.menu = self._create_menu()
 

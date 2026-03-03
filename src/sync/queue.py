@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -56,8 +57,11 @@ class OfflineQueue:
         self.db_path = db_path
         self.max_size = max_size
         self._local = threading.local()
+        # Track connections for cleanup in close() (M4)
         self._connections: list[sqlite3.Connection] = []
         self._connections_lock = threading.Lock()
+        self._last_integrity_check: float = time.monotonic()
+        self._integrity_check_interval: float = 3600.0  # 1 hour
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -148,6 +152,28 @@ class OfflineQueue:
                 """
             )
 
+    def check_integrity(self) -> bool:
+        """Run periodic SQLite integrity check (N2).
+
+        Returns True if database is healthy, False if corruption detected.
+        Automatically resets the database on corruption.
+        """
+        now = time.monotonic()
+        if now - self._last_integrity_check < self._integrity_check_interval:
+            return True
+        self._last_integrity_check = now
+        try:
+            with self._cursor() as cursor:
+                cursor.execute("PRAGMA quick_check")
+                result = cursor.fetchone()
+                if result[0] != "ok":
+                    logger.error(f"SQLite quick_check failed: {result[0]}")
+                    return False
+            return True
+        except sqlite3.DatabaseError as e:
+            logger.error(f"SQLite integrity check error: {e}")
+            return False
+
     def enqueue(self, events: list[dict]) -> int:
         """Add events to the queue.
 
@@ -184,24 +210,30 @@ class OfflineQueue:
             )
             return cursor.rowcount
 
-    def dequeue(self, batch_size: int = 100) -> list[QueuedEvent]:
+    def dequeue(self, batch_size: int = 100, max_retries: int = 5) -> list[QueuedEvent]:
         """Get a batch of events from the queue (oldest first).
+
+        Skips events that have exceeded max_retries (N7).
 
         Args:
             batch_size: Maximum number of events to return
+            max_retries: Skip events with retry_count >= this value
 
         Returns:
             List of QueuedEvent objects
         """
+        # Periodic integrity check (N2)
+        self.check_integrity()
         with self._cursor() as cursor:
             cursor.execute(
                 """
                 SELECT id, event_data, created_at, retry_count
                 FROM queued_events
+                WHERE retry_count < ?
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
-                (batch_size,),
+                (max_retries, batch_size),
             )
             return [QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall()]
 

@@ -82,6 +82,7 @@ class SyncCoordinator:
         # Flags set by the app layer
         self.logged_in = False
         self.paused_by_network = False
+        self._sync_in_progress = False
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
@@ -185,6 +186,8 @@ class SyncCoordinator:
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         try:
+            self._sync_in_progress = True
+
             if self.sync_engine.is_private:
                 return
 
@@ -251,6 +254,8 @@ class SyncCoordinator:
         except Exception as e:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
+        finally:
+            self._sync_in_progress = False
 
     def _refresh_hours_today(self) -> None:
         """Refresh tray hours from local active time tracker."""
@@ -591,6 +596,8 @@ class BetterFlowSyncApp:
 
     def _on_system_wake(self) -> None:
         """Handle system wake from sleep."""
+        # Drop stale TCP connections from sleep (N3)
+        self.bf.reset_session()
         if self._user_paused:
             logger.info("System wake — staying paused (user-initiated pause active)")
             return
@@ -632,10 +639,16 @@ class BetterFlowSyncApp:
                 self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
         else:
-            logger.info("Network offline — pausing sync immediately")
-            self.sync_engine.pause()
-            self.coordinator.paused_by_network = True
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+            # Don't interrupt an in-flight sync (N4) - let it complete or timeout
+            if self.coordinator._sync_in_progress:
+                logger.info("Network offline — sync in progress, will pause after completion")
+                self.coordinator.paused_by_network = True
+                self.tray.set_state(TrayState.QUEUED, "Offline")
+            else:
+                logger.info("Network offline — pausing sync immediately")
+                self.sync_engine.pause()
+                self.coordinator.paused_by_network = True
+                self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_export_logs(self) -> None:
         """Export logs and redacted config to a zip file on the Desktop."""
