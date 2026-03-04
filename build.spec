@@ -64,6 +64,7 @@ hiddenimports = [
     "aw_manager",
     "autostart",
     "display_info",
+    "sync.macos_window_watcher",
 ]
 
 a = Analysis(

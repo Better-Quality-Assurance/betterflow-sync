@@ -107,6 +107,7 @@ class SyncEngine:
             fraud_config=self.config.fraud_detection,
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
+        self._has_input_data = False  # Set to True when input buckets exist
 
     def _create_engagement_thresholds(self) -> EngagementThresholds:
         """Create EngagementThresholds from config."""
@@ -250,6 +251,7 @@ class SyncEngine:
             except AWClientError:
                 pass
         self._activity_analyzer.add_input_events(input_events_for_analysis)
+        self._has_input_data = len(input_buckets) > 0
 
         # Sync window buckets with gap-filling
         all_events = []
@@ -569,17 +571,22 @@ class SyncEngine:
 
         # Add activity classification for window events (fraud detection)
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
-            activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
+            if self._has_input_data:
+                activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
+                activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
 
-            result["activity_state"] = activity_state
-            result["activity_metrics"] = activity_metrics.to_dict()
+                result["activity_state"] = activity_state
+                result["activity_metrics"] = activity_metrics.to_dict()
 
-            # Add fraud assessment from session-level signals
-            fraud = self._activity_analyzer.get_fraud_assessment(event.timestamp, app=app)
-            result["fraud_score"] = fraud.score
-            result["fraud_signals"] = fraud.signals
-            result["activity_metrics"].update(fraud.extra_metrics)
+                # Add fraud assessment from session-level signals
+                fraud = self._activity_analyzer.get_fraud_assessment(event.timestamp, app=app)
+                result["fraud_score"] = fraud.score
+                result["fraud_signals"] = fraud.signals
+                result["activity_metrics"].update(fraud.extra_metrics)
+            else:
+                # No input watcher — treat all window events as active
+                activity_state = "active"
+                result["activity_state"] = activity_state
 
             # Track active time (only "active" events count)
             if activity_state == "active":

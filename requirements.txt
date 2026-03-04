@@ -6,6 +6,7 @@ apscheduler>=3.10
 platformdirs>=3.0
 Pillow>=10.0
 pyobjc-framework-SystemConfiguration>=10.0; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
 
 # Development dependencies (install with: pip install -r requirements-dev.txt)
 # pytest>=7.0

@@ -1,64 +1,31 @@
-"""In-process macOS window watcher using JXA.
+"""In-process macOS window watcher using native PyObjC APIs.
 
 Replaces the bf-window-tracker subprocess on macOS so that window tracking
-inherits the main process's Accessibility permission instead of requiring
-a separate grant for the subprocess binary.
+uses the main process's Accessibility permission directly (via PyObjC)
+instead of shelling out to osascript (which is a separate binary and needs
+its own Accessibility grant).
 
 Follows the same daemon-thread pattern as display_info.py.
 """
 
-import json
 import logging
-import os
 import platform
 import subprocess
-import sys
 import threading
 from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
-def _find_jxa_script() -> Optional[str]:
-    """Locate printAppStatus.jxa in resources.
-
-    Search order:
-    1. Development: project_root/resources/trackers/darwin/bf-window-tracker/aw_watcher_window/
-    2. PyInstaller frozen bundle: sys._MEIPASS/resources/...
-    3. Persistent install dir: ~/Library/Application Support/BetterFlow Sync/trackers/darwin/...
-    """
-    relative = os.path.join(
-        "resources", "trackers", "darwin",
-        "bf-window-tracker", "aw_watcher_window", "printAppStatus.jxa",
-    )
-
-    # Development layout
-    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    dev_path = os.path.join(src_dir, relative)
-    if os.path.isfile(dev_path):
-        return dev_path
-
-    # PyInstaller frozen bundle
-    if getattr(sys, "frozen", False):
-        frozen_path = os.path.join(sys._MEIPASS, relative)
-        if os.path.isfile(frozen_path):
-            return frozen_path
-
-    # Persistent install directory
-    install_path = os.path.join(
-        os.path.expanduser("~/Library/Application Support/BetterFlow Sync"),
-        "trackers", "darwin",
-        "bf-window-tracker", "aw_watcher_window", "printAppStatus.jxa",
-    )
-    if os.path.isfile(install_path):
-        return install_path
-
-    return None
+# Browser apps that support URL retrieval via AppleScript
+_CHROMIUM_BROWSERS = frozenset({
+    "Google Chrome", "Google Chrome Canary", "Chromium", "Brave Browser",
+})
+_URL_BROWSERS = _CHROMIUM_BROWSERS | {"Safari"}
 
 
 class MacOSWindowWatcher:
-    """Daemon thread that polls the active window via JXA and posts heartbeats to AW."""
+    """Daemon thread that polls the active window via PyObjC and posts heartbeats to AW."""
 
     def __init__(self, aw_client, poll_interval: float = 1.0):
         self._aw = aw_client
@@ -67,16 +34,24 @@ class MacOSWindowWatcher:
         self._thread: Optional[threading.Thread] = None
         self._hostname = platform.node()
         self._bucket_id = f"aw-watcher-window_{self._hostname}"
-        self._jxa_path: Optional[str] = None
 
     def start(self) -> bool:
         """Create the AW bucket and start the polling thread.
 
         Returns True if started successfully, False otherwise.
         """
-        self._jxa_path = _find_jxa_script()
-        if not self._jxa_path:
-            logger.error("Cannot start MacOSWindowWatcher: printAppStatus.jxa not found")
+        # Verify PyObjC Accessibility APIs are available
+        try:
+            from AppKit import NSWorkspace  # noqa: F401
+            from ApplicationServices import (  # noqa: F401
+                AXIsProcessTrusted,
+                AXUIElementCreateApplication,
+            )
+            trusted = AXIsProcessTrusted()
+            if not trusted:
+                logger.warning("Process does NOT have Accessibility permission — window titles will be empty")
+        except ImportError:
+            logger.error("Cannot start MacOSWindowWatcher: pyobjc-framework-ApplicationServices not installed")
             return False
 
         try:
@@ -98,31 +73,91 @@ class MacOSWindowWatcher:
             self._thread.join(timeout=5.0)
         logger.info("MacOSWindowWatcher stopped")
 
+    def _get_active_window(self) -> Optional[dict]:
+        """Get active window info using native macOS APIs (PyObjC).
+
+        Uses NSWorkspace for the frontmost app and Accessibility APIs
+        for the window title — both run in-process so they use this app's
+        Accessibility permission, not osascript's.
+        """
+        from AppKit import NSWorkspace
+        from ApplicationServices import (
+            AXUIElementCopyAttributeValue,
+            AXUIElementCreateApplication,
+        )
+
+        workspace = NSWorkspace.sharedWorkspace()
+        active_app = workspace.frontmostApplication()
+        if not active_app:
+            return None
+
+        app_name = active_app.localizedName()
+        pid = active_app.processIdentifier()
+
+        # Get window title via Accessibility API
+        title = ""
+        app_ref = AXUIElementCreateApplication(pid)
+        err, focused_window = AXUIElementCopyAttributeValue(
+            app_ref, "AXFocusedWindow", None,
+        )
+        if err == 0 and focused_window:
+            err2, ax_title = AXUIElementCopyAttributeValue(
+                focused_window, "AXTitle", None,
+            )
+            if err2 == 0 and ax_title:
+                title = str(ax_title)
+
+        result = {"app": app_name, "title": title}
+
+        # For browsers, get URL via AppleScript (doesn't need Accessibility)
+        if app_name in _URL_BROWSERS:
+            url, incognito = self._get_browser_url(app_name)
+            if url:
+                result["url"] = url
+            if incognito is not None:
+                result["incognito"] = incognito
+
+        return result
+
+    @staticmethod
+    def _get_browser_url(app_name: str) -> tuple[Optional[str], Optional[bool]]:
+        """Get URL from browser via AppleScript (doesn't need Accessibility)."""
+        try:
+            if app_name == "Safari":
+                script = 'tell application "Safari" to return URL of current tab of front window'
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip(), None
+            elif app_name in _CHROMIUM_BROWSERS:
+                # Get URL and mode in one call
+                script = f'tell application "{app_name}" to return (URL of active tab of front window) & "\\n" & (mode of front window as text)'
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split("\n")
+                    url = lines[0] if lines else None
+                    incognito = lines[1] == "incognito" if len(lines) > 1 else None
+                    return url, incognito
+        except (subprocess.TimeoutExpired, Exception):
+            pass
+        return None, None
+
     def _run(self) -> None:
-        """Poll loop: run JXA script, parse JSON, post heartbeat."""
+        """Poll loop: get active window via PyObjC, post heartbeat."""
         while not self._stop_event.wait(self._poll_interval):
             try:
-                result = subprocess.run(
-                    ["osascript", self._jxa_path],
-                    capture_output=True, text=True, timeout=10,
-                )
-
-                if result.returncode != 0:
-                    stderr = result.stderr.strip()
-                    # Accessibility errors are expected when permission is missing
-                    if stderr:
-                        logger.debug(f"JXA script error: {stderr}")
+                data = self._get_active_window()
+                if not data or not data.get("app"):
                     continue
-
-                output = result.stdout.strip()
-                if not output:
-                    continue
-
-                data = json.loads(output)
 
                 # Build heartbeat data matching AW window watcher format
                 heartbeat_data = {
-                    "app": data.get("app", "unknown"),
+                    "app": data["app"],
                     "title": data.get("title", ""),
                 }
                 if data.get("url"):
@@ -136,9 +171,5 @@ class MacOSWindowWatcher:
                     pulsetime=self._poll_interval + 1.0,
                 )
 
-            except json.JSONDecodeError as e:
-                logger.debug(f"JXA output parse error: {e}")
-            except subprocess.TimeoutExpired:
-                logger.debug("JXA script timed out")
             except Exception as e:
-                logger.debug(f"Window watcher poll error: {e}")
+                logger.warning(f"Window watcher poll error: {e}")

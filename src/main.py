@@ -272,17 +272,21 @@ class SyncCoordinator:
         """Refresh tray hours from local active time tracker."""
         try:
             if not self.logged_in:
+                logger.debug("_refresh_hours: skipped (not logged in)")
                 return
             if self.paused_by_network:
+                logger.debug("_refresh_hours: skipped (paused by network)")
                 return
             if self.sync_engine.is_paused or self.sync_engine.is_private:
+                logger.debug("_refresh_hours: skipped (paused or private)")
                 return
 
             # Use local active time tracker (already handles engagement detection)
             active_time = self.sync_engine.get_today_active_time()
+            logger.info(f"_refresh_hours: active_time={active_time}")
             self.tray.set_active_time(active_time)
         except Exception as e:
-            logger.debug(f"Failed to refresh tray hours: {e}")
+            logger.warning(f"Failed to refresh tray hours: {e}")
 
     def _fetch_trends(self) -> None:
         """Fetch weekly/monthly trend data from server."""
