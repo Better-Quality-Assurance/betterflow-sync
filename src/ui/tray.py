@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import threading
+import time
 import webbrowser
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
@@ -14,17 +15,28 @@ if TYPE_CHECKING:
     from ..config import Config
 
 
-def _hide_from_dock() -> None:
-    """Hide the app from the macOS Dock."""
+def _prevent_termination() -> None:
+    """Prevent macOS from silently killing the tray app.
+
+    Without these calls, macOS may terminate a background-only app after
+    a few minutes via Sudden Termination or Automatic Termination.
+
+    Note: Dock hiding is handled by LSUIElement=True in the Info.plist
+    (set in build.spec).  We intentionally do NOT call
+    setActivationPolicy_(1) here because it conflicts with pystray's
+    NSApplication setup and can prevent the status bar item from appearing.
+    """
     if platform.system() != "Darwin":
         return
     try:
-        import AppKit
-        ns_app = AppKit.NSApplication.sharedApplication()
-        # NSApplicationActivationPolicyAccessory = 1 (no Dock icon)
-        ns_app.setActivationPolicy_(1)
+        import Foundation
+
+        proc_info = Foundation.NSProcessInfo.processInfo()
+        proc_info.setAutomaticTerminationSupportEnabled_(False)
+        proc_info.disableSuddenTermination()
     except Exception:
         pass
+
 
 __all__ = ["TrayIcon", "TrayState", "TrayModel", "STATE_COLORS", "create_icon_image", "ProjectDict"]
 
@@ -194,6 +206,12 @@ class TrayIcon:
 
         self._icon: Optional[pystray.Icon] = None
         self._thread: Optional[threading.Thread] = None
+
+        # Menu debounce: rebuild at most once per second
+        self._menu_debounce_interval = 1.0
+        self._menu_last_rebuild: float = 0.0
+        self._menu_pending: bool = False
+        self._menu_lock = threading.Lock()
 
     def _create_menu(self) -> pystray.Menu:
         """Create the tray menu."""
@@ -669,8 +687,7 @@ class TrayIcon:
         total_seconds = int(active_time.total_seconds())
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
-        self._hours_today = f"{hours}h {minutes}m"
-        self.model.hours_today = self._hours_today
+        self.model.hours_today = f"{hours}h {minutes}m"
         self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
         self._update_menu()
 
@@ -680,14 +697,88 @@ class TrayIcon:
             self._icon.title = tooltip
 
     def _update_icon(self) -> None:
-        """Update the tray icon image and menu."""
-        if self._icon:
-            color = STATE_COLORS.get(self.model.state, STATE_COLORS[TrayState.STARTING])
-            self._icon.icon = create_icon_image(color)
-            self._icon.menu = self._create_menu()
+        """Update the tray icon image and menu.
+
+        On macOS, image updates are dispatched to the main thread via
+        performSelectorOnMainThread because AppKit calls from background
+        threads silently fail in PyInstaller .app bundles.
+        """
+        if not self._icon:
+            return
+        color = STATE_COLORS.get(self.model.state, STATE_COLORS[TrayState.STARTING])
+        new_image = create_icon_image(color)
+
+        if platform.system() == "Darwin":
+            try:
+                self._set_icon_main_thread(new_image)
+            except Exception:
+                logger.debug("Main-thread icon update failed, using fallback")
+                self._icon.icon = new_image
+        else:
+            self._icon.icon = new_image
+
+        self._icon.menu = self._create_menu()
+
+    def _set_icon_main_thread(self, pil_img: Image.Image) -> None:
+        """Update the NSStatusItem button image on the main thread (macOS).
+
+        Converts a PIL image to NSImage and dispatches setImage: to the
+        main thread run loop where AppKit can properly render it.
+        """
+        import AppKit
+        import Foundation
+        import io
+
+        thickness = 22
+        try:
+            thickness = max(int(self._icon._status_bar.thickness()), 22)
+        except Exception:
+            pass
+
+        sz = thickness
+        if pil_img.size != (sz, sz):
+            pil_img = pil_img.resize((sz, sz), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        pil_img.save(buf, "png")
+        ns_data = Foundation.NSData(buf.getvalue())
+        ns_img = AppKit.NSImage.alloc().initWithData_(ns_data)
+        ns_img.setSize_(Foundation.NSSize(sz, sz))
+
+        # Update pystray internal state to prevent stale-image redraws
+        self._icon._icon = pil_img
+        self._icon._icon_valid = True
+
+        # Dispatch setImage: to the main thread where AppKit works correctly
+        button = self._icon._status_item.button()
+        if button:
+            button.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"setImage:", ns_img, False,
+            )
 
     def _update_menu(self) -> None:
-        """Update the tray menu."""
+        """Update the tray menu (debounced: max once per second)."""
+        if not self._icon:
+            return
+        now = time.monotonic()
+        with self._menu_lock:
+            elapsed = now - self._menu_last_rebuild
+            if elapsed >= self._menu_debounce_interval:
+                self._menu_last_rebuild = now
+                self._menu_pending = False
+                self._icon.menu = self._create_menu()
+            elif not self._menu_pending:
+                self._menu_pending = True
+                delay = self._menu_debounce_interval - elapsed
+                timer = threading.Timer(delay, self._flush_menu)
+                timer.daemon = True
+                timer.start()
+
+    def _flush_menu(self) -> None:
+        """Deferred menu rebuild after debounce delay."""
+        with self._menu_lock:
+            self._menu_pending = False
+            self._menu_last_rebuild = time.monotonic()
         if self._icon:
             self._icon.menu = self._create_menu()
 
@@ -719,17 +810,48 @@ class TrayIcon:
     def run_blocking(self) -> None:
         """Run the tray icon in the main thread (blocking).
 
-        Must be called from the main thread — pystray/NSApplication requires it.
-        Dock hiding is handled by LSUIElement in Info.plist for bundled apps,
-        and by _hide_from_dock() as a fallback for source runs.
+        Retries up to 3 times if the event loop exits within 2 seconds,
+        which can happen on macOS when NSApplication fails to initialise.
         """
-        _hide_from_dock()
-        if self._icon is None:
-            color = STATE_COLORS[self.model.state]
-            self._icon = pystray.Icon(
-                "BetterFlow Sync",
-                create_icon_image(color),
-                "BetterFlow Sync",
-                self._create_menu(),
+        _prevent_termination()
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if self._icon is None:
+                color = STATE_COLORS[self.model.state]
+                self._icon = pystray.Icon(
+                    "BetterFlow Sync",
+                    create_icon_image(color),
+                    "BetterFlow Sync",
+                    self._create_menu(),
+                )
+
+            # Ensure activation policy is Accessory (1) for tray apps.
+            try:
+                policy = self._icon._app.activationPolicy()
+                logger.debug("NSApp activation policy: %d", policy)
+                if policy != 1:
+                    self._icon._app.setActivationPolicy_(1)
+                    logger.debug("Set activation policy to Accessory (1)")
+            except Exception:
+                logger.debug("Failed to check/set activation policy", exc_info=True)
+
+            self._icon.visible = True
+
+            start = time.monotonic()
+            logger.info("Tray event loop starting (attempt %d/%d)", attempt, max_retries)
+            self._icon.run(setup=lambda icon: None)
+            elapsed = time.monotonic() - start
+
+            if elapsed > 2.0:
+                logger.info("Tray event loop exited after %.1fs", elapsed)
+                return
+
+            logger.warning(
+                "Tray event loop exited after %.1fs (attempt %d/%d)",
+                elapsed, attempt, max_retries,
             )
-        self._icon.run()
+            self._icon = None
+            time.sleep(0.5)
+
+        logger.error("Tray icon failed to start after %d attempts", max_retries)

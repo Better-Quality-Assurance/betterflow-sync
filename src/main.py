@@ -8,14 +8,14 @@ import threading
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
 try:
-    from . import __version__
+    from .__init__ import __version__
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
@@ -84,10 +84,14 @@ class SyncCoordinator:
         self.paused_by_network = False
 
         # Optional callback wired by the app for auth-error re-login
-        self._on_auth_error: Optional[callable] = None
+        self._on_auth_error: Optional[Callable] = None
+        self._sync_in_progress = False
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
+        # BackgroundScheduler.shutdown() is terminal -- create a fresh one
+        if not self.scheduler.running:
+            self.scheduler = BackgroundScheduler()
         self._do_sync()
         self._fetch_trends()
 
@@ -182,6 +186,7 @@ class SyncCoordinator:
 
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
+        self._sync_in_progress = True
         try:
             if self.sync_engine.is_private:
                 return
@@ -249,6 +254,8 @@ class SyncCoordinator:
         except Exception as e:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
+        finally:
+            self._sync_in_progress = False
 
     def _fetch_hours_today(self) -> str:
         """Fetch today's tracked hours from API."""
@@ -359,7 +366,10 @@ class BetterFlowSyncApp:
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
-        self.display_tracker = start_display_tracker()
+        if self.config.privacy.track_display_info:
+            self.display_tracker = start_display_tracker()
+        else:
+            self.display_tracker = None
 
         # In-process window watcher on macOS (inherits Accessibility permission)
         self.window_watcher = None
@@ -416,6 +426,7 @@ class BetterFlowSyncApp:
         # State
         self._shutdown_done = False
         self._shutdown_event = threading.Event()
+        self._user_paused = False
 
     def run(self) -> None:
         """Run the application."""
@@ -466,22 +477,28 @@ class BetterFlowSyncApp:
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         # Start system event listeners
-        start_system_event_listener(
-            on_sleep=self._on_system_sleep,
-            on_wake=self._on_system_wake,
-            on_shutdown=self._on_system_shutdown,
-            on_network_change=self._on_network_change,
-            on_screen_lock=self._on_screen_lock,
-            on_screen_unlock=self._on_screen_unlock,
-        )
+        try:
+            start_system_event_listener(
+                on_sleep=self._on_system_sleep,
+                on_wake=self._on_system_wake,
+                on_shutdown=self._on_system_shutdown,
+                on_network_change=self._on_network_change,
+                on_screen_lock=self._on_screen_lock,
+                on_screen_unlock=self._on_screen_unlock,
+            )
+        except Exception:
+            logger.exception("Failed to start system event listeners")
 
         # Check for updates in background
-        if self.config.check_updates:
-            check_for_update(
-                (__version__ if isinstance(__version__, str) else __version__.__version__),
-                channel=self.config.update_channel,
-                callback=self._on_update_available,
-            )
+        try:
+            if self.config.check_updates:
+                check_for_update(
+                    (__version__ if isinstance(__version__, str) else __version__.__version__),
+                    channel=self.config.update_channel,
+                    callback=self._on_update_available,
+                )
+        except Exception:
+            logger.exception("Failed to start update checker")
 
         logger.info("BetterFlow Sync running")
         try:
@@ -509,10 +526,10 @@ class BetterFlowSyncApp:
                     "Accessibility permission in System Settings > Privacy & Security"
                 )
                 try:
-                    from .notifications import show_notification
+                    from .notifications import send_notification
                 except ImportError:
-                    from notifications import show_notification
-                show_notification(
+                    from notifications import send_notification
+                send_notification(
                     "BetterFlow Sync",
                     "Grant Accessibility permission to ActivityWatch in "
                     "System Settings > Privacy & Security for window tracking.",
@@ -524,10 +541,10 @@ class BetterFlowSyncApp:
         """Handle update available notification."""
         logger.info(f"Update available: v{version} — {url}")
         try:
-            from .notifications import show_notification
+            from .notifications import send_notification
         except ImportError:
-            from notifications import show_notification
-        show_notification(
+            from notifications import send_notification
+        send_notification(
             "BetterFlow Sync Update",
             f"Version {version} is available. Click to download.",
         )
@@ -572,6 +589,7 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
+        self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
@@ -580,6 +598,7 @@ class BetterFlowSyncApp:
 
     def _on_resume(self) -> None:
         """Handle resume action."""
+        self._user_paused = False
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
@@ -622,6 +641,10 @@ class BetterFlowSyncApp:
 
     def _on_system_wake(self) -> None:
         """Handle system wake from sleep."""
+        self.bf.reset_session()
+        if self._user_paused:
+            logger.info("System wake — staying paused (user-initiated pause active)")
+            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
@@ -638,12 +661,17 @@ class BetterFlowSyncApp:
         logger.info("Screen locked — pausing tracking")
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
+        self.reminder_manager.on_tracking_stopped()
 
     def _on_screen_unlock(self) -> None:
         """Handle screen unlock — resume tracking."""
         logger.info("Screen unlocked — resuming tracking")
+        if self._user_paused:
+            logger.info("Screen unlock — staying paused (user-initiated pause active)")
+            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
+        self.reminder_manager.on_tracking_started()
         self.coordinator.trigger_sync("unlock_sync")
 
     def _on_network_change(self, is_online: bool) -> None:
@@ -655,10 +683,15 @@ class BetterFlowSyncApp:
                 self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
         else:
-            logger.info("Network offline — pausing sync immediately")
-            self.sync_engine.pause()
-            self.coordinator.paused_by_network = True
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+            if self.coordinator._sync_in_progress:
+                logger.info("Network offline — sync in progress, will pause after completion")
+                self.coordinator.paused_by_network = True
+                self.tray.set_state(TrayState.QUEUED, "Offline")
+            else:
+                logger.info("Network offline — pausing sync immediately")
+                self.sync_engine.pause()
+                self.coordinator.paused_by_network = True
+                self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_export_logs(self) -> None:
         """Export logs and redacted config to a zip file on the Desktop."""
@@ -795,7 +828,8 @@ class BetterFlowSyncApp:
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()
-        self.display_tracker.stop()
+        if self.display_tracker is not None:
+            self.display_tracker.stop()
         self.aw.close()
         self.bf.close()
         self.queue.close()

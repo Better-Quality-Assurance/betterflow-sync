@@ -223,7 +223,7 @@ class TestBetterFlowClient:
             status=429,
         )
 
-        with pytest.raises(BetterFlowClientError, match="429.*Rate limit exceeded"):
+        with pytest.raises(BetterFlowClientError, match="Server returned 429"):
             self.client._request("GET", "test")
 
     @responses.activate
@@ -588,7 +588,7 @@ class TestRetryBehavior:
                 status=503,
             )
 
-        with pytest.raises(BetterFlowClientError, match="Server error"):
+        with pytest.raises(BetterFlowClientError, match="Server returned 503"):
             self.client._request("GET", "test")
 
     @responses.activate
@@ -617,7 +617,7 @@ class TestRetryBehavior:
             status=503,
         )
 
-        with pytest.raises(BetterFlowClientError, match="Server error"):
+        with pytest.raises(BetterFlowClientError, match="Server returned 503"):
             self.client._request("GET", "test", retry=False)
 
         # Should only call once

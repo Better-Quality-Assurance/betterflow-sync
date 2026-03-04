@@ -53,8 +53,7 @@ class DisplayTracker:
 def _start_macos_tracker() -> DisplayTracker:
     """Start a macOS display tracker using NSScreen and CGSGetActiveSpace."""
     from AppKit import NSScreen, NSWorkspace, NSObject
-    from Foundation import NSRunLoop, NSDate, NSTimer
-    from PyObjCTools import AppHelper
+    from Foundation import NSRunLoop, NSDate
 
     # Try importing private Quartz APIs for space tracking
     _cgs_available = False
@@ -148,6 +147,8 @@ def _start_macos_tracker() -> DisplayTracker:
     _stop_event = threading.Event()
 
     def _run() -> None:
+        observer = None
+        nc = None
         try:
             observer = _Observer.alloc().init()
             nc = NSWorkspace.sharedWorkspace().notificationCenter()
@@ -171,38 +172,20 @@ def _start_macos_tracker() -> DisplayTracker:
             _update_monitor_state()
             _update_desktop_state()
 
-            # Poll mainScreen every 5s via timer on the run loop
+            # Poll mainScreen every 5s
             # (no notification fires when the focused window moves to another monitor)
-            def _poll_timer_fired(timer) -> None:
-                if _stop_event.is_set():
-                    AppHelper.stopEventLoop()
-                    return
-                _update_monitor_state()
-
-            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                5.0,
-                observer,
-                "pollTimer:",
-                None,
-                True,
-            )
-
-            # Add pollTimer: method dynamically
-            import objc
-            def pollTimer_(self, timer):
-                _poll_timer_fired(timer)
-
-            # Use a simpler approach: run the event loop with periodic checks
             while not _stop_event.is_set():
-                NSRunLoop.currentRunLoop().runMode_beforeDate_(
-                    "NSDefaultRunLoopMode",
-                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
-                )
-                _update_monitor_state()
-
-            nc.removeObserver_(observer)
+                _stop_event.wait(5.0)
+                if not _stop_event.is_set():
+                    _update_monitor_state()
         except Exception as e:
             logger.debug(f"macOS display tracker run loop failed: {e}")
+        finally:
+            if nc is not None and observer is not None:
+                try:
+                    nc.removeObserver_(observer)
+                except Exception:
+                    pass
 
     def _stop() -> None:
         _stop_event.set()
@@ -358,11 +341,12 @@ def _start_windows_tracker() -> DisplayTracker:
 
     def _poll() -> None:
         """Poll loop for Windows -- runs every 2s."""
+        com_initialized = False
         try:
-            # Initialize COM for this thread
             if _vd_available:
                 try:
                     ctypes.windll.ole32.CoInitialize(None)  # type: ignore[attr-defined]
+                    com_initialized = True
                 except Exception:
                     pass
 
@@ -377,6 +361,12 @@ def _start_windows_tracker() -> DisplayTracker:
                 )
         except Exception as e:
             logger.debug(f"Windows display tracker poll failed: {e}")
+        finally:
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
 
     def _stop() -> None:
         _stop_event.set()

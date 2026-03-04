@@ -112,7 +112,15 @@ def _normalize_state(value: Optional[str]) -> str:
 
 
 def _allow_state_mismatch() -> bool:
-    """Opt-in local-dev bypass for strict state matching."""
+    """Opt-in local-dev bypass for strict state matching.
+
+    Requires BOTH env vars to be set:
+    - BETTERFLOW_ALLOW_STATE_MISMATCH=1
+    - BETTERFLOW_SYNC_ENV=development
+    This prevents accidental CSRF bypass in production builds.
+    """
+    if os.getenv("BETTERFLOW_SYNC_ENV", "").strip().lower() != "development":
+        return False
     return os.getenv("BETTERFLOW_ALLOW_STATE_MISMATCH", "").strip().lower() in {
         "1",
         "true",
@@ -151,9 +159,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             )
             if not state_ok:
                 if code and _allow_state_mismatch():
-                    logger.warning(
+                    logger.error(
                         "State mismatch bypassed because "
-                        "BETTERFLOW_ALLOW_STATE_MISMATCH is enabled"
+                        "BETTERFLOW_ALLOW_STATE_MISMATCH is enabled (dev only)"
                     )
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html")

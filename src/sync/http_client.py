@@ -4,6 +4,7 @@ import gzip
 import json
 import logging
 import os
+import socket
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -145,6 +146,9 @@ class BaseApiClient:
         files: Optional[dict] = None,
         compress: bool = False,
         retry: bool = True,
+        extra_headers: Optional[dict] = None,
+        timeout_override: Optional[int] = None,
+        retry_config_override: Optional[RetryConfig] = None,
     ) -> dict:
         """Make request to BetterFlow API.
 
@@ -155,6 +159,9 @@ class BaseApiClient:
             files: Files for multipart upload, e.g. {"file": ("name", bytes, "mime")}
             compress: Whether to gzip compress the payload
             retry: Whether to retry on transient failures
+            extra_headers: Additional headers to merge into the request
+            timeout_override: Override the default timeout for this request
+            retry_config_override: Override the default retry config for this request
 
         Returns:
             Response data as dict
@@ -165,7 +172,10 @@ class BaseApiClient:
         """
         url = f"{self.api_url}/{endpoint.lstrip('/')}"
         headers = self._get_headers()
-        kwargs: dict = {"timeout": self.timeout, "headers": headers}
+        if extra_headers:
+            headers.update(extra_headers)
+        effective_timeout = timeout_override if timeout_override is not None else self.timeout
+        kwargs: dict = {"timeout": effective_timeout, "headers": headers}
 
         if files:
             # Multipart upload — data goes as form fields, not JSON
@@ -193,6 +203,18 @@ class BaseApiClient:
                 if response.status_code == 403:
                     raise BetterFlowAuthError("Device not authorized")
 
+                if response.status_code in (408, 429, 503, 504):
+                    retry_after = response.headers.get("Retry-After")
+                    msg = f"Server returned {response.status_code}"
+                    if retry_after:
+                        msg += f" (Retry-After: {retry_after}s)"
+                        try:
+                            import time as _time
+                            _time.sleep(min(float(retry_after), 60))
+                        except (ValueError, TypeError):
+                            pass
+                    raise _TransientError(msg)
+
                 # Server errors (5xx) are retryable
                 if response.status_code >= 500:
                     raise _TransientError(f"Server error: {response.status_code}")
@@ -200,8 +222,20 @@ class BaseApiClient:
                 response.raise_for_status()
                 return response.json() if response.content else {}
 
-            except requests.exceptions.ConnectionError:
+            except requests.exceptions.ConnectionError as e:
+                # DNS resolution failures are not retryable (N8)
+                cause = e.__cause__
+                while cause is not None:
+                    if isinstance(cause, socket.gaierror):
+                        raise BetterFlowClientError(
+                            f"DNS resolution failed: {cause}"
+                        ) from e
+                    cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
                 raise _TransientError("Cannot connect to BetterFlow API")
+            except requests.exceptions.ChunkedEncodingError:
+                raise _TransientError("Connection dropped mid-response")
+            except requests.exceptions.ContentDecodingError:
+                raise _TransientError("Response body decoding failed")
             except requests.exceptions.Timeout:
                 raise _TransientError("Request timed out")
             except requests.exceptions.HTTPError as e:
@@ -214,11 +248,13 @@ class BaseApiClient:
                     f"API error ({e.response.status_code}): {error_detail or str(e)}"
                 ) from e
 
+        effective_retry_config = retry_config_override or self.retry_config
+
         if retry:
             try:
                 return retry_with_backoff(
                     do_request,
-                    config=self.retry_config,
+                    config=effective_retry_config,
                     retryable_exceptions=(_TransientError,),
                 )
             except RetryExhausted as e:
@@ -230,6 +266,20 @@ class BaseApiClient:
                 return do_request()
             except _TransientError as e:
                 raise BetterFlowClientError(str(e)) from e
+
+    def reset_session(self) -> None:
+        """Drop pooled connections and create a fresh session.
+
+        Call after laptop wake to avoid stale TCP connections that would
+        block the first request with a 30s timeout.
+        """
+        if self._owns_session and self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+        self._session = requests.Session()
+        self._owns_session = True
 
     def set_credentials(self, token: str, device_id: str) -> None:
         """Set authentication credentials."""
