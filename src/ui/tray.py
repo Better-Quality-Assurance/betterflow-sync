@@ -15,17 +15,29 @@ if TYPE_CHECKING:
     from ..config import Config
 
 
-def _hide_from_dock() -> None:
-    """Hide the app from the macOS Dock."""
+def _prevent_termination() -> None:
+    """Prevent macOS from silently killing the tray app.
+
+    Without these calls, macOS may terminate a background-only app after
+    a few minutes via Sudden Termination or Automatic Termination.
+
+    Note: Dock hiding is handled by LSUIElement=True in the Info.plist
+    (set in build.spec).  We intentionally do NOT call
+    setActivationPolicy_(1) here because it conflicts with pystray's
+    NSApplication setup and can prevent the status bar item from appearing.
+    """
     if platform.system() != "Darwin":
         return
     try:
-        import AppKit
-        ns_app = AppKit.NSApplication.sharedApplication()
-        # NSApplicationActivationPolicyAccessory = 1 (no Dock icon)
-        ns_app.setActivationPolicy_(1)
+        import Foundation
+
+        proc_info = Foundation.NSProcessInfo.processInfo()
+        proc_info.setAutomaticTerminationSupportEnabled_(False)
+        proc_info.disableSuddenTermination()
     except Exception:
         pass
+
+
 
 __all__ = ["TrayIcon", "TrayState", "TrayModel", "STATE_COLORS", "create_icon_image", "ProjectDict"]
 
@@ -64,9 +76,9 @@ class TrayModel:
         self.current_project: Optional[ProjectDict] = None
 
         # Preferences
-        self.sync_interval: int = 60
-        self.hash_titles: bool = True
-        self.domain_only_urls: bool = True
+        self.sync_interval: int = 30
+        self.hash_titles: bool = False
+        self.domain_only_urls: bool = False
         self.debug_mode: bool = False
         self.auto_start: bool = False
         self.update_channel: str = "stable"
@@ -223,9 +235,8 @@ class TrayIcon:
             Item(f"Daily avg this week: {self.model.daily_avg_this_week}", None, enabled=False),
         ), enabled=logged_in))
 
-        # ── Dashboard & Project Manager links ───────────────
+        # ── Dashboard link ─────────────────────────────────
         items.append(Item("Show My Dashboard", self._handle_show_dashboard, enabled=logged_in))
-        items.append(Item("Project Manager - Start / Stop / Create", self._handle_project_manager, enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 
@@ -312,16 +323,6 @@ class TrayIcon:
             ),
         ), enabled=logged_in))
 
-        # ── Quick Menu submenu ──────────────────────────────
-        quick_items = []
-        if not self.model.private_mode:
-            if self.model.paused:
-                quick_items.append(Item("Resume Tracking", self._handle_resume))
-            else:
-                quick_items.append(Item("Pause Tracking", self._handle_pause))
-        quick_items.append(Item("Sync Now", self._handle_sync_now))
-        items.append(Item("Quick Menu", pystray.Menu(*quick_items), enabled=logged_in))
-
         items.append(Item("─" * 20, None, enabled=False))
 
         # ── Diagnostics submenu ─────────────────────────────
@@ -336,51 +337,9 @@ class TrayIcon:
         # ── Preferences submenu ─────────────────────────────
         items.append(Item("Preferences", pystray.Menu(
             Item(
-                "Sync Interval",
-                pystray.Menu(
-                    Item("30s", self._make_interval_handler(30), checked=lambda item: self.model.sync_interval == 30),
-                    Item("60s", self._make_interval_handler(60), checked=lambda item: self.model.sync_interval == 60),
-                    Item("120s", self._make_interval_handler(120), checked=lambda item: self.model.sync_interval == 120),
-                    Item("300s", self._make_interval_handler(300), checked=lambda item: self.model.sync_interval == 300),
-                ),
-            ),
-            Item(
-                "Hash Window Titles",
-                self._make_toggle_handler("hash_titles", "hash_titles"),
-                checked=lambda item: self.model.hash_titles,
-            ),
-            Item(
-                "Domain Only URLs",
-                self._make_toggle_handler("domain_only_urls", "domain_only_urls"),
-                checked=lambda item: self.model.domain_only_urls,
-            ),
-            Item(
-                "Auto-Categorize Apps",
-                self._make_toggle_handler("auto_categorize", "auto_categorize"),
-                checked=lambda item: self.model.auto_categorize,
-            ),
-            Item(
-                "Track Display Info",
-                self._make_toggle_handler("track_display_info", "track_display_info"),
-                checked=lambda item: self.model.track_display_info,
-            ),
-            Item(
                 "Debug Mode",
                 self._make_toggle_handler("debug_mode", "debug_mode"),
                 checked=lambda item: self.model.debug_mode,
-            ),
-            Item(
-                "Launch at Login",
-                self._make_toggle_handler("auto_start", "auto_start"),
-                checked=lambda item: self.model.auto_start,
-            ),
-            Item(
-                "Update Channel",
-                pystray.Menu(
-                    Item("Stable", self._make_channel_handler("stable"), checked=lambda item: self.model.update_channel == "stable"),
-                    Item("Beta", self._make_channel_handler("beta"), checked=lambda item: self.model.update_channel == "beta"),
-                    Item("Canary", self._make_channel_handler("canary"), checked=lambda item: self.model.update_channel == "canary"),
-                ),
             ),
             Item("Export Logs", self._handle_export_logs),
             Item("Open Config File", self._handle_open_config),
@@ -686,11 +645,64 @@ class TrayIcon:
             self._icon.title = tooltip
 
     def _update_icon(self) -> None:
-        """Update the tray icon image and menu."""
-        if self._icon:
-            color = STATE_COLORS.get(self.model.state, STATE_COLORS[TrayState.STARTING])
-            self._icon.icon = create_icon_image(color)
-            self._icon.menu = self._create_menu()
+        """Update the tray icon image and menu.
+
+        On macOS, image updates are dispatched to the main thread via
+        performSelectorOnMainThread because AppKit calls from background
+        threads silently fail in PyInstaller .app bundles.
+        """
+        if not self._icon:
+            return
+        color = STATE_COLORS.get(self.model.state, STATE_COLORS[TrayState.STARTING])
+        new_image = create_icon_image(color)
+
+        if platform.system() == "Darwin":
+            try:
+                self._set_icon_main_thread(new_image)
+            except Exception:
+                logger.debug("Main-thread icon update failed, using fallback")
+                self._icon.icon = new_image
+        else:
+            self._icon.icon = new_image
+
+        self._icon.menu = self._create_menu()
+
+    def _set_icon_main_thread(self, pil_img: Image.Image) -> None:
+        """Update the NSStatusItem button image on the main thread (macOS).
+
+        Converts a PIL image to NSImage and dispatches setImage: to the
+        main thread run loop where AppKit can properly render it.
+        """
+        import AppKit
+        import Foundation
+        import io
+
+        thickness = 22
+        try:
+            thickness = max(int(self._icon._status_bar.thickness()), 22)
+        except Exception:
+            pass
+
+        sz = thickness
+        if pil_img.size != (sz, sz):
+            pil_img = pil_img.resize((sz, sz), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        pil_img.save(buf, "png")
+        ns_data = Foundation.NSData(buf.getvalue())
+        ns_img = AppKit.NSImage.alloc().initWithData_(ns_data)
+        ns_img.setSize_(Foundation.NSSize(sz, sz))
+
+        # Update pystray internal state to prevent stale-image redraws
+        self._icon._icon = pil_img
+        self._icon._icon_valid = True
+
+        # Dispatch setImage: to the main thread where AppKit works correctly
+        button = self._icon._status_item.button()
+        if button:
+            button.performSelectorOnMainThread_withObject_waitUntilDone_(
+                b"setImage:", ns_img, False,
+            )
 
     def _update_menu(self) -> None:
         """Update the tray menu (debounced: max once per second)."""
@@ -744,14 +756,57 @@ class TrayIcon:
             logger.info("Tray icon stopped")
 
     def run_blocking(self) -> None:
-        """Run the tray icon in the main thread (blocking)."""
-        _hide_from_dock()
-        if self._icon is None:
-            color = STATE_COLORS[self.model.state]
-            self._icon = pystray.Icon(
-                "BetterFlow Sync",
-                create_icon_image(color),
-                "BetterFlow Sync",
-                self._create_menu(),
+        """Run the tray icon in the main thread (blocking).
+
+        Retries up to 3 times if the event loop exits within 2 seconds,
+        which can happen on macOS when NSApplication fails to initialise.
+        """
+        _prevent_termination()
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if self._icon is None:
+                color = STATE_COLORS[self.model.state]
+                self._icon = pystray.Icon(
+                    "BetterFlow Sync",
+                    create_icon_image(color),
+                    "BetterFlow Sync",
+                    self._create_menu(),
+                )
+
+            # Ensure activation policy is Accessory (1) for tray apps.
+            # 0=Regular, 1=Accessory (tray apps), 2=Prohibited (no UI).
+            try:
+                policy = self._icon._app.activationPolicy()
+                logger.debug("NSApp activation policy: %d", policy)
+                if policy != 1:
+                    self._icon._app.setActivationPolicy_(1)
+                    logger.debug("Set activation policy to Accessory (1)")
+            except Exception:
+                logger.debug("Failed to check/set activation policy", exc_info=True)
+
+            # Make the icon visible on the main thread BEFORE the event
+            # loop starts.  pystray's default setup runs visible=True on
+            # a background thread, and AppKit calls from background threads
+            # silently fail in PyInstaller .app bundles on macOS.
+            self._icon.visible = True
+
+            start = time.monotonic()
+            logger.info("Tray event loop starting (attempt %d/%d)", attempt, max_retries)
+            # Pass no-op setup since we already set visible=True above.
+            self._icon.run(setup=lambda icon: None)
+            elapsed = time.monotonic() - start
+
+            if elapsed > 2.0:
+                # Normal exit (user quit or stop() called)
+                logger.info("Tray event loop exited after %.1fs", elapsed)
+                return
+
+            logger.warning(
+                "Tray event loop exited after %.1fs (attempt %d/%d)",
+                elapsed, attempt, max_retries,
             )
-        self._icon.run()
+            self._icon = None  # Reset for retry
+            time.sleep(0.5)
+
+        logger.error("Tray icon failed to start after %d attempts", max_retries)

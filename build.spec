@@ -109,7 +109,7 @@ if is_mac:
         upx=True,
         console=False,
         disable_windowed_traceback=False,
-        argv_emulation=True,
+        argv_emulation=False,
         target_arch=None,
         codesign_identity=None,
         entitlements_file=None,

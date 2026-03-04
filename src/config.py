@@ -84,7 +84,7 @@ DEFAULT_AW_HOST = "localhost"
 DEFAULT_AW_PORT = 5600
 
 # Sync settings
-DEFAULT_SYNC_INTERVAL = 60  # seconds
+DEFAULT_SYNC_INTERVAL = 30  # seconds
 DEFAULT_BATCH_SIZE = 100
 MAX_BATCH_SIZE = 1000
 MAX_QUEUE_SIZE = 100000  # ~1 week of events
@@ -94,7 +94,7 @@ MAX_QUEUE_SIZE = 100000  # ~1 week of events
 class PrivacySettings:
     """Privacy configuration."""
 
-    hash_titles: bool = True  # Hash window titles by default
+    hash_titles: bool = False  # Send actual window titles for categorization
     title_allowlist: list[str] = field(
         default_factory=lambda: [
             # IDEs and code editors
@@ -149,7 +149,7 @@ class PrivacySettings:
             "Adobe XD",
         ]
     )
-    domain_only_urls: bool = True  # Strip URLs to domain only
+    domain_only_urls: bool = False  # Send full URLs for categorization
     collect_full_urls: bool = False  # Collect full URLs (sensitive, opt-in)
     collect_page_category: bool = True  # Include coarse page category classification
     auto_categorize: bool = True  # Enrich events with app_category from server mappings

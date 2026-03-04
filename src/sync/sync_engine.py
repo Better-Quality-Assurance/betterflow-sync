@@ -5,7 +5,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 try:
@@ -65,7 +65,7 @@ class SyncEngine:
         bf: BFClientProtocol,
         queue: OfflineQueueProtocol,
         config: Config,
-        on_config_updated: Optional[callable] = None,
+        on_config_updated: Optional[Callable] = None,
         display_tracker=None,
         activity_analyzer: Optional[ActivityAnalyzer] = None,
         time_tracker: Optional[DailyTimeTracker] = None,

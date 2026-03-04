@@ -344,7 +344,10 @@ class BetterFlowSyncApp:
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
-        self.display_tracker = start_display_tracker()
+        if self.config.privacy.track_display_info:
+            self.display_tracker = start_display_tracker()
+        else:
+            self.display_tracker = None
 
         self.sync_engine = SyncEngine(
             aw=self.aw,
@@ -437,23 +440,29 @@ class BetterFlowSyncApp:
             self.coordinator.logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
-        # Start system event listeners
-        start_system_event_listener(
-            on_sleep=self._on_system_sleep,
-            on_wake=self._on_system_wake,
-            on_shutdown=self._on_system_shutdown,
-            on_network_change=self._on_network_change,
-            on_screen_lock=self._on_screen_lock,
-            on_screen_unlock=self._on_screen_unlock,
-        )
+        # Start system event listeners (non-critical: don't let failures prevent tray)
+        try:
+            start_system_event_listener(
+                on_sleep=self._on_system_sleep,
+                on_wake=self._on_system_wake,
+                on_shutdown=self._on_system_shutdown,
+                on_network_change=self._on_network_change,
+                on_screen_lock=self._on_screen_lock,
+                on_screen_unlock=self._on_screen_unlock,
+            )
+        except Exception:
+            logger.exception("Failed to start system event listeners")
 
         # Check for updates in background
-        if self.config.check_updates:
-            check_for_update(
-                __version__,
-                channel=self.config.update_channel,
-                callback=self._on_update_available,
-            )
+        try:
+            if self.config.check_updates:
+                check_for_update(
+                    __version__,
+                    channel=self.config.update_channel,
+                    callback=self._on_update_available,
+                )
+        except Exception:
+            logger.exception("Failed to start update checker")
 
         logger.info("BetterFlow Sync running")
         try:
@@ -783,7 +792,8 @@ class BetterFlowSyncApp:
 
         self.coordinator.stop()
         self.sync_engine.shutdown()
-        self.display_tracker.stop()
+        if self.display_tracker is not None:
+            self.display_tracker.stop()
         self.aw.close()
         self.bf.close()
         self.queue.close()

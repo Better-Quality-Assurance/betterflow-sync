@@ -172,14 +172,17 @@ def _start_macos_tracker() -> DisplayTracker:
             _update_monitor_state()
             _update_desktop_state()
 
-            # Poll mainScreen every 5s via the run loop
-            # (no notification fires when the focused window moves to another monitor)
+            # Poll mainScreen every 5s.
+            # NOTE: NSWorkspace notifications are delivered on the main thread,
+            # not on this background thread, so the observer callbacks won't
+            # fire here.  We use _stop_event.wait() for the polling interval
+            # instead of NSRunLoop.runMode_beforeDate_ (which returns
+            # immediately on a thread with no run-loop sources, causing 100%
+            # CPU spin).
             while not _stop_event.is_set():
-                NSRunLoop.currentRunLoop().runMode_beforeDate_(
-                    "NSDefaultRunLoopMode",
-                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
-                )
-                _update_monitor_state()
+                _stop_event.wait(5.0)
+                if not _stop_event.is_set():
+                    _update_monitor_state()
         except Exception as e:
             logger.debug(f"macOS display tracker run loop failed: {e}")
         finally:
