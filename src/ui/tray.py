@@ -716,7 +716,12 @@ class TrayIcon:
             logger.info("Tray icon stopped")
 
     def run_blocking(self) -> None:
-        """Run the tray icon in the main thread (blocking)."""
+        """Run the tray icon in the main thread (blocking).
+
+        Must be called from the main thread — pystray/NSApplication requires it.
+        Dock hiding is handled by LSUIElement in Info.plist for bundled apps,
+        and by _hide_from_dock() as a fallback for source runs.
+        """
         _hide_from_dock()
         if self._icon is None:
             color = STATE_COLORS[self.model.state]

@@ -159,8 +159,11 @@ class SyncCoordinator:
         try:
             response = self.bf.get_projects()
             projects = response.get("projects", [])
-            self.tray.set_projects(projects)
-            logger.info(f"Loaded {len(projects)} projects")
+            current_project = response.get("current_project")
+            self.tray.set_projects(projects, current_project=current_project)
+            if current_project:
+                self.sync_engine.set_current_project(current_project)
+            logger.info(f"Loaded {len(projects)} projects (active: {current_project.get('name') if current_project else 'none'})")
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 

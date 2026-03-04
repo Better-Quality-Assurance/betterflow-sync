@@ -18,6 +18,7 @@ __all__ = [
     "AWSettings",
     "ReminderSettings",
     "EngagementConfig",
+    "FraudDetectionConfig",
     "setup_logging",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
@@ -190,6 +191,24 @@ class EngagementConfig:
 
 
 @dataclass
+class FraudDetectionConfig:
+    """Fraud detection signal thresholds (server-configurable).
+
+    These thresholds control the sensitivity of client-side fraud detection
+    signals. Each signal produces a sub-score; the total is capped at 100.
+    """
+
+    keystroke_cv_threshold: float = 0.1  # Below this = suspiciously uniform
+    min_windows_for_variance: int = 6  # Need this many windows before checking
+    mouse_only_streak_threshold: int = 3  # Consecutive mouse-only windows
+    min_app_diversity: int = 2  # Fewer unique apps = suspicious
+    app_diversity_min_minutes: int = 60  # Only check after this much active time
+    click_keystroke_ratio_threshold: float = 10.0  # Above this = suspicious
+    input_regularity_cv_threshold: float = 0.1  # Below this = suspiciously regular
+    min_input_events_for_regularity: int = 10  # Need this many events for regularity check
+
+
+@dataclass
 class AWSettings:
     """ActivityWatch connection settings."""
 
@@ -223,6 +242,7 @@ class Config:
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     reminders: ReminderSettings = field(default_factory=ReminderSettings)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
+    fraud_detection: FraudDetectionConfig = field(default_factory=FraudDetectionConfig)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -285,6 +305,7 @@ class Config:
         privacy_data = data.pop("privacy", {})
         reminders_data = data.pop("reminders", {})
         engagement_data = data.pop("engagement", {})
+        fraud_detection_data = data.pop("fraud_detection", {})
         data.pop("screenshots", None)
 
         # Migrate legacy localhost URLs to production endpoint.
@@ -303,6 +324,7 @@ class Config:
             privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
             reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
             engagement=EngagementConfig(**engagement_data) if engagement_data else EngagementConfig(),
+            fraud_detection=FraudDetectionConfig(**fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -385,6 +407,25 @@ class Config:
                 self.engagement.combined_scrolls_min = int(eng["combined_scrolls_min"])
             if "window_minutes" in eng:
                 self.engagement.window_minutes = max(1, int(eng["window_minutes"]))
+
+        if "fraud_detection" in server_config:
+            fd = server_config["fraud_detection"]
+            if "keystroke_cv_threshold" in fd:
+                self.fraud_detection.keystroke_cv_threshold = float(fd["keystroke_cv_threshold"])
+            if "min_windows_for_variance" in fd:
+                self.fraud_detection.min_windows_for_variance = max(2, int(fd["min_windows_for_variance"]))
+            if "mouse_only_streak_threshold" in fd:
+                self.fraud_detection.mouse_only_streak_threshold = max(1, int(fd["mouse_only_streak_threshold"]))
+            if "min_app_diversity" in fd:
+                self.fraud_detection.min_app_diversity = max(1, int(fd["min_app_diversity"]))
+            if "app_diversity_min_minutes" in fd:
+                self.fraud_detection.app_diversity_min_minutes = max(1, int(fd["app_diversity_min_minutes"]))
+            if "click_keystroke_ratio_threshold" in fd:
+                self.fraud_detection.click_keystroke_ratio_threshold = float(fd["click_keystroke_ratio_threshold"])
+            if "input_regularity_cv_threshold" in fd:
+                self.fraud_detection.input_regularity_cv_threshold = float(fd["input_regularity_cv_threshold"])
+            if "min_input_events_for_regularity" in fd:
+                self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
 
         self.save()
 

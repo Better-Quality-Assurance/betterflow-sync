@@ -103,7 +103,8 @@ class SyncEngine:
 
         # Activity analysis for fraud detection (DIP)
         self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
-            thresholds=self._create_engagement_thresholds()
+            thresholds=self._create_engagement_thresholds(),
+            fraud_config=self.config.fraud_detection,
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
 
@@ -185,6 +186,7 @@ class SyncEngine:
             self._activity_analyzer.update_thresholds(
                 self._create_engagement_thresholds()
             )
+            self._activity_analyzer.update_fraud_config(self.config.fraud_detection)
 
             if self._on_config_updated:
                 self._on_config_updated()
@@ -575,6 +577,12 @@ class SyncEngine:
 
             result["activity_state"] = activity_state
             result["activity_metrics"] = activity_metrics.to_dict()
+
+            # Add fraud assessment from session-level signals
+            fraud = self._activity_analyzer.get_fraud_assessment(event.timestamp, app=app)
+            result["fraud_score"] = fraud.score
+            result["fraud_signals"] = fraud.signals
+            result["activity_metrics"].update(fraud.extra_metrics)
 
             # Track active time (only "active" events count)
             if activity_state == "active":

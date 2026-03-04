@@ -29,6 +29,11 @@ class TestSyncEngine:
         self.activity_analyzer.get_raw_metrics.return_value = Mock(
             to_dict=lambda: {"presses": 0, "clicks": 0, "scrolls": 0, "window_changes": 0}
         )
+        self.activity_analyzer.get_fraud_assessment.return_value = Mock(
+            score=0,
+            signals=[],
+            extra_metrics={"unique_apps": 0, "keystroke_variance": None},
+        )
 
         self.time_tracker = Mock(spec=DailyTimeTracker)
         self.time_tracker.get_today_active_time.return_value = timedelta(hours=1)
