@@ -226,6 +226,22 @@ class AWClient:
         buckets = self.get_buckets()
         return [b for b in buckets.values() if b.type == BUCKET_TYPE_INPUT]
 
+    def create_bucket(self, bucket_id: str, bucket_type: str, hostname: str) -> None:
+        """Create a bucket (idempotent — AW ignores if already exists)."""
+        self._request("POST", f"buckets/{bucket_id}", json={
+            "client": "betterflow-sync",
+            "type": bucket_type,
+            "hostname": hostname,
+        })
+
+    def post_heartbeat(self, bucket_id: str, timestamp: str, data: dict, pulsetime: float = 5.0) -> None:
+        """Send a heartbeat event (AW merges with previous if same data within pulsetime)."""
+        self._request("POST", f"buckets/{bucket_id}/heartbeat?pulsetime={pulsetime}", json={
+            "timestamp": timestamp,
+            "duration": 0,
+            "data": data,
+        })
+
     def get_events_since(
         self, bucket_id: str, since: datetime, limit: int = 1000
     ) -> list[AWEvent]:

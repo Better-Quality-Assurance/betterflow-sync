@@ -357,6 +357,16 @@ class BetterFlowSyncApp:
         self.keychain = KeychainManager()
         self.display_tracker = start_display_tracker()
 
+        # In-process window watcher on macOS (inherits Accessibility permission)
+        self.window_watcher = None
+        if sys.platform == "darwin":
+            try:
+                from .sync.macos_window_watcher import MacOSWindowWatcher
+            except ImportError:
+                from sync.macos_window_watcher import MacOSWindowWatcher
+            self.window_watcher = MacOSWindowWatcher(self.aw)
+            self.aw_manager.disable_component("bf-window-tracker")
+
         self.sync_engine = SyncEngine(
             aw=self.aw,
             bf=self.bf,
@@ -434,6 +444,10 @@ class BetterFlowSyncApp:
         # Start bundled ActivityWatch
         self.aw_manager.start()
 
+        # Start in-process window watcher (after AW server is up)
+        if self.window_watcher:
+            self.window_watcher.start()
+
         if state.logged_in:
             self.coordinator.logged_in = True
             self.tray.set_user(state.user_email, state.user_name)
@@ -460,7 +474,7 @@ class BetterFlowSyncApp:
         # Check for updates in background
         if self.config.check_updates:
             check_for_update(
-                __version__.__version__,
+                (__version__ if isinstance(__version__, str) else __version__.__version__),
                 channel=self.config.update_channel,
                 callback=self._on_update_available,
             )
@@ -719,7 +733,7 @@ class BetterFlowSyncApp:
         elif key == "update_channel":
             self.config.update_channel = value
             check_for_update(
-                __version__.__version__,
+                (__version__ if isinstance(__version__, str) else __version__.__version__),
                 channel=value,
                 callback=self._on_update_available,
             )
@@ -775,6 +789,8 @@ class BetterFlowSyncApp:
 
         self.coordinator.stop()
         self.sync_engine.shutdown()
+        if self.window_watcher:
+            self.window_watcher.stop()
         self.display_tracker.stop()
         self.aw.close()
         self.bf.close()

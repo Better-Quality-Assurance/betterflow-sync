@@ -540,9 +540,6 @@ class SyncEngine:
                     data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
-            # Send AFK periods as "break" bucket_type for chart display
-            if event.status == "afk":
-                bucket_type = "break"
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection
             data["presses"] = event.presses
