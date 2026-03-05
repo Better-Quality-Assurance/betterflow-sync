@@ -863,13 +863,18 @@ class SyncEngine:
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:
-        """Compare semver-style version strings."""
+        """Compare semver-style version strings.
+
+        Returns True (conservative) on parse failure so the user sees
+        the update warning rather than silently skipping it.
+        """
         try:
             cur = tuple(int(x) for x in current.split(".")[:3])
             min_ = tuple(int(x) for x in minimum.split(".")[:3])
             return cur < min_
         except (ValueError, AttributeError):
-            return False
+            logger.warning(f"Cannot parse version strings: current={current!r}, minimum={minimum!r}")
+            return True
 
     def get_status(self) -> dict:
         """Get current sync status."""
@@ -901,8 +906,8 @@ class SyncEngine:
             try:
                 for bucket in fetcher():
                     bucket_ids.add(bucket.id)
-            except (AWClientError, TypeError, AttributeError):
-                pass
+            except (AWClientError, TypeError, AttributeError) as e:
+                logger.debug(f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}")
 
         _collect(self.aw.get_window_buckets)
         _collect(self.aw.get_web_buckets)

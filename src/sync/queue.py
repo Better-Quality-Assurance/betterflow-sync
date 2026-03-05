@@ -92,15 +92,14 @@ class OfflineQueue:
         """Initialize the database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Integrity check — reset on corruption
+        # Integrity check — reset on corruption (close connection even on failure)
         try:
-            conn = sqlite3.connect(str(self.db_path))
-            result = conn.execute("PRAGMA integrity_check").fetchone()
-            conn.close()
-            if result[0] != "ok":
-                logger.error(f"SQLite integrity check failed: {result[0]} — resetting database")
-                backup = self.db_path.with_suffix(".db.corrupt")
-                self.db_path.rename(backup)
+            with sqlite3.connect(str(self.db_path)) as conn:
+                result = conn.execute("PRAGMA integrity_check").fetchone()
+                if result[0] != "ok":
+                    logger.error(f"SQLite integrity check failed: {result[0]} — resetting database")
+                    backup = self.db_path.with_suffix(".db.corrupt")
+                    self.db_path.rename(backup)
         except sqlite3.DatabaseError as e:
             logger.error(f"SQLite corruption detected: {e} — resetting database")
             backup = self.db_path.with_suffix(".db.corrupt")

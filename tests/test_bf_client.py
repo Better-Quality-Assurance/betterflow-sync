@@ -302,7 +302,7 @@ class TestBetterFlowClient:
 
     @responses.activate
     def test_send_events_auth_error(self):
-        """Test send_events handles auth errors."""
+        """Test send_events raises BetterFlowAuthError on 401."""
         responses.add(
             responses.POST,
             "https://betterflow.eu/api/agent/events/batch",
@@ -311,10 +311,8 @@ class TestBetterFlowClient:
         )
 
         events = [{"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}]
-        result = self.client.send_events(events)
-
-        assert result.success is False
-        assert "token" in result.error.lower()
+        with pytest.raises(BetterFlowAuthError):
+            self.client.send_events(events)
 
     @responses.activate
     def test_send_events_network_error(self):

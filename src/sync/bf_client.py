@@ -243,8 +243,8 @@ class BetterFlowClient(BaseApiClient):
                 events_queued=response.get("failed", 0),
                 accepted_ids=response.get("accepted_ids", []),
             )
-        except BetterFlowAuthError as e:
-            return SyncResult(success=False, error=str(e))
+        except BetterFlowAuthError:
+            raise  # Callers must handle token refresh / re-login
         except BetterFlowClientError as e:
             return SyncResult(success=False, error=str(e))
 

@@ -14,11 +14,7 @@ except ImportError:
 try:
     from ..config import FraudDetectionConfig
 except ImportError:
-    try:
-        from config import FraudDetectionConfig
-    except ImportError:
-        # Fallback for when config hasn't been imported yet (e.g. tests)
-        FraudDetectionConfig = None
+    from config import FraudDetectionConfig
 
 __all__ = [
     "ActivityAnalyzer",
@@ -130,10 +126,7 @@ class FraudSignalDetector:
     """
 
     def __init__(self, config=None):
-        if FraudDetectionConfig is not None:
-            self._config = config or FraudDetectionConfig()
-        else:
-            self._config = config
+        self._config = config or FraudDetectionConfig()
         # Per-window keystroke snapshots: list of press counts per window
         self._window_press_counts: list[int] = []
         # Unique apps seen this session
