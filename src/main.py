@@ -82,7 +82,7 @@ class SyncCoordinator:
         # Flags set by the app layer
         self.logged_in = False
         self.paused_by_network = False
-        self._sync_in_progress = False
+        self._sync_lock = threading.Lock()
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
@@ -186,12 +186,17 @@ class SyncCoordinator:
 
     # -- internal ---------------------------------------------------------
 
+    @property
+    def sync_in_progress(self) -> bool:
+        """Check if a sync is currently running (non-blocking)."""
+        return self._sync_lock.locked()
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
-        self._sync_in_progress = True
+        if not self._sync_lock.acquire(blocking=False):
+            logger.debug("Sync already in progress, skipping")
+            return
         try:
-            self._sync_in_progress = True
-
             if self.sync_engine.is_private:
                 return
 
@@ -259,7 +264,7 @@ class SyncCoordinator:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
         finally:
-            self._sync_in_progress = False
+            self._sync_lock.release()
 
     def _fetch_hours_today(self) -> str:
         """Fetch today's tracked hours from API."""
@@ -692,7 +697,7 @@ class BetterFlowSyncApp:
             self.coordinator.trigger_sync("network_sync")
         else:
             # Don't interrupt an in-flight sync (N4) - let it complete or timeout
-            if self.coordinator._sync_in_progress:
+            if self.coordinator.sync_in_progress:
                 logger.info("Network offline — sync in progress, will pause after completion")
                 self.coordinator.paused_by_network = True
                 self.tray.set_state(TrayState.QUEUED, "Offline")

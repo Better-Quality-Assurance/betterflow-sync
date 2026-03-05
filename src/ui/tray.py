@@ -58,6 +58,7 @@ class TrayModel:
     """
 
     def __init__(self) -> None:
+        self.lock = threading.RLock()
         self.state: TrayState = TrayState.STARTING
         self.paused: bool = False
         self.private_mode: bool = False
@@ -406,13 +407,15 @@ class TrayIcon:
 
     def _handle_private_toggle(self, icon, item) -> None:
         """Handle private time toggle."""
-        self.model.private_mode = not self.model.private_mode
-        if self.model.private_mode:
+        with self.model.lock:
+            self.model.private_mode = not self.model.private_mode
+            new_mode = self.model.private_mode
+        if new_mode:
             self.set_state(TrayState.PRIVATE)
         else:
             self.set_state(TrayState.SYNCING)
         if self._on_private_toggle:
-            self._on_private_toggle(self.model.private_mode)
+            self._on_private_toggle(new_mode)
         self._update_menu()
 
     def _handle_show_dashboard(self, icon, item) -> None:

@@ -519,7 +519,7 @@ class OfflineQueue:
                 )
 
     def close(self) -> None:
-        """Close all thread-local database connections."""
+        """Close all tracked database connections."""
         with self._connections_lock:
             for conn in self._connections:
                 try:

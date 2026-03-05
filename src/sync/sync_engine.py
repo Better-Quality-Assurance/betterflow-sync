@@ -100,6 +100,11 @@ class SyncEngine:
         self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
         self._SENT_CACHE_MAX = 5_000
 
+        # Thread safety: protects cross-thread mutable state
+        self._state_lock = threading.Lock()
+        # Dedicated lock for _sent_cache (OrderedDict LRU ops are multi-step)
+        self._cache_lock = threading.Lock()
+
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
         self._category_cache: Optional[dict[str, str]] = None
@@ -127,47 +132,62 @@ class SyncEngine:
 
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
-        if not self._paused:
+        with self._state_lock:
+            need_advance = not self._paused
+            self._paused = True
+            need_end_session = self._session_active
+            self._session_active = False
+        if need_advance:
             self._advance_checkpoints_to_now("pause")
-        self._paused = True
-        if self._session_active:
+        if need_end_session:
             try:
                 self.bf.end_session("app_quit")
-                self._session_active = False
             except BetterFlowClientError:
                 pass
 
     def resume(self) -> None:
         """Resume syncing."""
-        self._paused = False
+        with self._state_lock:
+            self._paused = False
 
     @property
     def is_paused(self) -> bool:
-        return self._paused
+        with self._state_lock:
+            return self._paused
 
     def set_private_mode(self, enabled: bool) -> None:
         """Enable/disable private time (no events recorded)."""
-        if enabled and not self._private_mode:
+        with self._state_lock:
+            entering_private = enabled and not self._private_mode
+            leaving_private = not enabled and self._private_mode and self._private_start is not None
+            private_start_snap = self._private_start
+            self._private_mode = enabled
+            if entering_private:
+                self._private_start = datetime.now(timezone.utc)
+            elif leaving_private:
+                self._private_start = None
+            need_end_session = enabled and self._session_active
+            if need_end_session:
+                self._session_active = False
+        if entering_private:
             self._advance_checkpoints_to_now("private_time")
-            self._private_start = datetime.now(timezone.utc)
-        elif not enabled and self._private_mode and self._private_start:
-            self._send_private_time_event()
-            self._private_start = None
-        self._private_mode = enabled
-        if enabled and self._session_active:
+        if leaving_private and private_start_snap:
+            self._send_private_time_event(private_start_snap)
+        if need_end_session:
             try:
                 self.bf.end_session("private_time")
-                self._session_active = False
             except BetterFlowClientError:
                 pass
 
     @property
     def is_private(self) -> bool:
-        return self._private_mode
+        with self._state_lock:
+            return self._private_mode
 
     def set_current_project(self, project: Optional[dict]) -> None:
         """Set the current project for event tagging."""
-        self._current_project = project
+        with self._state_lock:
+            self._current_project = project
 
     def invalidate_category_cache(self) -> None:
         """Clear the in-memory category cache so next lookup re-reads from DB."""
@@ -212,8 +232,9 @@ class SyncEngine:
         """
         stats = SyncStats()
 
-        if self._paused or self._private_mode:
-            return stats
+        with self._state_lock:
+            if self._paused or self._private_mode:
+                return stats
 
         # Fetch server config on first successful sync
         if not self._config_fetched and self.bf.is_reachable():
@@ -226,11 +247,14 @@ class SyncEngine:
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)
         # Retry once on transient failure (N13)
-        if not self._session_active:
+        with self._state_lock:
+            need_session = not self._session_active
+        if need_session:
             for attempt in range(2):
                 try:
                     self.bf.start_session()
-                    self._session_active = True
+                    with self._state_lock:
+                        self._session_active = True
                     break
                 except BetterFlowClientError as e:
                     if attempt == 0:
@@ -315,10 +339,13 @@ class SyncEngine:
             self._process_queue(stats)
 
         # Periodic heartbeat
-        self._heartbeat_count += 1
-        if self._heartbeat_count >= self._heartbeat_interval:
+        with self._state_lock:
+            self._heartbeat_count += 1
+            should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
+            if should_heartbeat:
+                self._heartbeat_count = 0
+        if should_heartbeat:
             self._send_heartbeat()
-            self._heartbeat_count = 0
 
         return stats
 
@@ -370,7 +397,8 @@ class SyncEngine:
         for event in events:
             # Dedup: skip if already sent with same duration
             cache_key = (bucket_id, event.id)
-            prev_duration = self._sent_cache.get(cache_key)
+            with self._cache_lock:
+                prev_duration = self._sent_cache.get(cache_key)
             if prev_duration is not None and abs(event.duration - prev_duration) < 0.5:
                 stats.events_filtered += 1
                 continue
@@ -379,10 +407,11 @@ class SyncEngine:
             if transformed_event:
                 transformed.append(transformed_event)
                 # LRU insert: add/move to end, evict oldest if over capacity
-                self._sent_cache[cache_key] = event.duration
-                self._sent_cache.move_to_end(cache_key)
-                if len(self._sent_cache) > self._SENT_CACHE_MAX:
-                    self._sent_cache.popitem(last=False)
+                with self._cache_lock:
+                    self._sent_cache[cache_key] = event.duration
+                    self._sent_cache.move_to_end(cache_key)
+                    if len(self._sent_cache) > self._SENT_CACHE_MAX:
+                        self._sent_cache.popitem(last=False)
             else:
                 stats.events_filtered += 1
 
@@ -596,8 +625,10 @@ class SyncEngine:
         }
 
         # Tag with current project if set
-        if self._current_project:
-            result["project_id"] = self._current_project["id"]
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            result["project_id"] = project["id"]
 
         # Add activity classification for window events (fraud detection)
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
@@ -651,22 +682,27 @@ class SyncEngine:
                 return category
         return "other"
 
-    def _send_private_time_event(self) -> None:
+    def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""
-        if not self._private_start:
+        if start is None:
+            with self._state_lock:
+                start = self._private_start
+        if not start:
             return
         now = datetime.now(timezone.utc)
-        duration = (now - self._private_start).total_seconds()
+        duration = (now - start).total_seconds()
         if duration < 1:
             return
         event = {
-            "timestamp": self._private_start.isoformat(),
+            "timestamp": start.isoformat(),
             "duration": round(duration, 2),
             "bucket_type": "private_time",
             "data": {"status": "private"},
         }
-        if self._current_project:
-            event["project_id"] = self._current_project["id"]
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            event["project_id"] = project["id"]
         try:
             self.bf.send_events([event])
             logger.info(f"Sent private_time event ({duration:.0f}s)")
@@ -788,11 +824,13 @@ class SyncEngine:
                 if cmd_type == "pause":
                     logger.info(f"Server requested pause: {cmd.get('reason')}")
                     self._advance_checkpoints_to_now("server_pause")
-                    self._paused = True
+                    with self._state_lock:
+                        self._paused = True
                 elif cmd_type == "deregister":
                     logger.warning(f"Device revoked: {cmd.get('reason')}")
                     self._advance_checkpoints_to_now("server_deregister")
-                    self._paused = True
+                    with self._state_lock:
+                        self._paused = True
 
             # Version compatibility check
             min_version = response.get("minimum_agent_version")
@@ -890,8 +928,10 @@ class SyncEngine:
 
     def shutdown(self) -> None:
         """Shutdown the sync engine gracefully."""
-        if self._session_active:
-            # Retry once on transient failure (N13)
+        with self._state_lock:
+            need_end = self._session_active
+            self._session_active = False
+        if need_end:
             for attempt in range(2):
                 try:
                     self.bf.end_session("app_quit")
@@ -899,7 +939,6 @@ class SyncEngine:
                 except BetterFlowClientError:
                     if attempt == 0:
                         logger.debug("Session end attempt 1 failed, retrying")
-            self._session_active = False
 
         # Close time tracker
         self._time_tracker.close()

@@ -42,6 +42,8 @@ class DailyTimeTracker:
 
         self._db_path = db_path
         self._local = threading.local()
+        self._all_connections: list[sqlite3.Connection] = []
+        self._conn_lock = threading.Lock()
         self._today: Optional[date] = None
         self._today_seconds: float = 0.0
         self._lock = threading.Lock()
@@ -52,8 +54,11 @@ class DailyTimeTracker:
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
         if not hasattr(self._local, "connection"):
-            self._local.connection = sqlite3.connect(str(self._db_path))
-            self._local.connection.row_factory = sqlite3.Row
+            conn = sqlite3.connect(str(self._db_path))
+            conn.row_factory = sqlite3.Row
+            self._local.connection = conn
+            with self._conn_lock:
+                self._all_connections.append(conn)
         return self._local.connection
 
     @contextmanager
@@ -229,7 +234,13 @@ class DailyTimeTracker:
             )
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close all database connections (from all threads)."""
+        with self._conn_lock:
+            for conn in self._all_connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_connections.clear()
         if hasattr(self._local, "connection"):
-            self._local.connection.close()
             del self._local.connection
