@@ -7,6 +7,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Guard: skip collection entirely if PyObjC is absent (Windows, Linux, Docker)
+pytest.importorskip("AppKit", reason="PyObjC not installed - macOS-only")
+
 from src.sync.macos_window_watcher import MacOSWindowWatcher
 
 
@@ -26,9 +29,7 @@ class TestMacOSWindowWatcher:
         watcher, aw = self._make_watcher()
 
         with patch.object(watcher, "_run"):
-            # Mock the PyObjC imports in start()
-            with patch("src.sync.macos_window_watcher.MacOSWindowWatcher.start", wraps=watcher.start):
-                watcher.start()
+            watcher.start()
 
         aw.create_bucket.assert_called_once()
         args = aw.create_bucket.call_args
@@ -101,7 +102,7 @@ class TestMacOSWindowWatcher:
 
     @patch("src.sync.macos_window_watcher.MacOSWindowWatcher._get_active_window")
     def test_exception_handled_gracefully(self, mock_get_window):
-        """Test that exceptions in polling don't crash the watcher."""
+        """Test that exceptions in polling don't crash the watcher thread."""
         mock_get_window.side_effect = Exception("some error")
 
         watcher, aw = self._make_watcher(poll_interval=0.05)
@@ -110,10 +111,13 @@ class TestMacOSWindowWatcher:
         watcher._thread = threading.Thread(target=watcher._run, daemon=True)
         watcher._thread.start()
         time.sleep(0.2)
-        watcher.stop()
 
+        # Thread should still be alive despite repeated exceptions
+        assert watcher._thread.is_alive()
+
+        watcher.stop()
         aw.post_heartbeat.assert_not_called()
-        assert not watcher._thread.is_alive()  # stopped cleanly
+        assert not watcher._thread.is_alive()
 
     @patch("src.sync.macos_window_watcher.MacOSWindowWatcher._get_active_window")
     def test_stop_event_exits_thread(self, mock_get_window):
@@ -127,6 +131,7 @@ class TestMacOSWindowWatcher:
 
         # Stop immediately
         watcher.stop()
+        watcher._thread.join(timeout=2.0)
 
         assert not watcher._thread.is_alive()
 
