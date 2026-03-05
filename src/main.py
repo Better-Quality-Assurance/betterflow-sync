@@ -41,6 +41,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Resolve version string once (handles both str and module forms from PyInstaller)
+_VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
+
 
 class SyncCoordinator:
     """Owns the sync scheduler, sync loop, and hours tracking.
@@ -510,7 +513,7 @@ class BetterFlowSyncApp:
         try:
             if self.config.check_updates:
                 check_for_update(
-                    (__version__ if isinstance(__version__, str) else __version__.__version__),
+                    _VERSION,
                     channel=self.config.update_channel,
                     callback=self._on_update_available,
                 )
@@ -797,10 +800,13 @@ class BetterFlowSyncApp:
         elif key == "update_channel":
             self.config.update_channel = value
             check_for_update(
-                (__version__ if isinstance(__version__, str) else __version__.__version__),
+                _VERSION,
                 channel=value,
                 callback=self._on_update_available,
             )
+        else:
+            logger.warning(f"Unknown preference key: {key}")
+            return
         self.config.save()
         logger.info(f"Preference changed: {key} = {value}")
 

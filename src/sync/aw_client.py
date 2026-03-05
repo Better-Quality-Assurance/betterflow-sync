@@ -23,9 +23,9 @@ BUCKET_TYPE_WEB = "aw-watcher-web"
 BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
 
 
-@dataclass
+@dataclass(frozen=True)
 class AWEvent:
-    """Represents an ActivityWatch event."""
+    """Represents an ActivityWatch event (immutable)."""
 
     id: int
     timestamp: datetime

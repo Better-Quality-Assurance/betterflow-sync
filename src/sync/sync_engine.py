@@ -505,7 +505,7 @@ class SyncEngine:
     ) -> int:
         """Extend window event durations to cover gaps confirmed by AFK data.
 
-        Mutates ``window_events`` in-place (sorted oldest-first).
+        Replaces events in ``window_events`` list (sorted oldest-first).
         Returns count of gaps filled.
         """
         if len(window_events) < 2 or not afk_events:
@@ -532,11 +532,18 @@ class SyncEngine:
                 continue
 
             old_duration = current.duration
-            current.duration = (next_ev.timestamp - current.timestamp).total_seconds()
+            new_duration = (next_ev.timestamp - current.timestamp).total_seconds()
+            # AWEvent is frozen; replace in list with updated copy
+            window_events[i] = AWEvent(
+                id=current.id,
+                timestamp=current.timestamp,
+                duration=new_duration,
+                data=current.data,
+            )
             filled += 1
             logger.info(
                 f"Filling {gap_seconds:.1f}s window gap: event {current.id} "
-                f"({current.app}) duration {old_duration:.1f}s -> {current.duration:.1f}s"
+                f"({current.app}) duration {old_duration:.1f}s -> {new_duration:.1f}s"
             )
 
         return filled

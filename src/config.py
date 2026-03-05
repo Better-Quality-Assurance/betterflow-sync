@@ -295,6 +295,7 @@ class Config:
     @classmethod
     def _from_dict(cls, data: dict) -> "Config":
         """Create Config from dictionary."""
+        data = dict(data)  # Shallow copy to avoid mutating caller's dict
         # Explicit runtime override (e.g. local backend for installed app).
         env_api_url = os.getenv("BETTERFLOW_API_URL")
         if env_api_url:

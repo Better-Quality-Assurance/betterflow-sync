@@ -668,7 +668,7 @@ class TrayIcon:
         else:
             self._icon.icon = new_image
 
-        self._icon.menu = self._create_menu()
+        self._update_menu()
 
     def _set_icon_main_thread(self, pil_img: Image.Image) -> None:
         """Update the NSStatusItem button image on the main thread (macOS).
@@ -697,15 +697,22 @@ class TrayIcon:
         ns_img.setSize_(Foundation.NSSize(sz, sz))
 
         # Update pystray internal state to prevent stale-image redraws
-        self._icon._icon = pil_img
-        self._icon._icon_valid = True
+        try:
+            self._icon._icon = pil_img
+            self._icon._icon_valid = True
+        except AttributeError:
+            logger.debug("pystray internal attributes unavailable for icon state update")
 
         # Dispatch setImage: to the main thread where AppKit works correctly
-        button = self._icon._status_item.button()
-        if button:
-            button.performSelectorOnMainThread_withObject_waitUntilDone_(
-                b"setImage:", ns_img, False,
-            )
+        try:
+            button = self._icon._status_item.button()
+            if button:
+                button.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    b"setImage:", ns_img, False,
+                )
+        except AttributeError:
+            logger.debug("pystray _status_item unavailable, falling back to icon assignment")
+            self._icon.icon = pil_img
 
     def _update_menu(self) -> None:
         """Update the tray menu (debounced: max once per second)."""
