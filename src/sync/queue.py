@@ -190,16 +190,26 @@ class OfflineQueue:
             events = events[-self.max_size:]
             logger.warning(f"Batch larger than max_size, truncated to {len(events)} events")
 
-        # Check if we need to make room
-        current_size = self.size()
-        if current_size + len(events) > self.max_size:
-            # Remove oldest events to make room
-            to_remove = current_size + len(events) - self.max_size
-            self._remove_oldest(to_remove)
-            logger.warning(f"Queue full, removed {to_remove} oldest events")
-
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
+            # Atomic: check size + evict + insert in a single transaction
+            cursor.execute("SELECT COUNT(*) FROM queued_events")
+            current_size = cursor.fetchone()[0]
+            if current_size + len(events) > self.max_size:
+                to_remove = current_size + len(events) - self.max_size
+                cursor.execute(
+                    """
+                    DELETE FROM queued_events
+                    WHERE id IN (
+                        SELECT id FROM queued_events
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (to_remove,),
+                )
+                logger.warning(f"Queue full, removed {to_remove} oldest events")
+
             cursor.executemany(
                 """
                 INSERT INTO queued_events (event_data, created_at)

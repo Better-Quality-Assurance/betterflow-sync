@@ -436,6 +436,7 @@ class BetterFlowSyncApp:
         self._shutdown_done = False
         self._shutdown_event = threading.Event()
         self._user_paused = False
+        self._login_lock = threading.Lock()
 
     def run(self) -> None:
         """Run the application."""
@@ -577,24 +578,34 @@ class BetterFlowSyncApp:
             logger.debug(f"Stale session check failed: {e}")
 
     def _on_login(self) -> None:
-        """Handle explicit login action from tray."""
-        def do_browser_login():
-            self.coordinator.logged_in = False
-            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
-            state = self.login_manager.login_via_browser()
-            if state.logged_in:
-                self.coordinator.logged_in = True
-                self.tray.set_user(state.user_email, state.user_name)
-                self.sync_engine.fetch_server_config()
-                self.coordinator.fetch_projects()
-                self.coordinator.fetch_categories()
-                if not self.coordinator.scheduler.running:
-                    self.coordinator.start()
-            else:
-                self.coordinator.logged_in = False
-                self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
+        """Handle explicit login action from tray.
 
-        threading.Thread(target=do_browser_login, daemon=True).start()
+        Uses a re-entry guard so multiple rapid login triggers (e.g.
+        auth-error callback + user click) don't spawn parallel flows.
+        """
+        def do_browser_login():
+            if not self._login_lock.acquire(blocking=False):
+                logger.debug("Login already in progress, skipping")
+                return
+            try:
+                self.coordinator.logged_in = False
+                self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+                state = self.login_manager.login_via_browser()
+                if state.logged_in:
+                    self.coordinator.logged_in = True
+                    self.tray.set_user(state.user_email, state.user_name)
+                    self.sync_engine.fetch_server_config()
+                    self.coordinator.fetch_projects()
+                    self.coordinator.fetch_categories()
+                    if not self.coordinator.scheduler.running:
+                        self.coordinator.start()
+                else:
+                    self.coordinator.logged_in = False
+                    self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
+            finally:
+                self._login_lock.release()
+
+        threading.Thread(target=do_browser_login, daemon=True, name="login-thread").start()
 
     def _on_pause(self) -> None:
         """Handle pause action."""
@@ -679,9 +690,6 @@ class BetterFlowSyncApp:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
         logger.info("Screen unlocked — resuming tracking")
-        if self._user_paused:
-            logger.info("Screen unlock — staying paused (user-initiated pause active)")
-            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
@@ -792,7 +800,18 @@ class BetterFlowSyncApp:
         logger.info(f"Preference changed: {key} = {value}")
 
     def _on_logout(self) -> None:
-        """Handle logout action."""
+        """Handle logout action.
+
+        Waits for any in-flight sync to finish before stopping the
+        coordinator, avoiding a race between sync writes and logout.
+        """
+        # Wait for any in-progress sync to finish (up to 10s)
+        for _ in range(100):
+            if not self.coordinator.sync_in_progress:
+                break
+            import time
+            time.sleep(0.1)
+
         # End server session before stopping
         self.sync_engine.shutdown()
         self.login_manager.logout()
@@ -815,7 +834,7 @@ class BetterFlowSyncApp:
                 self.coordinator.logged_in = False
                 self._on_quit()
 
-        threading.Thread(target=do_relogin, daemon=True).start()
+        threading.Thread(target=do_relogin, daemon=True, name="relogin-thread").start()
 
     def _on_quit(self) -> None:
         """Handle quit action."""
