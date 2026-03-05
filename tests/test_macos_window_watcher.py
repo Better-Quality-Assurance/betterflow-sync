@@ -1,12 +1,16 @@
 """Tests for macOS in-process window watcher."""
 
+import platform
 import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.sync.macos_window_watcher import MacOSWindowWatcher
 
 
+@pytest.mark.skipif(platform.system() != "Darwin", reason="macOS-only watcher")
 class TestMacOSWindowWatcher:
     """Tests for MacOSWindowWatcher."""
 
