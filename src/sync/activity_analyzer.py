@@ -160,8 +160,15 @@ class FraudSignalDetector:
             self._mouse_only_streak = 0
 
     def record_input_timestamp(self, timestamp: datetime) -> None:
-        """Record an input event timestamp for regularity analysis."""
+        """Record an input event timestamp for regularity analysis.
+
+        Prunes timestamps older than 60 minutes to bound memory usage.
+        """
         self._input_timestamps.append(timestamp)
+        # Prune old timestamps (keep last 60 minutes)
+        cutoff = timestamp - timedelta(minutes=60)
+        if self._input_timestamps and self._input_timestamps[0] < cutoff:
+            self._input_timestamps = [t for t in self._input_timestamps if t >= cutoff]
 
     def add_active_time(self, duration_seconds: float) -> None:
         """Accumulate active time for app diversity checks."""
@@ -220,11 +227,15 @@ class FraudSignalDetector:
         if len(self._window_press_counts) < cfg.min_windows_for_variance:
             return 0, None
 
-        mean = sum(self._window_press_counts) / len(self._window_press_counts)
+        n = len(self._window_press_counts)
+        mean = sum(self._window_press_counts) / n
         if mean == 0:
             return 0, None
+        if n < 2:
+            return 0, None
 
-        variance = sum((x - mean) ** 2 for x in self._window_press_counts) / len(self._window_press_counts)
+        # Sample variance (N-1) - we have a sample of windows, not the population
+        variance = sum((x - mean) ** 2 for x in self._window_press_counts) / (n - 1)
         std_dev = math.sqrt(variance)
         cv = std_dev / mean
 
@@ -252,14 +263,16 @@ class FraudSignalDetector:
             if gap > 0:
                 gaps.append(gap)
 
-        if len(gaps) < 2:
+        n_gaps = len(gaps)
+        if n_gaps < 2:
             return 0, None
 
-        mean = sum(gaps) / len(gaps)
+        mean = sum(gaps) / n_gaps
         if mean == 0:
             return 0, None
 
-        variance = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+        # Sample variance (N-1)
+        variance = sum((g - mean) ** 2 for g in gaps) / (n_gaps - 1)
         std_dev = math.sqrt(variance)
         cv = std_dev / mean
 
@@ -285,15 +298,19 @@ class FraudSignalDetector:
     def _check_app_diversity(self) -> int:
         """Check if too few unique apps over extended active time.
 
-        Returns score 0-15.
+        Returns score 0-15, graduated based on distance from threshold.
         """
         cfg = self._config
         if self._active_minutes < cfg.app_diversity_min_minutes:
             return 0
 
-        if len(self._unique_apps) < cfg.min_app_diversity:
-            return 15
-        return 0
+        app_count = len(self._unique_apps)
+        if app_count >= cfg.min_app_diversity:
+            return 0
+
+        # Graduated: 1 app below threshold -> 5, 2 below -> 10, 3+ -> 15
+        deficit = cfg.min_app_diversity - app_count
+        return min(deficit * 5, 15)
 
     def _check_click_keystroke_ratio(self) -> int:
         """Check for abnormally high click-to-keystroke ratio.
@@ -471,11 +488,10 @@ class ActivityAnalyzer:
         current_window_count = len(self._window_events) + len(self._input_events)
         if current_window_count != self._last_fraud_window_count:
             self._fraud_detector.record_window_metrics(metrics, app=app)
+            # Track active time for app diversity checks (inside guard to avoid double-counting)
+            if metrics.is_engaged(self._thresholds):
+                self._fraud_detector.add_active_time(self._thresholds.window_minutes * 60)
             self._last_fraud_window_count = current_window_count
-
-        # Track active time for app diversity checks
-        if metrics.is_engaged(self._thresholds):
-            self._fraud_detector.add_active_time(self._thresholds.window_minutes * 60)
 
         return self._fraud_detector.assess()
 
