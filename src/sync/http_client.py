@@ -40,7 +40,9 @@ class BetterFlowAuthError(BetterFlowClientError):
 class _TransientError(Exception):
     """Internal: Marks an error as transient/retryable."""
 
-    pass
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class BaseApiClient:
@@ -205,16 +207,16 @@ class BaseApiClient:
 
                 # Retryable HTTP status codes (N12)
                 if response.status_code in (408, 429, 503, 504):
-                    retry_after = response.headers.get("Retry-After")
+                    retry_after_hdr = response.headers.get("Retry-After")
+                    retry_after_secs = None
                     msg = f"Server returned {response.status_code}"
-                    if retry_after:
-                        msg += f" (Retry-After: {retry_after}s)"
+                    if retry_after_hdr:
+                        msg += f" (Retry-After: {retry_after_hdr}s)"
                         try:
-                            import time as _time
-                            _time.sleep(min(float(retry_after), 60))
+                            retry_after_secs = min(float(retry_after_hdr), 60)
                         except (ValueError, TypeError):
                             pass
-                    raise _TransientError(msg)
+                    raise _TransientError(msg, retry_after=retry_after_secs)
 
                 # Other server errors (5xx) are retryable
                 if response.status_code >= 500:
@@ -252,7 +254,6 @@ class BaseApiClient:
         effective_retry_config = retry_config_override or self.retry_config
 
         if retry:
-            effective_retry_config = retry_config_override or self.retry_config
             try:
                 return retry_with_backoff(
                     do_request,

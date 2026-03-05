@@ -2,6 +2,7 @@
 
 import logging
 import random
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
@@ -66,6 +67,7 @@ def retry_with_backoff(
     config: Optional[RetryConfig] = None,
     on_retry: Optional[Callable[[int, Exception, float], None]] = None,
     retryable_exceptions: tuple = (Exception,),
+    cancel_event: Optional[threading.Event] = None,
 ) -> T:
     """Execute a function with exponential backoff retry.
 
@@ -74,6 +76,8 @@ def retry_with_backoff(
         config: Retry configuration
         on_retry: Callback called before each retry (attempt, error, delay)
         retryable_exceptions: Tuple of exceptions that should trigger retry
+        cancel_event: Optional Event that, when set, interrupts sleeping
+                      retries so pause()/shutdown() can break out immediately.
 
     Returns:
         Result of successful function call
@@ -96,13 +100,18 @@ def retry_with_backoff(
             if attempt >= config.max_retries:
                 break
 
-            delay = calculate_delay(
-                attempt,
-                config.base_delay,
-                config.max_delay,
-                config.exponential_base,
-                config.jitter,
-            )
+            # Respect Retry-After from server if propagated via exception
+            server_delay = getattr(e, "retry_after", None)
+            if server_delay is not None and server_delay > 0:
+                delay = min(server_delay, config.max_delay)
+            else:
+                delay = calculate_delay(
+                    attempt,
+                    config.base_delay,
+                    config.max_delay,
+                    config.exponential_base,
+                    config.jitter,
+                )
 
             if on_retry:
                 on_retry(attempt, e, delay)
@@ -112,6 +121,12 @@ def retry_with_backoff(
                     f"Retrying in {delay:.1f}s..."
                 )
 
-            time.sleep(delay)
+            # Use cancel_event.wait() for interruptible sleep when available
+            if cancel_event is not None:
+                if cancel_event.wait(timeout=delay):
+                    # Cancelled - stop retrying
+                    break
+            else:
+                time.sleep(delay)
 
     raise RetryExhausted(config.max_retries + 1, last_error)

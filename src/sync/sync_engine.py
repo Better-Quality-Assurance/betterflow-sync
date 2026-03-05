@@ -752,8 +752,13 @@ class SyncEngine:
                 self.queue.enqueue(batch)
                 stats.events_queued += len(batch)
 
+    _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
+
     def _process_queue(self, stats: SyncStats) -> None:
-        """Process offline queue with exponential backoff."""
+        """Process offline queue with exponential backoff.
+
+        Capped at 30s wall-clock time to prevent tying up the sync thread.
+        """
         # Remove events that exceeded retry limit
         self.queue.remove_failed(max_retries=5)
 
@@ -763,11 +768,13 @@ class SyncEngine:
             return
 
         # Process queue in batches
+        import time as _time
+        deadline = _time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
         batch_size = self.config.sync.batch_size
         processed = 0
         max_per_cycle = batch_size * 10  # Max 10 batches per cycle
 
-        while processed < max_per_cycle:
+        while processed < max_per_cycle and _time.monotonic() < deadline:
             queued = self.queue.dequeue(batch_size)
             if not queued:
                 break
