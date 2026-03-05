@@ -181,6 +181,17 @@ def _start_macos_screen_lock_listener(
     thread.start()
 
 
+def cleanup_observers() -> None:
+    """Remove all registered macOS notification observers (M5)."""
+    with _observers_lock:
+        for center, observer in _registered_observers:
+            try:
+                center.removeObserver_(observer)
+            except Exception:
+                pass
+        _registered_observers.clear()
+
+
 # ---------------------------------------------------------------------------
 # macOS: SCNetworkReachability for network changes
 # ---------------------------------------------------------------------------
@@ -382,7 +393,7 @@ def _start_network_poller(
             except OSError:
                 online = False
 
-            if state["online"] is not None and state["online"] != online:
+            if state["online"] != online:
                 status = "online" if online else "offline"
                 logger.info(f"Network change detected — {status}")
                 _safe_call(on_change, online)

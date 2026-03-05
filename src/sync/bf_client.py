@@ -232,8 +232,7 @@ class BetterFlowClient(BaseApiClient):
             # the response (N1).
             idempotency_key = str(uuid.uuid4())
             response = self._request(
-                "POST",
-                "events/batch",
+                "POST", "events/batch",
                 data={"events": events},
                 compress=True,
                 extra_headers={"X-Idempotency-Key": idempotency_key},

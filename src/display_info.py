@@ -348,7 +348,6 @@ def _start_windows_tracker() -> DisplayTracker:
         """Poll loop for Windows -- runs every 2s."""
         com_initialized = False
         try:
-            # Initialize COM for this thread
             if _vd_available:
                 try:
                     ctypes.windll.ole32.CoInitialize(None)  # type: ignore[attr-defined]

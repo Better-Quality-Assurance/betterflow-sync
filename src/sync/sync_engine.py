@@ -94,7 +94,7 @@ class SyncEngine:
         self._server_time_offset: Optional[float] = None
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
-        # The lookback window re-fetches recent events for duration updates —
+        # The lookback window re-fetches recent events for duration updates -
         # we only re-send if the duration actually changed.
         # Bounded LRU: evicts oldest on every insert once at capacity.
         self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
@@ -107,9 +107,11 @@ class SyncEngine:
 
         # Activity analysis for fraud detection (DIP)
         self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
-            thresholds=self._create_engagement_thresholds()
+            thresholds=self._create_engagement_thresholds(),
+            fraud_config=self.config.fraud_detection,
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
+        self._has_input_data = False  # Set to True when input buckets exist
 
     def _create_engagement_thresholds(self) -> EngagementThresholds:
         """Create EngagementThresholds from config."""
@@ -191,6 +193,7 @@ class SyncEngine:
             self._activity_analyzer.update_thresholds(
                 self._create_engagement_thresholds()
             )
+            self._activity_analyzer.update_fraud_config(self.config.fraud_detection)
 
             if self._on_config_updated:
                 self._on_config_updated()
@@ -260,6 +263,7 @@ class SyncEngine:
             except AWClientError:
                 pass
         self._activity_analyzer.add_input_events(input_events_for_analysis)
+        self._has_input_data = len(input_buckets) > 0
 
         # Sync window buckets with gap-filling
         all_events = []
@@ -355,6 +359,8 @@ class SyncEngine:
 
         Skips events already sent with unchanged duration (dedup).
         Re-sends if duration has grown (heartbeat extension).
+        Returns (transformed_events, pending_checkpoint) — caller commits the
+        checkpoint only after a successful send (N5).
         """
         # Feed window events to activity analyzer for window change detection
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
@@ -595,11 +601,22 @@ class SyncEngine:
 
         # Add activity classification for window events (fraud detection)
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
-            activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
+            if self._has_input_data:
+                activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
+                activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
 
-            result["activity_state"] = activity_state
-            result["activity_metrics"] = activity_metrics.to_dict()
+                result["activity_state"] = activity_state
+                result["activity_metrics"] = activity_metrics.to_dict()
+
+                # Add fraud assessment from session-level signals
+                fraud = self._activity_analyzer.get_fraud_assessment(event.timestamp, app=app)
+                result["fraud_score"] = fraud.score
+                result["fraud_signals"] = fraud.signals
+                result["activity_metrics"].update(fraud.extra_metrics)
+            else:
+                # No input watcher — treat all window events as active
+                activity_state = "active"
+                result["activity_state"] = activity_state
 
             # Track active time (only "active" events count)
             if activity_state == "active":

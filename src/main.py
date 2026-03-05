@@ -165,8 +165,11 @@ class SyncCoordinator:
         try:
             response = self.bf.get_projects()
             projects = response.get("projects", [])
-            self.tray.set_projects(projects)
-            logger.info(f"Loaded {len(projects)} projects")
+            current_project = response.get("current_project")
+            self.tray.set_projects(projects, current_project=current_project)
+            if current_project:
+                self.sync_engine.set_current_project(current_project)
+            logger.info(f"Loaded {len(projects)} projects (active: {current_project.get('name') if current_project else 'none'})")
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 
@@ -185,6 +188,7 @@ class SyncCoordinator:
 
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
+        self._sync_in_progress = True
         try:
             self._sync_in_progress = True
 
@@ -257,21 +261,43 @@ class SyncCoordinator:
         finally:
             self._sync_in_progress = False
 
+    def _fetch_hours_today(self) -> str:
+        """Fetch today's tracked hours from API."""
+        try:
+            status = self.bf.get_status()
+            total_seconds = int(
+                status.get("data", {})
+                .get("today_summary", {})
+                .get("total_seconds", 0)
+            )
+            # Avoid UI regressions if backend summary is temporarily stale.
+            server_seconds = max(0, total_seconds)
+            if server_seconds >= self._hours_today_seconds:
+                self._hours_today_seconds = server_seconds
+            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            return self._hours_today_cache
+        except Exception:
+            return self._hours_today_cache
+
     def _refresh_hours_today(self) -> None:
         """Refresh tray hours from local active time tracker."""
         try:
             if not self.logged_in:
+                logger.debug("_refresh_hours: skipped (not logged in)")
                 return
             if self.paused_by_network:
+                logger.debug("_refresh_hours: skipped (paused by network)")
                 return
             if self.sync_engine.is_paused or self.sync_engine.is_private:
+                logger.debug("_refresh_hours: skipped (paused or private)")
                 return
 
             # Use local active time tracker (already handles engagement detection)
             active_time = self.sync_engine.get_today_active_time()
+            logger.info(f"_refresh_hours: active_time={active_time}")
             self.tray.set_active_time(active_time)
         except Exception as e:
-            logger.debug(f"Failed to refresh tray hours: {e}")
+            logger.warning(f"Failed to refresh tray hours: {e}")
 
     def _fetch_trends(self) -> None:
         """Fetch weekly/monthly trend data from server."""
@@ -348,6 +374,16 @@ class BetterFlowSyncApp:
             self.display_tracker = start_display_tracker()
         else:
             self.display_tracker = None
+
+        # In-process window watcher on macOS (inherits Accessibility permission)
+        self.window_watcher = None
+        if sys.platform == "darwin":
+            try:
+                from .sync.macos_window_watcher import MacOSWindowWatcher
+            except ImportError:
+                from sync.macos_window_watcher import MacOSWindowWatcher
+            self.window_watcher = MacOSWindowWatcher(self.aw)
+            self.aw_manager.disable_component("bf-window-tracker")
 
         self.sync_engine = SyncEngine(
             aw=self.aw,
@@ -427,6 +463,10 @@ class BetterFlowSyncApp:
         # Start bundled ActivityWatch
         self.aw_manager.start()
 
+        # Start in-process window watcher (after AW server is up)
+        if self.window_watcher:
+            self.window_watcher.start()
+
         if state.logged_in:
             self.coordinator.logged_in = True
             self.tray.set_user(state.user_email, state.user_name)
@@ -457,7 +497,7 @@ class BetterFlowSyncApp:
         try:
             if self.config.check_updates:
                 check_for_update(
-                    __version__,
+                    (__version__ if isinstance(__version__, str) else __version__.__version__),
                     channel=self.config.update_channel,
                     callback=self._on_update_available,
                 )
@@ -634,6 +674,9 @@ class BetterFlowSyncApp:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
         logger.info("Screen unlocked — resuming tracking")
+        if self._user_paused:
+            logger.info("Screen unlock — staying paused (user-initiated pause active)")
+            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
@@ -736,7 +779,7 @@ class BetterFlowSyncApp:
         elif key == "update_channel":
             self.config.update_channel = value
             check_for_update(
-                __version__,
+                (__version__ if isinstance(__version__, str) else __version__.__version__),
                 channel=value,
                 callback=self._on_update_available,
             )
@@ -792,6 +835,8 @@ class BetterFlowSyncApp:
 
         self.coordinator.stop()
         self.sync_engine.shutdown()
+        if self.window_watcher:
+            self.window_watcher.stop()
         if self.display_tracker is not None:
             self.display_tracker.stop()
         self.aw.close()

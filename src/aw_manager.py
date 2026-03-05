@@ -211,6 +211,10 @@ class AWManager:
         self._disabled_components: set[str] = set()
         self._stale_restart_count: int = 0
 
+    def disable_component(self, name: str) -> None:
+        """Prevent a component from being started/restarted."""
+        self._disabled_components.add(name)
+
     @property
     def is_managing(self) -> bool:
         """True if we started tracker processes (not using external)."""
@@ -541,6 +545,10 @@ class AWManager:
         This order ensures that binaries with existing macOS Accessibility
         permission are preferred over freshly-bundled copies that would
         require the user to re-grant permission.
+
+        On first run from a frozen bundle, the trackers are copied to the
+        persistent install dir so that macOS Accessibility permission (which
+        is granted per-binary path) survives app updates.
         """
         plat = _get_platform_key()
 
@@ -556,10 +564,47 @@ class AWManager:
         if os.path.isdir(dev_path) and _binaries_present(dev_path):
             return dev_path
 
-        # PyInstaller frozen bundle (last resort — may need new permission grant)
+        # PyInstaller frozen bundle — copy to persistent dir so Accessibility
+        # permission survives app updates (macOS grants it per binary path).
         if getattr(sys, "frozen", False):
             base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
             if os.path.isdir(base) and _binaries_present(base):
+                if self._install_to_persistent(base, install_dir):
+                    return install_dir
                 return base
 
         return None
+
+    @staticmethod
+    def _install_to_persistent(source_dir: str, install_dir: str) -> bool:
+        """Copy tracker binaries from app bundle to persistent location.
+
+        This ensures macOS Accessibility permission (granted per binary path)
+        survives app updates, since the persistent path never changes.
+        """
+        try:
+            os.makedirs(install_dir, exist_ok=True)
+            for name in ALL_COMPONENTS:
+                src_subdir = os.path.join(source_dir, name)
+                dst_subdir = os.path.join(install_dir, name)
+                if os.path.isdir(src_subdir):
+                    if os.path.isdir(dst_subdir):
+                        shutil.rmtree(dst_subdir)
+                    shutil.copytree(src_subdir, dst_subdir)
+                    # Ensure binaries are executable
+                    for root, _, files in os.walk(dst_subdir):
+                        for f in files:
+                            p = os.path.join(root, f)
+                            if os.path.basename(p).startswith("bf-"):
+                                st = os.stat(p)
+                                os.chmod(p, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                            # Strip quarantine
+                            subprocess.run(
+                                ["xattr", "-d", "com.apple.quarantine", p],
+                                capture_output=True,
+                            )
+            logger.info(f"Installed tracker binaries to {install_dir}")
+            return _binaries_present(install_dir)
+        except Exception as e:
+            logger.warning(f"Failed to install trackers to persistent dir: {e}")
+            return False

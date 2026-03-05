@@ -223,10 +223,6 @@ class BaseApiClient:
                 response.raise_for_status()
                 return response.json() if response.content else {}
 
-            except requests.exceptions.ChunkedEncodingError:
-                raise _TransientError("Connection dropped mid-response")
-            except requests.exceptions.ContentDecodingError:
-                raise _TransientError("Response body decoding failed")
             except requests.exceptions.ConnectionError as e:
                 # DNS resolution failures are not retryable (N8)
                 cause = e.__cause__
@@ -237,6 +233,10 @@ class BaseApiClient:
                         ) from e
                     cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
                 raise _TransientError("Cannot connect to BetterFlow API")
+            except requests.exceptions.ChunkedEncodingError:
+                raise _TransientError("Connection dropped mid-response")
+            except requests.exceptions.ContentDecodingError:
+                raise _TransientError("Response body decoding failed")
             except requests.exceptions.Timeout:
                 raise _TransientError("Request timed out")
             except requests.exceptions.HTTPError as e:
@@ -248,6 +248,8 @@ class BaseApiClient:
                 raise BetterFlowClientError(
                     f"API error ({e.response.status_code}): {error_detail or str(e)}"
                 ) from e
+
+        effective_retry_config = retry_config_override or self.retry_config
 
         if retry:
             effective_retry_config = retry_config_override or self.retry_config

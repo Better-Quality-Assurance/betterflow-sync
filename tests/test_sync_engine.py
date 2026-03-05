@@ -29,6 +29,11 @@ class TestSyncEngine:
         self.activity_analyzer.get_raw_metrics.return_value = Mock(
             to_dict=lambda: {"presses": 0, "clicks": 0, "scrolls": 0, "window_changes": 0}
         )
+        self.activity_analyzer.get_fraud_assessment.return_value = Mock(
+            score=0,
+            signals=[],
+            extra_metrics={"unique_apps": 0, "keystroke_variance": None},
+        )
 
         self.time_tracker = Mock(spec=DailyTimeTracker)
         self.time_tracker.get_today_active_time.return_value = timedelta(hours=1)
@@ -142,6 +147,7 @@ class TestSyncEngine:
 
     def test_transform_event_adds_activity_state_for_window_events(self):
         """Test that window events include activity state and metrics."""
+        self.engine._has_input_data = True
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
@@ -158,6 +164,7 @@ class TestSyncEngine:
 
     def test_transform_event_tracks_active_time_for_active_events(self):
         """Test that active events add time to tracker."""
+        self.engine._has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -175,7 +182,8 @@ class TestSyncEngine:
         assert args[0] == 60  # duration
 
     def test_transform_event_does_not_track_idle_active_time(self):
-        """Test that idle-active events don't add time to tracker."""
+        """Test that idle-active events don't add time to tracker when input data exists."""
+        self.engine._has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "idle-active"
 
         event = AWEvent(
