@@ -6,7 +6,7 @@ import signal
 import sys
 import threading
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -480,8 +480,15 @@ class BetterFlowSyncApp:
             self.coordinator.fetch_projects()
             self.coordinator.fetch_categories()
             self._check_stale_session()
-            self._check_accessibility_permission()
             self.coordinator.start()
+            # Check accessibility after scheduler starts (non-blocking, 5s delay)
+            self.coordinator.scheduler.add_job(
+                self._check_accessibility_permission,
+                "date",
+                run_date=datetime.now() + timedelta(seconds=5),
+                id="accessibility_check",
+                replace_existing=True,
+            )
         else:
             self.coordinator.logged_in = False
             self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
@@ -527,8 +534,6 @@ class BetterFlowSyncApp:
         if sys.platform != "darwin":
             return
         try:
-            import time
-            time.sleep(3)  # Give AW a moment to start watchers
             window_buckets = self.aw.get_window_buckets()
             if not window_buckets:
                 logger.warning(
@@ -863,6 +868,16 @@ class BetterFlowSyncApp:
             self.window_watcher.stop()
         if self.display_tracker is not None:
             self.display_tracker.stop()
+        # Clean up macOS notification observers (M5)
+        try:
+            if sys.platform == "darwin":
+                try:
+                    from .system_events import cleanup_observers
+                except ImportError:
+                    from system_events import cleanup_observers
+                cleanup_observers()
+        except Exception:
+            pass
         self.aw.close()
         self.bf.close()
         self.queue.close()

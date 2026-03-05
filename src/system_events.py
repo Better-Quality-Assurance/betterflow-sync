@@ -251,7 +251,13 @@ def _start_macos_network_listener(
             state["online"] = _is_reachable(flags)
 
         logger.debug("macOS network reachability listener started")
-        loop.run()
+        # Use interruptible run loop instead of blocking loop.run()
+        from Foundation import NSDate
+        while True:
+            loop.runMode_beforeDate_(
+                NSDefaultRunLoopMode,
+                NSDate.dateWithTimeIntervalSinceNow_(5.0),
+            )
 
     thread = threading.Thread(target=run_loop, name="system-network-listener", daemon=True)
     thread.start()
@@ -382,11 +388,12 @@ def _start_network_poller(
 ) -> None:
     """Poll network connectivity and fire callback on state changes."""
     state = {"online": None}  # None = unknown
+    stop_event = threading.Event()
 
     def poll():
         # Immediate first check before entering the wait loop (N10)
         first = True
-        while True:
+        while not stop_event.is_set():
             try:
                 socket.create_connection((host, 443), timeout=5).close()
                 online = True
@@ -403,7 +410,7 @@ def _start_network_poller(
             state["online"] = online
             first = False
 
-            threading.Event().wait(interval)
+            stop_event.wait(interval)
 
     thread = threading.Thread(target=poll, name="system-network-poller", daemon=True)
     thread.start()
@@ -413,17 +420,6 @@ def _start_network_poller(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def cleanup_observers() -> None:
-    """Remove all registered macOS notification observers (M5)."""
-    with _observers_lock:
-        for center, observer in _registered_observers:
-            try:
-                center.removeObserver_(observer)
-            except Exception:
-                pass
-        _registered_observers.clear()
-
 
 def _safe_call(fn: Callable, *args) -> None:
     """Call a function, catching and logging any exceptions."""
