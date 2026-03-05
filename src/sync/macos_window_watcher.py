@@ -17,9 +17,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Browser apps that support URL retrieval via AppleScript
+# Browser bundle IDs for safe AppleScript invocation (prevents injection via app name).
+# Using `tell application id "..."` instead of `tell application "..."`.
+_BROWSER_BUNDLE_IDS: dict[str, str] = {
+    "Google Chrome": "com.google.Chrome",
+    "Google Chrome Canary": "com.google.Chrome.canary",
+    "Chromium": "org.chromium.Chromium",
+    "Brave Browser": "com.brave.Browser",
+    "Safari": "com.apple.Safari",
+    "Microsoft Edge": "com.microsoft.edgemac",
+    "Arc": "company.thebrowser.Browser",
+    "Firefox": "org.mozilla.firefox",
+}
+
 _CHROMIUM_BROWSERS = frozenset({
     "Google Chrome", "Google Chrome Canary", "Chromium", "Brave Browser",
+    "Microsoft Edge", "Arc",
 })
 _URL_BROWSERS = _CHROMIUM_BROWSERS | {"Safari"}
 
@@ -121,10 +134,18 @@ class MacOSWindowWatcher:
 
     @staticmethod
     def _get_browser_url(app_name: str) -> tuple[Optional[str], Optional[bool]]:
-        """Get URL from browser via AppleScript (doesn't need Accessibility)."""
+        """Get URL from browser via AppleScript (doesn't need Accessibility).
+
+        Uses bundle IDs (tell application id "...") instead of app names
+        to prevent AppleScript injection via malicious process names.
+        """
+        bundle_id = _BROWSER_BUNDLE_IDS.get(app_name)
+        if not bundle_id:
+            return None, None
+
         try:
             if app_name == "Safari":
-                script = 'tell application "Safari" to return URL of current tab of front window'
+                script = f'tell application id "{bundle_id}" to return URL of current tab of front window'
                 result = subprocess.run(
                     ["osascript", "-e", script],
                     capture_output=True, text=True, timeout=3,
@@ -133,7 +154,10 @@ class MacOSWindowWatcher:
                     return result.stdout.strip(), None
             elif app_name in _CHROMIUM_BROWSERS:
                 # Get URL and mode in one call
-                script = f'tell application "{app_name}" to return (URL of active tab of front window) & "\\n" & (mode of front window as text)'
+                script = (
+                    f'tell application id "{bundle_id}" to return '
+                    f'(URL of active tab of front window) & "\\n" & (mode of front window as text)'
+                )
                 result = subprocess.run(
                     ["osascript", "-e", script],
                     capture_output=True, text=True, timeout=3,
@@ -143,8 +167,10 @@ class MacOSWindowWatcher:
                     url = lines[0] if lines else None
                     incognito = lines[1] == "incognito" if len(lines) > 1 else None
                     return url, incognito
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+        except subprocess.TimeoutExpired:
+            logger.debug(f"AppleScript timed out for {app_name}")
+        except Exception as e:
+            logger.debug(f"AppleScript failed for {app_name}: {e}")
         return None, None
 
     def _run(self) -> None:

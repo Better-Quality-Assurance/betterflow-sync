@@ -8,6 +8,7 @@ Security features:
 - PKCE (Proof Key for Code Exchange) for public client security
 """
 
+import hmac
 import logging
 import os
 import secrets
@@ -16,7 +17,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from urllib.parse import urlparse, parse_qs, quote
 
 from .pkce import generate_pkce_pair
 
@@ -87,29 +88,6 @@ _ERROR_HTML = """\
 """
 
 
-def _normalize_state(value: Optional[str]) -> str:
-    """Normalize callback `state` values for robust comparison."""
-    if value is None:
-        return ""
-
-    normalized = value.strip()
-    if (
-        len(normalized) >= 2
-        and normalized[0] == normalized[-1]
-        and normalized[0] in {"'", '"'}
-    ):
-        normalized = normalized[1:-1]
-
-    normalized = unquote(normalized).strip()
-    if (
-        len(normalized) >= 2
-        and normalized[0] == normalized[-1]
-        and normalized[0] in {"'", '"'}
-    ):
-        normalized = normalized[1:-1]
-
-    return normalized
-
 
 def _allow_state_mismatch() -> bool:
     """Opt-in local-dev bypass for strict state matching.
@@ -154,8 +132,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             state = params.get("state", [None])[0]
 
             # Verify state parameter (CSRF protection)
-            state_ok = _normalize_state(state) == _normalize_state(
-                self.server.expected_state
+            # Use hmac.compare_digest for constant-time comparison (no timing leak)
+            state_ok = hmac.compare_digest(
+                (state or "").encode(), self.server.expected_state.encode()
             )
             if not state_ok:
                 if code and _allow_state_mismatch():
@@ -281,14 +260,18 @@ class BrowserAuthFlow:
 
             if self._server.auth_code:
                 logger.info("Authorization code received (state verified)")
+                code = self._server.auth_code
+                self._server.auth_code = None  # Clear from memory immediately
                 return AuthFlowResult(
                     success=True,
-                    code=self._server.auth_code,
+                    code=code,
                     code_verifier=code_verifier,
                 )
 
-            logger.warning(f"Authorization failed: {self._server.auth_error}")
-            return AuthFlowResult(success=False, error=self._server.auth_error)
+            error = self._server.auth_error
+            self._server.auth_error = None  # Clear from memory
+            logger.warning(f"Authorization failed: {error}")
+            return AuthFlowResult(success=False, error=error)
         finally:
             # Always shut down server and clean up thread
             self._server.shutdown()
