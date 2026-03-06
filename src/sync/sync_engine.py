@@ -105,6 +105,12 @@ class SyncEngine:
         # Dedicated lock for _sent_cache (OrderedDict LRU ops are multi-step)
         self._cache_lock = threading.Lock()
 
+        # Time tracking dedup: track last-counted duration per event to avoid
+        # double-counting when the lookback window re-fetches events with grown
+        # durations.  Only the delta (new - old) is added to the time tracker.
+        self._time_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
+        self._TIME_CACHE_MAX = 5_000
+
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
         self._category_cache: Optional[dict[str, str]] = None
@@ -656,10 +662,20 @@ class SyncEngine:
                 activity_state = "active"
                 result["activity_state"] = activity_state
 
-            # Track active time (only "active" events count)
+            # Track active time (only "active" events count).
+            # Use delta to avoid double-counting re-fetched events whose
+            # duration grew via heartbeat extension or gap-filling.
             if activity_state == "active":
                 event_date = event.timestamp.astimezone().date()
-                self._time_tracker.add_active_time(event.duration, event_date)
+                time_key = (bucket_id, event.id)
+                prev_counted = self._time_cache.get(time_key, 0.0)
+                delta = event.duration - prev_counted
+                if delta > 0:
+                    self._time_tracker.add_active_time(delta, event_date)
+                    self._time_cache[time_key] = event.duration
+                    self._time_cache.move_to_end(time_key)
+                    if len(self._time_cache) > self._TIME_CACHE_MAX:
+                        self._time_cache.popitem(last=False)
 
         return result
 
