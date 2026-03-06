@@ -2,6 +2,7 @@
 
 import logging
 import time
+from typing import Callable, Optional
 
 try:
     from .config import ReminderSettings
@@ -21,13 +22,19 @@ class ReminderManager:
     evaluate whether a notification should be sent.
     """
 
-    def __init__(self, settings: ReminderSettings) -> None:
+    def __init__(
+        self,
+        settings: ReminderSettings,
+        on_break_triggered: Optional[Callable[[], None]] = None,
+    ) -> None:
         self._settings = settings
+        self._on_break_triggered = on_break_triggered
 
         # Break-time state
         self._work_start: float | None = None
         self._last_break_notification: float | None = None
         self._tracking_active: bool = False
+        self._on_break: bool = False
 
         # Private-time state
         self._private_start: float | None = None
@@ -70,6 +77,19 @@ class ReminderManager:
             self._private_active = False
             logger.debug("Private timer reset")
 
+    def on_break_started(self) -> None:
+        """Call when auto-break begins (suppresses further break checks)."""
+        self._on_break = True
+        logger.debug("Break active — suppressing break timer")
+
+    def on_break_ended(self) -> None:
+        """Call when auto-break ends (resets work timer for next interval)."""
+        self._on_break = False
+        now = time.monotonic()
+        self._work_start = now
+        self._last_break_notification = None
+        logger.debug("Break ended — work timer reset")
+
     def check(self) -> None:
         """Evaluate timers and send notifications if thresholds are exceeded."""
         now = time.monotonic()
@@ -86,6 +106,8 @@ class ReminderManager:
     def _check_break(self, now: float) -> None:
         if not self._settings.break_reminders_enabled:
             return
+        if self._on_break:
+            return
         if not self._tracking_active or self._work_start is None:
             return
 
@@ -99,12 +121,16 @@ class ReminderManager:
         ref = self._last_break_notification or self._work_start
         if now - ref >= interval:
             hours = int(elapsed // 3600)
-            send_notification(
-                "Time for a Break",
-                f"You've been working for {hours}h — take a short break!",
-            )
             self._last_break_notification = now
             logger.info(f"Break reminder sent ({hours}h elapsed)")
+
+            if self._on_break_triggered:
+                self._on_break_triggered()
+            else:
+                send_notification(
+                    "Time for a Break",
+                    f"You've been working for {hours}h — take a short break!",
+                )
 
     def _check_private(self, now: float) -> None:
         if not self._settings.private_reminders_enabled:

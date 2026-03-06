@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 # Support both relative imports (module) and absolute imports (PyInstaller)
@@ -87,6 +88,7 @@ class SyncCoordinator:
         # Flags set by the app layer
         self.logged_in = False
         self.paused_by_network = False
+        self._on_break = False
         self._sync_lock = threading.Lock()
 
         # Optional callback wired by the app for auth-error re-login
@@ -174,6 +176,91 @@ class SyncCoordinator:
         if self.scheduler.running:
             self.scheduler.add_job(self._do_sync, id=job_id, replace_existing=True)
 
+    def start_break(self) -> None:
+        """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
+        if self._on_break:
+            return
+        self._on_break = True
+        self.sync_engine.pause()
+        duration = self.config.reminders.break_duration_minutes
+
+        with self.tray.model.lock:
+            self.tray.model.on_break = True
+            self.tray.model.break_minutes_left = duration
+        self.tray.set_state(TrayState.ON_BREAK)
+
+        if self.reminder_manager:
+            self.reminder_manager.on_break_started()
+
+        # Schedule auto-resume
+        run_date = datetime.now() + timedelta(minutes=duration)
+        if self.scheduler.running:
+            self.scheduler.add_job(
+                self.end_break,
+                trigger=DateTrigger(run_date=run_date),
+                id="auto_break_end",
+                replace_existing=True,
+            )
+            # Countdown job updates minutes-left every 60s
+            self.scheduler.add_job(
+                self._update_break_countdown,
+                trigger=IntervalTrigger(seconds=60),
+                id="break_countdown",
+                replace_existing=True,
+            )
+
+        try:
+            from .notifications import send_notification
+        except ImportError:
+            from notifications import send_notification
+        send_notification(
+            "Break Time",
+            f"Tracking paused for {duration} minutes. Enjoy your break!",
+        )
+        logger.info(f"Auto-break started ({duration}m)")
+
+    def end_break(self) -> None:
+        """End the auto-break: resume sync, green tray, reset break timer."""
+        if not self._on_break:
+            return
+        self._on_break = False
+
+        with self.tray.model.lock:
+            self.tray.model.on_break = False
+            self.tray.model.break_minutes_left = 0
+
+        self.sync_engine.resume()
+        self.tray.set_state(TrayState.SYNCING)
+
+        if self.reminder_manager:
+            self.reminder_manager.on_break_ended()
+            self.reminder_manager.on_tracking_started()
+
+        # Remove scheduled jobs
+        if self.scheduler.running:
+            for job_id in ("auto_break_end", "break_countdown"):
+                try:
+                    self.scheduler.remove_job(job_id)
+                except Exception:
+                    pass
+
+        try:
+            from .notifications import send_notification
+        except ImportError:
+            from notifications import send_notification
+        send_notification(
+            "Break Over",
+            "Tracking resumed — welcome back!",
+        )
+        logger.info("Auto-break ended")
+
+    def _update_break_countdown(self) -> None:
+        """Decrement the break minutes-left counter for tray display."""
+        with self.tray.model.lock:
+            if self.tray.model.break_minutes_left > 0:
+                self.tray.model.break_minutes_left -= 1
+        self.tray._update_menu()
+
     def fetch_projects(self) -> None:
         """Fetch available projects from API and set on tray."""
         try:
@@ -215,7 +302,7 @@ class SyncCoordinator:
                 # Only set NEEDS_PERMISSIONS if not in a higher-priority state
                 current = self.tray.model.state
                 high_priority = (
-                    TrayState.PAUSED, TrayState.PRIVATE,
+                    TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
                     TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
                     TrayState.WAITING_AUTH,
                 )
@@ -237,6 +324,9 @@ class SyncCoordinator:
             return
         try:
             if self.sync_engine.is_private:
+                return
+
+            if self._on_break:
                 return
 
             if self.paused_by_network:
@@ -326,19 +416,18 @@ class SyncCoordinator:
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
-        """Refresh tray hours from local active time tracker."""
+        """Refresh tray hours from local active time tracker.
+
+        Always runs (even when paused/private) so the tray resets to
+        ``0h 0m`` at midnight instead of showing yesterday's stale value.
+        """
         try:
             if not self.logged_in:
                 logger.debug("_refresh_hours: skipped (not logged in)")
                 return
-            if self.paused_by_network:
-                logger.debug("_refresh_hours: skipped (paused by network)")
-                return
-            if self.sync_engine.is_paused or self.sync_engine.is_private:
-                logger.debug("_refresh_hours: skipped (paused or private)")
-                return
 
-            # Use local active time tracker (already handles engagement detection)
+            # get_today_active_time() is read-only and handles day rollover,
+            # so we call it unconditionally to keep the display current.
             active_time = self.sync_engine.get_today_active_time()
             logger.info(f"_refresh_hours: active_time={active_time}")
             self.tray.set_active_time(active_time)
@@ -455,6 +544,7 @@ class BetterFlowSyncApp:
             on_sync_now=self._on_sync_now,
             on_export_logs=self._on_export_logs,
             on_open_permissions=self._on_open_permissions,
+            on_end_break=self._on_end_break,
         )
         self.tray.set_config(self.config)
 
@@ -473,6 +563,8 @@ class BetterFlowSyncApp:
             reminder_manager=self.reminder_manager,
         )
         self.coordinator._on_auth_error = self._on_login
+        # Wire break callback now that coordinator exists
+        self.reminder_manager._on_break_triggered = self.coordinator.start_break
 
         # State
         self._shutdown_done = False
@@ -647,8 +739,15 @@ class BetterFlowSyncApp:
 
         threading.Thread(target=do_browser_login, daemon=True, name="login-thread").start()
 
+    def _on_end_break(self) -> None:
+        """Handle user ending break early from tray menu."""
+        self.coordinator.end_break()
+
     def _on_pause(self) -> None:
         """Handle pause action."""
+        # If on break, end the break first but stay paused (user intent wins)
+        if self.coordinator._on_break:
+            self.coordinator.end_break()
         self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
