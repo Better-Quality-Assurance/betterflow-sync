@@ -13,11 +13,13 @@ from typing import Optional
 import itertools
 
 try:
-    from ..config import Config
     from ..auth.login import LoginManager, LoginState
+    from ..config import Config
+    from .permissions import check_accessibility, check_screen_recording, open_accessibility_settings, open_screen_recording_settings
 except ImportError:
-    from config import Config
     from auth.login import LoginManager, LoginState
+    from config import Config
+    from ui.permissions import check_accessibility, check_screen_recording, open_accessibility_settings, open_screen_recording_settings
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,7 @@ class SetupWizard:
         self._login_state: Optional[LoginState] = None
         self._closing = False
         self._spinner_after_id: Optional[str] = None
+        self._permissions_refresh_id: Optional[str] = None
         self._button_id = itertools.count(1)
 
     def show(self) -> SetupResult:
@@ -131,6 +134,12 @@ class SetupWizard:
             except tk.TclError:
                 pass
             self._spinner_after_id = None
+        if self._permissions_refresh_id is not None:
+            try:
+                self._window.after_cancel(self._permissions_refresh_id)
+            except tk.TclError:
+                pass
+            self._permissions_refresh_id = None
         self._canvas.configure(cursor="")
         self._canvas.delete("all")
         for widget in self._canvas.winfo_children():
@@ -139,6 +148,12 @@ class SetupWizard:
     def _on_close(self) -> None:
         """Handle window close — cancel any in-progress login."""
         self._closing = True
+        if self._permissions_refresh_id is not None:
+            try:
+                self._window.after_cancel(self._permissions_refresh_id)
+            except tk.TclError:
+                pass
+            self._permissions_refresh_id = None
         self._result = SetupResult(completed=False)
         self._login_manager.cancel_login()
         self._window.destroy()
@@ -456,8 +471,163 @@ class SetupWizard:
             justify=tk.CENTER,
         )
 
-        # Launch button
-        self._make_button("Start Using BetterFlow", self._finish, cx, 438, width=280)
+        # Launch button — go to permissions screen next
+        self._make_button("Continue", self._show_permissions_entry, cx, 438, width=280)
+
+    # ── Permissions Screen ─────────────────────────────────────────
+
+    def _show_permissions_entry(self) -> None:
+        """Entry point from success screen — skip entirely if all granted."""
+        if platform.system() != "Darwin":
+            self._finish()
+            return
+        if check_accessibility() and check_screen_recording():
+            self._finish()
+            return
+        self._show_permissions()
+
+    def _show_permissions(self) -> None:
+        """Show the permissions screen with current status."""
+        acc = check_accessibility()
+        scr = check_screen_recording()
+        all_granted = acc and scr
+
+        cx = self._draw_scene(
+            title="System Permissions",
+            subtitle="BetterFlow needs these permissions for accurate tracking",
+        )
+
+        row_width = 560
+        row_height = 76
+        row_x1 = cx - row_width // 2
+        row_x2 = cx + row_width // 2
+        btn_area_width = 140  # reserved space on the right for button
+        text_max_x = row_x2 - btn_area_width - 8
+
+        # ── Accessibility row ──
+        row_y = 200
+        self._draw_permission_row(
+            row_x1, row_y, row_x2, row_height,
+            granted=acc,
+            title="Accessibility",
+            description="Track active window titles",
+            text_max_x=text_max_x,
+            on_open=None if acc else self._open_accessibility,
+        )
+
+        # ── Screen Recording row ──
+        row_y2 = row_y + row_height + 14
+        self._draw_permission_row(
+            row_x1, row_y2, row_x2, row_height,
+            granted=scr,
+            title="Screen Recording",
+            description="Capture browser URLs",
+            text_max_x=text_max_x,
+            on_open=None if scr else self._open_screen_recording,
+        )
+
+        # ── Bottom area ──
+        if all_granted:
+            self._canvas.create_text(
+                cx, row_y2 + row_height + 36,
+                text="All permissions granted!",
+                font=(FONT_FAMILY, 14, "bold"), fill=SUCCESS_COLOR,
+            )
+            self._make_button(
+                "Start Using BetterFlow", self._finish,
+                cx, row_y2 + row_height + 80, width=280,
+            )
+        else:
+            # Hint text
+            self._canvas.create_text(
+                cx, row_y2 + row_height + 30,
+                text="If already toggled on, try switching it off and on again.",
+                font=(FONT_FAMILY, 11), fill="#7a8fc0",
+            )
+
+            btn_y = row_y2 + row_height + 76
+            self._make_button(
+                "Refresh Status", self._show_permissions,
+                cx - 104, btn_y, width=180,
+            )
+            self._make_button(
+                "Skip for Now", self._finish,
+                cx + 104, btn_y, width=180, primary=False,
+            )
+
+        # Auto-refresh every 3 seconds
+        self._permissions_refresh_id = self._window.after(
+            3000, self._auto_refresh_permissions,
+        )
+
+    def _draw_permission_row(
+        self,
+        x1: int, y: int, x2: int, height: int,
+        granted: bool,
+        title: str,
+        description: str,
+        text_max_x: int,
+        on_open=None,
+    ) -> None:
+        """Draw a single permission status row."""
+        cy = y + height // 2
+        icon = "\u2713" if granted else "\u2717"
+        icon_color = SUCCESS_COLOR if granted else ERROR_COLOR
+        bg = "#112040" if granted else "#1a1a3a"
+        border = "#2a5040" if granted else CARD_BORDER
+
+        self._create_rounded_rect(
+            x1, y, x2, y + height,
+            radius=12, fill=bg, outline=border, width=1,
+        )
+
+        # Status icon
+        self._canvas.create_text(
+            x1 + 32, cy, text=icon,
+            font=(FONT_FAMILY, 22, "bold"), fill=icon_color,
+        )
+
+        # Title and description
+        self._canvas.create_text(
+            x1 + 64, cy - 10, text=title,
+            font=(FONT_FAMILY, 14, "bold"), fill=TEXT_COLOR, anchor=tk.W,
+        )
+        self._canvas.create_text(
+            x1 + 64, cy + 14, text=description,
+            font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
+        )
+
+        # "Open Settings" button (only when not granted)
+        if on_open is not None:
+            self._make_button(
+                "Open Settings", on_open,
+                x2 - 82, cy, width=128, primary=False,
+            )
+
+    def _auto_refresh_permissions(self) -> None:
+        """Auto-refresh the permissions screen when status changes."""
+        if self._closing:
+            return
+        try:
+            acc = check_accessibility()
+            scr = check_screen_recording()
+            if acc and scr:
+                # All granted — redraw to show success state
+                self._show_permissions()
+            else:
+                self._permissions_refresh_id = self._window.after(
+                    3000, self._auto_refresh_permissions,
+                )
+        except tk.TclError:
+            pass
+
+    def _open_accessibility(self) -> None:
+        """Open macOS Accessibility settings."""
+        open_accessibility_settings()
+
+    def _open_screen_recording(self) -> None:
+        """Open macOS Screen Recording settings."""
+        open_screen_recording_settings()
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
