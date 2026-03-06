@@ -558,10 +558,11 @@ class SetupWizard:
                 cx + 104, btn_y, width=180, primary=False,
             )
 
-        # Auto-refresh every 3 seconds
-        self._permissions_refresh_id = self._window.after(
-            3000, self._auto_refresh_permissions,
-        )
+        # Auto-refresh every 3 seconds (only while waiting for grant)
+        if not granted:
+            self._permissions_refresh_id = self._window.after(
+                3000, self._auto_refresh_permissions,
+            )
 
     def _auto_refresh_permissions(self) -> None:
         """Auto-refresh the permissions screen when status changes."""

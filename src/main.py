@@ -369,10 +369,13 @@ class SyncCoordinator:
                     logger.warning(f"Offline queue at {pct}% capacity")
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
-                elif self.tray.model.needs_permissions:
-                    self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                 else:
-                    self.tray.set_state(TrayState.SYNCING)
+                    with self.tray.model.lock:
+                        needs_perms = self.tray.model.needs_permissions
+                    if needs_perms:
+                        self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
+                    else:
+                        self.tray.set_state(TrayState.SYNCING)
             else:
                 self.tray.set_state(
                     TrayState.ERROR,
@@ -444,7 +447,7 @@ class SyncCoordinator:
             # get_today_active_time() is read-only and handles day rollover,
             # so we call it unconditionally to keep the display current.
             active_time = self.sync_engine.get_today_active_time()
-            logger.info(f"_refresh_hours: active_time={active_time}")
+            logger.debug(f"_refresh_hours: active_time={active_time}")
             self.tray.set_active_time(active_time)
         except Exception as e:
             logger.warning(f"Failed to refresh tray hours: {e}")
@@ -563,10 +566,7 @@ class BetterFlowSyncApp:
         )
         self.tray.set_config(self.config)
 
-        # Reminder manager
-        self.reminder_manager = ReminderManager(self.config.reminders)
-
-        # Sync coordinator
+        # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(
             config=self.config,
             aw=self.aw,
@@ -575,11 +575,15 @@ class BetterFlowSyncApp:
             sync_engine=self.sync_engine,
             tray=self.tray,
             aw_manager=self.aw_manager,
-            reminder_manager=self.reminder_manager,
         )
         self.coordinator._on_auth_error = self._on_login
-        # Wire break callback now that coordinator exists
-        self.reminder_manager._on_break_triggered = self.coordinator.start_break
+
+        # Reminder manager (created after coordinator for clean callback injection)
+        self.reminder_manager = ReminderManager(
+            self.config.reminders,
+            on_break_triggered=self.coordinator.start_break,
+        )
+        self.coordinator.reminder_manager = self.reminder_manager
 
         # State
         self._shutdown_done = False
