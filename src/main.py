@@ -24,7 +24,7 @@ try:
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
-    from .ui.permissions import all_permissions_granted, check_accessibility, check_screen_recording, open_accessibility_settings, open_screen_recording_settings
+    from .ui.permissions import check_accessibility, open_accessibility_settings
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
 except ImportError:
@@ -37,7 +37,7 @@ except ImportError:
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
-    from ui.permissions import all_permissions_granted, check_accessibility, check_screen_recording, open_accessibility_settings, open_screen_recording_settings
+    from ui.permissions import check_accessibility, open_accessibility_settings
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
 
@@ -206,9 +206,9 @@ class SyncCoordinator:
         return self._sync_lock.locked()
 
     def _check_permissions(self) -> None:
-        """Check macOS permissions and update tray state."""
+        """Check macOS Accessibility permission and update tray state."""
         try:
-            granted = all_permissions_granted()
+            granted = check_accessibility()
             with self.tray.model.lock:
                 self.tray.model.needs_permissions = not granted
             if not granted:
@@ -577,26 +577,15 @@ class BetterFlowSyncApp:
                 from .notifications import send_notification
             except ImportError:
                 from notifications import send_notification
-            missing = []
-            if not check_accessibility():
-                missing.append("Accessibility")
-            if not check_screen_recording():
-                missing.append("Screen Recording")
             send_notification(
                 "BetterFlow Sync",
-                f"Grant {' and '.join(missing)} permission in "
-                "System Settings > Privacy & Security for full tracking.",
+                "Grant Accessibility permission in "
+                "System Settings > Privacy & Security for window tracking.",
             )
 
     def _on_open_permissions(self) -> None:
-        """Open System Settings for whichever macOS permission is missing."""
-        if not check_accessibility():
-            open_accessibility_settings()
-        elif not check_screen_recording():
-            open_screen_recording_settings()
-        else:
-            # Both granted — open accessibility as default
-            open_accessibility_settings()
+        """Open System Settings to Accessibility permission pane."""
+        open_accessibility_settings()
 
     def _on_update_available(self, version: str, url: str) -> None:
         """Handle update available notification."""
