@@ -16,9 +16,6 @@ jobs:
           - os: macos-latest
             artifact_name: BetterFlow Sync.app
             asset_name: BetterFlow-Sync-macOS-arm64
-          - os: macos-13
-            artifact_name: BetterFlow Sync.app
-            asset_name: BetterFlow-Sync-macOS-x86_64
           - os: windows-latest
             artifact_name: BetterFlow Sync.exe
             asset_name: BetterFlow-Sync-Windows
@@ -89,12 +86,6 @@ jobs:
           name: BetterFlow-Sync-macOS-arm64
           path: ./artifacts
 
-      - name: Download macOS Intel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: BetterFlow-Sync-macOS-x86_64
-          path: ./artifacts
-
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
@@ -106,7 +97,6 @@ jobs:
         with:
           files: |
             artifacts/BetterFlow-Sync-macOS-arm64.zip
-            artifacts/BetterFlow-Sync-macOS-x86_64.zip
             artifacts/BetterFlow-Sync-Windows.zip
           draft: true
           generate_release_notes: true
