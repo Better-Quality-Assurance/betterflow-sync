@@ -15,7 +15,10 @@ jobs:
         include:
           - os: macos-latest
             artifact_name: BetterFlow Sync.app
-            asset_name: BetterFlow-Sync-macOS
+            asset_name: BetterFlow-Sync-macOS-arm64
+          - os: macos-13
+            artifact_name: BetterFlow Sync.app
+            asset_name: BetterFlow-Sync-macOS-x86_64
           - os: windows-latest
             artifact_name: BetterFlow Sync.exe
             asset_name: BetterFlow-Sync-Windows
@@ -48,15 +51,15 @@ jobs:
         run: pyinstaller build.spec --clean
 
       - name: List dist contents (macOS)
-        if: matrix.os == 'macos-latest'
+        if: runner.os == 'macOS'
         run: ls -la dist/
 
       - name: List dist contents (Windows)
         if: matrix.os == 'windows-latest'
         run: dir dist
 
-      - name: Create macOS DMG
-        if: matrix.os == 'macos-latest'
+      - name: Create macOS ZIP
+        if: runner.os == 'macOS'
         run: |
           cd dist
           zip -r "${{ matrix.asset_name }}.zip" "BetterFlow Sync.app"
@@ -80,10 +83,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Download macOS artifact
+      - name: Download macOS ARM artifact
         uses: actions/download-artifact@v4
         with:
-          name: BetterFlow-Sync-macOS
+          name: BetterFlow-Sync-macOS-arm64
+          path: ./artifacts
+
+      - name: Download macOS Intel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: BetterFlow-Sync-macOS-x86_64
           path: ./artifacts
 
       - name: Download Windows artifact
@@ -96,7 +105,8 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/BetterFlow-Sync-macOS.zip
+            artifacts/BetterFlow-Sync-macOS-arm64.zip
+            artifacts/BetterFlow-Sync-macOS-x86_64.zip
             artifacts/BetterFlow-Sync-Windows.zip
           draft: true
           generate_release_notes: true
