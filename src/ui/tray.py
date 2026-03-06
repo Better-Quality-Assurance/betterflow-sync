@@ -451,10 +451,18 @@ class TrayIcon:
             new_mode = self.model.private_mode
         if new_mode:
             self.set_state(TrayState.PRIVATE)
-        else:
-            self.set_state(TrayState.SYNCING)
         if self._on_private_toggle:
             self._on_private_toggle(new_mode)
+        if not new_mode:
+            with self.model.lock:
+                on_break = self.model.on_break
+                paused = self.model.paused
+            if on_break:
+                self.set_state(TrayState.ON_BREAK)
+            elif paused:
+                self.set_state(TrayState.PAUSED)
+            else:
+                self.set_state(TrayState.SYNCING)
         self._update_menu()
 
     def _handle_show_dashboard(self, icon, item) -> None:
@@ -607,7 +615,15 @@ class TrayIcon:
         if paused:
             self.set_state(TrayState.PAUSED)
         else:
-            self.set_state(TrayState.SYNCING)
+            with self.model.lock:
+                on_break = self.model.on_break
+                private = self.model.private_mode
+            if on_break:
+                self.set_state(TrayState.ON_BREAK)
+            elif private:
+                self.set_state(TrayState.PRIVATE)
+            else:
+                self.set_state(TrayState.SYNCING)
 
     def update_stats(
         self,

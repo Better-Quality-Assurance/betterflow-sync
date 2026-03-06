@@ -314,20 +314,18 @@ class SyncCoordinator:
             granted = check_accessibility()
             with self.tray.model.lock:
                 self.tray.model.needs_permissions = not granted
+                current_state = self.tray.model.state
             if not granted:
-                # Only set NEEDS_PERMISSIONS if not in a higher-priority state
-                current = self.tray.model.state
                 high_priority = (
                     TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
                     TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
                     TrayState.WAITING_AUTH,
                 )
-                if current not in high_priority:
+                if current_state not in high_priority:
                     self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                 logger.debug("macOS permissions missing")
             else:
-                # Clear permissions warning if it was set
-                if self.tray.model.state == TrayState.NEEDS_PERMISSIONS:
+                if current_state == TrayState.NEEDS_PERMISSIONS:
                     self.tray.set_state(TrayState.SYNCING)
                     logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
