@@ -604,9 +604,10 @@ class TrayIcon:
             state: New state
             status_text: Optional status message for error state
         """
-        self.model.state = state
-        if status_text:
-            self.model.status_text = status_text
+        with self.model.lock:
+            self.model.state = state
+            if status_text:
+                self.model.status_text = status_text
         self._update_icon()
 
     def set_paused(self, paused: bool) -> None:

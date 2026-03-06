@@ -185,16 +185,21 @@ class SyncCoordinator:
         if self.scheduler.running:
             self.scheduler.add_job(self._do_sync, id=job_id, replace_existing=True)
 
+    @property
+    def is_on_break(self) -> bool:
+        """Thread-safe read of break state."""
+        with self._break_lock:
+            return self._on_break
+
     def start_break(self) -> None:
         """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
         with self._break_lock:
             if self._on_break:
                 return
             self._on_break = True
-
-        # Capture current state before breaking so end_break can restore it
-        self._pre_break_paused = self.sync_engine.is_paused
-        self._pre_break_private = self.sync_engine.is_private
+            # Capture current state before breaking so end_break can restore it
+            self._pre_break_paused = self.sync_engine.is_paused
+            self._pre_break_private = self.sync_engine.is_private
 
         self.sync_engine.pause()
         duration = self.config.reminders.break_duration_minutes
@@ -236,15 +241,17 @@ class SyncCoordinator:
             if not self._on_break:
                 return
             self._on_break = False
+            pre_break_paused = self._pre_break_paused
+            pre_break_private = self._pre_break_private
 
         with self.tray.model.lock:
             self.tray.model.on_break = False
             self.tray.model.break_minutes_left = 0
 
         # Restore pre-break state instead of blindly resuming
-        if self._pre_break_private:
+        if pre_break_private:
             self.tray.set_state(TrayState.PRIVATE)
-        elif self._pre_break_paused:
+        elif pre_break_paused:
             self.tray.set_state(TrayState.PAUSED)
         else:
             self.sync_engine.resume()
@@ -252,7 +259,7 @@ class SyncCoordinator:
 
         if self.reminder_manager:
             self.reminder_manager.on_break_ended()
-            if not self._pre_break_paused and not self._pre_break_private:
+            if not pre_break_paused and not pre_break_private:
                 self.reminder_manager.on_tracking_started()
 
         # Remove scheduled jobs
@@ -266,7 +273,7 @@ class SyncCoordinator:
         if not silent:
             send_notification(
                 "Break Over",
-                "Tracking resumed — welcome back!",
+                "Tracking resumed - welcome back!",
             )
         logger.info("Auto-break ended")
 
@@ -757,7 +764,7 @@ class BetterFlowSyncApp:
     def _on_pause(self) -> None:
         """Handle pause action."""
         # If on break, end the break silently — user intent (pause) takes over
-        if self.coordinator._on_break:
+        if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
         self._user_paused = True
         self.coordinator.paused_by_network = False
@@ -816,7 +823,7 @@ class BetterFlowSyncApp:
         if self._user_paused:
             logger.info("System wake — staying paused (user-initiated pause active)")
             return
-        if self.coordinator._on_break:
+        if self.coordinator.is_on_break:
             logger.info("System wake — staying on break")
             return
         self.sync_engine.resume()
@@ -842,7 +849,7 @@ class BetterFlowSyncApp:
         if self._user_paused:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
-        if self.coordinator._on_break:
+        if self.coordinator.is_on_break:
             logger.info("Screen unlocked — staying on break")
             return
         logger.info("Screen unlocked — resuming tracking")
@@ -972,7 +979,7 @@ class BetterFlowSyncApp:
             time.sleep(0.1)
 
         # Cancel any active break before stopping (prevents stuck break state on re-login)
-        if self.coordinator._on_break:
+        if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
 
         # End server session before stopping
