@@ -1,7 +1,12 @@
 """macOS permission checking utilities.
 
-Uses ctypes to check Screen Recording and Accessibility permissions
-without requiring pyobjc. Returns True on non-macOS platforms.
+Uses pyobjc (preferred) or ctypes to check Accessibility permission.
+Returns True on non-macOS platforms.
+
+After a fresh build the app's code signature changes. macOS may show
+the toggle as ON in System Settings while AXIsProcessTrusted() returns
+False because the TCC entry still references the old signature. Toggling
+the permission off and on again in System Settings re-registers it.
 """
 
 import logging
@@ -13,34 +18,26 @@ logger = logging.getLogger(__name__)
 _IS_MACOS = platform.system() == "Darwin"
 
 
-def check_screen_recording() -> bool:
-    """Check if Screen Recording permission is granted.
-
-    Returns True on non-macOS platforms.
-    """
-    if not _IS_MACOS:
-        return True
-
-    try:
-        import ctypes
-        import ctypes.util
-
-        cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
-        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-        return cg.CGPreflightScreenCaptureAccess()
-    except Exception:
-        logger.debug("Could not check Screen Recording permission, assuming granted")
-        return True
-
-
 def check_accessibility() -> bool:
     """Check if Accessibility permission is granted.
 
+    Tries pyobjc ApplicationServices first (more reliable in PyInstaller
+    bundles), falls back to ctypes.
+
     Returns True on non-macOS platforms.
     """
     if not _IS_MACOS:
         return True
 
+    # Primary: pyobjc ApplicationServices binding
+    try:
+        from ApplicationServices import AXIsProcessTrusted
+
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        logger.debug("pyobjc accessibility check failed, trying ctypes")
+
+    # Fallback: ctypes
     try:
         import ctypes
         import ctypes.util
@@ -53,20 +50,6 @@ def check_accessibility() -> bool:
     except Exception:
         logger.debug("Could not check Accessibility permission, assuming granted")
         return True
-
-
-def open_screen_recording_settings() -> None:
-    """Open System Settings to Screen Recording pane."""
-    if not _IS_MACOS:
-        return
-
-    try:
-        subprocess.Popen([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-        ])
-    except Exception as e:
-        logger.warning(f"Failed to open Screen Recording settings: {e}")
 
 
 def open_accessibility_settings() -> None:

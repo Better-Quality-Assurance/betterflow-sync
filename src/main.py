@@ -24,6 +24,7 @@ try:
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
+    from .ui.permissions import check_accessibility, open_accessibility_settings
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
 except ImportError:
@@ -36,6 +37,7 @@ except ImportError:
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
+    from ui.permissions import check_accessibility, open_accessibility_settings
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
 
@@ -140,6 +142,15 @@ class SyncCoordinator:
             id="trends_refresh_job",
             replace_existing=True,
         )
+        # Periodic permissions check (macOS only)
+        if sys.platform == "darwin":
+            self._check_permissions()
+            self.scheduler.add_job(
+                self._check_permissions,
+                trigger=IntervalTrigger(seconds=60),
+                id="permissions_check_job",
+                replace_existing=True,
+            )
         self.scheduler.start()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -194,6 +205,31 @@ class SyncCoordinator:
         """Check if a sync is currently running (non-blocking)."""
         return self._sync_lock.locked()
 
+    def _check_permissions(self) -> None:
+        """Check macOS Accessibility permission and update tray state."""
+        try:
+            granted = check_accessibility()
+            with self.tray.model.lock:
+                self.tray.model.needs_permissions = not granted
+            if not granted:
+                # Only set NEEDS_PERMISSIONS if not in a higher-priority state
+                current = self.tray.model.state
+                high_priority = (
+                    TrayState.PAUSED, TrayState.PRIVATE,
+                    TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
+                    TrayState.WAITING_AUTH,
+                )
+                if current not in high_priority:
+                    self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
+                logger.debug("macOS permissions missing")
+            else:
+                # Clear permissions warning if it was set
+                if self.tray.model.state == TrayState.NEEDS_PERMISSIONS:
+                    self.tray.set_state(TrayState.SYNCING)
+                    logger.info("macOS permissions granted — clearing warning")
+        except Exception as e:
+            logger.debug(f"Permissions check failed: {e}")
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         if not self._sync_lock.acquire(blocking=False):
@@ -228,6 +264,8 @@ class SyncCoordinator:
                     logger.warning(f"Offline queue at {pct}% capacity")
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
+                elif self.tray.model.needs_permissions:
+                    self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                 else:
                     self.tray.set_state(TrayState.SYNCING)
             else:
@@ -416,6 +454,7 @@ class BetterFlowSyncApp:
             on_private_toggle=self._on_private_toggle,
             on_sync_now=self._on_sync_now,
             on_export_logs=self._on_export_logs,
+            on_open_permissions=self._on_open_permissions,
         )
         self.tray.set_config(self.config)
 
@@ -484,12 +523,12 @@ class BetterFlowSyncApp:
             self.coordinator.fetch_categories()
             self._check_stale_session()
             self.coordinator.start()
-            # Check accessibility after scheduler starts (non-blocking, 5s delay)
+            # Check permissions after scheduler starts (non-blocking, 5s delay)
             self.coordinator.scheduler.add_job(
-                self._check_accessibility_permission,
+                self._check_permissions_initial,
                 "date",
                 run_date=datetime.now() + timedelta(seconds=5),
-                id="accessibility_check",
+                id="permissions_initial_check",
                 replace_existing=True,
             )
         else:
@@ -528,32 +567,25 @@ class BetterFlowSyncApp:
 
     # -- Event handlers ---------------------------------------------------
 
-    def _check_accessibility_permission(self) -> None:
-        """On macOS, check if ActivityWatch can read window titles.
-
-        If no window buckets are found after AW is running, it likely means
-        Accessibility permission hasn't been granted to aw-watcher-window.
-        """
+    def _check_permissions_initial(self) -> None:
+        """Run initial permissions check on macOS (delegates to coordinator)."""
         if sys.platform != "darwin":
             return
-        try:
-            window_buckets = self.aw.get_window_buckets()
-            if not window_buckets:
-                logger.warning(
-                    "No window tracking detected — ActivityWatch may need "
-                    "Accessibility permission in System Settings > Privacy & Security"
-                )
-                try:
-                    from .notifications import send_notification
-                except ImportError:
-                    from notifications import send_notification
-                send_notification(
-                    "BetterFlow Sync",
-                    "Grant Accessibility permission to ActivityWatch in "
-                    "System Settings > Privacy & Security for window tracking.",
-                )
-        except Exception as e:
-            logger.debug(f"Accessibility check failed: {e}")
+        self.coordinator._check_permissions()
+        if self.tray.model.needs_permissions:
+            try:
+                from .notifications import send_notification
+            except ImportError:
+                from notifications import send_notification
+            send_notification(
+                "BetterFlow Sync",
+                "Grant Accessibility permission in "
+                "System Settings > Privacy & Security for window tracking.",
+            )
+
+    def _on_open_permissions(self) -> None:
+        """Open System Settings to Accessibility permission pane."""
+        open_accessibility_settings()
 
     def _on_update_available(self, version: str, url: str) -> None:
         """Handle update available notification."""
