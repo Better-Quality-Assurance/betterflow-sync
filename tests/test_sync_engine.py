@@ -245,6 +245,76 @@ class TestSyncEngine:
         assert self.engine._session_active is False
         self.time_tracker.close.assert_called_once()
 
+    def test_transform_event_delta_time_tracking_on_refetch(self):
+        """Test that re-fetched events with grown duration only add the delta."""
+        self.engine._has_input_data = True
+        self.activity_analyzer.get_activity_state.return_value = "active"
+
+        event_v1 = AWEvent(
+            id=42,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "VSCode", "title": "editor"},
+        )
+
+        # First fetch — full 60s should be added
+        self.engine._transform_event(event_v1, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.time_tracker.add_active_time.assert_called_once()
+        assert self.time_tracker.add_active_time.call_args[0][0] == 60
+
+        self.time_tracker.add_active_time.reset_mock()
+
+        # Re-fetch with grown duration (heartbeat extension: 60 → 90)
+        event_v2 = AWEvent(
+            id=42,
+            timestamp=event_v1.timestamp,
+            duration=90,
+            data={"app": "VSCode", "title": "editor"},
+        )
+        self.engine._transform_event(event_v2, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.time_tracker.add_active_time.assert_called_once()
+        assert self.time_tracker.add_active_time.call_args[0][0] == 30  # delta only
+
+    def test_transform_event_no_double_count_same_duration(self):
+        """Test that re-fetched events with same duration don't add time."""
+        self.engine._has_input_data = True
+        self.activity_analyzer.get_activity_state.return_value = "active"
+
+        event = AWEvent(
+            id=99,
+            timestamp=datetime.now(timezone.utc),
+            duration=120,
+            data={"app": "Firefox", "title": "Test"},
+        )
+
+        # First fetch
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.time_tracker.add_active_time.reset_mock()
+
+        # Re-fetch with identical duration — delta is 0, should not call
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.time_tracker.add_active_time.assert_not_called()
+
+    def test_transform_event_different_buckets_track_separately(self):
+        """Test that same event ID in different buckets tracks time independently."""
+        self.engine._has_input_data = True
+        self.activity_analyzer.get_activity_state.return_value = "active"
+
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "Chrome", "title": "Test"},
+        )
+
+        # Same event ID, different bucket — both should add full duration
+        self.engine._transform_event(event, "bucket-A", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-B", BUCKET_TYPE_WINDOW)
+
+        assert self.time_tracker.add_active_time.call_count == 2
+        for call in self.time_tracker.add_active_time.call_args_list:
+            assert call[0][0] == 60
+
     def test_fetch_server_config_updates_analyzer_thresholds(self):
         """Test that fetching server config updates analyzer thresholds."""
         self.bf.get_config.return_value = {

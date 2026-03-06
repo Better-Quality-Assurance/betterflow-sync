@@ -99,6 +99,10 @@ class TrayModel:
         # Display tracking
         self.track_display_info: bool = False
 
+        # Break state
+        self.on_break: bool = False
+        self.break_minutes_left: int = 0
+
         # Permissions
         self.needs_permissions: bool = False
 
@@ -122,6 +126,7 @@ class TrayState(Enum):
     ERROR = "error"  # Red - auth failed or AW not running
     PAUSED = "paused"  # Gray - user paused tracking
     PRIVATE = "private"  # Dark gray - private time, nothing recorded
+    ON_BREAK = "on_break"  # Amber - auto-break active
     NEEDS_PERMISSIONS = "needs_permissions"  # Amber - macOS permissions missing
     STARTING = "starting"  # Blue - starting up
     WAITING_AUTH = "waiting_auth"  # Amber - waiting for browser login
@@ -135,6 +140,7 @@ STATE_COLORS = {
     TrayState.ERROR: "#ef4444",  # Red
     TrayState.PAUSED: "#9ca3af",  # Gray
     TrayState.PRIVATE: "#6b7280",  # Dark gray - private time
+    TrayState.ON_BREAK: "#f59e0b",  # Amber - break active
     TrayState.NEEDS_PERMISSIONS: "#f59e0b",  # Amber - permissions missing
     TrayState.STARTING: "#3b82f6",  # Blue
     TrayState.WAITING_AUTH: "#f59e0b",  # Amber
@@ -181,6 +187,7 @@ class TrayIcon:
         on_sync_now: Optional[Callable[[], None]] = None,
         on_export_logs: Optional[Callable[[], None]] = None,
         on_open_permissions: Optional[Callable[[], None]] = None,
+        on_end_break: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -196,6 +203,7 @@ class TrayIcon:
             on_sync_now: Callback to trigger an immediate sync
             on_export_logs: Callback to export logs to a zip file
             on_open_permissions: Callback to open system permission settings
+            on_end_break: Callback when user ends break early
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -211,6 +219,7 @@ class TrayIcon:
         self._on_sync_now = on_sync_now
         self._on_export_logs = on_export_logs
         self._on_open_permissions = on_open_permissions
+        self._on_end_break = on_end_break
 
         self.model = TrayModel()
 
@@ -278,6 +287,11 @@ class TrayIcon:
                     ),
                     enabled=logged_in and not is_current,
                 ))
+            items.append(Item("─" * 20, None, enabled=False))
+
+        # ── End Break action ────────────────────────────────
+        if self.model.on_break:
+            items.append(Item("End Break", self._handle_end_break))
             items.append(Item("─" * 20, None, enabled=False))
 
         # ── Private Time toggle ─────────────────────────────
@@ -371,7 +385,10 @@ class TrayIcon:
 
     def _get_status_text(self) -> str:
         """Get short status text for the menu."""
-        if self.model.private_mode:
+        if self.model.on_break:
+            minutes = self.model.break_minutes_left
+            return f"On Break ({minutes}m left)"
+        elif self.model.private_mode:
             return "Private Time"
         elif self.model.state == TrayState.SYNCING:
             return "Active"
@@ -411,6 +428,11 @@ class TrayIcon:
         """Handle open permissions menu click."""
         if self._on_open_permissions:
             self._on_open_permissions()
+
+    def _handle_end_break(self, icon, item) -> None:
+        """Handle end break menu click."""
+        if self._on_end_break:
+            self._on_end_break()
 
     def _handle_pause(self, icon, item) -> None:
         """Handle pause menu click."""

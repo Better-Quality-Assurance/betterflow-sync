@@ -227,6 +227,7 @@ class ReminderSettings:
 
     break_reminders_enabled: bool = True
     break_interval_hours: int = 2  # 1, 2, 3, or 4
+    break_duration_minutes: int = 15  # Auto-break pause duration
     private_reminders_enabled: bool = True
     private_interval_minutes: int = 20  # 10, 20, or 30
 
