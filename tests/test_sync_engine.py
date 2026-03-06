@@ -1,5 +1,6 @@
 """Tests for sync engine."""
 
+import threading
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, MagicMock, patch
@@ -9,6 +10,9 @@ from src.sync.aw_client import AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUC
 from src.sync.sync_engine import SyncEngine
 from src.sync.activity_analyzer import ActivityAnalyzer
 from src.sync.daily_time_tracker import DailyTimeTracker
+from src.main import SyncCoordinator
+from src.reminders import ReminderManager
+from src.ui.tray import TrayState
 
 
 class TestSyncEngine:
@@ -369,3 +373,91 @@ class TestSyncEngine:
         # _cache_lock should have been acquired for _time_cache operations
         # _transform_event accesses _time_cache when activity_state is "active"
         assert acquire_count >= 1, f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"
+
+
+class TestSyncCoordinatorBreak:
+    """Tests for SyncCoordinator break state management."""
+
+    def setup_method(self):
+        self.config = Config()
+        self.aw = Mock()
+        self.bf = Mock()
+        self.queue = Mock()
+        self.queue.get_checkpoint.return_value = None
+        self.sync_engine = Mock(spec=SyncEngine)
+        self.sync_engine.is_paused = False
+        self.sync_engine.is_private = False
+        self.tray = Mock()
+        self.tray.model = Mock()
+        self.tray.model.lock = threading.RLock()
+        self.tray.model.on_break = False
+        self.tray.model.break_minutes_left = 0
+        self.tray.model.needs_permissions = False
+        self.tray.model.state = TrayState.SYNCING
+        self.aw_manager = Mock()
+        self.reminder = Mock(spec=ReminderManager)
+        self.coordinator = SyncCoordinator(
+            config=self.config,
+            aw=self.aw,
+            bf=self.bf,
+            queue=self.queue,
+            sync_engine=self.sync_engine,
+            tray=self.tray,
+            aw_manager=self.aw_manager,
+            reminder_manager=self.reminder,
+        )
+        self.coordinator.scheduler = Mock()
+        self.coordinator.scheduler.running = True
+
+    def test_start_break_sets_flag(self):
+        """start_break sets _on_break."""
+        self.coordinator.start_break()
+        assert self.coordinator._on_break is True
+        self.sync_engine.pause.assert_called_once()
+
+    def test_double_start_break_is_idempotent(self):
+        """Second start_break is a no-op."""
+        self.coordinator.start_break()
+        self.coordinator.start_break()
+        self.sync_engine.pause.assert_called_once()
+
+    def test_end_break_clears_flag(self):
+        """end_break clears _on_break."""
+        self.coordinator._on_break = True
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = False
+        self.coordinator.end_break()
+        assert self.coordinator._on_break is False
+        self.sync_engine.resume.assert_called_once()
+
+    def test_end_break_restores_paused_state(self):
+        """end_break should not resume if app was paused before break."""
+        self.coordinator._on_break = True
+        self.coordinator._pre_break_paused = True
+        self.coordinator._pre_break_private = False
+
+        self.coordinator.end_break()
+
+        self.sync_engine.resume.assert_not_called()
+        self.tray.set_state.assert_called_with(TrayState.PAUSED)
+
+    def test_end_break_restores_private_state(self):
+        """end_break should not resume if private mode was active before break."""
+        self.coordinator._on_break = True
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = True
+
+        self.coordinator.end_break()
+
+        self.sync_engine.resume.assert_not_called()
+        self.tray.set_state.assert_called_with(TrayState.PRIVATE)
+
+    def test_end_break_silent_no_notification(self):
+        """end_break(silent=True) should not send notification."""
+        self.coordinator._on_break = True
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = False
+
+        with patch("src.main.send_notification") as mock_notify:
+            self.coordinator.end_break(silent=True)
+            mock_notify.assert_not_called()

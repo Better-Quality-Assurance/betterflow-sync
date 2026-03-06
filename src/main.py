@@ -6,7 +6,7 @@ import signal
 import sys
 import threading
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -41,6 +41,12 @@ except ImportError:
     from ui.permissions import check_accessibility, open_accessibility_settings
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
+
+# Import send_notification at module level so tests can patch src.main.send_notification
+try:
+    from .notifications import send_notification
+except ImportError:
+    from notifications import send_notification  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +95,9 @@ class SyncCoordinator:
         self.logged_in = False
         self.paused_by_network = False
         self._on_break = False
+        self._break_lock = threading.Lock()
+        self._pre_break_paused = False
+        self._pre_break_private = False
         self._sync_lock = threading.Lock()
 
         # Optional callback wired by the app for auth-error re-login
@@ -178,9 +187,15 @@ class SyncCoordinator:
 
     def start_break(self) -> None:
         """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
-        if self._on_break:
-            return
-        self._on_break = True
+        with self._break_lock:
+            if self._on_break:
+                return
+            self._on_break = True
+
+        # Capture current state before breaking so end_break can restore it
+        self._pre_break_paused = self.sync_engine.is_paused
+        self._pre_break_private = self.sync_engine.is_private
+
         self.sync_engine.pause()
         duration = self.config.reminders.break_duration_minutes
 
@@ -192,8 +207,8 @@ class SyncCoordinator:
         if self.reminder_manager:
             self.reminder_manager.on_break_started()
 
-        # Schedule auto-resume
-        run_date = datetime.now() + timedelta(minutes=duration)
+        # Schedule auto-resume (timezone-aware to avoid APScheduler deprecation warning)
+        run_date = datetime.now(timezone.utc) + timedelta(minutes=duration)
         if self.scheduler.running:
             self.scheduler.add_job(
                 self.end_break,
@@ -209,32 +224,36 @@ class SyncCoordinator:
                 replace_existing=True,
             )
 
-        try:
-            from .notifications import send_notification
-        except ImportError:
-            from notifications import send_notification
         send_notification(
             "Break Time",
             f"Tracking paused for {duration} minutes. Enjoy your break!",
         )
         logger.info(f"Auto-break started ({duration}m)")
 
-    def end_break(self) -> None:
-        """End the auto-break: resume sync, green tray, reset break timer."""
-        if not self._on_break:
-            return
-        self._on_break = False
+    def end_break(self, silent: bool = False) -> None:
+        """End the auto-break: resume sync, restore pre-break tray state."""
+        with self._break_lock:
+            if not self._on_break:
+                return
+            self._on_break = False
 
         with self.tray.model.lock:
             self.tray.model.on_break = False
             self.tray.model.break_minutes_left = 0
 
-        self.sync_engine.resume()
-        self.tray.set_state(TrayState.SYNCING)
+        # Restore pre-break state instead of blindly resuming
+        if self._pre_break_private:
+            self.tray.set_state(TrayState.PRIVATE)
+        elif self._pre_break_paused:
+            self.tray.set_state(TrayState.PAUSED)
+        else:
+            self.sync_engine.resume()
+            self.tray.set_state(TrayState.SYNCING)
 
         if self.reminder_manager:
             self.reminder_manager.on_break_ended()
-            self.reminder_manager.on_tracking_started()
+            if not self._pre_break_paused and not self._pre_break_private:
+                self.reminder_manager.on_tracking_started()
 
         # Remove scheduled jobs
         if self.scheduler.running:
@@ -244,14 +263,11 @@ class SyncCoordinator:
                 except Exception:
                     pass
 
-        try:
-            from .notifications import send_notification
-        except ImportError:
-            from notifications import send_notification
-        send_notification(
-            "Break Over",
-            "Tracking resumed — welcome back!",
-        )
+        if not silent:
+            send_notification(
+                "Break Over",
+                "Tracking resumed — welcome back!",
+            )
         logger.info("Auto-break ended")
 
     def _update_break_countdown(self) -> None:
@@ -326,8 +342,9 @@ class SyncCoordinator:
             if self.sync_engine.is_private:
                 return
 
-            if self._on_break:
-                return
+            with self._break_lock:
+                if self._on_break:
+                    return
 
             if self.paused_by_network:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
@@ -665,10 +682,6 @@ class BetterFlowSyncApp:
             return
         self.coordinator._check_permissions()
         if self.tray.model.needs_permissions:
-            try:
-                from .notifications import send_notification
-            except ImportError:
-                from notifications import send_notification
             send_notification(
                 "BetterFlow Sync",
                 "Grant Accessibility permission in "
@@ -682,10 +695,6 @@ class BetterFlowSyncApp:
     def _on_update_available(self, version: str, url: str) -> None:
         """Handle update available notification."""
         logger.info(f"Update available: v{version} — {url}")
-        try:
-            from .notifications import send_notification
-        except ImportError:
-            from notifications import send_notification
         send_notification(
             "BetterFlow Sync Update",
             f"Version {version} is available. Click to download.",
@@ -745,9 +754,9 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
-        # If on break, end the break first but stay paused (user intent wins)
+        # If on break, end the break silently — user intent (pause) takes over
         if self.coordinator._on_break:
-            self.coordinator.end_break()
+            self.coordinator.end_break(silent=True)
         self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
@@ -805,6 +814,9 @@ class BetterFlowSyncApp:
         if self._user_paused:
             logger.info("System wake — staying paused (user-initiated pause active)")
             return
+        if self.coordinator._on_break:
+            logger.info("System wake — staying on break")
+            return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
@@ -827,6 +839,9 @@ class BetterFlowSyncApp:
         """Handle screen unlock — resume tracking."""
         if self._user_paused:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
+            return
+        if self.coordinator._on_break:
+            logger.info("Screen unlocked — staying on break")
             return
         logger.info("Screen unlocked — resuming tracking")
         self.sync_engine.resume()
@@ -953,6 +968,10 @@ class BetterFlowSyncApp:
                 break
             import time
             time.sleep(0.1)
+
+        # Cancel any active break before stopping (prevents stuck break state on re-login)
+        if self.coordinator._on_break:
+            self.coordinator.end_break(silent=True)
 
         # End server session before stopping
         self.sync_engine.shutdown()
