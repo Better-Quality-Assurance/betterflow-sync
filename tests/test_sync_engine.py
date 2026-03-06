@@ -327,3 +327,45 @@ class TestSyncEngine:
         self.engine.fetch_server_config()
 
         self.activity_analyzer.update_thresholds.assert_called_once()
+
+    def test_time_cache_uses_cache_lock(self):
+        """Test that _time_cache operations are protected by _cache_lock."""
+        import threading
+
+        self.engine._has_input_data = True
+        self.activity_analyzer.get_activity_state.return_value = "active"
+
+        event = AWEvent(
+            id=50,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "VSCode", "title": "editor"},
+        )
+
+        # Replace _cache_lock with a counting wrapper
+        acquire_count = 0
+        real_lock = threading.Lock()
+
+        class CountingLock:
+            def acquire(self, *args, **kwargs):
+                nonlocal acquire_count
+                acquire_count += 1
+                return real_lock.acquire(*args, **kwargs)
+
+            def release(self, *args, **kwargs):
+                return real_lock.release(*args, **kwargs)
+
+            def __enter__(self):
+                self.acquire()
+                return self
+
+            def __exit__(self, *args):
+                self.release()
+
+        self.engine._cache_lock = CountingLock()
+
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+
+        # _cache_lock should have been acquired for _time_cache operations
+        # _transform_event accesses _time_cache when activity_state is "active"
+        assert acquire_count >= 1, f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"

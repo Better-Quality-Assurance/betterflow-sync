@@ -668,14 +668,15 @@ class SyncEngine:
             if activity_state == "active":
                 event_date = event.timestamp.astimezone().date()
                 time_key = (bucket_id, event.id)
-                prev_counted = self._time_cache.get(time_key, 0.0)
-                delta = event.duration - prev_counted
-                if delta > 0:
-                    self._time_tracker.add_active_time(delta, event_date)
-                    self._time_cache[time_key] = event.duration
-                    self._time_cache.move_to_end(time_key)
-                    if len(self._time_cache) > self._TIME_CACHE_MAX:
-                        self._time_cache.popitem(last=False)
+                with self._cache_lock:
+                    prev_counted = self._time_cache.get(time_key, 0.0)
+                    delta = event.duration - prev_counted
+                    if delta > 0:
+                        self._time_tracker.add_active_time(delta, event_date)
+                        self._time_cache[time_key] = event.duration
+                        self._time_cache.move_to_end(time_key)
+                        if len(self._time_cache) > self._TIME_CACHE_MAX:
+                            self._time_cache.popitem(last=False)
 
         return result
 
