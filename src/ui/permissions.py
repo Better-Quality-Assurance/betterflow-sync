@@ -22,7 +22,11 @@ def check_accessibility() -> bool:
     """Check if Accessibility permission is granted.
 
     Tries pyobjc ApplicationServices first (more reliable in PyInstaller
-    bundles), falls back to ctypes.
+    bundles), falls back to ctypes, then to a practical AppleScript test.
+
+    The practical test is needed because AXIsProcessTrusted() can return
+    False for unsigned x86_64 PyInstaller binaries running under Rosetta
+    even when the System Settings toggle is ON.
 
     Returns True on non-macOS platforms.
     """
@@ -33,7 +37,8 @@ def check_accessibility() -> bool:
     try:
         from ApplicationServices import AXIsProcessTrusted
 
-        return bool(AXIsProcessTrusted())
+        if AXIsProcessTrusted():
+            return True
     except Exception:
         logger.debug("pyobjc accessibility check failed, trying ctypes")
 
@@ -46,10 +51,26 @@ def check_accessibility() -> bool:
             ctypes.util.find_library("ApplicationServices")
         )
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
-        return lib.AXIsProcessTrusted()
+        if lib.AXIsProcessTrusted():
+            return True
     except Exception:
-        logger.debug("Could not check Accessibility permission, assuming granted")
-        return True
+        pass
+
+    # Practical test: try reading the frontmost app name via AppleScript.
+    # This actually exercises the Accessibility API and works even when
+    # AXIsProcessTrusted() lies (Rosetta/unsigned binary edge case).
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            logger.debug("AXIsProcessTrusted=False but AppleScript works, treating as granted")
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def open_accessibility_settings() -> None:

@@ -83,6 +83,8 @@ class TrayModel:
         self.debug_mode: bool = False
         self.auto_start: bool = False
         self.update_channel: str = "stable"
+        self.update_version: Optional[str] = None
+        self.update_url: Optional[str] = None
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
         self.company_name: Optional[str] = None
@@ -379,6 +381,14 @@ class TrayIcon:
             items.append(Item("Login", self._handle_login))
 
         items.append(Item("─" * 20, None, enabled=False))
+
+        # ── Update available ──────────────────────────────────
+        if self.model.update_version:
+            items.append(Item(
+                f"Update available (v{self.model.update_version})",
+                self._handle_open_update,
+            ))
+
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
@@ -499,6 +509,13 @@ class TrayIcon:
         """Handle log out menu click."""
         if self._on_logout:
             self._on_logout()
+
+    def _handle_open_update(self, icon, item) -> None:
+        """Open the GitHub release page for the available update."""
+        with self.model.lock:
+            url = self.model.update_url
+        if url:
+            webbrowser.open(url)
 
     def _handle_quit(self, icon, item) -> None:
         """Handle quit menu click."""
@@ -696,6 +713,13 @@ class TrayIcon:
         minutes = (total_seconds % 3600) // 60
         self.model.hours_today = f"{hours}h {minutes}m"
         self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
+        self._update_menu()
+
+    def set_update_available(self, version: str, url: str) -> None:
+        """Show an update-available item in the tray menu."""
+        with self.model.lock:
+            self.model.update_version = version
+            self.model.update_url = url
         self._update_menu()
 
     def _update_tooltip(self, tooltip: str) -> None:

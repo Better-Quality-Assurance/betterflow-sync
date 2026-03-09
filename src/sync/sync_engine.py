@@ -123,6 +123,7 @@ class SyncEngine:
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
         self._has_input_data = False  # Set to True when input buckets exist
+        self._current_afk_events: list[AWEvent] = []  # AFK events for current sync cycle
 
     def _create_engagement_thresholds(self) -> EngagementThresholds:
         """Create EngagementThresholds from config."""
@@ -307,6 +308,9 @@ class SyncEngine:
                     latest_ev = raw_events[-1]
                     latest_end = latest_ev.timestamp + timedelta(seconds=latest_ev.duration)
                     afk_events = self._get_afk_events_for_range(earliest, latest_end)
+
+                    # Store AFK events so _transform_event can check idle status
+                    self._current_afk_events = afk_events
 
                     filled = self._fill_window_gaps(raw_events, afk_events)
                     stats.gaps_filled += filled
@@ -658,8 +662,14 @@ class SyncEngine:
                 result["fraud_signals"] = fraud.signals
                 result["activity_metrics"].update(fraud.extra_metrics)
             else:
-                # No input watcher — treat all window events as active
-                activity_state = "active"
+                # No input watcher — use AFK data to determine activity
+                event_end = event.timestamp + timedelta(seconds=event.duration)
+                if self._current_afk_events and not self._is_active_during(
+                    event.timestamp, event_end, self._current_afk_events
+                ):
+                    activity_state = "inactive"
+                else:
+                    activity_state = "active"
                 result["activity_state"] = activity_state
 
             # Track active time (only "active" events count).

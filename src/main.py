@@ -704,9 +704,10 @@ class BetterFlowSyncApp:
     def _on_update_available(self, version: str, url: str) -> None:
         """Handle update available notification."""
         logger.info(f"Update available: v{version} — {url}")
+        self.tray.set_update_available(version, url)
         send_notification(
             "BetterFlow Sync Update",
-            f"Version {version} is available. Click to download.",
+            f"Version {version} is available.",
         )
 
     def _check_stale_session(self) -> None:

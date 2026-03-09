@@ -202,6 +202,52 @@ class TestSyncEngine:
         # Should not call add_active_time
         self.time_tracker.add_active_time.assert_not_called()
 
+    def test_transform_event_no_input_data_uses_afk_for_active(self):
+        """Test that without input data, AFK 'not-afk' events mark window as active."""
+        self.engine._has_input_data = False
+        now = datetime.now(timezone.utc)
+        # AFK says user is active during this window
+        self.engine._current_afk_events = [
+            AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "not-afk"}),
+        ]
+        event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert result["activity_state"] == "active"
+        self.time_tracker.add_active_time.assert_called_once()
+
+    def test_transform_event_no_input_data_uses_afk_for_inactive(self):
+        """Test that without input data, AFK 'afk' events mark window as inactive."""
+        self.engine._has_input_data = False
+        now = datetime.now(timezone.utc)
+        # AFK says user is idle during this window
+        self.engine._current_afk_events = [
+            AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "afk"}),
+        ]
+        event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert result["activity_state"] == "inactive"
+        self.time_tracker.add_active_time.assert_not_called()
+
+    def test_transform_event_no_input_data_no_afk_defaults_active(self):
+        """Test that without input data AND no AFK events, defaults to active."""
+        self.engine._has_input_data = False
+        self.engine._current_afk_events = []
+        event = AWEvent(
+            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            data={"app": "Firefox", "title": "Test"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert result["activity_state"] == "active"
+
     def test_transform_event_input_bucket_no_activity_state(self):
         """Test that input events don't get activity state."""
         event = AWEvent(
