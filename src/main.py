@@ -345,10 +345,12 @@ class SyncCoordinator:
             return
         try:
             if self.sync_engine.is_private:
+                self.tray.set_state(TrayState.PRIVATE)
                 return
 
             with self._break_lock:
                 if self._on_break:
+                    self.tray.set_state(TrayState.ON_BREAK)
                     return
 
             if self.paused_by_network:
@@ -656,7 +658,7 @@ class BetterFlowSyncApp:
             self.coordinator.scheduler.add_job(
                 self._check_permissions_initial,
                 "date",
-                run_date=datetime.now() + timedelta(seconds=5),
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
                 id="permissions_initial_check",
                 replace_existing=True,
             )
@@ -775,13 +777,13 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
-        # If on break, end the break silently — user intent (pause) takes over
-        if self.coordinator.is_on_break:
-            self.coordinator.end_break(silent=True)
         self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
+        # End break after pausing — prevents brief resume window where events could sync
+        if self.coordinator.is_on_break:
+            self.coordinator.end_break(silent=True)
         self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused")
 
@@ -1007,14 +1009,20 @@ class BetterFlowSyncApp:
         self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         def do_relogin():
-            state = self.login_manager.login_via_browser()
-            if state.logged_in:
-                self.coordinator.logged_in = True
-                self.tray.set_user(state.user_email, state.user_name, state.user_role)
-                self.coordinator.start()
-            else:
-                self.coordinator.logged_in = False
-                self._on_quit()
+            if not self._login_lock.acquire(blocking=False):
+                logger.debug("Login already in progress, skipping relogin")
+                return
+            try:
+                state = self.login_manager.login_via_browser()
+                if state.logged_in:
+                    self.coordinator.logged_in = True
+                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
+                    self.coordinator.start()
+                else:
+                    self.coordinator.logged_in = False
+                    self._on_quit()
+            finally:
+                self._login_lock.release()
 
         threading.Thread(target=do_relogin, daemon=True, name="relogin-thread").start()
 

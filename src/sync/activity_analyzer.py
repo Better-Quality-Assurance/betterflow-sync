@@ -581,4 +581,4 @@ class ActivityAnalyzer:
         self._input_events.clear()
         self._window_events.clear()
         self._fraud_detector.clear()
-        self._last_fraud_window_count = 0
+        self._last_fraud_seq = 0

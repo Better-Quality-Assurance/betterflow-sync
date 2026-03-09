@@ -920,14 +920,17 @@ class SyncEngine:
 
     def get_status(self) -> dict:
         """Get current sync status."""
+        with self._state_lock:
+            paused = self._paused
+            session_active = self._session_active
         aw_running = self.aw.is_running()
-        bf_reachable = self.bf.is_reachable() if not self._paused else False
+        bf_reachable = self.bf.is_reachable() if not paused else False
         queue_size = self.queue.size()
         checkpoints = self.queue.get_all_checkpoints()
 
         return {
-            "paused": self._paused,
-            "session_active": self._session_active,
+            "paused": paused,
+            "session_active": session_active,
             "aw_running": aw_running,
             "bf_reachable": bf_reachable,
             "queue_size": queue_size,

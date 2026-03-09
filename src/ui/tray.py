@@ -466,14 +466,13 @@ class TrayIcon:
         with self.model.lock:
             self.model.private_mode = not self.model.private_mode
             new_mode = self.model.private_mode
+            on_break = self.model.on_break
+            paused = self.model.paused
         if new_mode:
             self.set_state(TrayState.PRIVATE)
         if self._on_private_toggle:
             self._on_private_toggle(new_mode)
         if not new_mode:
-            with self.model.lock:
-                on_break = self.model.on_break
-                paused = self.model.paused
             if on_break:
                 self.set_state(TrayState.ON_BREAK)
             elif paused:
@@ -493,7 +492,8 @@ class TrayIcon:
 
     def _handle_stop_project(self, icon, item) -> None:
         """Clear the currently running project."""
-        self.model.current_project = None
+        with self.model.lock:
+            self.model.current_project = None
         if self._on_project_change:
             self._on_project_change(None)
         self._update_menu()
@@ -506,7 +506,8 @@ class TrayIcon:
     def _make_project_handler(self, project: Optional[ProjectDict]) -> Callable:
         """Create a handler for switching to a project."""
         def handler(icon, item):
-            self.model.current_project = project
+            with self.model.lock:
+                self.model.current_project = project
             if self._on_project_change:
                 self._on_project_change(project)
             self._update_menu()
@@ -636,7 +637,8 @@ class TrayIcon:
 
     def set_paused(self, paused: bool) -> None:
         """Set paused state."""
-        self.model.paused = paused
+        with self.model.lock:
+            self.model.paused = paused
         if paused:
             self.set_state(TrayState.PAUSED)
         else:
@@ -698,9 +700,10 @@ class TrayIcon:
 
     def set_user(self, email: Optional[str], name: Optional[str] = None, role: Optional[str] = None) -> None:
         """Set current user info."""
-        self.model.user_email = email
-        self.model.user_name = name
-        self.model.user_role = role
+        with self.model.lock:
+            self.model.user_email = email
+            self.model.user_name = name
+            self.model.user_role = role
         self._update_menu()
 
     def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:
