@@ -35,6 +35,7 @@ class LoginState:
     logged_in: bool = False
     user_email: Optional[str] = None
     user_name: Optional[str] = None
+    user_role: Optional[str] = None
     device_id: Optional[str] = None
     error: Optional[str] = None
 
@@ -86,6 +87,7 @@ class LoginManager:
             state = LoginState(
                 logged_in=True,
                 user_email=credentials.user_email,
+                user_role=credentials.user_role,
                 device_id=credentials.device_id,
             )
             logger.info(f"Auto-login successful for {credentials.user_email}")
@@ -141,10 +143,12 @@ class LoginManager:
         # Store credentials in keychain
         user_email = result.user_email or device_name
         user_name = result.user_name or user_email
+        user_role = result.user_role or "user"
         credentials = StoredCredentials(
             api_token=result.api_token,
             device_id=result.device_id,
             user_email=user_email,
+            user_role=user_role,
         )
 
         if not self.keychain.store(credentials):
@@ -157,6 +161,7 @@ class LoginManager:
             logged_in=True,
             user_email=user_email,
             user_name=user_name,
+            user_role=user_role,
             device_id=result.device_id,
         )
         logger.info("Browser auth login successful")

@@ -71,6 +71,7 @@ class TrayModel:
         self.queue_size: int = 0
         self.user_email: Optional[str] = None
         self.user_name: Optional[str] = None
+        self.user_role: Optional[str] = None
 
         # Projects
         self.projects: list[ProjectDict] = []
@@ -389,7 +390,8 @@ class TrayIcon:
                 self._handle_open_update,
             ))
 
-        items.append(Item("Quit", self._handle_quit))
+        if self.model.user_role in ("admin", "super-admin"):
+            items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
 
@@ -689,10 +691,11 @@ class TrayIcon:
             self.model.daily_avg_this_week = daily_avg_this_week
         self._update_menu()
 
-    def set_user(self, email: Optional[str], name: Optional[str] = None) -> None:
+    def set_user(self, email: Optional[str], name: Optional[str] = None, role: Optional[str] = None) -> None:
         """Set current user info."""
         self.model.user_email = email
         self.model.user_name = name
+        self.model.user_role = role
         self._update_menu()
 
     def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:

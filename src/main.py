@@ -635,7 +635,7 @@ class BetterFlowSyncApp:
 
         if state.logged_in:
             self.coordinator.logged_in = True
-            self.tray.set_user(state.user_email, state.user_name)
+            self.tray.set_user(state.user_email, state.user_name, state.user_role)
             self.sync_engine.fetch_server_config()
             self.coordinator.fetch_projects()
             self.coordinator.fetch_categories()
@@ -744,7 +744,7 @@ class BetterFlowSyncApp:
                 state = self.login_manager.login_via_browser()
                 if state.logged_in:
                     self.coordinator.logged_in = True
-                    self.tray.set_user(state.user_email, state.user_name)
+                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
                     self.sync_engine.fetch_server_config()
                     self.coordinator.fetch_projects()
                     self.coordinator.fetch_categories()
@@ -999,7 +999,7 @@ class BetterFlowSyncApp:
             state = self.login_manager.login_via_browser()
             if state.logged_in:
                 self.coordinator.logged_in = True
-                self.tray.set_user(state.user_email, state.user_name)
+                self.tray.set_user(state.user_email, state.user_name, state.user_role)
                 self.coordinator.start()
             else:
                 self.coordinator.logged_in = False

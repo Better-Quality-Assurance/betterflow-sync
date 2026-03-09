@@ -79,6 +79,7 @@ class AuthResult:
     api_token: Optional[str] = None
     user_email: Optional[str] = None
     user_name: Optional[str] = None
+    user_role: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -192,6 +193,7 @@ class BetterFlowClient(BaseApiClient):
                 device_id=device_name,
                 user_email=user.get("email"),
                 user_name=user.get("name"),
+                user_role=user.get("role", "user"),
             )
         except requests.exceptions.ConnectionError:
             return AuthResult(success=False, error="Cannot connect to BetterFlow")
