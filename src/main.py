@@ -616,6 +616,17 @@ class BetterFlowSyncApp:
                 logger.info("Setup wizard cancelled — exiting")
                 return
             self.config.setup_complete = True
+            # Ensure auto-start is enabled after first setup
+            if not self.config.auto_start:
+                try:
+                    try:
+                        from .autostart import set_auto_start
+                    except ImportError:
+                        from autostart import set_auto_start
+                    if set_auto_start(True):
+                        self.config.auto_start = True
+                except Exception:
+                    pass
             self.config.save()
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state

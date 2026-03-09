@@ -365,6 +365,11 @@ class TrayIcon:
         # ── Preferences submenu ─────────────────────────────
         items.append(Item("Preferences", pystray.Menu(
             Item(
+                "Launch at Login",
+                self._make_toggle_handler("auto_start", "auto_start"),
+                checked=lambda item: self.model.auto_start,
+            ),
+            Item(
                 "Debug Mode",
                 self._make_toggle_handler("debug_mode", "debug_mode"),
                 checked=lambda item: self.model.debug_mode,

@@ -584,6 +584,17 @@ class SetupWizard:
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
+        # Enable launch at login on first setup
+        try:
+            try:
+                from ..autostart import set_auto_start
+            except ImportError:
+                from autostart import set_auto_start
+            set_auto_start(True)
+            self._config.auto_start = True
+        except Exception:
+            pass  # Non-critical — user can enable manually
+
         self._result = SetupResult(
             completed=True,
             logged_in=bool(self._login_state and self._login_state.logged_in),
