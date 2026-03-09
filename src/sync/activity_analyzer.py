@@ -3,7 +3,7 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -371,6 +371,7 @@ class ActivityAnalyzer:
         self._window_events: list[AWEvent] = []
         self._fraud_detector = FraudSignalDetector(config=fraud_config)
         self._last_fraud_window_count: int = 0
+        self._fraud_reset_date: Optional[date] = None
 
     def update_thresholds(self, thresholds: EngagementThresholds) -> None:
         """Update thresholds from server config.
@@ -484,6 +485,14 @@ class ActivityAnalyzer:
             FraudAssessment with score, signals, and extra metrics.
         """
         metrics = self._compute_metrics(timestamp)
+
+        # Reset fraud accumulators at day boundary to prevent multi-day dilution
+        today = timestamp.astimezone().date() if timestamp.tzinfo else date.today()
+        if self._fraud_reset_date is not None and today != self._fraud_reset_date:
+            self._fraud_detector.clear()
+            self._last_fraud_window_count = 0
+            logger.debug(f"Fraud detector reset for new day: {today}")
+        self._fraud_reset_date = today
 
         # Record this window's metrics into the fraud detector.
         # Use a simple counter to avoid recording the same conceptual window twice.
