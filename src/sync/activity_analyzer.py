@@ -215,6 +215,8 @@ class FraudSignalDetector:
             extra_metrics={
                 "unique_apps": len(self._unique_apps),
                 "keystroke_variance": round(ks_cv, 4) if ks_cv is not None else None,
+                "mouse_only_streak": self._mouse_only_streak,
+                "click_keystroke_ratio": round(self._total_clicks / max(self._total_presses, 1), 2),
             },
         )
 
