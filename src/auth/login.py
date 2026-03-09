@@ -87,6 +87,7 @@ class LoginManager:
             state = LoginState(
                 logged_in=True,
                 user_email=credentials.user_email,
+                user_name=credentials.user_name or None,
                 user_role=credentials.user_role,
                 device_id=credentials.device_id,
             )
@@ -148,6 +149,7 @@ class LoginManager:
             api_token=result.api_token,
             device_id=result.device_id,
             user_email=user_email,
+            user_name=user_name,
             user_role=user_role,
         )
 

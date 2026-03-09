@@ -54,6 +54,9 @@ class MacOSWindowWatcher:
         self._thread: Optional[threading.Thread] = None
         self._hostname = platform.node()
         self._bucket_id = f"aw-watcher-window_{self._hostname}"
+        # Cache terminal tab title to avoid spawning osascript every poll
+        self._terminal_cache_key: Optional[tuple[str, str]] = None  # (app_name, ax_title)
+        self._terminal_cache_value: Optional[str] = None
 
     def start(self) -> bool:
         """Create the AW bucket and start the polling thread.
@@ -129,11 +132,17 @@ class MacOSWindowWatcher:
 
         result = {"app": app_name, "title": title}
 
-        # For terminals, get tab-specific title via AppleScript
+        # For terminals, get tab-specific title via AppleScript (cached until AXTitle changes)
         if app_name in _TERMINAL_BUNDLE_IDS:
-            tab_title = self._get_terminal_tab_title(app_name)
-            if tab_title:
-                result["title"] = tab_title
+            cache_key = (app_name, title)
+            if cache_key == self._terminal_cache_key and self._terminal_cache_value:
+                result["title"] = self._terminal_cache_value
+            else:
+                tab_title = self._get_terminal_tab_title(app_name)
+                if tab_title:
+                    result["title"] = tab_title
+                self._terminal_cache_key = cache_key
+                self._terminal_cache_value = tab_title
 
         # For browsers, get URL via AppleScript (doesn't need Accessibility)
         if app_name in _URL_BROWSERS:
