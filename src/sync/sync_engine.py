@@ -294,7 +294,7 @@ class SyncEngine:
             except AWClientError:
                 pass
         self._activity_analyzer.add_input_events(input_events_for_analysis)
-        self._has_input_data = len(input_buckets) > 0
+        self._has_input_data = len(input_events_for_analysis) > 0
 
         # Sync window buckets with gap-filling
         all_events = []
@@ -683,6 +683,7 @@ class SyncEngine:
                     delta = event.duration - prev_counted
                     if delta > 0:
                         self._time_tracker.add_active_time(delta, event_date)
+                        logger.debug(f"Time tracked: +{delta:.1f}s for event {event.id} (total today: {self._time_tracker.get_today_active_time()})")
                         self._time_cache[time_key] = event.duration
                         self._time_cache.move_to_end(time_key)
                         if len(self._time_cache) > self._TIME_CACHE_MAX:
