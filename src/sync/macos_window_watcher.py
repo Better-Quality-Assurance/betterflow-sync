@@ -36,6 +36,13 @@ _CHROMIUM_BROWSERS = frozenset({
 })
 _URL_BROWSERS = _CHROMIUM_BROWSERS | {"Safari"}
 
+# Terminal apps with AppleScript support for tab-specific titles.
+_TERMINAL_BUNDLE_IDS: dict[str, str] = {
+    "Terminal": "com.apple.Terminal",
+    "iTerm2": "com.googlecode.iterm2",
+    "iTerm": "com.googlecode.iterm2",
+}
+
 
 class MacOSWindowWatcher:
     """Daemon thread that polls the active window via PyObjC and posts heartbeats to AW."""
@@ -122,6 +129,12 @@ class MacOSWindowWatcher:
 
         result = {"app": app_name, "title": title}
 
+        # For terminals, get tab-specific title via AppleScript
+        if app_name in _TERMINAL_BUNDLE_IDS:
+            tab_title = self._get_terminal_tab_title(app_name)
+            if tab_title:
+                result["title"] = tab_title
+
         # For browsers, get URL via AppleScript (doesn't need Accessibility)
         if app_name in _URL_BROWSERS:
             url, incognito = self._get_browser_url(app_name)
@@ -172,6 +185,35 @@ class MacOSWindowWatcher:
         except Exception as e:
             logger.debug(f"AppleScript failed for {app_name}: {e}")
         return None, None
+
+    @staticmethod
+    def _get_terminal_tab_title(app_name: str) -> Optional[str]:
+        """Get the active tab/session title from a terminal app via AppleScript."""
+        bundle_id = _TERMINAL_BUNDLE_IDS.get(app_name)
+        if not bundle_id:
+            return None
+
+        try:
+            if bundle_id == "com.apple.Terminal":
+                script = f'tell application id "{bundle_id}" to return name of selected tab of front window'
+            elif bundle_id == "com.googlecode.iterm2":
+                script = f'tell application id "{bundle_id}" to return name of current session of current tab of current window'
+            else:
+                return None
+
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                title = result.stdout.strip()
+                if title:
+                    return title
+        except subprocess.TimeoutExpired:
+            logger.debug(f"AppleScript timed out for {app_name}")
+        except Exception as e:
+            logger.debug(f"AppleScript failed for {app_name}: {e}")
+        return None
 
     def _run(self) -> None:
         """Poll loop: get active window via PyObjC, post heartbeat."""
