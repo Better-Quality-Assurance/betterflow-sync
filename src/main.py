@@ -184,6 +184,13 @@ class SyncCoordinator:
                 id="permissions_check_job",
                 replace_existing=True,
             )
+        # Refresh clock icon every minute so hands move
+        self.scheduler.add_job(
+            self.tray._update_icon,
+            trigger=IntervalTrigger(seconds=60),
+            id="icon_refresh_job",
+            replace_existing=True,
+        )
         self.scheduler.start()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
