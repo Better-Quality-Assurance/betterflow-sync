@@ -629,7 +629,8 @@ class TrayIcon:
     def _make_interval_handler(self, seconds: int) -> Callable:
         """Create a handler for setting sync interval."""
         def handler(icon, item):
-            self.model.sync_interval = seconds
+            with self.model.lock:
+                self.model.sync_interval = seconds
             if self._on_preferences:
                 self._on_preferences("sync_interval", seconds)
             self._update_menu()
@@ -638,8 +639,9 @@ class TrayIcon:
     def _make_toggle_handler(self, attr: str, key: str) -> Callable:
         """Create a handler that toggles a boolean preference."""
         def handler(icon, item):
-            new_value = not getattr(self.model, attr)
-            setattr(self.model, attr, new_value)
+            with self.model.lock:
+                new_value = not getattr(self.model, attr)
+                setattr(self.model, attr, new_value)
             if self._on_preferences:
                 self._on_preferences(key, new_value)
         return handler
@@ -647,11 +649,13 @@ class TrayIcon:
     def _make_break_reminder_handler(self, enabled: bool, hours: int = 0) -> Callable:
         """Create a combined handler for break reminder radio selection."""
         def handler(icon, item):
-            self.model.break_reminders_enabled = enabled
+            with self.model.lock:
+                self.model.break_reminders_enabled = enabled
+                if enabled and hours:
+                    self.model.break_interval_hours = hours
             if self._on_preferences:
                 self._on_preferences("break_reminders_enabled", enabled)
             if enabled and hours:
-                self.model.break_interval_hours = hours
                 if self._on_preferences:
                     self._on_preferences("break_interval_hours", hours)
             self._update_menu()
@@ -660,11 +664,13 @@ class TrayIcon:
     def _make_private_reminder_handler(self, enabled: bool, minutes: int = 0) -> Callable:
         """Create a combined handler for private time reminder radio selection."""
         def handler(icon, item):
-            self.model.private_reminders_enabled = enabled
+            with self.model.lock:
+                self.model.private_reminders_enabled = enabled
+                if enabled and minutes:
+                    self.model.private_interval_minutes = minutes
             if self._on_preferences:
                 self._on_preferences("private_reminders_enabled", enabled)
             if enabled and minutes:
-                self.model.private_interval_minutes = minutes
                 if self._on_preferences:
                     self._on_preferences("private_interval_minutes", minutes)
             self._update_menu()
@@ -673,7 +679,8 @@ class TrayIcon:
     def _make_channel_handler(self, channel: str) -> Callable:
         """Create a handler for switching update channel."""
         def handler(icon, item):
-            self.model.update_channel = channel
+            with self.model.lock:
+                self.model.update_channel = channel
             if self._on_preferences:
                 self._on_preferences("update_channel", channel)
             self._update_menu()
@@ -696,23 +703,24 @@ class TrayIcon:
 
     def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
-        self.model.sync_interval = config.sync.interval_seconds
-        self.model.hash_titles = config.privacy.hash_titles
-        self.model.domain_only_urls = config.privacy.domain_only_urls
-        self.model.auto_categorize = config.privacy.auto_categorize
-        self.model.track_display_info = config.privacy.track_display_info
-        self.model.debug_mode = config.debug_mode
-        self.model.auto_start = config.auto_start
-        self.model.config_file_path = str(config.get_config_file())
-        self.model.break_reminders_enabled = config.reminders.break_reminders_enabled
-        self.model.break_interval_hours = config.reminders.break_interval_hours
-        self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
-        self.model.private_interval_minutes = config.reminders.private_interval_minutes
-        self.model.update_channel = config.update_channel
-        # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)
-        self.model.dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
+        dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
+        with self.model.lock:
+            self.model.sync_interval = config.sync.interval_seconds
+            self.model.hash_titles = config.privacy.hash_titles
+            self.model.domain_only_urls = config.privacy.domain_only_urls
+            self.model.auto_categorize = config.privacy.auto_categorize
+            self.model.track_display_info = config.privacy.track_display_info
+            self.model.debug_mode = config.debug_mode
+            self.model.auto_start = config.auto_start
+            self.model.config_file_path = str(config.get_config_file())
+            self.model.break_reminders_enabled = config.reminders.break_reminders_enabled
+            self.model.break_interval_hours = config.reminders.break_interval_hours
+            self.model.private_reminders_enabled = config.reminders.private_reminders_enabled
+            self.model.private_interval_minutes = config.reminders.private_interval_minutes
+            self.model.update_channel = config.update_channel
+            self.model.dashboard_url = dashboard_url
         self._update_menu()
 
     def set_state(self, state: TrayState, status_text: Optional[str] = None) -> None:
@@ -777,18 +785,19 @@ class TrayIcon:
             except (TypeError, ValueError):
                 pass
 
-        if hours_today is not None:
-            self.model.hours_today = hours_today
-        if last_sync is not None:
-            self.model.last_sync = last_sync
-        if queue_size is not None:
-            self.model.queue_size = queue_size
-        if hours_this_week is not None:
-            self.model.hours_this_week = hours_this_week
-        if hours_this_month is not None:
-            self.model.hours_this_month = hours_this_month
-        if daily_avg_this_week is not None:
-            self.model.daily_avg_this_week = daily_avg_this_week
+        with self.model.lock:
+            if hours_today is not None:
+                self.model.hours_today = hours_today
+            if last_sync is not None:
+                self.model.last_sync = last_sync
+            if queue_size is not None:
+                self.model.queue_size = queue_size
+            if hours_this_week is not None:
+                self.model.hours_this_week = hours_this_week
+            if hours_this_month is not None:
+                self.model.hours_this_month = hours_this_month
+            if daily_avg_this_week is not None:
+                self.model.daily_avg_this_week = daily_avg_this_week
         self._update_menu()
 
     def set_user(self, email: Optional[str], name: Optional[str] = None, role: Optional[str] = None) -> None:
@@ -801,9 +810,10 @@ class TrayIcon:
 
     def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:
         """Set available projects and current selection."""
-        self.model.projects = projects
-        if current_project:
-            self.model.current_project = current_project
+        with self.model.lock:
+            self.model.projects = projects
+            if current_project:
+                self.model.current_project = current_project
         self._update_menu()
 
     def set_active_time(self, active_time) -> None:
@@ -815,7 +825,8 @@ class TrayIcon:
         total_seconds = int(active_time.total_seconds())
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
-        self.model.hours_today = f"{hours}h {minutes}m"
+        with self.model.lock:
+            self.model.hours_today = f"{hours}h {minutes}m"
         self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
         self._update_menu()
 

@@ -343,22 +343,34 @@ class SyncCoordinator:
         """Check macOS Accessibility permission and update tray state."""
         try:
             granted = check_accessibility()
+            high_priority = (
+                TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
+                TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
+                TrayState.WAITING_AUTH,
+            )
             with self.tray.model.lock:
                 self.tray.model.needs_permissions = not granted
                 current_state = self.tray.model.state
+                if not granted:
+                    if current_state not in high_priority:
+                        self.tray.model.state = TrayState.NEEDS_PERMISSIONS
+                        self.tray.model.status_text = "Permissions Required"
+                        should_update_icon = True
+                    else:
+                        should_update_icon = False
+                else:
+                    if current_state == TrayState.NEEDS_PERMISSIONS:
+                        self.tray.model.state = TrayState.SYNCING
+                        should_update_icon = True
+                    else:
+                        should_update_icon = False
+            if should_update_icon:
+                self.tray._update_icon()
+                self.tray._update_menu()
             if not granted:
-                high_priority = (
-                    TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
-                    TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
-                    TrayState.WAITING_AUTH,
-                )
-                if current_state not in high_priority:
-                    self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                 logger.debug("macOS permissions missing")
-            else:
-                if current_state == TrayState.NEEDS_PERMISSIONS:
-                    self.tray.set_state(TrayState.SYNCING)
-                    logger.info("macOS permissions granted — clearing warning")
+            elif should_update_icon:
+                logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
             logger.debug(f"Permissions check failed: {e}")
 
