@@ -310,6 +310,7 @@ class SyncCoordinator:
         """Fetch available projects from API and set on tray."""
         try:
             response = self.bf.get_projects()
+            logger.debug(f"Raw projects response: {response}")
             data = response.get("data", {})
             projects = data.get("projects", [])
             current_project = data.get("current_project")
@@ -693,6 +694,8 @@ class BetterFlowSyncApp:
 
         # Start system event listeners (non-critical: don't let failures prevent tray)
         try:
+            from urllib.parse import urlparse
+            api_host = urlparse(self.config.api_url).hostname or ""
             start_system_event_listener(
                 on_sleep=self._on_system_sleep,
                 on_wake=self._on_system_wake,
@@ -700,6 +703,7 @@ class BetterFlowSyncApp:
                 on_network_change=self._on_network_change,
                 on_screen_lock=self._on_screen_lock,
                 on_screen_unlock=self._on_screen_unlock,
+                reachability_host=api_host,
             )
         except Exception:
             logger.exception("Failed to start system event listeners")

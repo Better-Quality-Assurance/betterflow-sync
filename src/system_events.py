@@ -28,19 +28,21 @@ def start_system_event_listener(
     on_network_change: Callable,  # fn(is_online: bool)
     on_screen_lock: Callable = None,   # fn() — screen locked
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
+    reachability_host: str = "",  # Host to check for network reachability
 ) -> None:
     """Start platform-specific system event listeners.
 
     All listeners run on daemon threads and die automatically on process exit.
     """
+    host = reachability_host or "app.betterflow.eu"
     if _system == "Darwin":
         _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
-        _start_macos_network_listener(on_network_change)
+        _start_macos_network_listener(on_network_change, host=host)
         if on_screen_lock or on_screen_unlock:
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
     elif _system == "Windows":
         _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
-        _start_network_poller(on_network_change)
+        _start_network_poller(on_network_change, host=host)
     else:
         logger.warning(f"System events not supported on {_system}")
 
