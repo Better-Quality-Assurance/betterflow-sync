@@ -620,6 +620,7 @@ class BetterFlowSyncApp:
             on_cancel_login=self._on_cancel_login,
         )
         self.tray.set_config(self.config)
+        self.tray.model.app_version = _VERSION
 
         # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(

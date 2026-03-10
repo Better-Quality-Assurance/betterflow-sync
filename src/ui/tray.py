@@ -93,6 +93,7 @@ class TrayModel:
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
+        self.app_version: str = ""
 
         # Reminder preferences
         self.break_reminders_enabled: bool = True
@@ -485,6 +486,8 @@ class TrayIcon:
                 self._handle_open_update,
             ))
 
+        if self.model.app_version:
+            items.append(Item(f"v{self.model.app_version}", None, enabled=False))
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
