@@ -376,19 +376,24 @@ class TrayIcon:
                 checked=lambda item: not self.model.break_reminders_enabled,
             ),
             Item(
-                "Every 1 Hour",
+                "After 1 Hour",
                 self._make_break_reminder_handler(enabled=True, hours=1),
                 checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 1,
             ),
             Item(
-                "Every 2 Hours",
+                "After 2 Hours",
                 self._make_break_reminder_handler(enabled=True, hours=2),
                 checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 2,
             ),
             Item(
-                "Every 3 Hours",
+                "After 3 Hours",
                 self._make_break_reminder_handler(enabled=True, hours=3),
                 checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 3,
+            ),
+            Item(
+                "After 4 Hours",
+                self._make_break_reminder_handler(enabled=True, hours=4),
+                checked=lambda item: self.model.break_reminders_enabled and self.model.break_interval_hours == 4,
             ),
         ), enabled=logged_in))
 
