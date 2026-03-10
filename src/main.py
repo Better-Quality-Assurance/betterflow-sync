@@ -44,9 +44,9 @@ except ImportError:
 
 # Import send_notification at module level so tests can patch src.main.send_notification
 try:
-    from .notifications import send_notification
+    from .notifications import send_notification, clear_notifications
 except ImportError:
-    from notifications import send_notification  # type: ignore[no-redef]
+    from notifications import send_notification, clear_notifications  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -1039,6 +1039,9 @@ class BetterFlowSyncApp:
             import time
             time.sleep(0.1)
 
+        # Clear notifications from previous session
+        clear_notifications()
+
         # Cancel any active break before stopping (prevents stuck break state on re-login)
         if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
@@ -1103,6 +1106,7 @@ class BetterFlowSyncApp:
         self._shutdown_done = True
         logger.info("Shutting down...")
 
+        clear_notifications()
         self.coordinator.stop()
         self.sync_engine.shutdown()
         if self.window_watcher:
