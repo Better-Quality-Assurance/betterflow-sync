@@ -310,8 +310,9 @@ class SyncCoordinator:
         """Fetch available projects from API and set on tray."""
         try:
             response = self.bf.get_projects()
-            projects = response.get("projects", [])
-            current_project = response.get("current_project")
+            data = response.get("data", {})
+            projects = data.get("projects", [])
+            current_project = data.get("current_project")
             self.tray.set_projects(projects, current_project=current_project)
             if current_project:
                 self.sync_engine.set_current_project(current_project)
