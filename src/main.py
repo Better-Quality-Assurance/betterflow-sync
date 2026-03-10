@@ -314,6 +314,10 @@ class SyncCoordinator:
             data = response.get("data", {})
             projects = data.get("projects", [])
             current_project = data.get("current_project")
+            # Auto-select when there's exactly one project and none is active
+            if not current_project and len(projects) == 1:
+                current_project = projects[0]
+                logger.info(f"Auto-selected sole project: {current_project['name']}")
             self.tray.set_projects(projects, current_project=current_project)
             if current_project:
                 self.sync_engine.set_current_project(current_project)
