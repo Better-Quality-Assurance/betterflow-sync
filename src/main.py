@@ -50,6 +50,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _greeting() -> str:
+    """Return a time-of-day greeting."""
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Good morning"
+    elif hour < 17:
+        return "Good afternoon"
+    return "Good evening"
+
+
+def _day_greeting() -> str:
+    """Return a contextual sub-message based on day of week."""
+    day = datetime.now().weekday()  # 0=Mon … 6=Sun
+    if day == 0:
+        return "Have a productive week!"
+    elif day == 4:
+        return "Happy Friday!"
+    elif day >= 5:
+        return "Enjoy your weekend!"
+    return "Have a productive day!"
+
 # Resolve version string once (handles both str and module forms from PyInstaller)
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
 
@@ -654,6 +676,9 @@ class BetterFlowSyncApp:
             self.coordinator.fetch_categories()
             self._check_stale_session()
             self.coordinator.start()
+            first_name = (state.user_name or "").split()[0] if state.user_name else ""
+            greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
+            send_notification(greeting, _day_greeting())
             # Check permissions after scheduler starts (non-blocking, 5s delay)
             self.coordinator.scheduler.add_job(
                 self._check_permissions_initial,
@@ -763,6 +788,9 @@ class BetterFlowSyncApp:
                     self.coordinator.fetch_categories()
                     if not self.coordinator.scheduler.running:
                         self.coordinator.start()
+                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                    send_notification(greeting, _day_greeting())
                 else:
                     self.coordinator.logged_in = False
                     self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
@@ -785,6 +813,7 @@ class BetterFlowSyncApp:
         if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
         self.reminder_manager.on_tracking_stopped()
+        send_notification("Tracking Paused", "Your activity is no longer being recorded.", sound=False)
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
@@ -794,6 +823,7 @@ class BetterFlowSyncApp:
         self.sync_engine.resume()
         self.tray.set_paused(False)
         self.reminder_manager.on_tracking_started()
+        send_notification("Tracking Resumed", "Your activity is being recorded again.", sound=False)
         logger.info("Tracking resumed")
 
     def _on_project_change(self, project: Optional[dict]) -> None:
@@ -811,11 +841,13 @@ class BetterFlowSyncApp:
             self.sync_engine.set_private_mode(True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
+            send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
         else:
             logger.info("Private time ended — recording resumed")
             self.sync_engine.set_private_mode(False)
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
+            send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
@@ -871,6 +903,7 @@ class BetterFlowSyncApp:
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
         self.coordinator.trigger_sync("unlock_sync")
+        send_notification("Welcome back!", _day_greeting(), sound=False)
 
     def _on_network_change(self, is_online: bool) -> None:
         """Handle network connectivity change."""
@@ -1018,6 +1051,9 @@ class BetterFlowSyncApp:
                     self.coordinator.logged_in = True
                     self.tray.set_user(state.user_email, state.user_name, state.user_role)
                     self.coordinator.start()
+                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                    send_notification(greeting, _day_greeting())
                 else:
                     self.coordinator.logged_in = False
                     self._on_quit()
