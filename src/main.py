@@ -117,6 +117,7 @@ class SyncCoordinator:
         self._logged_in = False
         self._paused_by_network = False
         self._on_break = False
+        self._break_start: Optional[datetime] = None
         self._state_lock = threading.Lock()
         self._break_lock = threading.Lock()
         self._pre_break_paused = False
@@ -250,6 +251,7 @@ class SyncCoordinator:
             if self.sync_engine.is_paused:
                 return
             self._on_break = True
+            self._break_start = datetime.now(timezone.utc)
             # Capture private mode so end_break can restore it.
             # _pre_break_paused is always False here (we just checked is_paused).
             self._pre_break_paused = False
@@ -295,8 +297,14 @@ class SyncCoordinator:
             if not self._on_break:
                 return
             self._on_break = False
+            break_start = self._break_start
+            self._break_start = None
             pre_break_paused = self._pre_break_paused
             pre_break_private = self._pre_break_private
+
+        # Send break event to backend
+        if break_start:
+            self.sync_engine.send_break_event(break_start)
 
         with self.tray.model.lock:
             self.tray.model.on_break = False
