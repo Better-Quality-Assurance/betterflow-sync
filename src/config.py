@@ -310,13 +310,12 @@ class Config:
         fraud_detection_data = data.pop("fraud_detection", {})
         data.pop("screenshots", None)
 
-        # Migrate legacy localhost URLs to production endpoint.
+        # Migrate legacy localhost:8000 URLs to production endpoint.
+        # Note: 8001 is intentionally excluded — it is the standard local dev port.
         api_url = data.get("api_url")
         if api_url in {
             "http://localhost:8000/api/agent",
             "http://127.0.0.1:8000/api/agent",
-            "http://localhost:8001/api/agent",
-            "http://127.0.0.1:8001/api/agent",
         }:
             data["api_url"] = DEFAULT_API_URL
 
