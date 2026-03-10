@@ -379,11 +379,11 @@ class TrayIcon:
         else:
             items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
-        # ── Private Time toggle ─────────────────────────────
+        # ── Private Time toggle (disabled when paused) ──────
         if self.model.private_mode:
             items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
         else:
-            items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
+            items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in and not self.model.paused))
 
         # ── Private Time Reminder submenu ───────────────────
         items.append(Item("Private Time Reminder", pystray.Menu(
@@ -561,6 +561,9 @@ class TrayIcon:
     def _handle_private_toggle(self, icon, item) -> None:
         """Handle private time toggle."""
         with self.model.lock:
+            # Can't enable private time while paused
+            if not self.model.private_mode and self.model.paused:
+                return
             self.model.private_mode = not self.model.private_mode
             new_mode = self.model.private_mode
             on_break = self.model.on_break
