@@ -447,6 +447,7 @@ class TrayIcon:
             Item(f"Last sync: {self.model.last_sync}", None, enabled=False),
         ]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
+        items.append(Item("Sync Now", self._handle_sync_now, enabled=logged_in))
 
         # ── Preferences submenu ─────────────────────────────
         items.append(Item("Preferences", pystray.Menu(
