@@ -3,10 +3,12 @@
 import logging
 import os
 import platform
+import sys
 import threading
 import time
 import webbrowser
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 from PIL import Image, ImageDraw
@@ -135,23 +137,50 @@ class TrayState(Enum):
     WAITING_AUTH = "waiting_auth"  # Amber - waiting for browser login
 
 
-# Colors for each state
+# Colors for each state — BetterFlow brand palette
 STATE_COLORS = {
-    TrayState.SYNCING: "#22c55e",  # Green
-    TrayState.QUEUED: "#eab308",  # Yellow
+    TrayState.SYNCING: "#7D69B8",  # BetterFlow purple - active
+    TrayState.QUEUED: "#eab308",  # Yellow - offline
     TrayState.QUEUE_WARNING: "#f97316",  # Orange - queue nearing capacity
-    TrayState.ERROR: "#ef4444",  # Red
+    TrayState.ERROR: "#c96660",  # BetterFlow error red
     TrayState.PAUSED: "#9ca3af",  # Gray
     TrayState.PRIVATE: "#6b7280",  # Dark gray - private time
-    TrayState.ON_BREAK: "#f59e0b",  # Amber - break active
+    TrayState.ON_BREAK: "#B57EF5",  # BetterFlow light purple - break
     TrayState.NEEDS_PERMISSIONS: "#f59e0b",  # Amber - permissions missing
-    TrayState.STARTING: "#3b82f6",  # Blue
+    TrayState.STARTING: "#614D87",  # BetterFlow dark purple
     TrayState.WAITING_AUTH: "#f59e0b",  # Amber
 }
 
 
+def _resources_dir() -> Path:
+    """Return the resources directory (works for dev and PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "resources"
+    return Path(__file__).resolve().parent.parent.parent / "resources"
+
+
+# Cache the logo template to avoid re-reading from disk on every state change.
+_logo_template: Optional[Image.Image] = None
+
+
+def _get_logo_template() -> Optional[Image.Image]:
+    """Load and cache the B logo as an alpha mask."""
+    global _logo_template
+    if _logo_template is not None:
+        return _logo_template
+    logo_path = _resources_dir() / "logo.png"
+    if not logo_path.exists():
+        return None
+    try:
+        img = Image.open(logo_path).convert("RGBA")
+        _logo_template = img
+        return _logo_template
+    except Exception:
+        return None
+
+
 def create_icon_image(color: str, size: int = 64) -> Image.Image:
-    """Create a simple colored circle icon.
+    """Create a tinted B logo icon, falling back to a colored circle.
 
     Args:
         color: Hex color code
@@ -160,17 +189,26 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
     Returns:
         PIL Image
     """
-    # Create transparent image
+    template = _get_logo_template()
+    if template is not None:
+        # Resize the logo template
+        resized = template.resize((size, size), Image.LANCZOS)
+        # Tint: replace RGB with the state color, keep original alpha
+        r_val = int(color[1:3], 16)
+        g_val = int(color[3:5], 16)
+        b_val = int(color[5:7], 16)
+        tinted = Image.new("RGBA", (size, size), (r_val, g_val, b_val, 255))
+        tinted.putalpha(resized.split()[3])  # Use logo's alpha channel
+        return tinted
+
+    # Fallback: colored circle
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-
-    # Draw filled circle
     margin = size // 8
     draw.ellipse(
         [margin, margin, size - margin, size - margin],
         fill=color,
     )
-
     return image
 
 

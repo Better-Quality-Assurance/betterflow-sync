@@ -6,11 +6,15 @@ Runs only when config.setup_complete is False.
 
 import logging
 import platform
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 import itertools
+
+from PIL import Image, ImageTk
 
 try:
     from ..auth.login import LoginManager, LoginState
@@ -45,18 +49,25 @@ BTN_BORDER_RADIUS = 13
 SPINNER_RADIUS = 30
 SPINNER_FRAME_MS = 50
 
-# Colors
-BG_COLOR = "#0a1022"
-CARD_COLOR = "#0f1936"
-CARD_BORDER = "#2d4480"
-ACCENT_COLOR = "#1a2c58"
-PRIMARY_COLOR = "#00c5e6"
-PRIMARY_HOVER = "#00aac8"
-TEXT_COLOR = "#f4f7ff"
-TEXT_MUTED = "#a8badf"
-SUCCESS_COLOR = "#37d67a"
-ERROR_COLOR = "#ff5a7a"
+# Colors — BetterFlow brand palette
+BG_COLOR = "#0f0a1a"
+CARD_COLOR = "#1a1028"
+CARD_BORDER = "#3d2d6b"
+ACCENT_COLOR = "#2a1d45"
+PRIMARY_COLOR = "#7D69B8"
+PRIMARY_HOVER = "#614D87"
+TEXT_COLOR = "#f4f0ff"
+TEXT_MUTED = "#b8a8d6"
+SUCCESS_COLOR = "#368a5e"
+ERROR_COLOR = "#c96660"
 BTN_TEXT = "#ffffff"
+
+
+def _resources_dir() -> Path:
+    """Return the resources directory (works for dev and PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "resources"
+    return Path(__file__).resolve().parent.parent.parent / "resources"
 
 
 @dataclass
@@ -161,9 +172,9 @@ class SetupWizard:
     def _make_button(self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True) -> str:
         """Create a cross-platform canvas button (macOS tk.Button ignores custom bg)."""
         bg = PRIMARY_COLOR if primary else ACCENT_COLOR
-        hover_bg = PRIMARY_HOVER if primary else "#274078"
-        border = "#5fdfff" if primary else "#3f588e"
-        text_color = "#06243a" if primary else BTN_TEXT
+        hover_bg = PRIMARY_HOVER if primary else "#362654"
+        border = "#B57EF5" if primary else "#4a3875"
+        text_color = BTN_TEXT
         x1, y1 = x - (width // 2), y - (BTN_HEIGHT // 2)
         x2, y2 = x + (width // 2), y + (BTN_HEIGHT // 2)
         tag = f"btn_{next(self._button_id)}"
@@ -212,18 +223,18 @@ class SetupWizard:
         """Draw atmospheric gradient-like background."""
         self._canvas.create_rectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, fill=BG_COLOR, outline="")
 
-        # Layered ambient bands for depth.
+        # Layered ambient bands for depth — purple tones.
         bands = [
-            ("#101938", 0, 0, WINDOW_WIDTH, 120),
-            ("#0f1731", 0, 120, WINDOW_WIDTH, 280),
-            ("#0c1328", 0, 280, WINDOW_WIDTH, WINDOW_HEIGHT),
+            ("#150e24", 0, 0, WINDOW_WIDTH, 120),
+            ("#120b20", 0, 120, WINDOW_WIDTH, 280),
+            ("#0e081a", 0, 280, WINDOW_WIDTH, WINDOW_HEIGHT),
         ]
         for color, x1, y1, x2, y2 in bands:
             self._canvas.create_rectangle(x1, y1, x2, y2, fill=color, outline="")
 
-        # Soft glows.
-        self._canvas.create_oval(-120, -110, 230, 170, fill="#13274a", outline="")
-        self._canvas.create_oval(460, 280, 860, 650, fill="#0f2448", outline="")
+        # Soft purple glows.
+        self._canvas.create_oval(-120, -110, 230, 170, fill="#1e1340", outline="")
+        self._canvas.create_oval(460, 280, 860, 650, fill="#18103a", outline="")
 
     def _draw_card_shell(self) -> tuple[int, int, int, int]:
         """Return content bounds; the window itself is the only card surface."""
@@ -258,23 +269,27 @@ class SetupWizard:
             subtitle="Install local tracking and connect your BetterFlow account",
         )
 
-        # Logo circle
+        # Logo image
         logo_y = 244
-        r = 44
-        self._canvas.create_oval(
-            cx - r, logo_y - r, cx + r, logo_y + r,
-            fill=PRIMARY_COLOR, outline=""
-        )
-        self._canvas.create_oval(
-            cx - r - 9, logo_y - r - 9, cx + r + 9, logo_y + r + 9,
-            outline="#35e0ff", width=2
-        )
-        self._canvas.create_text(
-            cx, logo_y,
-            text="BF",
-            font=(FONT_FAMILY, 26, "bold"),
-            fill="#071226",
-        )
+        logo_path = _resources_dir() / "logo.png"
+        if logo_path.exists():
+            logo_img = Image.open(logo_path).convert("RGBA")
+            logo_img = logo_img.resize((80, 80), Image.LANCZOS)
+            self._logo_photo = ImageTk.PhotoImage(logo_img)
+            self._canvas.create_image(cx, logo_y, image=self._logo_photo)
+        else:
+            # Fallback: text logo
+            r = 44
+            self._canvas.create_oval(
+                cx - r, logo_y - r, cx + r, logo_y + r,
+                fill=PRIMARY_COLOR, outline=""
+            )
+            self._canvas.create_text(
+                cx, logo_y,
+                text="B",
+                font=(FONT_FAMILY, 32, "bold"),
+                fill="#ffffff",
+            )
 
         # Description
         self._canvas.create_text(
@@ -292,7 +307,7 @@ class SetupWizard:
             cx, 384,
             text="The next step opens your browser for secure sign-in.",
             font=FONT_SMALL,
-            fill="#8fa7d6",
+            fill="#9a87c4",
             justify=tk.CENTER,
         )
 
@@ -357,7 +372,7 @@ class SetupWizard:
             start=0,
             extent=359,
             style=tk.ARC,
-            outline="#304a89",
+            outline="#3d2d6b",
             width=3,
             tags="spinner_bg",
         )
@@ -505,8 +520,8 @@ class SetupWizard:
         cy = row_y + row_height // 2
         icon = "\u2713" if granted else "\u2717"
         icon_color = SUCCESS_COLOR if granted else ERROR_COLOR
-        bg = "#112040" if granted else "#1a1a3a"
-        border = "#2a5040" if granted else CARD_BORDER
+        bg = "#1a1430" if granted else "#1a1028"
+        border = "#3d5040" if granted else CARD_BORDER
 
         self._create_rounded_rect(
             row_x1, row_y, row_x2, row_y + row_height,
@@ -546,7 +561,7 @@ class SetupWizard:
             self._canvas.create_text(
                 cx, row_y + row_height + 34,
                 text="If already toggled on, try switching it off and on again.",
-                font=(FONT_FAMILY, 11), fill="#7a8fc0",
+                font=(FONT_FAMILY, 11), fill="#8a7ab0",
             )
             btn_y = row_y + row_height + 82
             self._make_button(
