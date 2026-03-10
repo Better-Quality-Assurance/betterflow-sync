@@ -163,18 +163,26 @@ class AWClient:
         return self._request("GET", "info")
 
     def get_buckets(self) -> dict[str, "AWBucket"]:
-        """Get all buckets (cached with 30s TTL)."""
+        """Get all buckets (cached with 30s TTL).
+
+        The HTTP request is made outside the lock to avoid blocking
+        other threads while waiting for ActivityWatch to respond.
+        """
         with self._buckets_lock:
             now = time.monotonic()
             if self._buckets_cache is not None and (now - self._buckets_cache_time) < self._buckets_cache_ttl:
                 return self._buckets_cache
-            response = self._request("GET", "buckets/")
-            result = {
-                bucket_id: AWBucket.from_dict(bucket_id, data)
-                for bucket_id, data in response.items()
-            }
+
+        # Fetch outside lock to avoid blocking other callers
+        response = self._request("GET", "buckets/")
+        result = {
+            bucket_id: AWBucket.from_dict(bucket_id, data)
+            for bucket_id, data in response.items()
+        }
+
+        with self._buckets_lock:
             self._buckets_cache = result
-            self._buckets_cache_time = now
+            self._buckets_cache_time = time.monotonic()
             return result
 
     def get_bucket(self, bucket_id: str) -> Optional[AWBucket]:

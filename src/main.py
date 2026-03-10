@@ -113,10 +113,11 @@ class SyncCoordinator:
             "daily_avg_this_week": "---",
         }
 
-        # Flags set by the app layer
-        self.logged_in = False
-        self.paused_by_network = False
+        # Flags set by the app layer — protected by _state_lock
+        self._logged_in = False
+        self._paused_by_network = False
         self._on_break = False
+        self._state_lock = threading.Lock()
         self._break_lock = threading.Lock()
         self._pre_break_paused = False
         self._pre_break_private = False
@@ -124,6 +125,26 @@ class SyncCoordinator:
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
+
+    @property
+    def logged_in(self) -> bool:
+        with self._state_lock:
+            return self._logged_in
+
+    @logged_in.setter
+    def logged_in(self, value: bool) -> None:
+        with self._state_lock:
+            self._logged_in = value
+
+    @property
+    def paused_by_network(self) -> bool:
+        with self._state_lock:
+            return self._paused_by_network
+
+    @paused_by_network.setter
+    def paused_by_network(self, value: bool) -> None:
+        with self._state_lock:
+            self._paused_by_network = value
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
@@ -225,9 +246,13 @@ class SyncCoordinator:
         with self._break_lock:
             if self._on_break:
                 return
+            # Don't start a break if tracking is already paused
+            if self.sync_engine.is_paused:
+                return
             self._on_break = True
-            # Capture current state before breaking so end_break can restore it
-            self._pre_break_paused = self.sync_engine.is_paused
+            # Capture private mode so end_break can restore it.
+            # _pre_break_paused is always False here (we just checked is_paused).
+            self._pre_break_paused = False
             self._pre_break_private = self.sync_engine.is_private
 
         self.sync_engine.pause()
@@ -643,8 +668,11 @@ class BetterFlowSyncApp:
 
         # State
         self._shutdown_done = False
+        self._shutdown_lock = threading.Lock()
         self._shutdown_event = threading.Event()
+        self._pause_state_lock = threading.Lock()
         self._user_paused = False
+        self._pre_sleep_private = False
         self._login_lock = threading.Lock()
 
     def run(self) -> None:
@@ -756,7 +784,9 @@ class BetterFlowSyncApp:
         if sys.platform != "darwin":
             return
         self.coordinator._check_permissions()
-        if self.tray.model.needs_permissions:
+        with self.tray.model.lock:
+            needs_perms = self.tray.model.needs_permissions
+        if needs_perms:
             send_notification(
                 "BetterFlow Sync",
                 "Grant Accessibility permission in "
@@ -841,7 +871,8 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
-        self._user_paused = True
+        with self._pause_state_lock:
+            self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
@@ -854,7 +885,8 @@ class BetterFlowSyncApp:
 
     def _on_resume(self) -> None:
         """Handle resume action."""
-        self._user_paused = False
+        with self._pause_state_lock:
+            self._user_paused = False
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
@@ -892,6 +924,8 @@ class BetterFlowSyncApp:
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
+        with self._pause_state_lock:
+            self._pre_sleep_private = self.sync_engine.is_private
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
@@ -902,11 +936,18 @@ class BetterFlowSyncApp:
         """Handle system wake from sleep."""
         # Drop stale TCP connections from sleep (N3)
         self.bf.reset_session()
-        if self._user_paused:
+        with self._pause_state_lock:
+            user_paused = self._user_paused
+            pre_sleep_private = self._pre_sleep_private
+        if user_paused:
             logger.info("System wake — staying paused (user-initiated pause active)")
             return
         if self.coordinator.is_on_break:
             logger.info("System wake — staying on break")
+            return
+        if pre_sleep_private:
+            logger.info("System wake — restoring private time")
+            self.tray.set_state(TrayState.PRIVATE)
             return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
@@ -921,6 +962,8 @@ class BetterFlowSyncApp:
 
     def _on_screen_lock(self) -> None:
         """Handle screen lock — treat as AFK."""
+        with self._pause_state_lock:
+            self._pre_sleep_private = self.sync_engine.is_private
         logger.info("Screen locked — pausing tracking")
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
@@ -928,11 +971,18 @@ class BetterFlowSyncApp:
 
     def _on_screen_unlock(self) -> None:
         """Handle screen unlock — resume tracking."""
-        if self._user_paused:
+        with self._pause_state_lock:
+            user_paused = self._user_paused
+            pre_sleep_private = self._pre_sleep_private
+        if user_paused:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
         if self.coordinator.is_on_break:
             logger.info("Screen unlocked — staying on break")
+            return
+        if pre_sleep_private:
+            logger.info("Screen unlocked — restoring private time")
+            self.tray.set_state(TrayState.PRIVATE)
             return
         logger.info("Screen unlocked — resuming tracking")
         self.sync_engine.resume()
@@ -1123,9 +1173,10 @@ class BetterFlowSyncApp:
 
     def _shutdown(self) -> None:
         """Shutdown the application. Safe to call multiple times."""
-        if self._shutdown_done:
-            return
-        self._shutdown_done = True
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
         logger.info("Shutting down...")
 
         clear_notifications()

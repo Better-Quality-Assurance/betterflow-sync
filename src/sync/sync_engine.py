@@ -99,6 +99,8 @@ class SyncEngine:
         # Bounded LRU: evicts oldest on every insert once at capacity.
         self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
         self._SENT_CACHE_MAX = 5_000
+        # Track original AW durations for gap-filled events to prevent re-send
+        self._gap_filled_originals: dict[int, float] = {}
 
         # Thread safety: protects cross-thread mutable state
         self._state_lock = threading.Lock()
@@ -325,6 +327,10 @@ class SyncEngine:
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
 
+        # Clear window-specific AFK context before processing non-window buckets
+        # to prevent AFK events from one window bucket leaking into unrelated buckets.
+        self._current_afk_events = []
+
         # Sync non-window buckets normally
         for bucket in web_buckets + afk_buckets + input_buckets:
             try:
@@ -405,11 +411,20 @@ class SyncEngine:
 
         transformed = []
         for event in events:
-            # Dedup: skip if already sent with same duration
+            # Dedup: skip if already sent with same duration.
+            # For gap-filled events, also accept the original AW duration
+            # (gap-filling is deterministic, so the extended version was
+            # already sent on a prior cycle).
             cache_key = (bucket_id, event.id)
             with self._cache_lock:
                 prev_duration = self._sent_cache.get(cache_key)
             if prev_duration is not None and abs(event.duration - prev_duration) < 0.5:
+                stats.events_filtered += 1
+                continue
+            # Check if this event was gap-filled on a prior cycle —
+            # AW returns original duration but we already sent the extended one
+            orig = self._gap_filled_originals.get(event.id)
+            if orig is not None and abs(event.duration - orig) < 0.5:
                 stats.events_filtered += 1
                 continue
 
@@ -550,6 +565,10 @@ class SyncEngine:
                 duration=new_duration,
                 data=current.data,
             )
+            # Pre-seed sent cache with original AW duration so next sync's
+            # dedup check sees original→original (unchanged) and skips.
+            # The gap-filled event is already sent with extended duration.
+            self._gap_filled_originals[current.id] = old_duration
             filled += 1
             logger.info(
                 f"Filling {gap_seconds:.1f}s window gap: event {current.id} "
@@ -776,16 +795,20 @@ class SyncEngine:
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
-                # Queue remaining unsent batches before re-raising
-                for remaining in batches[i:]:
+                # Queue remaining unsent batches before re-raising.
+                # Start from i+1: the current batch (i) was already sent to
+                # the server and may have been processed before the 401.
+                for remaining in batches[i + 1:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
                 stats.errors.append(f"Authentication error: {e}")
                 raise
             except BetterFlowClientError:
-                # Network error - queue for later
-                self.queue.enqueue(batch)
-                stats.events_queued += len(batch)
+                # Network error — queue this and all remaining batches, then stop
+                for remaining in batches[i:]:
+                    self.queue.enqueue(remaining)
+                    stats.events_queued += len(remaining)
+                break
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
 

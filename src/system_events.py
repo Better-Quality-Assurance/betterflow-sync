@@ -19,6 +19,7 @@ _system = platform.system()
 # Store observer refs for cleanup (M5)
 _registered_observers: list[tuple] = []  # [(center, observer), ...]
 _observers_lock = threading.Lock()
+_stop_event = threading.Event()  # Signal run loops to exit on cleanup
 
 
 def start_system_event_listener(
@@ -121,7 +122,14 @@ def _start_macos_power_listener(
 
         logger.debug("macOS power event listener started")
         try:
-            AppHelper.runConsoleEventLoop()
+            # Use interruptible run loop so cleanup_observers() can stop us
+            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+            loop = NSRunLoop.currentRunLoop()
+            while not _stop_event.is_set():
+                loop.runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
+                )
         finally:
             center.removeObserver_(observer)
 
@@ -175,7 +183,13 @@ def _start_macos_screen_lock_listener(
 
         logger.debug("macOS screen lock listener started")
         try:
-            AppHelper.runConsoleEventLoop()
+            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+            loop = NSRunLoop.currentRunLoop()
+            while not _stop_event.is_set():
+                loop.runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
+                )
         finally:
             center.removeObserver_(observer)
 
@@ -184,7 +198,8 @@ def _start_macos_screen_lock_listener(
 
 
 def cleanup_observers() -> None:
-    """Remove all registered macOS notification observers (M5)."""
+    """Remove all registered macOS notification observers and stop run loops (M5)."""
+    _stop_event.set()
     with _observers_lock:
         for center, observer in _registered_observers:
             try:
@@ -255,7 +270,7 @@ def _start_macos_network_listener(
         logger.debug("macOS network reachability listener started")
         # Use interruptible run loop instead of blocking loop.run()
         from Foundation import NSDate
-        while True:
+        while not _stop_event.is_set():
             loop.runMode_beforeDate_(
                 NSDefaultRunLoopMode,
                 NSDate.dateWithTimeIntervalSinceNow_(5.0),

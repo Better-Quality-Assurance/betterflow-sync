@@ -330,13 +330,15 @@ class Config:
         )
 
     def save(self) -> None:
-        """Save config to file."""
+        """Save config to file atomically (write tmp then rename)."""
         config_file = self.get_config_file()
         config_file.parent.mkdir(parents=True, exist_ok=True)
 
         data = asdict(self)
-        with open(config_file, "w") as f:
+        tmp_file = config_file.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp_file, config_file)
         logger.info(f"Config saved to {config_file}")
 
     @staticmethod

@@ -198,7 +198,10 @@ class BaseApiClient:
 
         def do_request() -> dict:
             try:
-                response = self._session.request(method, url, **kwargs)
+                session = self._session
+                if session is None:
+                    raise BetterFlowClientError("Client has been closed")
+                response = session.request(method, url, **kwargs)
 
                 if response.status_code == 401:
                     raise BetterFlowAuthError("Invalid or expired API token")

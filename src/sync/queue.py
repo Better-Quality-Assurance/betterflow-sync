@@ -60,13 +60,26 @@ class OfflineQueue:
         # Track connections for cleanup in close() (M4)
         self._connections: list[sqlite3.Connection] = []
         self._connections_lock = threading.Lock()
+        self._closed = False
         self._last_integrity_check: float = time.monotonic()
         self._integrity_check_interval: float = 3600.0  # 1 hour
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get thread-local database connection."""
-        if not hasattr(self._local, "connection"):
+        """Get thread-local database connection.
+
+        Recreates the connection if the queue was closed and reopened,
+        or if this thread's handle was closed by close().
+        """
+        need_new = not hasattr(self._local, "connection")
+        if not need_new:
+            # Check if existing connection was closed
+            try:
+                self._local.connection.execute("SELECT 1")
+            except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+                del self._local.connection
+                need_new = True
+        if need_new:
             conn = sqlite3.connect(str(self.db_path))
             conn.row_factory = sqlite3.Row
             self._local.connection = conn
@@ -528,7 +541,11 @@ class OfflineQueue:
                 )
 
     def close(self) -> None:
-        """Close all tracked database connections."""
+        """Close all tracked database connections.
+
+        After close(), any thread calling _get_connection() will create
+        a fresh connection (the old closed handles are removed from tracking).
+        """
         with self._connections_lock:
             for conn in self._connections:
                 try:
@@ -536,5 +553,10 @@ class OfflineQueue:
                 except Exception:
                     pass
             self._connections.clear()
+        # Clear the calling thread's reference; other threads will get
+        # a sqlite3.ProgrammingError on next use of their stale handle,
+        # which _get_connection detects via hasattr and replaces.
         if hasattr(self._local, "connection"):
             del self._local.connection
+        # Mark as closed so _get_connection can detect stale handles
+        self._closed = True
