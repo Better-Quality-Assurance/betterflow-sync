@@ -11,7 +11,9 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
-from PIL import Image, ImageDraw
+import math
+
+from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -89,7 +91,7 @@ class TrayModel:
         self.update_version: Optional[str] = None
         self.update_url: Optional[str] = None
         self.config_file_path: Optional[str] = None
-        self.dashboard_url: str = "https://app.betterflow.eu/dashboard"
+        self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
 
         # Reminder preferences
@@ -180,35 +182,75 @@ def _get_logo_template() -> Optional[Image.Image]:
 
 
 def create_icon_image(color: str, size: int = 64) -> Image.Image:
-    """Create a tinted B logo icon, falling back to a colored circle.
+    """Create a clock icon with the given state color.
+
+    Draws a round clock face with hour marks and hour/minute hands
+    showing the current local time.
 
     Args:
-        color: Hex color code
+        color: Hex color code for the clock color
         size: Icon size in pixels
 
     Returns:
         PIL Image
     """
-    template = _get_logo_template()
-    if template is not None:
-        # Resize the logo template
-        resized = template.resize((size, size), Image.LANCZOS)
-        # Tint: replace RGB with the state color, keep original alpha
-        r_val = int(color[1:3], 16)
-        g_val = int(color[3:5], 16)
-        b_val = int(color[5:7], 16)
-        tinted = Image.new("RGBA", (size, size), (r_val, g_val, b_val, 255))
-        tinted.putalpha(resized.split()[3])  # Use logo's alpha channel
-        return tinted
+    from datetime import datetime
 
-    # Fallback: colored circle
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    now = datetime.now()
+    hour = now.hour % 12
+    minute = now.minute
+
+    # Use 4x supersampling for smooth anti-aliased lines
+    ss = 4
+    big = size * ss
+    image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    margin = size // 8
+
+    cx, cy = big // 2, big // 2
+    radius = int(big * 0.42)
+    ring_width = max(2, big // 16)
+
+    # Clock face ring
     draw.ellipse(
-        [margin, margin, size - margin, size - margin],
-        fill=color,
+        [cx - radius, cy - radius, cx + radius, cy + radius],
+        outline=color,
+        width=ring_width,
     )
+
+    # Hour tick marks
+    tick_outer = radius - ring_width // 2 - max(1, big // 64)
+    tick_inner_long = int(tick_outer * 0.72)
+    tick_inner_short = int(tick_outer * 0.84)
+    for i in range(12):
+        angle = math.radians(i * 30 - 90)
+        inner = tick_inner_long if i % 3 == 0 else tick_inner_short
+        x1 = cx + int(inner * math.cos(angle))
+        y1 = cy + int(inner * math.sin(angle))
+        x2 = cx + int(tick_outer * math.cos(angle))
+        y2 = cy + int(tick_outer * math.sin(angle))
+        w = max(2, big // 32) if i % 3 == 0 else max(1, big // 48)
+        draw.line([x1, y1, x2, y2], fill=color, width=w)
+
+    # "B" letter in the center
+    font_size = int(radius * 1.1)
+    try:
+        if platform.system() == "Darwin":
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+        elif platform.system() == "Windows":
+            font = ImageFont.truetype("segoeui.ttf", font_size)
+        else:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+    bbox = draw.textbbox((0, 0), "B", font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = cx - tw // 2 - bbox[0]
+    ty = cy - th // 2 - bbox[1]
+    draw.text((tx, ty), "B", fill=color, font=font)
+
+    # Downsample for smooth result
+    image = image.resize((size, size), Image.LANCZOS)
     return image
 
 
@@ -300,23 +342,13 @@ class TrayIcon:
         ), enabled=logged_in))
 
         # ── Dashboard link ─────────────────────────────────
-        items.append(Item("Show My Dashboard", self._handle_show_dashboard, enabled=logged_in))
+        items.append(Item("Show My Hours", self._handle_show_dashboard, enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 
-        # ── Running Project ─────────────────────────────────
-        items.append(Item("Running Project", None, enabled=False))
-        if self.model.current_project:
-            items.append(Item(f"  {self.model.current_project['name']}", None, enabled=False))
-            items.append(Item(f"  Stop ({self.model.hours_today})", self._handle_stop_project, enabled=logged_in))
-        else:
-            items.append(Item("  No project selected", None, enabled=False))
-
-        items.append(Item("─" * 20, None, enabled=False))
-
-        # ── Recent Projects ─────────────────────────────────
+        # ── Assigned Projects ───────────────────────────────
         if self.model.projects:
-            items.append(Item("Recent Projects", None, enabled=False))
+            items.append(Item("Assigned Projects", None, enabled=False))
             for proj in self.model.projects:
                 is_current = (
                     self.model.current_project is not None
@@ -331,12 +363,20 @@ class TrayIcon:
                     ),
                     enabled=logged_in and not is_current,
                 ))
+            if self.model.current_project:
+                items.append(Item(f"  Stop ({self.model.hours_today})", self._handle_stop_project, enabled=logged_in))
             items.append(Item("─" * 20, None, enabled=False))
 
         # ── End Break action ────────────────────────────────
         if self.model.on_break:
             items.append(Item("End Break", self._handle_end_break))
             items.append(Item("─" * 20, None, enabled=False))
+
+        # ── Pause / Resume toggle ──────────────────────────
+        if self.model.paused:
+            items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
+        else:
+            items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
         # ── Private Time toggle ─────────────────────────────
         if self.model.private_mode:
@@ -444,8 +484,7 @@ class TrayIcon:
                 self._handle_open_update,
             ))
 
-        if self.model.user_role in ("admin", "super-admin"):
-            items.append(Item("Quit", self._handle_quit))
+        items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
 
@@ -673,7 +712,7 @@ class TrayIcon:
         # Derive dashboard URL from API URL (e.g. https://app.betterflow.eu/api/agent -> https://app.betterflow.eu/dashboard)
         from urllib.parse import urlparse
         parsed = urlparse(config.api_url)
-        self.model.dashboard_url = f"{parsed.scheme}://{parsed.netloc}/dashboard"
+        self.model.dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
         self._update_menu()
 
     def set_state(self, state: TrayState, status_text: Optional[str] = None) -> None:
