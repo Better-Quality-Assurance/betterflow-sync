@@ -500,13 +500,18 @@ class SyncCoordinator:
             logger.debug(f"Failed to fetch trends: {e}")
 
     def reset_trends(self) -> None:
-        """Reset cached trends to placeholder values."""
+        """Reset cached trends and hours to placeholder values."""
+        self._hours_today_seconds = 0
+        self._hours_today_cache = "0h 0m"
         self._trends_cache = {
             "hours_this_week": "---",
             "hours_this_month": "---",
             "daily_avg_this_week": "---",
         }
-        self.tray.update_stats(**self._trends_cache)
+        self.tray.update_stats(
+            hours_today="0h 0m",
+            **self._trends_cache,
+        )
 
     def _expire_old_queue_events(self) -> None:
         """Remove queue events older than 30 days."""
@@ -1035,6 +1040,7 @@ class BetterFlowSyncApp:
         self.coordinator.logged_in = False
         self.coordinator.reset_trends()
         self.tray.set_user(None)
+        self.tray.set_projects([], None)
         logger.info("Logged out")
 
         self.coordinator.stop()
@@ -1050,6 +1056,9 @@ class BetterFlowSyncApp:
                 if state.logged_in:
                     self.coordinator.logged_in = True
                     self.tray.set_user(state.user_email, state.user_name, state.user_role)
+                    self.sync_engine.fetch_server_config()
+                    self.coordinator.fetch_projects()
+                    self.coordinator.fetch_categories()
                     self.coordinator.start()
                     first_name = (state.user_name or "").split()[0] if state.user_name else ""
                     greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
