@@ -599,6 +599,7 @@ class BetterFlowSyncApp:
             on_export_logs=self._on_export_logs,
             on_open_permissions=self._on_open_permissions,
             on_end_break=self._on_end_break,
+            on_cancel_login=self._on_cancel_login,
         )
         self.tray.set_config(self.config)
 
@@ -798,11 +799,19 @@ class BetterFlowSyncApp:
                     send_notification(greeting, _day_greeting())
                 else:
                     self.coordinator.logged_in = False
-                    self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
+                    error = state.error or "Login failed"
+                    self.tray.set_state(TrayState.ERROR, error)
+                    send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
             finally:
                 self._login_lock.release()
 
         threading.Thread(target=do_browser_login, daemon=True, name="login-thread").start()
+
+    def _on_cancel_login(self) -> None:
+        """Cancel an in-progress browser login flow."""
+        logger.info("Login cancelled by user")
+        self.login_manager.cancel_login()
+        self.tray.set_state(TrayState.ERROR, "Login cancelled")
 
     def _on_end_break(self) -> None:
         """Handle user ending break early from tray menu."""
@@ -1065,7 +1074,9 @@ class BetterFlowSyncApp:
                     send_notification(greeting, _day_greeting())
                 else:
                     self.coordinator.logged_in = False
-                    self._on_quit()
+                    error = state.error or "Login failed"
+                    self.tray.set_state(TrayState.ERROR, error)
+                    send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
             finally:
                 self._login_lock.release()
 

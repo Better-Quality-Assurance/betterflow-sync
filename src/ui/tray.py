@@ -229,6 +229,7 @@ class TrayIcon:
         on_export_logs: Optional[Callable[[], None]] = None,
         on_open_permissions: Optional[Callable[[], None]] = None,
         on_end_break: Optional[Callable[[], None]] = None,
+        on_cancel_login: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -245,6 +246,7 @@ class TrayIcon:
             on_export_logs: Callback to export logs to a zip file
             on_open_permissions: Callback to open system permission settings
             on_end_break: Callback when user ends break early
+            on_cancel_login: Callback when user cancels in-progress login
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -261,6 +263,7 @@ class TrayIcon:
         self._on_export_logs = on_export_logs
         self._on_open_permissions = on_open_permissions
         self._on_end_break = on_end_break
+        self._on_cancel_login = on_cancel_login
 
         self.model = TrayModel()
 
@@ -421,6 +424,9 @@ class TrayIcon:
         # ── Account ─────────────────────────────────────────
         if self.model.user_email:
             items.append(Item("Log Out", self._handle_logout))
+        elif self.model.state == TrayState.WAITING_AUTH:
+            items.append(Item("Cancel Login", self._handle_cancel_login))
+            items.append(Item("Retry Login", self._handle_login))
         else:
             items.append(Item("Login", self._handle_login))
 
@@ -478,6 +484,11 @@ class TrayIcon:
         """Handle login menu click."""
         if self._on_login:
             self._on_login()
+
+    def _handle_cancel_login(self, icon, item) -> None:
+        """Handle cancel login menu click."""
+        if self._on_cancel_login:
+            self._on_cancel_login()
 
     def _handle_open_permissions(self, icon, item) -> None:
         """Handle open permissions menu click."""
