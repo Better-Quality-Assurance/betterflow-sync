@@ -413,10 +413,9 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed",
                 )
 
-            # Use local active time tracking (more accurate for engaged work)
-            active_time = self.sync_engine.get_today_active_time()
-            self.tray.set_active_time(active_time)
+            # Fetch hours from server (source of truth after sync)
             self.tray.update_stats(
+                hours_today=self._fetch_hours_today(),
                 last_sync=datetime.now().strftime("%H:%M"),
                 queue_size=self.queue.size(),
             )
@@ -447,7 +446,7 @@ class SyncCoordinator:
             self._sync_lock.release()
 
     def _fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API."""
+        """Fetch today's tracked hours from API (source of truth)."""
         try:
             status = self.bf.get_status()
             total_seconds = int(
@@ -455,17 +454,14 @@ class SyncCoordinator:
                 .get("today_summary", {})
                 .get("total_seconds", 0)
             )
-            # Avoid UI regressions if backend summary is temporarily stale.
-            server_seconds = max(0, total_seconds)
-            if server_seconds >= self._hours_today_seconds:
-                self._hours_today_seconds = server_seconds
+            self._hours_today_seconds = max(0, total_seconds)
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             return self._hours_today_cache
         except Exception:
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
-        """Refresh tray hours from local active time tracker.
+        """Refresh tray hours from server.
 
         Always runs (even when paused/private) so the tray resets to
         ``0h 0m`` at midnight instead of showing yesterday's stale value.
@@ -475,11 +471,8 @@ class SyncCoordinator:
                 logger.debug("_refresh_hours: skipped (not logged in)")
                 return
 
-            # get_today_active_time() is read-only and handles day rollover,
-            # so we call it unconditionally to keep the display current.
-            active_time = self.sync_engine.get_today_active_time()
-            logger.debug(f"_refresh_hours: active_time={active_time}")
-            self.tray.set_active_time(active_time)
+            hours = self._fetch_hours_today()
+            self.tray.update_stats(hours_today=hours)
         except Exception as e:
             logger.warning(f"Failed to refresh tray hours: {e}")
 
