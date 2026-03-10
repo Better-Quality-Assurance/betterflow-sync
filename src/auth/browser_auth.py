@@ -196,7 +196,7 @@ class BrowserAuthFlow:
     6. Return code and code_verifier for token exchange
     """
 
-    TIMEOUT_SECONDS = 300  # 5 minutes
+    TIMEOUT_SECONDS = 120  # 2 minutes
 
     def __init__(self, authorize_url_base: str):
         """Initialize browser auth flow.

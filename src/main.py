@@ -44,11 +44,33 @@ except ImportError:
 
 # Import send_notification at module level so tests can patch src.main.send_notification
 try:
-    from .notifications import send_notification
+    from .notifications import send_notification, clear_notifications
 except ImportError:
-    from notifications import send_notification  # type: ignore[no-redef]
+    from notifications import send_notification, clear_notifications  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
+
+
+def _greeting() -> str:
+    """Return a time-of-day greeting."""
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Good morning"
+    elif hour < 17:
+        return "Good afternoon"
+    return "Good evening"
+
+
+def _day_greeting() -> str:
+    """Return a contextual sub-message based on day of week."""
+    day = datetime.now().weekday()  # 0=Mon … 6=Sun
+    if day == 0:
+        return "Have a productive week!"
+    elif day == 4:
+        return "Happy Friday!"
+    elif day >= 5:
+        return "Enjoy your weekend!"
+    return "Have a productive day!"
 
 # Resolve version string once (handles both str and module forms from PyInstaller)
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
@@ -91,10 +113,11 @@ class SyncCoordinator:
             "daily_avg_this_week": "---",
         }
 
-        # Flags set by the app layer
-        self.logged_in = False
-        self.paused_by_network = False
+        # Flags set by the app layer — protected by _state_lock
+        self._logged_in = False
+        self._paused_by_network = False
         self._on_break = False
+        self._state_lock = threading.Lock()
         self._break_lock = threading.Lock()
         self._pre_break_paused = False
         self._pre_break_private = False
@@ -102,6 +125,26 @@ class SyncCoordinator:
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
+
+    @property
+    def logged_in(self) -> bool:
+        with self._state_lock:
+            return self._logged_in
+
+    @logged_in.setter
+    def logged_in(self, value: bool) -> None:
+        with self._state_lock:
+            self._logged_in = value
+
+    @property
+    def paused_by_network(self) -> bool:
+        with self._state_lock:
+            return self._paused_by_network
+
+    @paused_by_network.setter
+    def paused_by_network(self, value: bool) -> None:
+        with self._state_lock:
+            self._paused_by_network = value
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
@@ -162,6 +205,13 @@ class SyncCoordinator:
                 id="permissions_check_job",
                 replace_existing=True,
             )
+        # Refresh clock icon every minute so hands move
+        self.scheduler.add_job(
+            self.tray._update_icon,
+            trigger=IntervalTrigger(seconds=60),
+            id="icon_refresh_job",
+            replace_existing=True,
+        )
         self.scheduler.start()
         logger.info(
             f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -196,9 +246,13 @@ class SyncCoordinator:
         with self._break_lock:
             if self._on_break:
                 return
+            # Don't start a break if tracking is already paused
+            if self.sync_engine.is_paused:
+                return
             self._on_break = True
-            # Capture current state before breaking so end_break can restore it
-            self._pre_break_paused = self.sync_engine.is_paused
+            # Capture private mode so end_break can restore it.
+            # _pre_break_paused is always False here (we just checked is_paused).
+            self._pre_break_paused = False
             self._pre_break_private = self.sync_engine.is_private
 
         self.sync_engine.pause()
@@ -288,8 +342,14 @@ class SyncCoordinator:
         """Fetch available projects from API and set on tray."""
         try:
             response = self.bf.get_projects()
-            projects = response.get("projects", [])
-            current_project = response.get("current_project")
+            logger.debug(f"Raw projects response: {response}")
+            data = response.get("data", {})
+            projects = data.get("projects", [])
+            current_project = data.get("current_project")
+            # Auto-select when there's exactly one project and none is active
+            if not current_project and len(projects) == 1:
+                current_project = projects[0]
+                logger.info(f"Auto-selected sole project: {current_project['name']}")
             self.tray.set_projects(projects, current_project=current_project)
             if current_project:
                 self.sync_engine.set_current_project(current_project)
@@ -319,22 +379,34 @@ class SyncCoordinator:
         """Check macOS Accessibility permission and update tray state."""
         try:
             granted = check_accessibility()
+            high_priority = (
+                TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
+                TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
+                TrayState.WAITING_AUTH,
+            )
             with self.tray.model.lock:
                 self.tray.model.needs_permissions = not granted
                 current_state = self.tray.model.state
+                if not granted:
+                    if current_state not in high_priority:
+                        self.tray.model.state = TrayState.NEEDS_PERMISSIONS
+                        self.tray.model.status_text = "Permissions Required"
+                        should_update_icon = True
+                    else:
+                        should_update_icon = False
+                else:
+                    if current_state == TrayState.NEEDS_PERMISSIONS:
+                        self.tray.model.state = TrayState.SYNCING
+                        should_update_icon = True
+                    else:
+                        should_update_icon = False
+            if should_update_icon:
+                self.tray._update_icon()
+                self.tray._update_menu()
             if not granted:
-                high_priority = (
-                    TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
-                    TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
-                    TrayState.WAITING_AUTH,
-                )
-                if current_state not in high_priority:
-                    self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                 logger.debug("macOS permissions missing")
-            else:
-                if current_state == TrayState.NEEDS_PERMISSIONS:
-                    self.tray.set_state(TrayState.SYNCING)
-                    logger.info("macOS permissions granted — clearing warning")
+            elif should_update_icon:
+                logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
             logger.debug(f"Permissions check failed: {e}")
 
@@ -345,10 +417,12 @@ class SyncCoordinator:
             return
         try:
             if self.sync_engine.is_private:
+                self.tray.set_state(TrayState.PRIVATE)
                 return
 
             with self._break_lock:
                 if self._on_break:
+                    self.tray.set_state(TrayState.ON_BREAK)
                     return
 
             if self.paused_by_network:
@@ -389,10 +463,9 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed",
                 )
 
-            # Use local active time tracking (more accurate for engaged work)
-            active_time = self.sync_engine.get_today_active_time()
-            self.tray.set_active_time(active_time)
+            # Fetch hours from server (source of truth after sync)
             self.tray.update_stats(
+                hours_today=self._fetch_hours_today(),
                 last_sync=datetime.now().strftime("%H:%M"),
                 queue_size=self.queue.size(),
             )
@@ -423,7 +496,7 @@ class SyncCoordinator:
             self._sync_lock.release()
 
     def _fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API."""
+        """Fetch today's tracked hours from API (source of truth)."""
         try:
             status = self.bf.get_status()
             total_seconds = int(
@@ -431,17 +504,14 @@ class SyncCoordinator:
                 .get("today_summary", {})
                 .get("total_seconds", 0)
             )
-            # Avoid UI regressions if backend summary is temporarily stale.
-            server_seconds = max(0, total_seconds)
-            if server_seconds >= self._hours_today_seconds:
-                self._hours_today_seconds = server_seconds
+            self._hours_today_seconds = max(0, total_seconds)
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             return self._hours_today_cache
         except Exception:
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
-        """Refresh tray hours from local active time tracker.
+        """Refresh tray hours from server.
 
         Always runs (even when paused/private) so the tray resets to
         ``0h 0m`` at midnight instead of showing yesterday's stale value.
@@ -451,11 +521,8 @@ class SyncCoordinator:
                 logger.debug("_refresh_hours: skipped (not logged in)")
                 return
 
-            # get_today_active_time() is read-only and handles day rollover,
-            # so we call it unconditionally to keep the display current.
-            active_time = self.sync_engine.get_today_active_time()
-            logger.debug(f"_refresh_hours: active_time={active_time}")
-            self.tray.set_active_time(active_time)
+            hours = self._fetch_hours_today()
+            self.tray.update_stats(hours_today=hours)
         except Exception as e:
             logger.warning(f"Failed to refresh tray hours: {e}")
 
@@ -476,13 +543,18 @@ class SyncCoordinator:
             logger.debug(f"Failed to fetch trends: {e}")
 
     def reset_trends(self) -> None:
-        """Reset cached trends to placeholder values."""
+        """Reset cached trends and hours to placeholder values."""
+        self._hours_today_seconds = 0
+        self._hours_today_cache = "0h 0m"
         self._trends_cache = {
             "hours_this_week": "---",
             "hours_this_month": "---",
             "daily_avg_this_week": "---",
         }
-        self.tray.update_stats(**self._trends_cache)
+        self.tray.update_stats(
+            hours_today="0h 0m",
+            **self._trends_cache,
+        )
 
     def _expire_old_queue_events(self) -> None:
         """Remove queue events older than 30 days."""
@@ -570,8 +642,10 @@ class BetterFlowSyncApp:
             on_export_logs=self._on_export_logs,
             on_open_permissions=self._on_open_permissions,
             on_end_break=self._on_end_break,
+            on_cancel_login=self._on_cancel_login,
         )
         self.tray.set_config(self.config)
+        self.tray.model.app_version = _VERSION
 
         # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(
@@ -594,8 +668,11 @@ class BetterFlowSyncApp:
 
         # State
         self._shutdown_done = False
+        self._shutdown_lock = threading.Lock()
         self._shutdown_event = threading.Event()
+        self._pause_state_lock = threading.Lock()
         self._user_paused = False
+        self._pre_sleep_private = False
         self._login_lock = threading.Lock()
 
     def run(self) -> None:
@@ -616,6 +693,17 @@ class BetterFlowSyncApp:
                 logger.info("Setup wizard cancelled — exiting")
                 return
             self.config.setup_complete = True
+            # Ensure auto-start is enabled after first setup
+            if not self.config.auto_start:
+                try:
+                    try:
+                        from .autostart import set_auto_start
+                    except ImportError:
+                        from autostart import set_auto_start
+                    if set_auto_start(True):
+                        self.config.auto_start = True
+                except Exception:
+                    pass
             self.config.save()
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
@@ -635,17 +723,20 @@ class BetterFlowSyncApp:
 
         if state.logged_in:
             self.coordinator.logged_in = True
-            self.tray.set_user(state.user_email, state.user_name)
+            self.tray.set_user(state.user_email, state.user_name, state.user_role)
             self.sync_engine.fetch_server_config()
             self.coordinator.fetch_projects()
             self.coordinator.fetch_categories()
             self._check_stale_session()
             self.coordinator.start()
+            first_name = (state.user_name or "").split()[0] if state.user_name else ""
+            greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
+            send_notification(greeting, _day_greeting())
             # Check permissions after scheduler starts (non-blocking, 5s delay)
             self.coordinator.scheduler.add_job(
                 self._check_permissions_initial,
                 "date",
-                run_date=datetime.now() + timedelta(seconds=5),
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
                 id="permissions_initial_check",
                 replace_existing=True,
             )
@@ -655,6 +746,8 @@ class BetterFlowSyncApp:
 
         # Start system event listeners (non-critical: don't let failures prevent tray)
         try:
+            from urllib.parse import urlparse
+            api_host = urlparse(self.config.api_url).hostname or ""
             start_system_event_listener(
                 on_sleep=self._on_system_sleep,
                 on_wake=self._on_system_wake,
@@ -662,6 +755,7 @@ class BetterFlowSyncApp:
                 on_network_change=self._on_network_change,
                 on_screen_lock=self._on_screen_lock,
                 on_screen_unlock=self._on_screen_unlock,
+                reachability_host=api_host,
             )
         except Exception:
             logger.exception("Failed to start system event listeners")
@@ -690,7 +784,9 @@ class BetterFlowSyncApp:
         if sys.platform != "darwin":
             return
         self.coordinator._check_permissions()
-        if self.tray.model.needs_permissions:
+        with self.tray.model.lock:
+            needs_perms = self.tray.model.needs_permissions
+        if needs_perms:
             send_notification(
                 "BetterFlow Sync",
                 "Grant Accessibility permission in "
@@ -744,19 +840,30 @@ class BetterFlowSyncApp:
                 state = self.login_manager.login_via_browser()
                 if state.logged_in:
                     self.coordinator.logged_in = True
-                    self.tray.set_user(state.user_email, state.user_name)
+                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
                     self.sync_engine.fetch_server_config()
                     self.coordinator.fetch_projects()
                     self.coordinator.fetch_categories()
                     if not self.coordinator.scheduler.running:
                         self.coordinator.start()
+                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                    send_notification(greeting, _day_greeting())
                 else:
                     self.coordinator.logged_in = False
-                    self.tray.set_state(TrayState.ERROR, state.error or "Login failed")
+                    error = state.error or "Login failed"
+                    self.tray.set_state(TrayState.ERROR, error)
+                    send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
             finally:
                 self._login_lock.release()
 
         threading.Thread(target=do_browser_login, daemon=True, name="login-thread").start()
+
+    def _on_cancel_login(self) -> None:
+        """Cancel an in-progress browser login flow."""
+        logger.info("Login cancelled by user")
+        self.login_manager.cancel_login()
+        self.tray.set_state(TrayState.ERROR, "Login cancelled")
 
     def _on_end_break(self) -> None:
         """Handle user ending break early from tray menu."""
@@ -764,23 +871,27 @@ class BetterFlowSyncApp:
 
     def _on_pause(self) -> None:
         """Handle pause action."""
-        # If on break, end the break silently — user intent (pause) takes over
-        if self.coordinator.is_on_break:
-            self.coordinator.end_break(silent=True)
-        self._user_paused = True
+        with self._pause_state_lock:
+            self._user_paused = True
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_paused(True)
+        # End break after pausing — prevents brief resume window where events could sync
+        if self.coordinator.is_on_break:
+            self.coordinator.end_break(silent=True)
         self.reminder_manager.on_tracking_stopped()
+        send_notification("Tracking Paused", "Your activity is no longer being recorded.", sound=False)
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
         """Handle resume action."""
-        self._user_paused = False
+        with self._pause_state_lock:
+            self._user_paused = False
         self.coordinator.paused_by_network = False
         self.sync_engine.resume()
         self.tray.set_paused(False)
         self.reminder_manager.on_tracking_started()
+        send_notification("Tracking Resumed", "Your activity is being recorded again.", sound=False)
         logger.info("Tracking resumed")
 
     def _on_project_change(self, project: Optional[dict]) -> None:
@@ -798,11 +909,13 @@ class BetterFlowSyncApp:
             self.sync_engine.set_private_mode(True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
+            send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
         else:
             logger.info("Private time ended — recording resumed")
             self.sync_engine.set_private_mode(False)
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
+            send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
@@ -811,6 +924,8 @@ class BetterFlowSyncApp:
 
     def _on_system_sleep(self) -> None:
         """Handle system sleep / lid close."""
+        with self._pause_state_lock:
+            self._pre_sleep_private = self.sync_engine.is_private
         self.coordinator.paused_by_network = False
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
@@ -821,11 +936,18 @@ class BetterFlowSyncApp:
         """Handle system wake from sleep."""
         # Drop stale TCP connections from sleep (N3)
         self.bf.reset_session()
-        if self._user_paused:
+        with self._pause_state_lock:
+            user_paused = self._user_paused
+            pre_sleep_private = self._pre_sleep_private
+        if user_paused:
             logger.info("System wake — staying paused (user-initiated pause active)")
             return
         if self.coordinator.is_on_break:
             logger.info("System wake — staying on break")
+            return
+        if pre_sleep_private:
+            logger.info("System wake — restoring private time")
+            self.tray.set_state(TrayState.PRIVATE)
             return
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
@@ -840,6 +962,8 @@ class BetterFlowSyncApp:
 
     def _on_screen_lock(self) -> None:
         """Handle screen lock — treat as AFK."""
+        with self._pause_state_lock:
+            self._pre_sleep_private = self.sync_engine.is_private
         logger.info("Screen locked — pausing tracking")
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
@@ -847,17 +971,25 @@ class BetterFlowSyncApp:
 
     def _on_screen_unlock(self) -> None:
         """Handle screen unlock — resume tracking."""
-        if self._user_paused:
+        with self._pause_state_lock:
+            user_paused = self._user_paused
+            pre_sleep_private = self._pre_sleep_private
+        if user_paused:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
         if self.coordinator.is_on_break:
             logger.info("Screen unlocked — staying on break")
+            return
+        if pre_sleep_private:
+            logger.info("Screen unlocked — restoring private time")
+            self.tray.set_state(TrayState.PRIVATE)
             return
         logger.info("Screen unlocked — resuming tracking")
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
         self.coordinator.trigger_sync("unlock_sync")
+        send_notification("Welcome back!", _day_greeting(), sound=False)
 
     def _on_network_change(self, is_online: bool) -> None:
         """Handle network connectivity change."""
@@ -979,6 +1111,9 @@ class BetterFlowSyncApp:
             import time
             time.sleep(0.1)
 
+        # Clear notifications from previous session
+        clear_notifications()
+
         # Cancel any active break before stopping (prevents stuck break state on re-login)
         if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
@@ -989,6 +1124,7 @@ class BetterFlowSyncApp:
         self.coordinator.logged_in = False
         self.coordinator.reset_trends()
         self.tray.set_user(None)
+        self.tray.set_projects([], None)
         logger.info("Logged out")
 
         self.coordinator.stop()
@@ -996,14 +1132,28 @@ class BetterFlowSyncApp:
         self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
         def do_relogin():
-            state = self.login_manager.login_via_browser()
-            if state.logged_in:
-                self.coordinator.logged_in = True
-                self.tray.set_user(state.user_email, state.user_name)
-                self.coordinator.start()
-            else:
-                self.coordinator.logged_in = False
-                self._on_quit()
+            if not self._login_lock.acquire(blocking=False):
+                logger.debug("Login already in progress, skipping relogin")
+                return
+            try:
+                state = self.login_manager.login_via_browser()
+                if state.logged_in:
+                    self.coordinator.logged_in = True
+                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
+                    self.sync_engine.fetch_server_config()
+                    self.coordinator.fetch_projects()
+                    self.coordinator.fetch_categories()
+                    self.coordinator.start()
+                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                    send_notification(greeting, _day_greeting())
+                else:
+                    self.coordinator.logged_in = False
+                    error = state.error or "Login failed"
+                    self.tray.set_state(TrayState.ERROR, error)
+                    send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
+            finally:
+                self._login_lock.release()
 
         threading.Thread(target=do_relogin, daemon=True, name="relogin-thread").start()
 
@@ -1023,11 +1173,13 @@ class BetterFlowSyncApp:
 
     def _shutdown(self) -> None:
         """Shutdown the application. Safe to call multiple times."""
-        if self._shutdown_done:
-            return
-        self._shutdown_done = True
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
         logger.info("Shutting down...")
 
+        clear_notifications()
         self.coordinator.stop()
         self.sync_engine.shutdown()
         if self.window_watcher:

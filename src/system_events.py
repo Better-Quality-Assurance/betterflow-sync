@@ -19,6 +19,7 @@ _system = platform.system()
 # Store observer refs for cleanup (M5)
 _registered_observers: list[tuple] = []  # [(center, observer), ...]
 _observers_lock = threading.Lock()
+_stop_event = threading.Event()  # Signal run loops to exit on cleanup
 
 
 def start_system_event_listener(
@@ -28,19 +29,21 @@ def start_system_event_listener(
     on_network_change: Callable,  # fn(is_online: bool)
     on_screen_lock: Callable = None,   # fn() — screen locked
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
+    reachability_host: str = "",  # Host to check for network reachability
 ) -> None:
     """Start platform-specific system event listeners.
 
     All listeners run on daemon threads and die automatically on process exit.
     """
+    host = reachability_host or "app.betterflow.eu"
     if _system == "Darwin":
         _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
-        _start_macos_network_listener(on_network_change)
+        _start_macos_network_listener(on_network_change, host=host)
         if on_screen_lock or on_screen_unlock:
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
     elif _system == "Windows":
         _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
-        _start_network_poller(on_network_change)
+        _start_network_poller(on_network_change, host=host)
     else:
         logger.warning(f"System events not supported on {_system}")
 
@@ -119,7 +122,14 @@ def _start_macos_power_listener(
 
         logger.debug("macOS power event listener started")
         try:
-            AppHelper.runConsoleEventLoop()
+            # Use interruptible run loop so cleanup_observers() can stop us
+            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+            loop = NSRunLoop.currentRunLoop()
+            while not _stop_event.is_set():
+                loop.runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
+                )
         finally:
             center.removeObserver_(observer)
 
@@ -173,7 +183,13 @@ def _start_macos_screen_lock_listener(
 
         logger.debug("macOS screen lock listener started")
         try:
-            AppHelper.runConsoleEventLoop()
+            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+            loop = NSRunLoop.currentRunLoop()
+            while not _stop_event.is_set():
+                loop.runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
+                )
         finally:
             center.removeObserver_(observer)
 
@@ -182,7 +198,8 @@ def _start_macos_screen_lock_listener(
 
 
 def cleanup_observers() -> None:
-    """Remove all registered macOS notification observers (M5)."""
+    """Remove all registered macOS notification observers and stop run loops (M5)."""
+    _stop_event.set()
     with _observers_lock:
         for center, observer in _registered_observers:
             try:
@@ -253,7 +270,7 @@ def _start_macos_network_listener(
         logger.debug("macOS network reachability listener started")
         # Use interruptible run loop instead of blocking loop.run()
         from Foundation import NSDate
-        while True:
+        while not _stop_event.is_set():
             loop.runMode_beforeDate_(
                 NSDefaultRunLoopMode,
                 NSDate.dateWithTimeIntervalSinceNow_(5.0),

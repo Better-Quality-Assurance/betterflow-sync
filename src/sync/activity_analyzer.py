@@ -3,7 +3,7 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -215,6 +215,8 @@ class FraudSignalDetector:
             extra_metrics={
                 "unique_apps": len(self._unique_apps),
                 "keystroke_variance": round(ks_cv, 4) if ks_cv is not None else None,
+                "mouse_only_streak": self._mouse_only_streak,
+                "click_keystroke_ratio": round(self._total_clicks / max(self._total_presses, 1), 2),
             },
         )
 
@@ -368,7 +370,9 @@ class ActivityAnalyzer:
         self._input_events: list[AWEvent] = []
         self._window_events: list[AWEvent] = []
         self._fraud_detector = FraudSignalDetector(config=fraud_config)
-        self._last_fraud_window_count: int = 0
+        self._fraud_seq: int = 0  # monotonic counter for fraud window dedup
+        self._last_fraud_seq: int = 0
+        self._fraud_reset_date: Optional[date] = None
 
     def update_thresholds(self, thresholds: EngagementThresholds) -> None:
         """Update thresholds from server config.
@@ -409,6 +413,8 @@ class ActivityAnalyzer:
         # Record timestamps for fraud regularity analysis
         for e in new_events:
             self._fraud_detector.record_input_timestamp(e.timestamp)
+        if new_events:
+            self._fraud_seq += 1
 
         # Prune old events (older than 2x window to allow for lookback)
         cutoff = datetime.now(timezone.utc) - timedelta(
@@ -435,6 +441,8 @@ class ActivityAnalyzer:
         existing_ids = {e.id for e in self._window_events}
         new_events = [e for e in events if e.id not in existing_ids]
         self._window_events.extend(new_events)
+        if new_events:
+            self._fraud_seq += 1
 
         # Prune old events (older than 2x window to allow for lookback)
         cutoff = datetime.now(timezone.utc) - timedelta(
@@ -483,15 +491,22 @@ class ActivityAnalyzer:
         """
         metrics = self._compute_metrics(timestamp)
 
+        # Reset fraud accumulators at day boundary to prevent multi-day dilution
+        today = timestamp.astimezone().date() if timestamp.tzinfo else date.today()
+        if self._fraud_reset_date is not None and today != self._fraud_reset_date:
+            self._fraud_detector.clear()
+            self._last_fraud_seq = 0
+            logger.debug(f"Fraud detector reset for new day: {today}")
+        self._fraud_reset_date = today
+
         # Record this window's metrics into the fraud detector.
-        # Use a simple counter to avoid recording the same conceptual window twice.
-        current_window_count = len(self._window_events) + len(self._input_events)
-        if current_window_count != self._last_fraud_window_count:
+        # Use monotonic sequence counter to avoid recording the same window twice.
+        if self._fraud_seq != self._last_fraud_seq:
             self._fraud_detector.record_window_metrics(metrics, app=app)
             # Track active time for app diversity checks (inside guard to avoid double-counting)
             if metrics.is_engaged(self._thresholds):
                 self._fraud_detector.add_active_time(self._thresholds.window_minutes * 60)
-            self._last_fraud_window_count = current_window_count
+            self._last_fraud_seq = self._fraud_seq
 
         return self._fraud_detector.assess()
 
@@ -566,4 +581,4 @@ class ActivityAnalyzer:
         self._input_events.clear()
         self._window_events.clear()
         self._fraud_detector.clear()
-        self._last_fraud_window_count = 0
+        self._last_fraud_seq = 0

@@ -23,6 +23,8 @@ class StoredCredentials:
     api_token: str
     device_id: str
     user_email: str
+    user_name: str = ""
+    user_role: str = "user"
 
     def to_json(self) -> str:
         return json.dumps(
@@ -30,6 +32,8 @@ class StoredCredentials:
                 "api_token": self.api_token,
                 "device_id": self.device_id,
                 "user_email": self.user_email,
+                "user_name": self.user_name,
+                "user_role": self.user_role,
             }
         )
 
@@ -40,6 +44,8 @@ class StoredCredentials:
             api_token=parsed["api_token"],
             device_id=parsed["device_id"],
             user_email=parsed["user_email"],
+            user_name=parsed.get("user_name", ""),
+            user_role=parsed.get("user_role", "user"),
         )
 
 

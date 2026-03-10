@@ -109,7 +109,8 @@ def _download_aw_binaries(install_dir: str) -> bool:
 
     tmp_zip = None
     try:
-        tmp_zip = tempfile.mktemp(suffix=".zip")
+        fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
         urllib.request.urlretrieve(url, tmp_zip)
 
         size_mb = os.path.getsize(tmp_zip) / (1024 * 1024)
