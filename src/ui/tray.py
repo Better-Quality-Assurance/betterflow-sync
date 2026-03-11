@@ -391,6 +391,8 @@ class TrayIcon:
                 "break_interval_hours": self.model.break_interval_hours,
                 "private_reminders_enabled": self.model.private_reminders_enabled,
                 "private_interval_minutes": self.model.private_interval_minutes,
+                "auto_categorize": self.model.auto_categorize,
+                "track_display_info": self.model.track_display_info,
             }
 
     def _create_menu(self) -> pystray.Menu:

@@ -488,14 +488,20 @@ class TestSyncCoordinatorBreak:
         self.tray.set_state.assert_called_with(TrayState.PAUSED)
 
     def test_end_break_restores_private_state(self):
-        """end_break should not resume if private mode was active before break."""
+        """end_break should resume the engine then re-enable private mode.
+
+        start_break() pauses the engine before enabling private mode, so
+        end_break() must un-pause it (resume) before re-applying private mode.
+        This ensures both flags are consistent: paused=False, private=True.
+        """
         self.coordinator._on_break = True
         self.coordinator._pre_break_paused = False
         self.coordinator._pre_break_private = True
 
         self.coordinator.end_break()
 
-        self.sync_engine.resume.assert_not_called()
+        self.sync_engine.resume.assert_called_once()
+        self.sync_engine.set_private_mode.assert_called_once_with(True)
         self.tray.set_state.assert_called_with(TrayState.PRIVATE)
 
     def test_end_break_silent_no_notification(self):

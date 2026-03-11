@@ -134,8 +134,10 @@ def _clear_windows() -> None:
         "$history = [Windows.UI.Notifications.ToastNotificationManager]::History; "
         "$history.Clear('BetterFlow Sync')"
     )
-    subprocess.run(
+    result = subprocess.run(
         ["powershell", "-Command", ps_script],
         capture_output=True,
         timeout=10,
     )
+    if result.returncode != 0:
+        logger.debug(f"[notifications] _clear_windows failed (rc={result.returncode}): {result.stderr.decode(errors='replace').strip()}")

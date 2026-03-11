@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -309,6 +310,10 @@ class SyncCoordinator:
 
         # Restore pre-break state instead of blindly resuming
         if pre_break_private:
+            # Engine was paused by start_break(); un-pause it then re-enable private
+            # mode so both flags are consistent (paused=False, private=True).
+            self.sync_engine.resume()
+            self.sync_engine.set_private_mode(True)
             self.tray.set_state(TrayState.PRIVATE)
         elif pre_break_paused:
             self.tray.set_state(TrayState.PAUSED)
@@ -1112,9 +1117,9 @@ class BetterFlowSyncApp:
         (main thread on macOS) is never blocked for more than a few ms.
         """
         def _do_logout() -> None:
-            # Acquire login lock first to serialize with any concurrent login attempt.
-            # Without this, a concurrent _on_login thread could start the coordinator
-            # between our shutdown() and stop() calls.
+            # Phase 1 — shutdown (lock held).
+            # Acquire login lock to prevent a concurrent _on_login thread from
+            # starting the coordinator between our stop() and start() calls.
             if not self._login_lock.acquire(blocking=True, timeout=15.0):
                 logger.warning("Logout aborted: could not acquire login lock within 15s")
                 return
@@ -1142,25 +1147,30 @@ class BetterFlowSyncApp:
 
                 self.coordinator.stop()
                 self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
-
-                state = self.login_manager.login_via_browser()
-                if state.logged_in:
-                    self.coordinator.logged_in = True
-                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
-                    self.sync_engine.fetch_server_config()
-                    self.coordinator.fetch_projects()
-                    self.coordinator.fetch_categories()
-                    self.coordinator.start()
-                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
-                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
-                    send_notification(greeting, _day_greeting())
-                else:
-                    self.coordinator.logged_in = False
-                    error = state.error or "Login failed"
-                    self.tray.set_state(TrayState.ERROR, error)
-                    send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
             finally:
+                # Release lock before the browser auth wait (up to 120s).
+                # The tray is now in WAITING_AUTH state so no login button is
+                # visible and no concurrent _on_login thread can be triggered.
                 self._login_lock.release()
+
+            # Phase 2 — browser auth (lock NOT held; at most one flow can run
+            # because the tray state prevents the user from clicking Login again).
+            state = self.login_manager.login_via_browser()
+            if state.logged_in:
+                self.coordinator.logged_in = True
+                self.tray.set_user(state.user_email, state.user_name, state.user_role)
+                self.sync_engine.fetch_server_config()
+                self.coordinator.fetch_projects()
+                self.coordinator.fetch_categories()
+                self.coordinator.start()
+                first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                send_notification(greeting, _day_greeting())
+            else:
+                self.coordinator.logged_in = False
+                error = state.error or "Login failed"
+                self.tray.set_state(TrayState.ERROR, error)
+                send_notification("Login Failed", f"{error}. Use the tray menu to retry.")
 
         threading.Thread(target=_do_logout, daemon=True, name="logout-thread").start()
 
