@@ -99,8 +99,10 @@ class SyncEngine:
         # Bounded LRU: evicts oldest on every insert once at capacity.
         self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
         self._SENT_CACHE_MAX = 5_000
-        # Track original AW durations for gap-filled events to prevent re-send
-        self._gap_filled_originals: dict[int, float] = {}
+        # Track original AW durations for gap-filled events to prevent re-send.
+        # Bounded LRU: evicts oldest once at capacity (same pattern as _sent_cache).
+        self._gap_filled_originals: OrderedDict[int, float] = OrderedDict()
+        self._GAP_ORIGINALS_MAX = 5_000
 
         # Thread safety: protects cross-thread mutable state
         self._state_lock = threading.Lock()
@@ -569,6 +571,9 @@ class SyncEngine:
             # dedup check sees original→original (unchanged) and skips.
             # The gap-filled event is already sent with extended duration.
             self._gap_filled_originals[current.id] = old_duration
+            self._gap_filled_originals.move_to_end(current.id)
+            if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
+                self._gap_filled_originals.popitem(last=False)
             filled += 1
             logger.info(
                 f"Filling {gap_seconds:.1f}s window gap: event {current.id} "

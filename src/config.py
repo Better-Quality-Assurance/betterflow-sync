@@ -336,9 +336,16 @@ class Config:
 
         data = asdict(self)
         tmp_file = config_file.with_suffix(".tmp")
-        with open(tmp_file, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_file, config_file)
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_file, config_file)
+        except Exception:
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         logger.info(f"Config saved to {config_file}")
 
     @staticmethod

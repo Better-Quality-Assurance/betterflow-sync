@@ -181,8 +181,12 @@ class AWClient:
         }
 
         with self._buckets_lock:
+            # Re-check in case another thread populated the cache while we fetched
+            now2 = time.monotonic()
+            if self._buckets_cache is not None and (now2 - self._buckets_cache_time) < self._buckets_cache_ttl:
+                return self._buckets_cache
             self._buckets_cache = result
-            self._buckets_cache_time = time.monotonic()
+            self._buckets_cache_time = now2
             return result
 
     def get_bucket(self, bucket_id: str) -> Optional[AWBucket]:

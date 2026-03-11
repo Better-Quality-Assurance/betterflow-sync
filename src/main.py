@@ -207,7 +207,7 @@ class SyncCoordinator:
             )
         # Refresh clock icon every minute so hands move
         self.scheduler.add_job(
-            self.tray._update_icon,
+            self.tray.tick_clock,
             trigger=IntervalTrigger(seconds=60),
             id="icon_refresh_job",
             replace_existing=True,
@@ -243,17 +243,21 @@ class SyncCoordinator:
 
     def start_break(self) -> None:
         """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
+        # Read engine state BEFORE acquiring _break_lock to preserve lock ordering.
+        # SyncEngine._state_lock must never be acquired while _break_lock is held.
+        already_paused = self.sync_engine.is_paused
+        pre_break_private = self.sync_engine.is_private
         with self._break_lock:
             if self._on_break:
                 return
             # Don't start a break if tracking is already paused
-            if self.sync_engine.is_paused:
+            if already_paused:
                 return
             self._on_break = True
             # Capture private mode so end_break can restore it.
             # _pre_break_paused is always False here (we just checked is_paused).
             self._pre_break_paused = False
-            self._pre_break_private = self.sync_engine.is_private
+            self._pre_break_private = pre_break_private
 
         self.sync_engine.pause()
         duration = self.config.reminders.break_duration_minutes
@@ -349,7 +353,7 @@ class SyncCoordinator:
             # Auto-select when there's exactly one project and none is active
             if not current_project and len(projects) == 1:
                 current_project = projects[0]
-                logger.info(f"Auto-selected sole project: {current_project['name']}")
+                logger.info(f"Auto-selected sole project: {current_project.get('name', '<unnamed>')}")
             self.tray.set_projects(projects, current_project=current_project)
             if current_project:
                 self.sync_engine.set_current_project(current_project)
@@ -919,6 +923,9 @@ class BetterFlowSyncApp:
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
+        if not self.coordinator.scheduler.running:
+            logger.debug("Sync Now ignored: scheduler not running (not logged in?)")
+            return
         logger.info("Manual sync triggered")
         self.coordinator.trigger_sync()
 
@@ -1101,37 +1108,35 @@ class BetterFlowSyncApp:
     def _on_logout(self) -> None:
         """Handle logout action.
 
-        Waits for any in-flight sync to finish before stopping the
-        coordinator, avoiding a race between sync writes and logout.
+        All work is offloaded to a background thread so the tray callback
+        (main thread on macOS) is never blocked for more than a few ms.
         """
-        # Wait for any in-progress sync to finish (up to 10s)
-        for _ in range(100):
-            if not self.coordinator.sync_in_progress:
-                break
-            import time
-            time.sleep(0.1)
+        def _do_logout() -> None:
+            # Wait for any in-progress sync to finish (up to 10s)
+            deadline = time.monotonic() + 10.0
+            while self.coordinator.sync_in_progress and time.monotonic() < deadline:
+                time.sleep(0.1)
 
-        # Clear notifications from previous session
-        clear_notifications()
+            # Clear notifications from previous session
+            clear_notifications()
 
-        # Cancel any active break before stopping (prevents stuck break state on re-login)
-        if self.coordinator.is_on_break:
-            self.coordinator.end_break(silent=True)
+            # Cancel any active break before stopping (prevents stuck break state on re-login)
+            if self.coordinator.is_on_break:
+                self.coordinator.end_break(silent=True)
 
-        # End server session before stopping
-        self.sync_engine.shutdown()
-        self.login_manager.logout()
-        self.coordinator.logged_in = False
-        self.coordinator.reset_trends()
-        self.tray.set_user(None)
-        self.tray.set_projects([], None)
-        logger.info("Logged out")
+            # End server session before stopping
+            self.sync_engine.shutdown()
+            self.login_manager.logout()
+            self.coordinator.logged_in = False
+            self.coordinator.reset_trends()
+            self.tray.set_user(None)
+            self.tray.set_projects([], None)
+            logger.info("Logged out")
 
-        self.coordinator.stop()
+            self.coordinator.stop()
 
-        self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
 
-        def do_relogin():
             if not self._login_lock.acquire(blocking=False):
                 logger.debug("Login already in progress, skipping relogin")
                 return
@@ -1155,7 +1160,7 @@ class BetterFlowSyncApp:
             finally:
                 self._login_lock.release()
 
-        threading.Thread(target=do_relogin, daemon=True, name="relogin-thread").start()
+        threading.Thread(target=_do_logout, daemon=True, name="logout-thread").start()
 
     def _on_quit(self) -> None:
         """Handle quit action."""

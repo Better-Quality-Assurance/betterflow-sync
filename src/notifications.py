@@ -2,6 +2,7 @@
 
 import logging
 import platform
+import re
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,6 @@ def _send_windows(title: str, message: str) -> None:
     """Send toast notification via PowerShell on Windows."""
     # Sanitize for PowerShell single-quoted string literals:
     # strip control chars, limit length, escape single quotes.
-    import re
     safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)[:200].replace("'", "''")
     safe_message = re.sub(r'[\x00-\x1f\x7f]', '', message)[:500].replace("'", "''")
 
@@ -114,11 +114,16 @@ def _send_windows(title: str, message: str) -> None:
         "[Windows.UI.Notifications.ToastNotificationManager]::"
         "CreateToastNotifier('BetterFlow Sync').Show($toast)"
     )
-    subprocess.run(
+    result = subprocess.run(
         ["powershell", "-Command", ps_script],
         capture_output=True,
         timeout=10,
     )
+    if result.returncode != 0:
+        logger.debug(
+            f"PowerShell notification failed (exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace')[:200]}"
+        )
 
 
 def _clear_windows() -> None:
