@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import platform
+import subprocess
 import sys
 import threading
 import time
@@ -101,7 +102,6 @@ class TrayModel:
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
-        self.app_version: str = ""
 
         # Reminder preferences
         self.break_reminders_enabled: bool = True
@@ -385,7 +385,6 @@ class TrayIcon:
                 "update_version": self.model.update_version,
                 "update_url": self.model.update_url,
                 "dashboard_url": self.model.dashboard_url,
-                "app_version": self.model.app_version,
                 "company_name": self.model.company_name,
                 "config_file_path": self.model.config_file_path,
                 "break_reminders_enabled": self.model.break_reminders_enabled,
@@ -813,7 +812,6 @@ class TrayIcon:
             self._on_export_logs()
 
     def _handle_open_config(self, icon, item) -> None:
-        import subprocess
         with self.model.lock:
             path = self.model.config_file_path
         if not path:

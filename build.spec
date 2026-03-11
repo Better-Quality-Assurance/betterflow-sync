@@ -77,6 +77,7 @@ hiddenimports = [
     "autostart",
     "display_info",
     "sync.macos_window_watcher",
+    "_build_info",  # Generated at build time by the spec preamble
 ]
 
 a = Analysis(

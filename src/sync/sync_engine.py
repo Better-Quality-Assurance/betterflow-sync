@@ -425,7 +425,8 @@ class SyncEngine:
                 continue
             # Check if this event was gap-filled on a prior cycle —
             # AW returns original duration but we already sent the extended one
-            orig = self._gap_filled_originals.get(event.id)
+            with self._cache_lock:
+                orig = self._gap_filled_originals.get(event.id)
             if orig is not None and abs(event.duration - orig) < 0.5:
                 stats.events_filtered += 1
                 continue
@@ -570,10 +571,11 @@ class SyncEngine:
             # Pre-seed sent cache with original AW duration so next sync's
             # dedup check sees original→original (unchanged) and skips.
             # The gap-filled event is already sent with extended duration.
-            self._gap_filled_originals[current.id] = old_duration
-            self._gap_filled_originals.move_to_end(current.id)
-            if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
-                self._gap_filled_originals.popitem(last=False)
+            with self._cache_lock:
+                self._gap_filled_originals[current.id] = old_duration
+                self._gap_filled_originals.move_to_end(current.id)
+                if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
+                    self._gap_filled_originals.popitem(last=False)
             filled += 1
             logger.info(
                 f"Filling {gap_seconds:.1f}s window gap: event {current.id} "

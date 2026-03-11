@@ -340,7 +340,7 @@ class Config:
             with open(tmp_file, "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_file, config_file)
-        except Exception:
+        except (OSError, ValueError):
             try:
                 tmp_file.unlink(missing_ok=True)
             except OSError:

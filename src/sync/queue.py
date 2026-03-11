@@ -31,15 +31,12 @@ class QueuedEvent:
     retry_count: int = 0
 
     @classmethod
-    def from_row(cls, row: tuple) -> "Optional[QueuedEvent]":
+    def from_row(cls, row: tuple) -> Optional["QueuedEvent"]:
         """Create from database row. Returns None if the row is corrupt."""
         try:
             event_data = json.loads(row[1])
         except (json.JSONDecodeError, TypeError):
-            import logging as _logging
-            _logging.getLogger(__name__).error(
-                f"[queue] Corrupt event row id={row[0]}, discarding"
-            )
+            logger.error(f"[queue] Corrupt event row id={row[0]}, discarding")
             return None
         return cls(
             id=row[0],

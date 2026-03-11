@@ -243,8 +243,11 @@ class SyncCoordinator:
 
     def start_break(self) -> None:
         """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
-        # Read engine state BEFORE acquiring _break_lock to preserve lock ordering.
+        # Read engine state BEFORE acquiring _break_lock to preserve lock ordering:
         # SyncEngine._state_lock must never be acquired while _break_lock is held.
+        # These snapshots may be slightly stale (concurrent pause/resume can change
+        # them between the read and the lock). A missed break start is recoverable
+        # (scheduler retries); a stale private-mode capture is a rare edge case.
         already_paused = self.sync_engine.is_paused
         pre_break_private = self.sync_engine.is_private
         with self._break_lock:
@@ -254,8 +257,6 @@ class SyncCoordinator:
             if already_paused:
                 return
             self._on_break = True
-            # Capture private mode so end_break can restore it.
-            # _pre_break_paused is always False here (we just checked is_paused).
             self._pre_break_paused = False
             self._pre_break_private = pre_break_private
 
@@ -649,7 +650,6 @@ class BetterFlowSyncApp:
             on_cancel_login=self._on_cancel_login,
         )
         self.tray.set_config(self.config)
-        self.tray.model.app_version = _VERSION
 
         # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(
@@ -1112,35 +1112,37 @@ class BetterFlowSyncApp:
         (main thread on macOS) is never blocked for more than a few ms.
         """
         def _do_logout() -> None:
-            # Wait for any in-progress sync to finish (up to 10s)
-            deadline = time.monotonic() + 10.0
-            while self.coordinator.sync_in_progress and time.monotonic() < deadline:
-                time.sleep(0.1)
-
-            # Clear notifications from previous session
-            clear_notifications()
-
-            # Cancel any active break before stopping (prevents stuck break state on re-login)
-            if self.coordinator.is_on_break:
-                self.coordinator.end_break(silent=True)
-
-            # End server session before stopping
-            self.sync_engine.shutdown()
-            self.login_manager.logout()
-            self.coordinator.logged_in = False
-            self.coordinator.reset_trends()
-            self.tray.set_user(None)
-            self.tray.set_projects([], None)
-            logger.info("Logged out")
-
-            self.coordinator.stop()
-
-            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
-
-            if not self._login_lock.acquire(blocking=False):
-                logger.debug("Login already in progress, skipping relogin")
+            # Acquire login lock first to serialize with any concurrent login attempt.
+            # Without this, a concurrent _on_login thread could start the coordinator
+            # between our shutdown() and stop() calls.
+            if not self._login_lock.acquire(blocking=True, timeout=15.0):
+                logger.warning("Logout aborted: could not acquire login lock within 15s")
                 return
             try:
+                # Wait for any in-progress sync to finish (up to 10s)
+                deadline = time.monotonic() + 10.0
+                while self.coordinator.sync_in_progress and time.monotonic() < deadline:
+                    time.sleep(0.1)
+
+                # Clear notifications from previous session
+                clear_notifications()
+
+                # Cancel any active break before stopping
+                if self.coordinator.is_on_break:
+                    self.coordinator.end_break(silent=True)
+
+                # End server session before stopping
+                self.sync_engine.shutdown()
+                self.login_manager.logout()
+                self.coordinator.logged_in = False
+                self.coordinator.reset_trends()
+                self.tray.set_user(None)
+                self.tray.set_projects([], None)
+                logger.info("Logged out")
+
+                self.coordinator.stop()
+                self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+
                 state = self.login_manager.login_via_browser()
                 if state.logged_in:
                     self.coordinator.logged_in = True
