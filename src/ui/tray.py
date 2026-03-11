@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 import math
 
+try:
+    from .._build_info import BUILD_DATE
+except ImportError:
+    BUILD_DATE = "dev"
+
 from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
@@ -530,8 +535,11 @@ class TrayIcon:
                 self._handle_open_update,
             ))
 
-        if s["app_version"]:
-            items.append(Item(f"v{s['app_version']}", None, enabled=False))
+        # ── Version info ───────────────────────────────────────
+        from .. import __version__
+        items.append(Item(f"v{__version__} ({BUILD_DATE})", None, enabled=False))
+
+
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
