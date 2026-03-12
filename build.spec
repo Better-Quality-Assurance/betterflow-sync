@@ -81,6 +81,12 @@ hiddenimports = [
     "aw_manager",
     "autostart",
     "display_info",
+    "reminders",
+    "notifications",
+    "self_updater",
+    "update_checker",
+    "system_events",
+    "auth.browser_auth",
     "sync.macos_window_watcher",
     "sync.macos_input_watcher",
     # macOS frameworks for in-process watchers (CGEventTap, etc.)
