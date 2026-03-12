@@ -473,17 +473,11 @@ class TrayIcon:
         else:
             items.append(Item("Start Break", self._handle_start_break, enabled=logged_in and not s["paused"]))
 
-        # ── Pause / Resume toggle ──────────────────────────
-        if s["paused"] and not s["on_break"]:
-            items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
-        elif not s["on_break"]:
-            items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
-
-        # ── Private Time toggle (disabled when paused) ──────
-        if s["private_mode"]:
+        # ── Private Time toggle (replaces both pause and old private time) ──
+        if s["private_mode"] or (s["paused"] and not s["on_break"]):
             items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
-        else:
-            items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in and not s["paused"]))
+        elif not s["on_break"]:
+            items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
 
         # ── Private Time Reminder submenu ───────────────────
         items.append(Item("Private Time Reminder", pystray.Menu(

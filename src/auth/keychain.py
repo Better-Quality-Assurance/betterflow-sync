@@ -1,12 +1,20 @@
-"""Secure credential storage using system keychain."""
+"""Secure credential storage using system keychain with file fallback."""
 
 import json
 import logging
+import os
+import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import keyring
 from keyring.errors import KeyringError
+
+try:
+    from .config_access import get_config_dir
+except ImportError:
+    from config_access import get_config_dir
 
 __all__ = ["KeychainManager", "StoredCredentials"]
 
@@ -49,70 +57,98 @@ class StoredCredentials:
         )
 
 
+def _credentials_file() -> Path:
+    """Get path to file-based credential storage (owner-only permissions)."""
+    return get_config_dir() / ".credentials"
+
+
+def _store_to_file(credentials: StoredCredentials) -> bool:
+    """Store credentials to a file with restrictive permissions."""
+    try:
+        cred_file = _credentials_file()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(credentials.to_json())
+        os.chmod(cred_file, stat.S_IRUSR | stat.S_IWUSR)  # 600
+        logger.info(f"Credentials stored to file for {credentials.user_email}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to store credentials to file: {e}")
+        return False
+
+
+def _load_from_file() -> Optional[StoredCredentials]:
+    """Load credentials from file."""
+    try:
+        cred_file = _credentials_file()
+        if cred_file.exists():
+            data = cred_file.read_text()
+            return StoredCredentials.from_json(data)
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to load credentials from file: {e}")
+        return None
+
+
+def _delete_file() -> bool:
+    """Delete credential file."""
+    try:
+        cred_file = _credentials_file()
+        if cred_file.exists():
+            cred_file.unlink()
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to delete credential file: {e}")
+        return False
+
+
 class KeychainManager:
-    """Manages secure credential storage."""
+    """Manages secure credential storage with file fallback."""
 
     def __init__(self, service_name: str = SERVICE_NAME):
-        """Initialize keychain manager.
-
-        Args:
-            service_name: Service name for keychain entries
-        """
         self.service_name = service_name
 
     def store(self, credentials: StoredCredentials) -> bool:
-        """Store credentials in keychain.
-
-        Args:
-            credentials: Credentials to store
-
-        Returns:
-            True if stored successfully
-        """
+        """Store credentials in keychain, falling back to file."""
         try:
             keyring.set_password(
                 self.service_name, ACCOUNT_NAME, credentials.to_json()
             )
             logger.info(f"Credentials stored for {credentials.user_email}")
+            _delete_file()  # Clean up file fallback if keychain works
             return True
-        except KeyringError as e:
-            logger.warning(f"Failed to store credentials: {e}")
-            return False
+        except (KeyringError, Exception) as e:
+            logger.warning(f"Keychain unavailable ({e}), using file fallback")
+            return _store_to_file(credentials)
 
     def load(self) -> Optional[StoredCredentials]:
-        """Load credentials from keychain.
-
-        Returns:
-            StoredCredentials if found, None otherwise
-        """
+        """Load credentials from keychain, falling back to file."""
         try:
             data = keyring.get_password(self.service_name, ACCOUNT_NAME)
             if data:
                 return StoredCredentials.from_json(data)
-            return None
-        except KeyringError as e:
-            logger.warning(f"Failed to load credentials: {e}")
-            return None
+        except (KeyringError, Exception) as e:
+            logger.debug(f"Keychain read failed: {e}")
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"Invalid credential format: {e}")
-            return None
+            logger.warning(f"Invalid credential format in keychain: {e}")
+
+        # Try file fallback
+        return _load_from_file()
 
     def delete(self) -> bool:
-        """Delete stored credentials.
-
-        Returns:
-            True if deleted (or didn't exist)
-        """
+        """Delete stored credentials from both keychain and file."""
+        ok = True
         try:
             keyring.delete_password(self.service_name, ACCOUNT_NAME)
-            logger.info("Credentials deleted")
-            return True
+            logger.info("Credentials deleted from keychain")
         except keyring.errors.PasswordDeleteError:
-            # Password didn't exist
-            return True
-        except KeyringError as e:
-            logger.warning(f"Failed to delete credentials: {e}")
-            return False
+            pass
+        except (KeyringError, Exception):
+            pass
+
+        if not _delete_file():
+            ok = False
+
+        return ok
 
     def has_credentials(self) -> bool:
         """Check if credentials are stored."""

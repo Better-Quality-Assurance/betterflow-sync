@@ -580,7 +580,7 @@ class SyncCoordinator:
                     else:
                         self.tray.set_state(TrayState.SYNCING)
                 if stats.events_sent > 0:
-                    send_notification("Sync Complete", f"{stats.events_sent} events synced.", sound=False)
+                    logger.info(f"Sync complete: {stats.events_sent} events synced")
             else:
                 self.tray.set_state(
                     TrayState.ERROR,
@@ -1074,16 +1074,30 @@ class BetterFlowApp:
         self.sync_engine.set_current_project(project)
 
     def _on_private_toggle(self, private: bool) -> None:
-        """Handle private time toggle."""
+        """Handle private time toggle (also serves as pause/resume)."""
         if private:
             logger.info("Private time started — recording paused")
+            with self._pause_state_lock:
+                self._user_paused = True
+            self.coordinator.paused_by_network = False
+            self.coordinator.clear_idle_pause(send_event=True)
             self.sync_engine.set_private_mode(True)
+            self.sync_engine.pause()
+            self.tray.set_paused(True)
+            if self.coordinator.is_on_break:
+                self.coordinator.end_break(silent=True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
             send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
         else:
             logger.info("Private time ended — recording resumed")
+            with self._pause_state_lock:
+                self._user_paused = False
+            self.coordinator.paused_by_network = False
+            self.coordinator.clear_idle_pause(send_event=True)
             self.sync_engine.set_private_mode(False)
+            self.sync_engine.resume()
+            self.tray.set_paused(False)
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
             send_notification("Private Time Ended", "Tracking has resumed.", sound=False)

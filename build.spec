@@ -72,6 +72,7 @@ hiddenimports = [
     "sync.protocols",
     "auth",
     "auth.keychain",
+    "auth.config_access",
     "auth.login",
     "ui",
     "ui.tray",
@@ -81,6 +82,13 @@ hiddenimports = [
     "autostart",
     "display_info",
     "sync.macos_window_watcher",
+    "sync.macos_input_watcher",
+    # macOS frameworks for in-process watchers (CGEventTap, etc.)
+    "Quartz",
+    "CoreFoundation",
+    "AppKit",
+    "Foundation",
+    "SystemConfiguration",
     "_build_info",  # Generated at build time by the spec preamble
 ]
 
