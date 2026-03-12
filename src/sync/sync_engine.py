@@ -376,8 +376,10 @@ class SyncEngine:
         if checkpoint is None:
             # First sync for this bucket — start from now so we don't
             # retroactively sync old AW events that accumulated before
-            # BetterFlow was running.
+            # BetterFlow was running.  Persist immediately so the next
+            # cycle uses the 2-min lookback instead of resetting to "now".
             checkpoint = datetime.now(timezone.utc)
+            self.queue.set_checkpoint(bucket_id, checkpoint)
             lookback_start = checkpoint
         else:
             lookback_start = checkpoint - timedelta(minutes=2)
