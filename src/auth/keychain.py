@@ -12,7 +12,7 @@ __all__ = ["KeychainManager", "StoredCredentials"]
 
 logger = logging.getLogger(__name__)
 
-SERVICE_NAME = "BetterFlow Sync"
+SERVICE_NAME = "BetterFlow"
 ACCOUNT_NAME = "api_credentials"
 
 

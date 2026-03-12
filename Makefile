@@ -1,4 +1,4 @@
-# BetterFlow Sync - Build Makefile
+# BetterFlow - Build Makefile
 
 .PHONY: install install-dev test lint format clean build build-mac build-windows run download-aw clean-aw
 
@@ -43,12 +43,12 @@ build: download-aw
 # Build for macOS
 build-mac: download-aw
 	pyinstaller build.spec --clean
-	@echo "Built: dist/BetterFlow Sync.app"
+	@echo "Built: dist/BetterFlow.app"
 
 # Build for Windows (run on Windows)
 build-windows: download-aw
 	pyinstaller build.spec --clean
-	@echo "Built: dist/BetterFlow Sync.exe"
+	@echo "Built: dist/BetterFlow.exe"
 
 # Run the application (development)
 run:
@@ -57,22 +57,22 @@ run:
 # Create macOS DMG (requires create-dmg)
 dmg: build-mac
 	create-dmg \
-		--volname "BetterFlow Sync" \
+		--volname "BetterFlow" \
 		--volicon "resources/icon.icns" \
 		--window-pos 200 120 \
 		--window-size 600 400 \
 		--icon-size 100 \
-		--icon "BetterFlow Sync.app" 150 190 \
+		--icon "BetterFlow.app" 150 190 \
 		--app-drop-link 450 185 \
-		"dist/BetterFlow Sync.dmg" \
-		"dist/BetterFlow Sync.app"
-	rm -f "dist/BetterFlow Sync"
+		"dist/BetterFlow.dmg" \
+		"dist/BetterFlow.app"
+	rm -f "dist/BetterFlow"
 	@# Set custom file icon on the DMG so it shows BetterFlow logo in Finder
 	python3 -c "\
 	import Cocoa, os; \
 	ws = Cocoa.NSWorkspace.sharedWorkspace(); \
 	img = Cocoa.NSImage.alloc().initWithContentsOfFile_(os.path.abspath('resources/icon.png')); \
-	ws.setIcon_forFile_options_(img, os.path.abspath('dist/BetterFlow Sync.dmg'), 0); \
+	ws.setIcon_forFile_options_(img, os.path.abspath('dist/BetterFlow.dmg'), 0); \
 	print('Custom icon set on DMG')"
 
 # Development server (auto-reload)

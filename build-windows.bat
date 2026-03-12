@@ -1,8 +1,8 @@
 @echo off
-REM BetterFlow Sync - Windows Build Script
+REM BetterFlow - Windows Build Script
 REM Run this on a Windows machine to build the executable
 
-echo === BetterFlow Sync Windows Build ===
+echo === BetterFlow Windows Build ===
 echo.
 
 REM Check Python
@@ -42,12 +42,12 @@ echo Building executable...
 pyinstaller build.spec --clean
 
 REM Check result
-if exist "dist\BetterFlow Sync.exe" (
+if exist "dist\BetterFlow.exe" (
     echo.
     echo === BUILD SUCCESSFUL ===
-    echo Executable created: dist\BetterFlow Sync.exe
+    echo Executable created: dist\BetterFlow.exe
     echo.
-    echo To run: dist\BetterFlow Sync.exe
+    echo To run: dist\BetterFlow.exe
 ) else (
     echo.
     echo === BUILD FAILED ===

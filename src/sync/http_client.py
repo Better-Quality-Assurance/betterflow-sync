@@ -66,7 +66,7 @@ class BaseApiClient:
         jitter=True,
     )
 
-    USER_AGENT = f"BetterFlow-Sync/{__version__}"
+    USER_AGENT = f"BetterFlow/{__version__}"
 
     def __init__(
         self,

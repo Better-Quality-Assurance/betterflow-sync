@@ -1,4 +1,4 @@
-"""Native OS notifications for BetterFlow Sync."""
+"""Native OS notifications for BetterFlow."""
 
 import logging
 import platform
@@ -112,7 +112,7 @@ def _send_windows(title: str, message: str) -> None:
         f"$textNodes.Item(1).AppendChild($template.CreateTextNode('{safe_message}')) > $null; "
         "$toast = [Windows.UI.Notifications.ToastNotification]::new($template); "
         "[Windows.UI.Notifications.ToastNotificationManager]::"
-        "CreateToastNotifier('BetterFlow Sync').Show($toast)"
+        "CreateToastNotifier('BetterFlow').Show($toast)"
     )
     subprocess.run(
         ["powershell", "-Command", ps_script],
@@ -127,7 +127,7 @@ def _clear_windows() -> None:
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
         "ContentType = WindowsRuntime] > $null; "
         "$history = [Windows.UI.Notifications.ToastNotificationManager]::History; "
-        "$history.Clear('BetterFlow Sync')"
+        "$history.Clear('BetterFlow')"
     )
     subprocess.run(
         ["powershell", "-Command", ps_script],

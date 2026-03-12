@@ -1,12 +1,12 @@
-; BetterFlow Sync - Inno Setup Installer Script
+; BetterFlow - Inno Setup Installer Script
 ; Download Inno Setup from https://jrsoftware.org/isinfo.php
 ; Compile with: iscc windows-installer.iss
 
-#define MyAppName "BetterFlow Sync"
+#define MyAppName "BetterFlow"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "BetterQA"
 #define MyAppURL "https://betterflow.eu"
-#define MyAppExeName "BetterFlow Sync.exe"
+#define MyAppExeName "BetterFlow.exe"
 
 [Setup]
 AppId={{A7B8C9D0-E1F2-3456-7890-ABCDEF123456}
@@ -21,7 +21,7 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 LicenseFile=..\LICENSE
 OutputDir=..\dist
-OutputBaseFilename=BetterFlow-Sync-Setup-{#MyAppVersion}
+OutputBaseFilename=BetterFlow-Setup-{#MyAppVersion}
 SetupIconFile=..\resources\icon.ico
 Compression=lzma
 SolidCompression=yes
@@ -46,7 +46,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Registry]
 ; Add to Windows startup if selected
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "BetterFlowSync"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: startupicon
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "BetterFlow"; ValueData: """{app}\{#MyAppExeName}"""; Flags: uninsdeletevalue; Tasks: startupicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

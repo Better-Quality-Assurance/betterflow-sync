@@ -7,7 +7,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-LAUNCHAGENT_LABEL = "co.betterqa.betterflow-sync"
+LAUNCHAGENT_LABEL = "co.betterqa.betterflow"
 
 
 def set_auto_start(enabled: bool) -> bool:
@@ -97,7 +97,7 @@ def _get_macos() -> bool:
 # -- Windows: Registry Run key ------------------------------------------------
 
 _WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-_WIN_VALUE_NAME = "BetterFlow Sync"
+_WIN_VALUE_NAME = "BetterFlow"
 
 
 def _set_windows(enabled: bool) -> bool:

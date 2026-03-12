@@ -1,7 +1,7 @@
-# BetterFlow Sync - Windows Build Script (PowerShell)
+# BetterFlow - Windows Build Script (PowerShell)
 # Run: powershell -ExecutionPolicy Bypass -File build-windows.ps1
 
-Write-Host "=== BetterFlow Sync Windows Build ===" -ForegroundColor Cyan
+Write-Host "=== BetterFlow Windows Build ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Check Python
@@ -43,21 +43,21 @@ Write-Host "Building executable..." -ForegroundColor Yellow
 pyinstaller build.spec --clean
 
 # Check result
-if (Test-Path "dist\BetterFlow Sync.exe") {
+if (Test-Path "dist\BetterFlow.exe") {
     Write-Host ""
     Write-Host "=== BUILD SUCCESSFUL ===" -ForegroundColor Green
-    Write-Host "Executable created: dist\BetterFlow Sync.exe"
+    Write-Host "Executable created: dist\BetterFlow.exe"
     Write-Host ""
 
     # Get file info
-    $exe = Get-Item "dist\BetterFlow Sync.exe"
+    $exe = Get-Item "dist\BetterFlow.exe"
     Write-Host "Size: $([math]::Round($exe.Length / 1MB, 2)) MB"
     Write-Host ""
 
     # Offer to run
     $run = Read-Host "Run the app now? (y/n)"
     if ($run -eq "y") {
-        Start-Process "dist\BetterFlow Sync.exe"
+        Start-Process "dist\BetterFlow.exe"
     }
 } else {
     Write-Host ""

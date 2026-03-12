@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "betterflow-sync"
+name = "betterflow"
 version = "1.0.0"
-description = "BetterFlow Sync Companion - Syncs ActivityWatch data to BetterFlow"
+description = "BetterFlow Companion - Syncs ActivityWatch data to BetterFlow"
 readme = "README.md"
 license = {text = "Proprietary"}
 requires-python = ">=3.10"
@@ -46,10 +46,10 @@ dev = [
 ]
 
 [project.scripts]
-betterflow-sync = "src.main:main"
+betterflow = "src.main:main"
 
 [project.gui-scripts]
-betterflow-sync-gui = "src.main:main"
+betterflow-gui = "src.main:main"
 
 [project.urls]
 Homepage = "https://betterflow.eu"

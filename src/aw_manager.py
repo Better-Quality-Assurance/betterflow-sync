@@ -52,20 +52,20 @@ def _get_platform_key() -> str:
 def _get_install_dir() -> str:
     """Get persistent directory for tracker binaries (survives app updates)."""
     if platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/BetterFlow Sync")
+        base = os.path.expanduser("~/Library/Application Support/BetterFlow")
     else:
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        base = os.path.join(base, "BetterQA", "BetterFlow Sync")
+        base = os.path.join(base, "BetterQA", "BetterFlow")
     return os.path.join(base, "trackers", _get_platform_key())
 
 
 def _get_db_dir() -> str:
     """Get sqlite file path for tracker database storage."""
     if platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/BetterFlow Sync")
+        base = os.path.expanduser("~/Library/Application Support/BetterFlow")
     else:
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        base = os.path.join(base, "BetterQA", "BetterFlow Sync")
+        base = os.path.join(base, "BetterQA", "BetterFlow")
     return os.path.join(base, "data", "aw-db.sqlite")
 
 

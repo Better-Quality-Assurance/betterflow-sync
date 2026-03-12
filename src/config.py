@@ -1,4 +1,4 @@
-"""Configuration management for BetterFlow Sync."""
+"""Configuration management for BetterFlow."""
 
 import json
 import logging
@@ -27,15 +27,15 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-APP_NAME = "BetterFlow Sync"
+APP_NAME = "BetterFlow"
 APP_AUTHOR = "BetterQA"
 
 
 def _load_dotenv() -> None:
     """Load environment variables from a local .env file (if present)."""
     candidates: list[Path] = []
-    if os.getenv("BETTERFLOW_SYNC_ENV_FILE"):
-        candidates.append(Path(os.environ["BETTERFLOW_SYNC_ENV_FILE"]).expanduser())
+    if os.getenv("BETTERFLOW_ENV_FILE"):
+        candidates.append(Path(os.environ["BETTERFLOW_ENV_FILE"]).expanduser())
 
     # Installed app runtime config location.
     candidates.append(Path(user_config_dir(APP_NAME, APP_AUTHOR)) / ".env")
@@ -440,7 +440,7 @@ def setup_logging(debug: bool = False) -> None:
     """
     log_dir = Config.get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "betterflow-sync.log"
+    log_file = log_dir / "betterflow.log"
 
     level = logging.DEBUG if debug else logging.INFO
     format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

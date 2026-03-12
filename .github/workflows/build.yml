@@ -14,11 +14,11 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            artifact_name: BetterFlow Sync.app
-            asset_name: BetterFlow-Sync-macOS-arm64
+            artifact_name: BetterFlow.app
+            asset_name: BetterFlow-macOS-arm64
           - os: windows-latest
-            artifact_name: BetterFlow Sync.exe
-            asset_name: BetterFlow-Sync-Windows
+            artifact_name: BetterFlow.exe
+            asset_name: BetterFlow-Windows
 
     runs-on: ${{ matrix.os }}
 
@@ -59,13 +59,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -r "${{ matrix.asset_name }}.zip" "BetterFlow Sync.app"
+          zip -r "${{ matrix.asset_name }}.zip" "BetterFlow.app"
 
       - name: Create Windows ZIP
         if: matrix.os == 'windows-latest'
         run: |
           cd dist
-          Compress-Archive -Path "BetterFlow Sync.exe" -DestinationPath "${{ matrix.asset_name }}.zip"
+          Compress-Archive -Path "BetterFlow.exe" -DestinationPath "${{ matrix.asset_name }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -83,21 +83,21 @@ jobs:
       - name: Download macOS ARM artifact
         uses: actions/download-artifact@v4
         with:
-          name: BetterFlow-Sync-macOS-arm64
+          name: BetterFlow-macOS-arm64
           path: ./artifacts
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
         with:
-          name: BetterFlow-Sync-Windows
+          name: BetterFlow-Windows
           path: ./artifacts
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/BetterFlow-Sync-macOS-arm64.zip
-            artifacts/BetterFlow-Sync-Windows.zip
+            artifacts/BetterFlow-macOS-arm64.zip
+            artifacts/BetterFlow-Windows.zip
           draft: true
           generate_release_notes: true
         env:

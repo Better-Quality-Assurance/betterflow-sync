@@ -243,7 +243,7 @@ class AWClient:
     def create_bucket(self, bucket_id: str, bucket_type: str, hostname: str) -> None:
         """Create a bucket (idempotent — AW ignores if already exists)."""
         self._request("POST", f"buckets/{bucket_id}", json={
-            "client": "betterflow-sync",
+            "client": "betterflow",
             "type": bucket_type,
             "hostname": hostname,
         })

@@ -1,10 +1,10 @@
-# BetterFlow Sync
+# BetterFlow
 
 A lightweight companion app that syncs ActivityWatch data to BetterFlow for automatic time tracking.
 
 ## Overview
 
-BetterFlow Sync reads activity data from your local [ActivityWatch](https://activitywatch.net/) installation and securely syncs it to your BetterFlow account. This enables automatic timesheet population based on your actual computer usage.
+BetterFlow reads activity data from your local [ActivityWatch](https://activitywatch.net/) installation and securely syncs it to your BetterFlow account. This enables automatic timesheet population based on your actual computer usage.
 
 ## Features
 
@@ -31,15 +31,15 @@ BetterFlow Sync reads activity data from your local [ActivityWatch](https://acti
 ### Pre-built Binaries
 
 Download the latest release for your platform:
-- **macOS**: `BetterFlow Sync.dmg`
-- **Windows**: `BetterFlow Sync.exe`
+- **macOS**: `BetterFlow.dmg`
+- **Windows**: `BetterFlow.exe`
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/Better-Quality-Assurance/betterflow-sync.git
-cd betterflow-sync
+git clone https://github.com/Better-Quality-Assurance/betterflow.git
+cd betterflow
 
 # Create virtual environment
 python3 -m venv venv
@@ -56,7 +56,7 @@ python3 -m src.main
 ## Usage
 
 1. **Start ActivityWatch** - ensure `aw-server` and `aw-watcher-window` are running
-2. **Launch BetterFlow Sync** - `python3 -m src.main` or `make run`
+2. **Launch BetterFlow** - `python3 -m src.main` or `make run`
 3. **Sign in** - the app opens your browser to the BetterFlow login page
 4. **Done!** - the tray icon turns green once syncing starts
 
@@ -79,7 +79,7 @@ Right-click the tray icon for options including pause/resume, private time, proj
 
 ## Privacy
 
-BetterFlow Sync is designed with privacy in mind:
+BetterFlow is designed with privacy in mind:
 
 - **Window titles** are hashed (SHA-256) by default - only a fingerprint is sent, not the actual title
 - **URLs** are stripped to domain-only - no full paths or query parameters
@@ -96,9 +96,9 @@ You can customize these settings in Preferences.
 
 | File | Location (macOS) | Location (Windows) |
 |---|---|---|
-| Config | `~/Library/Application Support/BetterFlow Sync/config.json` | `%APPDATA%\BetterQA\BetterFlow Sync\config.json` |
-| Logs | `~/Library/Logs/BetterFlow Sync/betterflow-sync.log` | `%APPDATA%\BetterQA\BetterFlow Sync\Logs\betterflow-sync.log` |
-| Queue DB | `~/Library/Application Support/BetterFlow Sync/offline_queue.db` | `%APPDATA%\BetterQA\BetterFlow Sync\offline_queue.db` |
+| Config | `~/Library/Application Support/BetterFlow/config.json` | `%APPDATA%\BetterQA\BetterFlow\config.json` |
+| Logs | `~/Library/Logs/BetterFlow/betterflow.log` | `%APPDATA%\BetterQA\BetterFlow\Logs\betterflow.log` |
+| Queue DB | `~/Library/Application Support/BetterFlow/offline_queue.db` | `%APPDATA%\BetterQA\BetterFlow\offline_queue.db` |
 | Credentials | System keychain (Keychain Access) | Windows Credential Manager |
 
 ### Environment Overrides (`.env`)
@@ -113,7 +113,7 @@ cp .env.example .env
 |---|---|---|
 | `BETTERFLOW_API_URL` | Agent sync API endpoint | `https://app.betterflow.eu/api/agent` |
 | `BETTERFLOW_WEB_BASE_URL` | Web app base URL (for auth & dashboard links) | derived from API URL |
-| `BETTERFLOW_SYNC_ENV_FILE` | Explicit path to a `.env` file | — |
+| `BETTERFLOW_ENV_FILE` | Explicit path to a `.env` file | — |
 
 Example for local backend development:
 
@@ -156,8 +156,8 @@ pytest tests/ -v --cov=src --cov-report=term-missing
 #### macOS
 
 ```bash
-make build-mac          # creates dist/BetterFlow Sync.app
-make dmg                # creates dist/BetterFlow Sync.dmg (requires create-dmg)
+make build-mac          # creates dist/BetterFlow.app
+make dmg                # creates dist/BetterFlow.dmg (requires create-dmg)
 ```
 
 #### Windows
@@ -177,7 +177,7 @@ python scripts\generate_icons.py
 pyinstaller build.spec --clean
 ```
 
-Creates: `dist\BetterFlow Sync.exe`
+Creates: `dist\BetterFlow.exe`
 
 **Option 3: Create installer**
 
@@ -188,7 +188,7 @@ Creates: `dist\BetterFlow Sync.exe`
 iscc installer\windows-installer.iss
 ```
 
-Creates: `dist\BetterFlow-Sync-Setup-1.0.0.exe`
+Creates: `dist\BetterFlow-Setup-1.0.0.exe`
 
 #### GitHub Actions (CI/CD)
 

@@ -1,4 +1,4 @@
-"""First-run setup wizard for BetterFlow Sync.
+"""First-run setup wizard for BetterFlow.
 
 A polished onboarding wizard: Welcome → Browser login → Success.
 Runs only when config.setup_complete is False.
@@ -96,7 +96,7 @@ class SetupWizard:
     def show(self) -> SetupResult:
         """Show the wizard and return result when closed."""
         self._window = tk.Tk()
-        self._window.title("BetterFlow Sync")
+        self._window.title("BetterFlow")
         self._window.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self._window.resizable(False, False)
         self._window.configure(bg=BG_COLOR)
@@ -265,7 +265,7 @@ class SetupWizard:
     def _show_welcome(self) -> None:
         """Show the welcome screen."""
         cx = self._draw_scene(
-            title="Welcome to BetterFlow Sync",
+            title="Welcome to BetterFlow",
             subtitle="Install local tracking and connect your BetterFlow account",
         )
 
@@ -449,7 +449,7 @@ class SetupWizard:
         """Show success screen."""
         cx = self._draw_scene(
             title="You’re All Set",
-            subtitle="BetterFlow Sync is ready to run",
+            subtitle="BetterFlow is ready to run",
         )
 
         # Success checkmark circle
@@ -478,7 +478,7 @@ class SetupWizard:
         self._canvas.create_text(
             cx, 352,
             text=(
-                "BetterFlow Sync will now run in your menu bar.\n"
+                "BetterFlow will now run in your menu bar.\n"
                 "It will automatically track and sync your activity."
             ),
             font=FONT_BODY,
@@ -537,7 +537,7 @@ class SetupWizard:
         )
         self._canvas.create_text(
             row_x1 + 64, cy + 14,
-            text="Allow BetterFlow Sync to read window titles",
+            text="Allow BetterFlow to read window titles",
             font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
         )
         if not granted:
