@@ -1,4 +1,4 @@
-"""BetterFlow Sync - Main entry point."""
+"""BetterFlow - Main entry point."""
 
 import logging
 import os
@@ -79,7 +79,7 @@ _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__v
 class SyncCoordinator:
     """Owns the sync scheduler, sync loop, and hours tracking.
 
-    Pulled out of BetterFlowSyncApp so that the app class focuses on
+    Pulled out of BetterFlowApp so that the app class focuses on
     lifecycle orchestration and event wiring only.
     """
 
@@ -578,7 +578,7 @@ class SyncCoordinator:
         minutes = (int(total_seconds) % 3600) // 60
         return f"{hours}h {minutes}m"
 
-class BetterFlowSyncApp:
+class BetterFlowApp:
     """Main application orchestrator.
 
     Wires components together, handles lifecycle (start / shutdown),
@@ -590,7 +590,7 @@ class BetterFlowSyncApp:
         self.config = Config.load()
         setup_logging(self.config.debug_mode)
 
-        logger.info("BetterFlow Sync starting...")
+        logger.info("BetterFlow starting...")
         logger.info(f"Using API URL: {self.config.api_url}")
 
         # Initialize AW process manager
@@ -649,6 +649,7 @@ class BetterFlowSyncApp:
             on_sync_now=self._on_sync_now,
             on_export_logs=self._on_export_logs,
             on_open_permissions=self._on_open_permissions,
+            on_start_break=self._on_start_break,
             on_end_break=self._on_end_break,
             on_cancel_login=self._on_cancel_login,
         )
@@ -755,7 +756,9 @@ class BetterFlowSyncApp:
         # Start system event listeners (non-critical: don't let failures prevent tray)
         try:
             from urllib.parse import urlparse
-            api_host = urlparse(self.config.api_url).hostname or ""
+            parsed_api = urlparse(self.config.api_url)
+            api_host = parsed_api.hostname or ""
+            api_port = parsed_api.port or (443 if parsed_api.scheme == "https" else 80)
             start_system_event_listener(
                 on_sleep=self._on_system_sleep,
                 on_wake=self._on_system_wake,
@@ -764,6 +767,7 @@ class BetterFlowSyncApp:
                 on_screen_lock=self._on_screen_lock,
                 on_screen_unlock=self._on_screen_unlock,
                 reachability_host=api_host,
+                reachability_port=api_port,
             )
         except Exception:
             logger.exception("Failed to start system event listeners")
@@ -779,7 +783,7 @@ class BetterFlowSyncApp:
         except Exception:
             logger.exception("Failed to start update checker")
 
-        logger.info("BetterFlow Sync running")
+        logger.info("BetterFlow running")
         try:
             self.tray.run_blocking()
         finally:
@@ -796,7 +800,7 @@ class BetterFlowSyncApp:
             needs_perms = self.tray.model.needs_permissions
         if needs_perms:
             send_notification(
-                "BetterFlow Sync",
+                "BetterFlow",
                 "Grant Accessibility permission in "
                 "System Settings > Privacy & Security for window tracking.",
             )
@@ -810,7 +814,7 @@ class BetterFlowSyncApp:
         logger.info(f"Update available: v{version} — {url}")
         self.tray.set_update_available(version, url)
         send_notification(
-            "BetterFlow Sync Update",
+            "BetterFlow Update",
             f"Version {version} is available.",
         )
 
@@ -835,12 +839,16 @@ class BetterFlowSyncApp:
     def _on_login(self) -> None:
         """Handle explicit login action from tray.
 
-        Uses a re-entry guard so multiple rapid login triggers (e.g.
-        auth-error callback + user click) don't spawn parallel flows.
+        If a login flow is already in progress (e.g. from auto-relogin
+        after logout), cancel it first so the new attempt can proceed.
         """
+        # Cancel any in-progress flow so the lock is released
+        self.login_manager.cancel_login()
+
         def do_browser_login():
-            if not self._login_lock.acquire(blocking=False):
-                logger.debug("Login already in progress, skipping")
+            # Wait briefly for the cancelled flow to release the lock
+            if not self._login_lock.acquire(timeout=3):
+                logger.warning("Could not acquire login lock after cancel")
                 return
             try:
                 self.coordinator.logged_in = False
@@ -872,6 +880,10 @@ class BetterFlowSyncApp:
         logger.info("Login cancelled by user")
         self.login_manager.cancel_login()
         self.tray.set_state(TrayState.ERROR, "Login cancelled")
+
+    def _on_start_break(self) -> None:
+        """Handle user starting a manual break from tray menu."""
+        self.coordinator.start_break()
 
     def _on_end_break(self) -> None:
         """Handle user ending break early from tray menu."""
@@ -1211,7 +1223,7 @@ class BetterFlowSyncApp:
 
         logger.info("Shutdown complete")
 
-    def __enter__(self) -> "BetterFlowSyncApp":
+    def __enter__(self) -> "BetterFlowApp":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -1224,7 +1236,7 @@ class SingleInstanceLock:
     def __init__(self):
         self._file = None
         self._path = os.path.join(
-            Config.get_config_dir(), ".betterflow-sync.lock"
+            Config.get_config_dir(), ".betterflow.lock"
         )
 
     def acquire(self) -> bool:
@@ -1281,11 +1293,11 @@ _instance_lock = SingleInstanceLock()
 def main() -> None:
     """Main entry point."""
     if not _instance_lock.acquire():
-        print("BetterFlow Sync is already running.")
+        print("BetterFlow is already running.")
         sys.exit(0)
 
     try:
-        with BetterFlowSyncApp() as app:
+        with BetterFlowApp() as app:
             app.run()
     finally:
         _instance_lock.release()

@@ -80,6 +80,7 @@ class TrayModel:
         # Projects
         self.projects: list[ProjectDict] = []
         self.current_project: Optional[ProjectDict] = None
+        self.project_started_at: Optional[float] = None  # time.monotonic() when project was selected
 
         # Preferences
         self.sync_interval: int = 30
@@ -271,6 +272,7 @@ class TrayIcon:
         on_sync_now: Optional[Callable[[], None]] = None,
         on_export_logs: Optional[Callable[[], None]] = None,
         on_open_permissions: Optional[Callable[[], None]] = None,
+        on_start_break: Optional[Callable[[], None]] = None,
         on_end_break: Optional[Callable[[], None]] = None,
         on_cancel_login: Optional[Callable[[], None]] = None,
     ):
@@ -288,6 +290,7 @@ class TrayIcon:
             on_sync_now: Callback to trigger an immediate sync
             on_export_logs: Callback to export logs to a zip file
             on_open_permissions: Callback to open system permission settings
+            on_start_break: Callback when user starts a manual break
             on_end_break: Callback when user ends break early
             on_cancel_login: Callback when user cancels in-progress login
         """
@@ -305,6 +308,7 @@ class TrayIcon:
         self._on_sync_now = on_sync_now
         self._on_export_logs = on_export_logs
         self._on_open_permissions = on_open_permissions
+        self._on_start_break = on_start_break
         self._on_end_break = on_end_break
         self._on_cancel_login = on_cancel_login
 
@@ -342,6 +346,7 @@ class TrayIcon:
                 "user_role": self.model.user_role,
                 "projects": list(self.model.projects),
                 "current_project": self.model.current_project,
+                "project_started_at": self.model.project_started_at,
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
                 "needs_permissions": self.model.needs_permissions,
@@ -409,18 +414,24 @@ class TrayIcon:
                     enabled=logged_in and not is_current,
                 ))
             if s["current_project"]:
-                items.append(Item(f"  Stop ({s['hours_today']})", self._handle_stop_project, enabled=logged_in))
+                proj_elapsed = ""
+                if s["project_started_at"] is not None:
+                    elapsed_m = int(time.monotonic() - s["project_started_at"]) // 60
+                    eh, em = divmod(elapsed_m, 60)
+                    proj_elapsed = f" ({eh}h {em}m)"
+                items.append(Item(f"  Stop{proj_elapsed}", self._handle_stop_project, enabled=logged_in))
             items.append(Item("─" * 20, None, enabled=False))
 
-        # ── End Break action ────────────────────────────────
+        # ── Break toggle ───────────────────────────────────
         if s["on_break"]:
-            items.append(Item("End Break", self._handle_end_break))
-            items.append(Item("─" * 20, None, enabled=False))
+            items.append(Item("End Break", self._handle_end_break, enabled=logged_in))
+        else:
+            items.append(Item("Start Break", self._handle_start_break, enabled=logged_in and not s["paused"]))
 
         # ── Pause / Resume toggle ──────────────────────────
-        if s["paused"]:
+        if s["paused"] and not s["on_break"]:
             items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
-        else:
+        elif not s["on_break"]:
             items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
         # ── Private Time toggle (disabled when paused) ──────
@@ -620,6 +631,11 @@ class TrayIcon:
         if self._on_open_permissions:
             self._on_open_permissions()
 
+    def _handle_start_break(self, icon, item) -> None:
+        """Handle start break menu click."""
+        if self._on_start_break:
+            self._on_start_break()
+
     def _handle_end_break(self, icon, item) -> None:
         """Handle end break menu click."""
         if self._on_end_break:
@@ -673,6 +689,7 @@ class TrayIcon:
         """Clear the currently running project."""
         with self.model.lock:
             self.model.current_project = None
+            self.model.project_started_at = None
         if self._on_project_change:
             self._on_project_change(None)
         self._update_menu()
@@ -691,6 +708,7 @@ class TrayIcon:
         def handler(icon, item):
             with self.model.lock:
                 self.model.current_project = project
+                self.model.project_started_at = time.monotonic() if project else None
             if self._on_project_change:
                 self._on_project_change(project)
             self._update_menu()
@@ -904,6 +922,9 @@ class TrayIcon:
             self.model.projects = projects
             if current_project:
                 self.model.current_project = current_project
+                # Only set start time if not already tracking this project
+                if self.model.project_started_at is None:
+                    self.model.project_started_at = time.monotonic()
         self._update_menu()
 
     def set_active_time(self, active_time) -> None:
@@ -917,7 +938,7 @@ class TrayIcon:
         minutes = (total_seconds % 3600) // 60
         with self.model.lock:
             self.model.hours_today = f"{hours}h {minutes}m"
-        self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
+        self._update_tooltip(f"BetterFlow - Today: {hours}h {minutes}m active")
         self._update_menu()
 
     def set_update_available(self, version: str, url: str) -> None:
@@ -1040,9 +1061,9 @@ class TrayIcon:
 
         color = STATE_COLORS[self.model.state]
         self._icon = pystray.Icon(
-            "BetterFlow Sync",
+            "BetterFlow",
             create_icon_image(color),
-            "BetterFlow Sync",
+            "BetterFlow",
             self._create_menu(),
         )
 
@@ -1071,9 +1092,9 @@ class TrayIcon:
             if self._icon is None:
                 color = STATE_COLORS[self.model.state]
                 self._icon = pystray.Icon(
-                    "BetterFlow Sync",
+                    "BetterFlow",
                     create_icon_image(color),
-                    "BetterFlow Sync",
+                    "BetterFlow",
                     self._create_menu(),
                 )
 
