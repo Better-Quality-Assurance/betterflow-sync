@@ -99,8 +99,10 @@ class SyncEngine:
         # Bounded LRU: evicts oldest on every insert once at capacity.
         self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
         self._SENT_CACHE_MAX = 5_000
-        # Track original AW durations for gap-filled events to prevent re-send
-        self._gap_filled_originals: dict[int, float] = {}
+        # Track original AW durations for gap-filled events to prevent re-send.
+        # Bounded LRU: evicts oldest once at capacity (same pattern as _sent_cache).
+        self._gap_filled_originals: OrderedDict[int, float] = OrderedDict()
+        self._GAP_ORIGINALS_MAX = 5_000
 
         # Thread safety: protects cross-thread mutable state
         self._state_lock = threading.Lock()
@@ -428,7 +430,8 @@ class SyncEngine:
                 continue
             # Check if this event was gap-filled on a prior cycle —
             # AW returns original duration but we already sent the extended one
-            orig = self._gap_filled_originals.get(event.id)
+            with self._cache_lock:
+                orig = self._gap_filled_originals.get(event.id)
             if orig is not None and abs(event.duration - orig) < 0.5:
                 stats.events_filtered += 1
                 continue
@@ -573,7 +576,11 @@ class SyncEngine:
             # Pre-seed sent cache with original AW duration so next sync's
             # dedup check sees original→original (unchanged) and skips.
             # The gap-filled event is already sent with extended duration.
-            self._gap_filled_originals[current.id] = old_duration
+            with self._cache_lock:
+                self._gap_filled_originals[current.id] = old_duration
+                self._gap_filled_originals.move_to_end(current.id)
+                if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
+                    self._gap_filled_originals.popitem(last=False)
             filled += 1
             logger.info(
                 f"Filling {gap_seconds:.1f}s window gap: event {current.id} "

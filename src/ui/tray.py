@@ -1,8 +1,10 @@
 """System tray icon and menu."""
 
 import logging
+import math
 import os
 import platform
+import subprocess
 import sys
 import threading
 import time
@@ -11,7 +13,19 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
-import math
+try:
+    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE  # module execution
+except ImportError:
+    try:
+        import _build_info as _bi  # PyInstaller bundle (src/ is root, no parent package)
+        _APP_VERSION = _bi.APP_VERSION
+        BUILD_DATE = _bi.BUILD_DATE
+    except ImportError:
+        try:
+            from .. import __version__ as _APP_VERSION
+        except ImportError:
+            _APP_VERSION = "unknown"
+        BUILD_DATE = "dev"
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -40,7 +54,6 @@ def _prevent_termination() -> None:
         proc_info.disableSuddenTermination()
     except Exception:
         pass
-
 
 
 __all__ = ["TrayIcon", "TrayState", "TrayModel", "STATE_COLORS", "create_icon_image", "ProjectDict"]
@@ -97,7 +110,6 @@ class TrayModel:
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
-        self.app_version: str = ""
 
         # Reminder preferences
         self.break_reminders_enabled: bool = True
@@ -189,8 +201,8 @@ def _get_logo_template() -> Optional[Image.Image]:
 def create_icon_image(color: str, size: int = 64) -> Image.Image:
     """Create a clock icon with the given state color.
 
-    Draws a round clock face with hour marks and hour/minute hands
-    showing the current local time.
+    Draws a round clock face with hour marks, hour/minute hands showing
+    the current local time, and a "B" glyph in the center.
 
     Args:
         color: Hex color code for the clock color
@@ -235,6 +247,28 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         y2 = cy + int(tick_outer * math.sin(angle))
         w = max(2, big // 32) if i % 3 == 0 else max(1, big // 48)
         draw.line([x1, y1, x2, y2], fill=color, width=w)
+
+    # Minute hand
+    minute_angle = math.radians(minute * 6 - 90)
+    minute_len = int(tick_outer * 0.82)
+    draw.line(
+        [cx, cy,
+         cx + int(minute_len * math.cos(minute_angle)),
+         cy + int(minute_len * math.sin(minute_angle))],
+        fill=color,
+        width=max(2, big // 32),
+    )
+
+    # Hour hand (shorter, thicker)
+    hour_angle = math.radians((hour * 30 + minute * 0.5) - 90)
+    hour_len = int(tick_outer * 0.55)
+    draw.line(
+        [cx, cy,
+         cx + int(hour_len * math.cos(hour_angle)),
+         cy + int(hour_len * math.sin(hour_angle))],
+        fill=color,
+        width=max(3, big // 24),
+    )
 
     # "B" letter in the center
     font_size = int(radius * 1.1)
@@ -332,6 +366,7 @@ class TrayIcon:
         # Sync Now cooldown (5 seconds)
         self._sync_now_cooldown = 5.0
         self._sync_now_last: float = 0.0
+        self._sync_now_lock = threading.Lock()
 
     def _snapshot_model(self) -> dict:
         """Take a consistent snapshot of all model fields under lock."""
@@ -368,11 +403,14 @@ class TrayIcon:
                 "update_in_progress": self.model.update_in_progress,
                 "update_status": self.model.update_status,
                 "dashboard_url": self.model.dashboard_url,
-                "app_version": self.model.app_version,
+                "company_name": self.model.company_name,
+                "config_file_path": self.model.config_file_path,
                 "break_reminders_enabled": self.model.break_reminders_enabled,
                 "break_interval_hours": self.model.break_interval_hours,
                 "private_reminders_enabled": self.model.private_reminders_enabled,
                 "private_interval_minutes": self.model.private_interval_minutes,
+                "auto_categorize": self.model.auto_categorize,
+                "track_display_info": self.model.track_display_info,
             }
 
     def _create_menu(self) -> pystray.Menu:
@@ -557,9 +595,11 @@ class TrayIcon:
                     self._handle_open_update,
                 ))
 
-        if s["app_version"]:
-            items.append(Item(f"v{s['app_version']}", None, enabled=False))
-        items.append(Item("Quit", self._handle_quit))
+        # ── Version info ───────────────────────────────────────
+        items.append(Item(f"v{_APP_VERSION} ({BUILD_DATE})", None, enabled=False))
+
+        if s["user_role"] in ("admin", "super-admin"):
+            items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
 
@@ -696,11 +736,6 @@ class TrayIcon:
             url = self.model.dashboard_url
         webbrowser.open(url)
 
-    def _handle_project_manager(self, icon, item) -> None:
-        """Open project manager page in browser."""
-        base = self.model.dashboard_url.rsplit("/", 1)[0]
-        webbrowser.open(f"{base}/projects")
-
     def _handle_stop_project(self, icon, item) -> None:
         """Clear the currently running project."""
         with self.model.lock:
@@ -713,9 +748,10 @@ class TrayIcon:
     def _handle_sync_now(self, icon, item) -> None:
         """Trigger an immediate sync (debounced to prevent rapid clicks)."""
         now = time.monotonic()
-        if now - self._sync_now_last < self._sync_now_cooldown:
-            return
-        self._sync_now_last = now
+        with self._sync_now_lock:
+            if now - self._sync_now_last < self._sync_now_cooldown:
+                return
+            self._sync_now_last = now
         if self._on_sync_now:
             self._on_sync_now()
 
@@ -828,14 +864,16 @@ class TrayIcon:
             self._on_export_logs()
 
     def _handle_open_config(self, icon, item) -> None:
-        if self.model.config_file_path:
-            import subprocess
-            if platform.system() == "Windows":
-                os.startfile(self.model.config_file_path)
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", self.model.config_file_path])
-            else:
-                subprocess.Popen(["xdg-open", self.model.config_file_path])
+        with self.model.lock:
+            path = self.model.config_file_path
+        if not path:
+            return
+        if platform.system() == "Windows":
+            os.startfile(path)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
@@ -991,6 +1029,10 @@ class TrayIcon:
                 icon.title = tooltip
         except AttributeError:
             pass  # Icon was stopped concurrently
+
+    def tick_clock(self) -> None:
+        """Called periodically to advance the clock-face icon hands."""
+        self._update_icon()
 
     def _update_icon(self) -> None:
         """Update the tray icon image and menu.

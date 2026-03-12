@@ -426,12 +426,11 @@ def _start_network_poller(
 ) -> None:
     """Poll network connectivity and fire callback on state changes."""
     state = {"online": None}  # None = unknown
-    stop_event = threading.Event()
 
     def poll():
         # Immediate first check before entering the wait loop (N10)
         first = True
-        while not stop_event.is_set():
+        while not _stop_event.is_set():
             try:
                 socket.create_connection((host, port), timeout=5).close()
                 online = True
@@ -448,7 +447,7 @@ def _start_network_poller(
             state["online"] = online
             first = False
 
-            stop_event.wait(interval)
+            _stop_event.wait(interval)
 
     thread = threading.Thread(target=poll, name="system-network-poller", daemon=True)
     thread.start()

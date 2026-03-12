@@ -31,11 +31,16 @@ class QueuedEvent:
     retry_count: int = 0
 
     @classmethod
-    def from_row(cls, row: tuple) -> "QueuedEvent":
-        """Create from database row."""
+    def from_row(cls, row: tuple) -> Optional["QueuedEvent"]:
+        """Create from database row. Returns None if the row is corrupt."""
+        try:
+            event_data = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError):
+            logger.error(f"[queue] Corrupt event row id={row[0]}, discarding")
+            return None
         return cls(
             id=row[0],
-            event_data=json.loads(row[1]),
+            event_data=event_data,
             created_at=datetime.fromisoformat(row[2]),
             retry_count=row[3],
         )
@@ -80,6 +85,8 @@ class OfflineQueue:
                 del self._local.connection
                 need_new = True
         if need_new:
+            if self._closed:
+                raise sqlite3.ProgrammingError("OfflineQueue has been closed")
             conn = sqlite3.connect(str(self.db_path))
             conn.row_factory = sqlite3.Row
             self._local.connection = conn
@@ -223,6 +230,7 @@ class OfflineQueue:
                 )
                 logger.warning(f"Queue full, removed {to_remove} oldest events")
 
+            count = len(events)
             cursor.executemany(
                 """
                 INSERT INTO queued_events (event_data, created_at)
@@ -230,7 +238,7 @@ class OfflineQueue:
                 """,
                 [(json.dumps(e), now) for e in events],
             )
-            return cursor.rowcount
+            return count
 
     def dequeue(self, batch_size: int = 100, max_retries: int = 5) -> list[QueuedEvent]:
         """Get a batch of events from the queue (oldest first).
@@ -257,7 +265,10 @@ class OfflineQueue:
                 """,
                 (max_retries, batch_size),
             )
-            return [QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall()]
+            return [
+                e for e in (QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall())
+                if e is not None
+            ]
 
     def remove(self, event_ids: list[int]) -> int:
         """Remove events from the queue.
