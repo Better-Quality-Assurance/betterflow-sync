@@ -100,6 +100,17 @@ Tests use pytest with mocking. The test fixtures create Mock objects for `AWClie
 pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
+## Building DMG (IMPORTANT)
+
+**Before every `make dmg` or `make build-mac`**, bump the version in `src/__init__.py`. The build spec reads `__version__` automatically for `CFBundleVersion` and the tray menu display.
+
+```bash
+# 1. Bump version in src/__init__.py
+# 2. Build
+make dmg
+# 3. Install: drag from DMG to /Applications
+```
+
 ## CI/CD
 
 GitHub Actions workflow (`.github/workflows/build.yml`) builds for macOS and Windows on push to `main`. Tagged releases (`v*`) create draft GitHub releases with ZIP artifacts.
