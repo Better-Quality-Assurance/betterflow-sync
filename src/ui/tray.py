@@ -413,8 +413,11 @@ class TrayIcon:
                     checked=lambda item, p=proj: self._is_current_project(p),
                     enabled=logged_in and not is_current,
                 ))
-            if s["current_project"]:
-                items.append(Item(f"  Stop ({s['hours_today']})", self._handle_stop_project, enabled=logged_in))
+            items.append(Item(
+                f"  Stop ({s['hours_today']})",
+                self._handle_stop_project,
+                enabled=logged_in and s["current_project"] is not None,
+            ))
             items.append(Item("─" * 20, None, enabled=False))
 
         # ── Break toggle ───────────────────────────────────

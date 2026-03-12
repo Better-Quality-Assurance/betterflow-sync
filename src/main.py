@@ -118,14 +118,22 @@ class SyncCoordinator:
         self._paused_by_network = False
         self._on_break = False
         self._break_start: Optional[datetime] = None
+        self._idle_paused = False
+        self._idle_start: Optional[datetime] = None
         self._state_lock = threading.Lock()
         self._break_lock = threading.Lock()
         self._pre_break_paused = False
         self._pre_break_private = False
         self._sync_lock = threading.Lock()
 
+        # Idle pause threshold (seconds) — stop syncing if AFK this long
+        self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
+
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
+
+        # Optional callback to pause/resume input watcher on idle
+        self._on_idle_pause: Optional[Callable[[bool], None]] = None
 
     @property
     def logged_in(self) -> bool:
@@ -146,6 +154,35 @@ class SyncCoordinator:
     def paused_by_network(self, value: bool) -> None:
         with self._state_lock:
             self._paused_by_network = value
+
+    @property
+    def idle_paused(self) -> bool:
+        with self._state_lock:
+            return self._idle_paused
+
+    def clear_idle_pause(self, send_event: bool = True) -> None:
+        """Clear idle pause state and optionally send the idle_time event.
+
+        Called by the app layer on manual resume, screen unlock, wake, etc.
+        """
+        with self._state_lock:
+            was_paused = self._idle_paused
+            idle_start = self._idle_start
+            self._idle_paused = False
+            self._idle_start = None
+        if was_paused and send_event and idle_start:
+            self.sync_engine.send_idle_event(idle_start)
+        if was_paused and self._on_idle_pause:
+            self._on_idle_pause(False)
+
+    def flush_idle_event(self) -> None:
+        """Send idle_time event for current idle period (e.g. on shutdown)."""
+        with self._state_lock:
+            idle_start = self._idle_start
+            self._idle_start = None
+            self._idle_paused = False
+        if idle_start:
+            self.sync_engine.send_idle_event(idle_start)
 
     def start(self) -> None:
         """Run the initial sync and start the periodic scheduler."""
@@ -206,6 +243,13 @@ class SyncCoordinator:
                 id="permissions_check_job",
                 replace_existing=True,
             )
+        # Check idle status every 60s — pause sync if AFK > 20 minutes
+        self.scheduler.add_job(
+            self._check_idle_status,
+            trigger=IntervalTrigger(seconds=60),
+            id="idle_check_job",
+            replace_existing=True,
+        )
         # Refresh clock icon every minute so hands move
         self.scheduler.add_job(
             self.tray._update_icon,
@@ -418,6 +462,61 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Permissions check failed: {e}")
 
+    def _check_idle_status(self) -> None:
+        """Check AFK bucket — pause sync if user idle for 20+ minutes."""
+        if not self.logged_in:
+            return
+
+        with self._state_lock:
+            was_idle_paused = self._idle_paused
+
+        # When not idle-paused, skip if user/break/private already paused sync
+        if not was_idle_paused:
+            if self.sync_engine.is_paused or self.sync_engine.is_private:
+                return
+            with self._break_lock:
+                if self._on_break:
+                    return
+
+        try:
+            afk_buckets = self.aw.get_afk_buckets()
+            if not afk_buckets:
+                return
+
+            events = self.aw.get_events(afk_buckets[0].id, limit=1)
+            if not events:
+                return
+
+            latest = events[0]
+            is_afk = latest.status == "afk"
+            afk_duration = latest.duration
+
+            if is_afk and afk_duration >= self._idle_pause_threshold:
+                if not was_idle_paused:
+                    # Use the AFK event's own timestamp as idle start
+                    idle_start = latest.timestamp
+                    logger.info(
+                        f"User idle for {int(afk_duration)}s (>= {self._idle_pause_threshold}s) "
+                        f"— pausing sync"
+                    )
+                    with self._state_lock:
+                        self._idle_paused = True
+                        self._idle_start = idle_start
+                    self.sync_engine.pause()
+                    self.tray.set_state(TrayState.PAUSED, "Idle")
+                    if self._on_idle_pause:
+                        self._on_idle_pause(True)
+            else:
+                if was_idle_paused:
+                    logger.info("User active again — resuming sync after idle pause")
+                    self.clear_idle_pause(send_event=True)
+                    self.sync_engine.resume()
+                    self.tray.set_state(TrayState.SYNCING)
+                    self.trigger_sync("idle_resume_sync")
+
+        except Exception as e:
+            logger.debug(f"Idle check error: {e}")
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         if not self._sync_lock.acquire(blocking=False):
@@ -431,6 +530,11 @@ class SyncCoordinator:
             with self._break_lock:
                 if self._on_break:
                     self.tray.set_state(TrayState.ON_BREAK)
+                    return
+
+            with self._state_lock:
+                if self._idle_paused:
+                    self.tray.set_state(TrayState.PAUSED, "Idle")
                     return
 
             if self.paused_by_network:
@@ -617,12 +721,16 @@ class BetterFlowApp:
 
         # In-process window watcher on macOS (inherits Accessibility permission)
         self.window_watcher = None
+        self.input_watcher = None
         if sys.platform == "darwin":
             try:
                 from .sync.macos_window_watcher import MacOSWindowWatcher
+                from .sync.macos_input_watcher import MacOSInputWatcher
             except ImportError:
                 from sync.macos_window_watcher import MacOSWindowWatcher
+                from sync.macos_input_watcher import MacOSInputWatcher
             self.window_watcher = MacOSWindowWatcher(self.aw)
+            self.input_watcher = MacOSInputWatcher(self.aw)
             self.aw_manager.disable_component("bf-window-tracker")
 
         self.sync_engine = SyncEngine(
@@ -667,6 +775,7 @@ class BetterFlowApp:
             aw_manager=self.aw_manager,
         )
         self.coordinator._on_auth_error = self._on_login
+        self.coordinator._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(
@@ -726,9 +835,11 @@ class BetterFlowApp:
         # Start bundled ActivityWatch
         self.aw_manager.start()
 
-        # Start in-process window watcher (after AW server is up)
+        # Start in-process watchers (after AW server is up)
         if self.window_watcher:
             self.window_watcher.start()
+        if self.input_watcher:
+            self.input_watcher.start()
 
         if state.logged_in:
             self.coordinator.logged_in = True
@@ -894,6 +1005,8 @@ class BetterFlowApp:
         with self._pause_state_lock:
             self._user_paused = True
         self.coordinator.paused_by_network = False
+        # Flush idle event if idle-paused, then clear state
+        self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
         self.tray.set_paused(True)
         # End break after pausing — prevents brief resume window where events could sync
@@ -908,6 +1021,7 @@ class BetterFlowApp:
         with self._pause_state_lock:
             self._user_paused = False
         self.coordinator.paused_by_network = False
+        self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.resume()
         self.tray.set_paused(False)
         self.reminder_manager.on_tracking_started()
@@ -937,6 +1051,16 @@ class BetterFlowApp:
             self.reminder_manager.on_tracking_started()
             send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
 
+    def _on_idle_pause(self, paused: bool) -> None:
+        """Handle idle pause/resume — also pause/resume input watcher."""
+        if self.input_watcher:
+            if paused:
+                self.input_watcher.stop()
+                logger.info("Input watcher stopped (user idle)")
+            else:
+                self.input_watcher.start()
+                logger.info("Input watcher resumed (user active)")
+
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
         logger.info("Manual sync triggered")
@@ -947,6 +1071,7 @@ class BetterFlowApp:
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
         self.coordinator.paused_by_network = False
+        self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
         self.reminder_manager.on_tracking_stopped()
@@ -985,6 +1110,7 @@ class BetterFlowApp:
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
         logger.info("Screen locked — pausing tracking")
+        self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
         self.reminder_manager.on_tracking_stopped()
@@ -1199,11 +1325,15 @@ class BetterFlowApp:
             self._shutdown_done = True
         logger.info("Shutting down...")
 
+        # Flush idle event before stopping (otherwise idle period is lost)
+        self.coordinator.flush_idle_event()
         clear_notifications()
         self.coordinator.stop()
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()
+        if self.input_watcher:
+            self.input_watcher.stop()
         if self.display_tracker is not None:
             self.display_tracker.stop()
         # Clean up macOS notification observers (M5)

@@ -172,6 +172,7 @@ class SyncSettings:
     interval_seconds: int = DEFAULT_SYNC_INTERVAL
     batch_size: int = DEFAULT_BATCH_SIZE
     compress: bool = True  # Use gzip compression
+    idle_pause_minutes: int = 20  # Pause sync after this many minutes AFK
 
 
 @dataclass
@@ -395,6 +396,10 @@ class Config:
                 self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
+            if "idle_pause_minutes" in sync:
+                val = int(sync["idle_pause_minutes"])
+                if 5 <= val <= 120:
+                    self.sync.idle_pause_minutes = val
 
         if "engagement" in server_config:
             eng = server_config["engagement"]

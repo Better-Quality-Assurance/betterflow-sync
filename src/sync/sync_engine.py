@@ -765,6 +765,30 @@ class SyncEngine:
             logger.warning(f"Failed to send break_time event: {e}")
             self.queue.enqueue([event])
 
+    def send_idle_event(self, start: datetime, end: Optional[datetime] = None) -> None:
+        """Send an idle_time event covering the idle duration."""
+        if end is None:
+            end = datetime.now(timezone.utc)
+        duration = (end - start).total_seconds()
+        if duration < 1:
+            return
+        event = {
+            "timestamp": start.isoformat(),
+            "duration": round(duration, 2),
+            "bucket_type": "idle_time",
+            "data": {"status": "idle"},
+        }
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            event["project_id"] = project["id"]
+        try:
+            self.bf.send_events([event])
+            logger.info(f"Sent idle_time event ({duration:.0f}s)")
+        except BetterFlowClientError as e:
+            logger.warning(f"Failed to send idle_time event: {e}")
+            self.queue.enqueue([event])
+
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""
         if start is None:

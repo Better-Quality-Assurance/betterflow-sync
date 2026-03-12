@@ -256,6 +256,10 @@ class AWClient:
             "data": data,
         })
 
+    def post_events(self, bucket_id: str, events: list[dict]) -> None:
+        """Insert events into a bucket (no merging, unlike heartbeat)."""
+        self._request("POST", f"buckets/{bucket_id}/events", json=events)
+
     def get_events_since(
         self, bucket_id: str, since: datetime, limit: int = 1000
     ) -> list[AWEvent]:
