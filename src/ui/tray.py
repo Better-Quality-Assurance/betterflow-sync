@@ -414,12 +414,7 @@ class TrayIcon:
                     enabled=logged_in and not is_current,
                 ))
             if s["current_project"]:
-                proj_elapsed = ""
-                if s["project_started_at"] is not None:
-                    elapsed_m = int(time.monotonic() - s["project_started_at"]) // 60
-                    eh, em = divmod(elapsed_m, 60)
-                    proj_elapsed = f" ({eh}h {em}m)"
-                items.append(Item(f"  Stop{proj_elapsed}", self._handle_stop_project, enabled=logged_in))
+                items.append(Item(f"  Stop ({s['hours_today']})", self._handle_stop_project, enabled=logged_in))
             items.append(Item("─" * 20, None, enabled=False))
 
         # ── Break toggle ───────────────────────────────────
