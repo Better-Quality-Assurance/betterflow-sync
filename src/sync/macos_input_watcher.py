@@ -53,13 +53,14 @@ class MacOSInputWatcher:
         # Store CFRunLoop ref so stop() can break out of it
         self._run_loop = None
         self._tap_ref = None
+        self._loop_ready = threading.Event()
 
     @property
     def is_running(self) -> bool:
         """True if threads are alive."""
         return (
-            self._tap_thread is not None and self._tap_thread.is_alive()
-            or self._emit_thread is not None and self._emit_thread.is_alive()
+            (self._tap_thread is not None and self._tap_thread.is_alive())
+            or (self._emit_thread is not None and self._emit_thread.is_alive())
         )
 
     def start(self) -> bool:
@@ -87,6 +88,11 @@ class MacOSInputWatcher:
 
         # Reset stop signal so new threads don't exit immediately
         self._stop_event.clear()
+        self._loop_ready.clear()
+        with self._lock:
+            self._presses = 0
+            self._clicks = 0
+            self._scrolls = 0
         self._run_loop = None
         self._tap_ref = None
 
@@ -110,6 +116,9 @@ class MacOSInputWatcher:
             return
 
         self._stop_event.set()
+
+        # Wait for the run loop to be initialised before stopping it
+        self._loop_ready.wait(timeout=2.0)
 
         # Break the CFRunLoop so the tap thread exits
         if self._run_loop is not None:
@@ -199,6 +208,7 @@ class MacOSInputWatcher:
         CFRunLoopAddSource(self._run_loop, source, kCFRunLoopCommonModes)
 
         logger.debug("CGEventTap run loop starting")
+        self._loop_ready.set()
         CFRunLoopRun()
         logger.debug("CGEventTap run loop exited")
 

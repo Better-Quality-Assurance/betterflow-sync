@@ -159,6 +159,7 @@ def apply_update(
 timeout /t 2 /nobreak >nul
 xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"
 start "" "{exe_path}"
+rd /s /q "{tmp_dir}"
 del "%~f0"
 """
             bat_path.write_text(bat_content)
