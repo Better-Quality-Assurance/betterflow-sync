@@ -32,8 +32,8 @@ if getattr(sys, "frozen", False) and sys.platform == "darwin":
             _root = tk.Tk()
             _root.withdraw()
             messagebox.showwarning(
-                "BetterFlow Sync",
-                "Please drag BetterFlow Sync to your Applications folder "
+                "BetterFlow",
+                "Please drag BetterFlow to your Applications folder "
                 "before launching.\n\n"
                 "Running from the disk image will cause crashes.",
             )

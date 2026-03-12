@@ -1,1 +1,1 @@
-"""Tests for BetterFlow Sync."""
+"""Tests for BetterFlow."""

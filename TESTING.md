@@ -1,6 +1,6 @@
-# Testing guide for BetterFlow Sync agent
+# Testing guide for BetterFlow agent
 
-This guide covers how to manually test the BetterFlow Sync desktop agent after installing from the DMG.
+This guide covers how to manually test the BetterFlow desktop agent after installing from the DMG.
 
 ## Prerequisites
 
@@ -12,9 +12,9 @@ ActivityWatch is **bundled** inside the app - you do not need to install it sepa
 
 ## Installation
 
-1. Open `BetterFlow Sync.dmg`
-2. Drag **BetterFlow Sync** into the **Applications** folder
-3. Launch from Applications (or Spotlight: "BetterFlow Sync")
+1. Open `BetterFlow.dmg`
+2. Drag **BetterFlow** into the **Applications** folder
+3. Launch from Applications (or Spotlight: "BetterFlow")
 4. On first launch, macOS may show "app from unidentified developer" - go to **System Settings > Privacy & Security** and click **Open Anyway**
 
 ## First launch (setup wizard)
@@ -175,7 +175,7 @@ These specifically verify the fixes in this release:
 If something goes wrong, check the logs:
 
 ```
-~/Library/Logs/BetterFlow Sync/betterflow-sync.log
+~/Library/Logs/BetterFlow/betterflow.log
 ```
 
 Enable Debug Mode (tray > Preferences > Debug Mode) for verbose logging.

@@ -39,7 +39,7 @@ _SUCCESS_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-    <title>BetterFlow Sync - Authorized</title>
+    <title>BetterFlow - Authorized</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f3f4f6; }
         .card { background: white; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,.1); max-width: 400px; }
@@ -55,7 +55,7 @@ _SUCCESS_HTML = """\
             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
         </div>
         <h1>Authorization Successful</h1>
-        <p>You can close this tab and return to BetterFlow Sync.</p>
+        <p>You can close this tab and return to BetterFlow.</p>
     </div>
 </body>
 </html>
@@ -65,7 +65,7 @@ _ERROR_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-    <title>BetterFlow Sync - Error</title>
+    <title>BetterFlow - Error</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f3f4f6; }
         .card { background: white; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,.1); max-width: 400px; }
@@ -94,10 +94,10 @@ def _allow_state_mismatch() -> bool:
 
     Requires BOTH env vars to be set:
     - BETTERFLOW_ALLOW_STATE_MISMATCH=1
-    - BETTERFLOW_SYNC_ENV=development
+    - BETTERFLOW_ENV=development
     This prevents accidental CSRF bypass in production builds.
     """
-    if os.getenv("BETTERFLOW_SYNC_ENV", "").strip().lower() != "development":
+    if os.getenv("BETTERFLOW_ENV", "").strip().lower() != "development":
         return False
     return os.getenv("BETTERFLOW_ALLOW_STATE_MISMATCH", "").strip().lower() in {
         "1",

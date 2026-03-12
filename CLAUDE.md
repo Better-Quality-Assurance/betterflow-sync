@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-BetterFlow Sync is a Python desktop app that syncs ActivityWatch data to BetterFlow for automatic time tracking. It runs as a system tray application on macOS and Windows, polling ActivityWatch locally and sending events to the BetterFlow API.
+BetterFlow is a Python desktop app that syncs ActivityWatch data to BetterFlow for automatic time tracking. It runs as a system tray application on macOS and Windows, polling ActivityWatch locally and sending events to the BetterFlow API.
 
 ## Commands
 
@@ -50,7 +50,7 @@ ActivityWatch (localhost:5600)
 
 ### Core Components
 
-**BetterFlowSyncApp** (`main.py`) - Main application orchestrator. Initializes all components, manages the APScheduler sync loop (default 60s), handles tray icon state transitions.
+**BetterFlowApp** (`main.py`) - Main application orchestrator. Initializes all components, manages the APScheduler sync loop (default 60s), handles tray icon state transitions.
 
 **SyncEngine** (`sync/sync_engine.py`) - Orchestrates AW -> BetterFlow data flow. Fetches events since last checkpoint, applies privacy transformations, batches and sends to API. On network failure, queues events to SQLite.
 
@@ -68,10 +68,10 @@ Privacy settings in `Config.privacy`:
 
 ### Configuration Storage
 
-- **Config**: `~/Library/Application Support/BetterFlow Sync/config.json` (macOS) or `%APPDATA%\BetterQA\BetterFlow Sync\config.json` (Windows)
+- **Config**: `~/Library/Application Support/BetterFlow/config.json` (macOS) or `%APPDATA%\BetterQA\BetterFlow\config.json` (Windows)
 - **Credentials**: System keychain via `keyring` library
 - **Queue/Checkpoints**: SQLite at `Config.get_data_dir() / "offline_queue.db"`
-- **Logs**: `Config.get_log_dir() / "betterflow-sync.log"`
+- **Logs**: `Config.get_log_dir() / "betterflow.log"`
 
 ### Bucket Types
 

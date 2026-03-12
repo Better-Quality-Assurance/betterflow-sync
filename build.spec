@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec file for BetterFlow Sync."""
+"""PyInstaller spec file for BetterFlow."""
 
 import platform
 import re
@@ -103,7 +103,7 @@ if is_mac:
         pyz,
         a.scripts,
         exclude_binaries=True,
-        name="BetterFlow Sync",
+        name="BetterFlow",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -124,24 +124,24 @@ if is_mac:
         a.datas,
         strip=False,
         upx=True,
-        name="BetterFlowSync",
+        name="BetterFlow",
     )
 
     app = BUNDLE(
         coll,
-        name="BetterFlow Sync.app",
+        name="BetterFlow.app",
         icon=str(resources_dir / "icon.icns") if (resources_dir / "icon.icns").exists() else None,
-        bundle_identifier="co.betterqa.betterflow-sync",
+        bundle_identifier="co.betterqa.betterflow",
         info_plist={
-            "CFBundleName": "BetterFlow Sync",
-            "CFBundleDisplayName": "BetterFlow Sync",
+            "CFBundleName": "BetterFlow",
+            "CFBundleDisplayName": "BetterFlow",
             "CFBundleVersion": APP_VERSION,
             "CFBundleShortVersionString": APP_VERSION,
             "LSUIElement": True,  # Hide from dock (menu bar app)
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "10.15",
             "NSRequiresAquaSystemAppearance": True,
-            "NSAppleEventsUsageDescription": "BetterFlow Sync needs this to track your active applications for time tracking.",
+            "NSAppleEventsUsageDescription": "BetterFlow needs this to track your active applications for time tracking.",
         },
     )
 
@@ -153,7 +153,7 @@ elif is_windows:
         a.zipfiles,
         a.datas,
         [],
-        name="BetterFlow Sync",
+        name="BetterFlow",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,

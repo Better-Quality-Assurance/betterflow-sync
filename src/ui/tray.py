@@ -80,6 +80,7 @@ class TrayModel:
         # Projects
         self.projects: list[ProjectDict] = []
         self.current_project: Optional[ProjectDict] = None
+        self.project_started_at: Optional[float] = None  # time.monotonic() when project was selected
 
         # Preferences
         self.sync_interval: int = 30
@@ -90,6 +91,9 @@ class TrayModel:
         self.update_channel: str = "stable"
         self.update_version: Optional[str] = None
         self.update_url: Optional[str] = None
+        self.update_asset_url: Optional[str] = None  # Direct ZIP download for self-update
+        self.update_in_progress: bool = False
+        self.update_status: str = ""
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
@@ -271,8 +275,10 @@ class TrayIcon:
         on_sync_now: Optional[Callable[[], None]] = None,
         on_export_logs: Optional[Callable[[], None]] = None,
         on_open_permissions: Optional[Callable[[], None]] = None,
+        on_start_break: Optional[Callable[[], None]] = None,
         on_end_break: Optional[Callable[[], None]] = None,
         on_cancel_login: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[str], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -288,8 +294,10 @@ class TrayIcon:
             on_sync_now: Callback to trigger an immediate sync
             on_export_logs: Callback to export logs to a zip file
             on_open_permissions: Callback to open system permission settings
+            on_start_break: Callback when user starts a manual break
             on_end_break: Callback when user ends break early
             on_cancel_login: Callback when user cancels in-progress login
+            on_install_update: Callback when user clicks Install & Restart (receives asset URL)
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -305,8 +313,10 @@ class TrayIcon:
         self._on_sync_now = on_sync_now
         self._on_export_logs = on_export_logs
         self._on_open_permissions = on_open_permissions
+        self._on_start_break = on_start_break
         self._on_end_break = on_end_break
         self._on_cancel_login = on_cancel_login
+        self._on_install_update = on_install_update
 
         self.model = TrayModel()
 
@@ -342,6 +352,7 @@ class TrayIcon:
                 "user_role": self.model.user_role,
                 "projects": list(self.model.projects),
                 "current_project": self.model.current_project,
+                "project_started_at": self.model.project_started_at,
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
                 "needs_permissions": self.model.needs_permissions,
@@ -353,6 +364,9 @@ class TrayIcon:
                 "update_channel": self.model.update_channel,
                 "update_version": self.model.update_version,
                 "update_url": self.model.update_url,
+                "update_asset_url": self.model.update_asset_url,
+                "update_in_progress": self.model.update_in_progress,
+                "update_status": self.model.update_status,
                 "dashboard_url": self.model.dashboard_url,
                 "app_version": self.model.app_version,
                 "break_reminders_enabled": self.model.break_reminders_enabled,
@@ -408,19 +422,23 @@ class TrayIcon:
                     checked=lambda item, p=proj: self._is_current_project(p),
                     enabled=logged_in and not is_current,
                 ))
-            if s["current_project"]:
-                items.append(Item(f"  Stop ({s['hours_today']})", self._handle_stop_project, enabled=logged_in))
+            items.append(Item(
+                f"  Stop ({s['hours_today']})",
+                self._handle_stop_project,
+                enabled=logged_in and s["current_project"] is not None,
+            ))
             items.append(Item("─" * 20, None, enabled=False))
 
-        # ── End Break action ────────────────────────────────
+        # ── Break toggle ───────────────────────────────────
         if s["on_break"]:
-            items.append(Item("End Break", self._handle_end_break))
-            items.append(Item("─" * 20, None, enabled=False))
+            items.append(Item("End Break", self._handle_end_break, enabled=logged_in))
+        else:
+            items.append(Item("Start Break", self._handle_start_break, enabled=logged_in and not s["paused"]))
 
         # ── Pause / Resume toggle ──────────────────────────
-        if s["paused"]:
+        if s["paused"] and not s["on_break"]:
             items.append(Item("Resume Tracking", self._handle_resume, enabled=logged_in))
-        else:
+        elif not s["on_break"]:
             items.append(Item("Pause Tracking", self._handle_pause, enabled=logged_in))
 
         # ── Private Time toggle (disabled when paused) ──────
@@ -524,11 +542,20 @@ class TrayIcon:
         items.append(Item("─" * 20, None, enabled=False))
 
         # ── Update available ──────────────────────────────────
-        if s["update_version"]:
-            items.append(Item(
-                f"Update available (v{s['update_version']})",
-                self._handle_open_update,
-            ))
+        if s["update_in_progress"]:
+            status = s["update_status"] or "Updating..."
+            items.append(Item(status, None, enabled=False))
+        elif s["update_version"]:
+            if s["update_asset_url"]:
+                items.append(Item(
+                    f"Install v{s['update_version']} & Restart",
+                    self._handle_install_update,
+                ))
+            else:
+                items.append(Item(
+                    f"Update available (v{s['update_version']})",
+                    self._handle_open_update,
+                ))
 
         if s["app_version"]:
             items.append(Item(f"v{s['app_version']}", None, enabled=False))
@@ -620,6 +647,11 @@ class TrayIcon:
         if self._on_open_permissions:
             self._on_open_permissions()
 
+    def _handle_start_break(self, icon, item) -> None:
+        """Handle start break menu click."""
+        if self._on_start_break:
+            self._on_start_break()
+
     def _handle_end_break(self, icon, item) -> None:
         """Handle end break menu click."""
         if self._on_end_break:
@@ -673,6 +705,7 @@ class TrayIcon:
         """Clear the currently running project."""
         with self.model.lock:
             self.model.current_project = None
+            self.model.project_started_at = None
         if self._on_project_change:
             self._on_project_change(None)
         self._update_menu()
@@ -691,6 +724,7 @@ class TrayIcon:
         def handler(icon, item):
             with self.model.lock:
                 self.model.current_project = project
+                self.model.project_started_at = time.monotonic() if project else None
             if self._on_project_change:
                 self._on_project_change(project)
             self._update_menu()
@@ -707,6 +741,18 @@ class TrayIcon:
             url = self.model.update_url
         if url:
             webbrowser.open(url)
+
+    def _handle_install_update(self, icon, item) -> None:
+        """Download and install the update, then restart."""
+        with self.model.lock:
+            asset_url = self.model.update_asset_url
+            if self.model.update_in_progress:
+                return
+            self.model.update_in_progress = True
+        self._update_menu()
+
+        if self._on_install_update and asset_url:
+            self._on_install_update(asset_url)
 
     def _handle_quit(self, icon, item) -> None:
         """Handle quit menu click."""
@@ -904,6 +950,9 @@ class TrayIcon:
             self.model.projects = projects
             if current_project:
                 self.model.current_project = current_project
+                # Only set start time if not already tracking this project
+                if self.model.project_started_at is None:
+                    self.model.project_started_at = time.monotonic()
         self._update_menu()
 
     def set_active_time(self, active_time) -> None:
@@ -917,14 +966,21 @@ class TrayIcon:
         minutes = (total_seconds % 3600) // 60
         with self.model.lock:
             self.model.hours_today = f"{hours}h {minutes}m"
-        self._update_tooltip(f"BetterFlow Sync - Today: {hours}h {minutes}m active")
+        self._update_tooltip(f"BetterFlow - Today: {hours}h {minutes}m active")
         self._update_menu()
 
-    def set_update_available(self, version: str, url: str) -> None:
+    def set_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
         """Show an update-available item in the tray menu."""
         with self.model.lock:
             self.model.update_version = version
             self.model.update_url = url
+            self.model.update_asset_url = asset_url
+        self._update_menu()
+
+    def set_update_progress(self, status: str) -> None:
+        """Update the self-update progress text in the menu."""
+        with self.model.lock:
+            self.model.update_status = status
         self._update_menu()
 
     def _update_tooltip(self, tooltip: str) -> None:
@@ -1040,9 +1096,9 @@ class TrayIcon:
 
         color = STATE_COLORS[self.model.state]
         self._icon = pystray.Icon(
-            "BetterFlow Sync",
+            "BetterFlow",
             create_icon_image(color),
-            "BetterFlow Sync",
+            "BetterFlow",
             self._create_menu(),
         )
 
@@ -1071,9 +1127,9 @@ class TrayIcon:
             if self._icon is None:
                 color = STATE_COLORS[self.model.state]
                 self._icon = pystray.Icon(
-                    "BetterFlow Sync",
+                    "BetterFlow",
                     create_icon_image(color),
-                    "BetterFlow Sync",
+                    "BetterFlow",
                     self._create_menu(),
                 )
 

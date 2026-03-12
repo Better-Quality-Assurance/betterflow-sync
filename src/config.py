@@ -1,4 +1,4 @@
-"""Configuration management for BetterFlow Sync."""
+"""Configuration management for BetterFlow."""
 
 import json
 import logging
@@ -27,15 +27,15 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-APP_NAME = "BetterFlow Sync"
+APP_NAME = "BetterFlow"
 APP_AUTHOR = "BetterQA"
 
 
 def _load_dotenv() -> None:
     """Load environment variables from a local .env file (if present)."""
     candidates: list[Path] = []
-    if os.getenv("BETTERFLOW_SYNC_ENV_FILE"):
-        candidates.append(Path(os.environ["BETTERFLOW_SYNC_ENV_FILE"]).expanduser())
+    if os.getenv("BETTERFLOW_ENV_FILE"):
+        candidates.append(Path(os.environ["BETTERFLOW_ENV_FILE"]).expanduser())
 
     # Installed app runtime config location.
     candidates.append(Path(user_config_dir(APP_NAME, APP_AUTHOR)) / ".env")
@@ -172,6 +172,7 @@ class SyncSettings:
     interval_seconds: int = DEFAULT_SYNC_INTERVAL
     batch_size: int = DEFAULT_BATCH_SIZE
     compress: bool = True  # Use gzip compression
+    idle_pause_minutes: int = 20  # Pause sync after this many minutes AFK
 
 
 @dataclass
@@ -395,6 +396,10 @@ class Config:
                 self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
+            if "idle_pause_minutes" in sync:
+                val = int(sync["idle_pause_minutes"])
+                if 5 <= val <= 120:
+                    self.sync.idle_pause_minutes = val
 
         if "engagement" in server_config:
             eng = server_config["engagement"]
@@ -440,7 +445,7 @@ def setup_logging(debug: bool = False) -> None:
     """
     log_dir = Config.get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "betterflow-sync.log"
+    log_file = log_dir / "betterflow.log"
 
     level = logging.DEBUG if debug else logging.INFO
     format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -243,7 +243,7 @@ class AWClient:
     def create_bucket(self, bucket_id: str, bucket_type: str, hostname: str) -> None:
         """Create a bucket (idempotent — AW ignores if already exists)."""
         self._request("POST", f"buckets/{bucket_id}", json={
-            "client": "betterflow-sync",
+            "client": "betterflow",
             "type": bucket_type,
             "hostname": hostname,
         })
@@ -255,6 +255,10 @@ class AWClient:
             "duration": 0,
             "data": data,
         })
+
+    def post_events(self, bucket_id: str, events: list[dict]) -> None:
+        """Insert events into a bucket (no merging, unlike heartbeat)."""
+        self._request("POST", f"buckets/{bucket_id}/events", json=events)
 
     def get_events_since(
         self, bucket_id: str, since: datetime, limit: int = 1000

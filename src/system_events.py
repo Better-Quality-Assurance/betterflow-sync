@@ -22,6 +22,11 @@ _observers_lock = threading.Lock()
 _stop_event = threading.Event()  # Signal run loops to exit on cleanup
 
 
+def _is_localhost(host: str) -> bool:
+    """Check if a host refers to the local machine."""
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
 def start_system_event_listener(
     on_sleep: Callable,
     on_wake: Callable,
@@ -30,12 +35,27 @@ def start_system_event_listener(
     on_screen_lock: Callable = None,   # fn() — screen locked
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
     reachability_host: str = "",  # Host to check for network reachability
+    reachability_port: int = 443,  # Port to check for network reachability
 ) -> None:
     """Start platform-specific system event listeners.
 
     All listeners run on daemon threads and die automatically on process exit.
     """
     host = reachability_host or "app.betterflow.eu"
+
+    # Localhost APIs are always reachable — skip network monitoring and report online
+    if _is_localhost(host):
+        logger.info(f"API host is localhost ({host}) — assuming always online")
+        _safe_call(on_network_change, True)
+        # Still start power/screen listeners, just skip network monitoring
+        if _system == "Darwin":
+            _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
+            if on_screen_lock or on_screen_unlock:
+                _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
+        elif _system == "Windows":
+            _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
+        return
+
     if _system == "Darwin":
         _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
         _start_macos_network_listener(on_network_change, host=host)
@@ -43,7 +63,7 @@ def start_system_event_listener(
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
     elif _system == "Windows":
         _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
-        _start_network_poller(on_network_change, host=host)
+        _start_network_poller(on_network_change, host=host, port=reachability_port)
     else:
         logger.warning(f"System events not supported on {_system}")
 
@@ -342,7 +362,7 @@ def _start_windows_listener(
     def run_message_pump():
         wnd_proc_cb = WNDPROC(wnd_proc)
 
-        class_name = "BetterFlowSyncEvents"
+        class_name = "BetterFlowEvents"
 
         class WNDCLASSW(ctypes.Structure):
             _fields_ = [
@@ -368,7 +388,7 @@ def _start_windows_listener(
             return
 
         hwnd = user32.CreateWindowExW(
-            0, class_name, "BetterFlow Sync Events", 0,
+            0, class_name, "BetterFlow Events", 0,
             0, 0, 0, 0,
             HWND_MESSAGE, None, wc.hInstance, None,
         )
@@ -401,6 +421,7 @@ def _start_windows_listener(
 def _start_network_poller(
     on_change: Callable,
     host: str = "app.betterflow.eu",
+    port: int = 443,
     interval: int = 5,
 ) -> None:
     """Poll network connectivity and fire callback on state changes."""
@@ -412,7 +433,7 @@ def _start_network_poller(
         first = True
         while not stop_event.is_set():
             try:
-                socket.create_connection((host, 443), timeout=5).close()
+                socket.create_connection((host, port), timeout=5).close()
                 online = True
             except OSError:
                 online = False
