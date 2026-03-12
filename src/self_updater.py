@@ -1,8 +1,6 @@
 """Self-update: download a new release ZIP, replace the running .app, and relaunch."""
 
 import logging
-import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -15,12 +13,6 @@ from typing import Callable, Optional
 import requests
 
 logger = logging.getLogger(__name__)
-
-# Asset name patterns per platform (must match CI workflow)
-_ASSET_PATTERNS = {
-    "Darwin": "BetterFlow-macOS",
-    "Windows": "BetterFlow-Windows",
-}
 
 
 def _get_app_bundle_path() -> Optional[Path]:
@@ -44,19 +36,6 @@ def _get_app_bundle_path() -> Optional[Path]:
             return Path(sys._MEIPASS).parent if hasattr(sys, "_MEIPASS") else exe.parent
         return None
 
-    return None
-
-
-def find_asset_url(release: dict) -> Optional[str]:
-    """Find the platform-specific ZIP download URL from a GitHub release."""
-    pattern = _ASSET_PATTERNS.get(platform.system())
-    if not pattern:
-        return None
-
-    for asset in release.get("assets", []):
-        name = asset.get("name", "")
-        if pattern in name and name.endswith(".zip"):
-            return asset.get("browser_download_url")
     return None
 
 
@@ -104,10 +83,14 @@ def apply_update(
                     pct = int(downloaded / total * 100)
                     _status(f"Downloading... {pct}%")
 
-        # 2. Extract
+        # 2. Extract (with Zip Slip protection)
         _status("Extracting...")
         extract_dir = tmp_dir / "extracted"
         with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.namelist():
+                member_path = (extract_dir / member).resolve()
+                if not str(member_path).startswith(str(extract_dir.resolve())):
+                    raise ValueError(f"Zip entry escapes target directory: {member}")
             zf.extractall(extract_dir)
 
         # 3. Find the new .app or exe dir inside the extract
@@ -143,7 +126,7 @@ def apply_update(
             _status("Restarting...")
             subprocess.Popen(["open", str(app_path)])
             # Exit current process
-            os._exit(0)
+            sys.exit(0)
 
         elif sys.platform == "win32":
             # Windows: extract contains BetterFlow.exe + supporting files
@@ -155,19 +138,20 @@ def apply_update(
 
             bat_path = tmp_dir / "update.bat"
             exe_path = app_path / "BetterFlow.exe"
-            bat_content = f"""@echo off
-timeout /t 2 /nobreak >nul
-xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"
-start "" "{exe_path}"
-rd /s /q "{tmp_dir}"
-del "%~f0"
-"""
+            # Paths are from tempfile.mkdtemp (safe) and validated app_path,
+            # but quote defensively against spaces in install paths.
+            bat_content = '@echo off\r\n'
+            bat_content += 'timeout /t 2 /nobreak >nul\r\n'
+            bat_content += f'xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"\r\n'
+            bat_content += f'start "" "{exe_path}"\r\n'
+            bat_content += f'rd /s /q "{tmp_dir}"\r\n'
+            bat_content += 'del "%~f0"\r\n'
             bat_path.write_text(bat_content)
             subprocess.Popen(
                 ["cmd", "/c", str(bat_path)],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            os._exit(0)
+            sys.exit(0)
 
         return True
 
@@ -197,19 +181,19 @@ def _find_app_in(directory: Path) -> Optional[Path]:
 
 
 def _fix_permissions(app_path: Path) -> None:
-    """Ensure the main executable inside the .app has execute permission."""
+    """Ensure the main executable inside the .app has owner-execute permission."""
     macos_dir = app_path / "Contents" / "MacOS"
     if macos_dir.exists():
         for f in macos_dir.iterdir():
             if f.is_file():
-                f.chmod(f.stat().st_mode | 0o111)
+                f.chmod(f.stat().st_mode | 0o100)  # owner-execute only
     # Also fix bundled tracker binaries
     resources = app_path / "Contents" / "Resources"
     if resources.exists():
         for tracker in resources.rglob("*"):
             if tracker.is_file() and not tracker.suffix:
                 try:
-                    tracker.chmod(tracker.stat().st_mode | 0o111)
+                    tracker.chmod(tracker.stat().st_mode | 0o100)  # owner-execute only
                 except Exception:
                     pass
 

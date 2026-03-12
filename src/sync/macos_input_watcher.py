@@ -225,7 +225,11 @@ class MacOSInputWatcher:
                     self._clicks = 0
                     self._scrolls = 0
 
-                # Always post — zero counts tell the backend "user was idle"
+                # Skip zero-count events to avoid 8,640 idle events/day.
+                # AFK bucket already handles idle detection.
+                if presses == 0 and clicks == 0 and scrolls == 0:
+                    continue
+
                 now = datetime.now(timezone.utc).isoformat()
                 self._aw.post_events(self._bucket_id, [{
                     "timestamp": now,
