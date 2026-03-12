@@ -282,10 +282,11 @@ class AWClient:
         return info.get("hostname", "unknown")
 
     def close(self) -> None:
-        """Close the session."""
+        """Close the session. The session object remains valid after close()
+        (it just won't reuse connections), so in-flight requests on other
+        threads will get ConnectionError rather than AttributeError."""
         if self._session is not None:
             self._session.close()
-            self._session = None
 
     def __del__(self) -> None:
         try:

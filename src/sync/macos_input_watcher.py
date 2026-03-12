@@ -145,8 +145,8 @@ class MacOSInputWatcher:
                     from Quartz import CGEventTapEnable
                     CGEventTapEnable(self._tap_ref, True)
                     logger.debug("Re-enabled CGEventTap after timeout")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to re-enable CGEventTap: {e}")
             return event
 
         with self._lock:

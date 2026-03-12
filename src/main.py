@@ -608,6 +608,7 @@ class SyncCoordinator:
 
         except BetterFlowAuthError as e:
             logger.warning(f"Auth error during sync: {e} — triggering re-login")
+            self.logged_in = False
             self.tray.set_state(
                 TrayState.WAITING_AUTH, "Session expired, re-login required"
             )
@@ -1196,7 +1197,10 @@ class BetterFlowApp:
         if is_online:
             logger.info("Network back online — triggering sync to flush queue")
             if self.coordinator.paused_by_network:
-                self.sync_engine.resume()
+                with self._pause_state_lock:
+                    user_paused = self._user_paused
+                if not user_paused:
+                    self.sync_engine.resume()
                 self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
         else:

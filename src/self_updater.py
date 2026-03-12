@@ -9,6 +9,7 @@ import threading
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -63,6 +64,12 @@ def apply_update(
         _status("Cannot determine app location — update aborted")
         return False
 
+    # Reject non-HTTPS download URLs to prevent MITM attacks
+    parsed_url = urlparse(download_url)
+    if parsed_url.scheme != "https":
+        _status(f"Refusing non-HTTPS download URL: {download_url}")
+        return False
+
     tmp_dir = None
     try:
         # 1. Download
@@ -98,6 +105,11 @@ def apply_update(
             new_app = _find_app_in(extract_dir)
             if new_app is None:
                 _status("No .app found in update archive — aborted")
+                return False
+
+            # 3b. Verify code signature before installing
+            if not _verify_codesign(new_app):
+                _status("Code signature verification failed — update aborted")
                 return False
 
             # 4. Replace: move old to trash, move new in place
@@ -195,7 +207,27 @@ def _fix_permissions(app_path: Path) -> None:
                 try:
                     tracker.chmod(tracker.stat().st_mode | 0o100)  # owner-execute only
                 except Exception:
-                    pass
+                    logger.warning(f"Failed to set execute permission on {tracker}")
+
+
+def _verify_codesign(app_path: Path) -> bool:
+    """Verify macOS code signature on the extracted .app bundle."""
+    try:
+        result = subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", str(app_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(f"codesign verification failed: {result.stderr.strip()}")
+            return False
+        logger.info("Code signature verified successfully")
+        return True
+    except FileNotFoundError:
+        logger.warning("codesign binary not found - skipping verification")
+        return True  # Allow update on systems without codesign
+    except subprocess.TimeoutExpired:
+        logger.error("codesign verification timed out")
+        return False
 
 
 def apply_update_async(
