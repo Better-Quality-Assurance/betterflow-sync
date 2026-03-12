@@ -14,13 +14,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 try:
-    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE
+    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE  # module execution
 except ImportError:
     try:
-        from .. import __version__ as _APP_VERSION
+        import _build_info as _bi  # PyInstaller bundle (src/ is root, no parent package)
+        _APP_VERSION = _bi.APP_VERSION
+        BUILD_DATE = _bi.BUILD_DATE
     except ImportError:
-        _APP_VERSION = "unknown"
-    BUILD_DATE = "dev"
+        try:
+            from .. import __version__ as _APP_VERSION
+        except ImportError:
+            _APP_VERSION = "unknown"
+        BUILD_DATE = "dev"
 
 from PIL import Image, ImageDraw, ImageFont
 
