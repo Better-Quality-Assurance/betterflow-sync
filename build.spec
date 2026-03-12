@@ -14,9 +14,13 @@ _version_file = Path(SPECPATH) / "src" / "__init__.py"
 _version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _version_file.read_text())
 APP_VERSION = _version_match.group(1) if _version_match else "0.0.0"
 
-# Stamp build date into _build_info.py
+# Stamp build metadata into _build_info.py
 _build_info = Path(SPECPATH) / "src" / "_build_info.py"
-_build_info.write_text(f'"""Build metadata - regenerated at build time."""\n\nBUILD_DATE = "{date.today().isoformat()}"\n')
+_build_info.write_text(
+    f'"""Build metadata - regenerated at build time."""\n\n'
+    f'APP_VERSION = "{APP_VERSION}"\n'
+    f'BUILD_DATE = "{date.today().isoformat()}"\n'
+)
 
 # Determine platform
 is_mac = platform.system() == "Darwin"

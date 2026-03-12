@@ -14,14 +14,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 try:
-    from .._build_info import BUILD_DATE
+    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE
 except ImportError:
+    try:
+        from .. import __version__ as _APP_VERSION
+    except ImportError:
+        _APP_VERSION = "unknown"
     BUILD_DATE = "dev"
-
-try:
-    from .. import __version__ as _APP_VERSION
-except ImportError:
-    _APP_VERSION = "unknown"
 
 from PIL import Image, ImageDraw, ImageFont
 
