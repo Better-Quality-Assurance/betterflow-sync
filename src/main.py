@@ -579,6 +579,8 @@ class SyncCoordinator:
                         self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
                     else:
                         self.tray.set_state(TrayState.SYNCING)
+                if stats.events_sent > 0:
+                    send_notification("Sync Complete", f"{stats.events_sent} events synced.", sound=False)
             else:
                 self.tray.set_state(
                     TrayState.ERROR,
