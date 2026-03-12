@@ -91,6 +91,9 @@ class TrayModel:
         self.update_channel: str = "stable"
         self.update_version: Optional[str] = None
         self.update_url: Optional[str] = None
+        self.update_asset_url: Optional[str] = None  # Direct ZIP download for self-update
+        self.update_in_progress: bool = False
+        self.update_status: str = ""
         self.config_file_path: Optional[str] = None
         self.dashboard_url: str = ""  # Set by set_config() from api_url
         self.company_name: Optional[str] = None
@@ -275,6 +278,7 @@ class TrayIcon:
         on_start_break: Optional[Callable[[], None]] = None,
         on_end_break: Optional[Callable[[], None]] = None,
         on_cancel_login: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[str], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -293,6 +297,7 @@ class TrayIcon:
             on_start_break: Callback when user starts a manual break
             on_end_break: Callback when user ends break early
             on_cancel_login: Callback when user cancels in-progress login
+            on_install_update: Callback when user clicks Install & Restart (receives asset URL)
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -311,6 +316,7 @@ class TrayIcon:
         self._on_start_break = on_start_break
         self._on_end_break = on_end_break
         self._on_cancel_login = on_cancel_login
+        self._on_install_update = on_install_update
 
         self.model = TrayModel()
 
@@ -358,6 +364,9 @@ class TrayIcon:
                 "update_channel": self.model.update_channel,
                 "update_version": self.model.update_version,
                 "update_url": self.model.update_url,
+                "update_asset_url": self.model.update_asset_url,
+                "update_in_progress": self.model.update_in_progress,
+                "update_status": self.model.update_status,
                 "dashboard_url": self.model.dashboard_url,
                 "app_version": self.model.app_version,
                 "break_reminders_enabled": self.model.break_reminders_enabled,
@@ -533,11 +542,20 @@ class TrayIcon:
         items.append(Item("─" * 20, None, enabled=False))
 
         # ── Update available ──────────────────────────────────
-        if s["update_version"]:
-            items.append(Item(
-                f"Update available (v{s['update_version']})",
-                self._handle_open_update,
-            ))
+        if s["update_in_progress"]:
+            status = s["update_status"] or "Updating..."
+            items.append(Item(status, None, enabled=False))
+        elif s["update_version"]:
+            if s["update_asset_url"]:
+                items.append(Item(
+                    f"Install v{s['update_version']} & Restart",
+                    self._handle_install_update,
+                ))
+            else:
+                items.append(Item(
+                    f"Update available (v{s['update_version']})",
+                    self._handle_open_update,
+                ))
 
         if s["app_version"]:
             items.append(Item(f"v{s['app_version']}", None, enabled=False))
@@ -723,6 +741,18 @@ class TrayIcon:
             url = self.model.update_url
         if url:
             webbrowser.open(url)
+
+    def _handle_install_update(self, icon, item) -> None:
+        """Download and install the update, then restart."""
+        with self.model.lock:
+            asset_url = self.model.update_asset_url
+            if self.model.update_in_progress:
+                return
+            self.model.update_in_progress = True
+        self._update_menu()
+
+        if self._on_install_update and asset_url:
+            self._on_install_update(asset_url)
 
     def _handle_quit(self, icon, item) -> None:
         """Handle quit menu click."""
@@ -939,11 +969,18 @@ class TrayIcon:
         self._update_tooltip(f"BetterFlow - Today: {hours}h {minutes}m active")
         self._update_menu()
 
-    def set_update_available(self, version: str, url: str) -> None:
+    def set_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
         """Show an update-available item in the tray menu."""
         with self.model.lock:
             self.model.update_version = version
             self.model.update_url = url
+            self.model.update_asset_url = asset_url
+        self._update_menu()
+
+    def set_update_progress(self, status: str) -> None:
+        """Update the self-update progress text in the menu."""
+        with self.model.lock:
+            self.model.update_status = status
         self._update_menu()
 
     def _update_tooltip(self, tooltip: str) -> None:

@@ -1,6 +1,7 @@
 """Check for new releases via GitHub Releases API."""
 
 import logging
+import platform
 import threading
 from typing import Callable, Optional
 
@@ -41,6 +42,24 @@ def _matches_channel(release: dict, channel: str) -> bool:
     elif channel == "canary":
         return True
     return not is_prerelease
+
+
+_ASSET_PATTERNS = {
+    "Darwin": "BetterFlow-macOS",
+    "Windows": "BetterFlow-Windows",
+}
+
+
+def _find_platform_asset(release: dict) -> Optional[str]:
+    """Find the platform-specific ZIP download URL from a GitHub release."""
+    pattern = _ASSET_PATTERNS.get(platform.system())
+    if not pattern:
+        return None
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        if pattern in name and name.endswith(".zip"):
+            return asset.get("browser_download_url")
+    return None
 
 
 def check_for_update(
@@ -110,12 +129,16 @@ def check_for_update(
 
             latest_tag = best["tag_name"]
             html_url = best.get("html_url", "")
+
+            # Find platform-specific ZIP asset URL for self-update
+            asset_url = _find_platform_asset(best)
+
             logger.info(
                 f"Update available ({channel}): {current_version} -> {latest_tag} — {html_url}"
             )
 
             if callback:
-                callback(latest_tag.lstrip("v"), html_url)
+                callback(latest_tag.lstrip("v"), html_url, asset_url)
 
         except Exception as e:
             logger.debug(f"Update check failed: {e}")

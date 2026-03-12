@@ -760,6 +760,7 @@ class BetterFlowApp:
             on_start_break=self._on_start_break,
             on_end_break=self._on_end_break,
             on_cancel_login=self._on_cancel_login,
+            on_install_update=self._on_install_update,
         )
         self.tray.set_config(self.config)
         self.tray.model.app_version = _VERSION
@@ -920,14 +921,39 @@ class BetterFlowApp:
         """Open System Settings to Accessibility permission pane."""
         open_accessibility_settings()
 
-    def _on_update_available(self, version: str, url: str) -> None:
+    def _on_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
         """Handle update available notification."""
-        logger.info(f"Update available: v{version} — {url}")
-        self.tray.set_update_available(version, url)
-        send_notification(
-            "BetterFlow Update",
-            f"Version {version} is available.",
-        )
+        logger.info(f"Update available: v{version} — {url} (asset: {asset_url})")
+        self.tray.set_update_available(version, url, asset_url)
+        if asset_url:
+            send_notification(
+                "BetterFlow Update",
+                f"Version {version} is available. Click 'Install & Restart' in the menu.",
+            )
+        else:
+            send_notification(
+                "BetterFlow Update",
+                f"Version {version} is available.",
+            )
+
+    def _on_install_update(self, asset_url: str) -> None:
+        """Handle self-update: download, replace, relaunch."""
+        try:
+            from .self_updater import apply_update_async
+        except ImportError:
+            from self_updater import apply_update_async
+
+        def on_progress(status: str) -> None:
+            self.tray.set_update_progress(status)
+
+        def on_complete(success: bool) -> None:
+            if not success:
+                with self.tray.model.lock:
+                    self.tray.model.update_in_progress = False
+                self.tray._update_menu()
+                send_notification("Update Failed", "Self-update failed. Try again later.")
+
+        apply_update_async(asset_url, on_progress=on_progress, on_complete=on_complete)
 
     def _check_stale_session(self) -> None:
         """Check if previous session is still active on server (forgot to clock out)."""
