@@ -129,9 +129,11 @@ class ReminderManager:
 
             # Determine when the last notification was sent (or use work_start).
             ref = self._last_break_notification or self._work_start
-            if now - ref >= interval:
-                hours = int(elapsed // 3600)
-                self._last_break_notification = now
+            if now - ref < interval:
+                return
+
+            hours = int(elapsed // 3600)
+            self._last_break_notification = now
 
         # Send notification outside the lock to avoid holding it during I/O
         logger.info(f"Break reminder sent ({hours}h elapsed)")
@@ -154,13 +156,15 @@ class ReminderManager:
                 return
 
             ref = self._last_private_notification or self._private_start
-            if now - ref >= interval:
-                minutes = int(elapsed // 60)
-                self._last_private_notification = now
+            if now - ref < interval:
+                return
+
+            minutes = int(elapsed // 60)
+            self._last_private_notification = now
 
         # Send notification outside the lock
+        logger.info(f"Private time reminder sent ({minutes}m elapsed)")
         send_notification(
             "Private Time Still Active",
             f"Private mode has been on for {minutes}m - tracking is paused.",
         )
-            logger.info(f"Private time reminder sent ({minutes}m elapsed)")
