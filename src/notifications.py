@@ -7,24 +7,6 @@ import subprocess
 
 logger = logging.getLogger(__name__)
 
-# macOS native notification center (lazy-initialized)
-_mac_center = None
-
-
-def _get_mac_center():
-    """Get the macOS NSUserNotificationCenter singleton."""
-    global _mac_center
-    if _mac_center is not None:
-        return _mac_center
-    try:
-        import objc
-
-        NSUserNotificationCenter = objc.lookUpClass("NSUserNotificationCenter")
-        _mac_center = NSUserNotificationCenter.defaultUserNotificationCenter()
-        return _mac_center
-    except Exception:
-        return None
-
 
 def send_notification(title: str, message: str, sound: bool = True) -> None:
     """Send a native OS notification.
@@ -47,39 +29,28 @@ def send_notification(title: str, message: str, sound: bool = True) -> None:
 
 
 def clear_notifications() -> None:
-    """Remove all delivered notifications from Notification Center."""
+    """Remove all delivered notifications from Notification Center.
+
+    Note: on macOS this is a no-op. The deprecated NSUserNotificationCenter
+    API (removeAllDeliveredNotifications) has no effect on macOS 13+, and
+    osascript-based notifications cannot be programmatically cleared.
+    Windows toast notifications can be cleared via ToastNotificationManager.
+    """
     system = platform.system()
     try:
-        if system == "Darwin":
-            center = _get_mac_center()
-            if center:
-                center.removeAllDeliveredNotifications()
-                logger.debug("Cleared all delivered notifications")
-        elif system == "Windows":
+        if system == "Windows":
             _clear_windows()
     except Exception as e:
         logger.debug(f"Failed to clear notifications: {e}")
 
 
 def _send_macos(title: str, message: str, sound: bool) -> None:
-    """Send notification via NSUserNotificationCenter on macOS."""
-    center = _get_mac_center()
-    if center:
-        try:
-            import objc
+    """Send notification via osascript on macOS.
 
-            NSUserNotification = objc.lookUpClass("NSUserNotification")
-            notification = NSUserNotification.alloc().init()
-            notification.setTitle_(title)
-            notification.setInformativeText_(message)
-            if sound:
-                notification.setSoundName_("default")
-            center.deliverNotification_(notification)
-            return
-        except Exception as e:
-            logger.debug(f"NSUserNotification failed, falling back to osascript: {e}")
-
-    # Fallback to osascript
+    Uses 'display notification' which routes through the modern
+    UserNotifications framework. The deprecated NSUserNotificationCenter
+    API was removed because it causes ghost notifications on macOS 13+.
+    """
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
     safe_message = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
 
