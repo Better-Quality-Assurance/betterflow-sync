@@ -79,9 +79,8 @@ def _start_macos_power_listener(
 ) -> None:
     """Listen for macOS sleep/wake/shutdown via NSWorkspace notifications."""
     try:
-        from Foundation import NSObject
         from AppKit import NSWorkspace
-        from PyObjCTools import AppHelper
+        from Foundation import NSObject
     except ImportError:
         logger.warning("pyobjc not available — sleep/wake detection disabled")
         return
@@ -142,14 +141,12 @@ def _start_macos_power_listener(
 
         logger.debug("macOS power event listener started")
         try:
-            # Use interruptible run loop so cleanup_observers() can stop us
-            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
-            loop = NSRunLoop.currentRunLoop()
-            while not _stop_event.is_set():
-                loop.runMode_beforeDate_(
-                    NSDefaultRunLoopMode,
-                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
-                )
+            # NSWorkspace.notificationCenter() delivers on the main thread,
+            # not on the observer's thread.  NSRunLoop.runMode_beforeDate_
+            # returns immediately here (no run-loop sources) causing 100% CPU.
+            # Block with _stop_event.wait() instead — the observer is retained
+            # by the notification center regardless of run-loop state.
+            _stop_event.wait()
         finally:
             center.removeObserver_(observer)
 
@@ -168,7 +165,6 @@ def _start_macos_screen_lock_listener(
     """Detect macOS screen lock/unlock via DistributedNotificationCenter."""
     try:
         from Foundation import NSObject, NSDistributedNotificationCenter
-        from PyObjCTools import AppHelper
     except ImportError:
         logger.warning("pyobjc not available — screen lock detection disabled")
         return
@@ -203,13 +199,11 @@ def _start_macos_screen_lock_listener(
 
         logger.debug("macOS screen lock listener started")
         try:
-            from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
-            loop = NSRunLoop.currentRunLoop()
-            while not _stop_event.is_set():
-                loop.runMode_beforeDate_(
-                    NSDefaultRunLoopMode,
-                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
-                )
+            # NSDistributedNotificationCenter delivers on the main thread's
+            # run loop, not on this background thread.  runMode_beforeDate_
+            # returns immediately here (no run-loop sources) causing 100% CPU.
+            # Block with _stop_event.wait() instead.
+            _stop_event.wait()
         finally:
             center.removeObserver_(observer)
 
