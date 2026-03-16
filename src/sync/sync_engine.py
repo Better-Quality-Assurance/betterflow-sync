@@ -155,6 +155,8 @@ class SyncEngine:
                 self.bf.end_session("app_quit")
             except BetterFlowClientError:
                 pass
+        # Free fraud detector accumulators while paused
+        self._activity_analyzer.clear()
 
     def resume(self) -> None:
         """Resume syncing."""
@@ -1073,5 +1075,7 @@ class SyncEngine:
                     if attempt == 0:
                         logger.debug("Session end attempt 1 failed, retrying")
 
+        # Free fraud detector accumulators
+        self._activity_analyzer.clear()
         # Close time tracker
         self._time_tracker.close()

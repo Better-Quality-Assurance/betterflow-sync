@@ -2,6 +2,7 @@
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
@@ -133,8 +134,8 @@ class FraudSignalDetector:
         self._unique_apps: set[str] = set()
         # Consecutive mouse-only window count
         self._mouse_only_streak: int = 0
-        # Input event timestamps for regularity analysis
-        self._input_timestamps: list[datetime] = []
+        # Input event timestamps for regularity analysis (bounded: ~60 events/min * 60 min)
+        self._input_timestamps: deque[datetime] = deque(maxlen=3600)
         # Session-level cumulative metrics
         self._total_clicks: int = 0
         self._total_presses: int = 0
@@ -162,13 +163,9 @@ class FraudSignalDetector:
     def record_input_timestamp(self, timestamp: datetime) -> None:
         """Record an input event timestamp for regularity analysis.
 
-        Prunes timestamps older than 60 minutes to bound memory usage.
+        Uses a bounded deque (maxlen=3600) for O(1) append with automatic eviction.
         """
         self._input_timestamps.append(timestamp)
-        # Prune old timestamps (keep last 60 minutes)
-        cutoff = timestamp - timedelta(minutes=60)
-        if self._input_timestamps and self._input_timestamps[0] < cutoff:
-            self._input_timestamps = [t for t in self._input_timestamps if t >= cutoff]
 
     def add_active_time(self, duration_seconds: float) -> None:
         """Accumulate active time for app diversity checks."""

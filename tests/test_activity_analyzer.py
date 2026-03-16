@@ -552,7 +552,7 @@ class TestFraudSignalDetector:
         assert self.detector._window_press_counts == []
         assert self.detector._unique_apps == set()
         assert self.detector._mouse_only_streak == 0
-        assert self.detector._input_timestamps == []
+        assert len(self.detector._input_timestamps) == 0
         assert self.detector._total_clicks == 0
         assert self.detector._total_presses == 0
         assert self.detector._active_minutes == 0.0
@@ -663,7 +663,7 @@ class TestActivityAnalyzerFraudIntegration:
         self.analyzer.clear()
 
         assert self.analyzer._fraud_detector._unique_apps == set()
-        assert self.analyzer._fraud_detector._input_timestamps == []
+        assert len(self.analyzer._fraud_detector._input_timestamps) == 0
 
     def test_fraud_config_update(self):
         """update_fraud_config should propagate to the detector."""
