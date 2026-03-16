@@ -1119,7 +1119,7 @@ class BetterFlowApp:
                 self.input_watcher.start()
                 logger.info("Input watcher resumed (user active)")
         if self.window_watcher:
-            self.window_watcher.set_poll_interval(5.0 if paused else 1.0)
+            self.window_watcher.set_poll_interval(5.0 if paused else 2.0)
         # Stop/start the break reminder timer so it doesn't fire during AFK
         if self.reminder_manager:
             if paused:

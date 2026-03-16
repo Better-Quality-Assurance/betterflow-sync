@@ -47,7 +47,7 @@ _TERMINAL_BUNDLE_IDS: dict[str, str] = {
 class MacOSWindowWatcher:
     """Daemon thread that polls the active window via PyObjC and posts heartbeats to AW."""
 
-    def __init__(self, aw_client, poll_interval: float = 1.0):
+    def __init__(self, aw_client, poll_interval: float = 2.0):
         self._aw = aw_client
         self._poll_interval = poll_interval
         self._stop_event = threading.Event()
@@ -59,6 +59,11 @@ class MacOSWindowWatcher:
         self._terminal_cache_key: Optional[tuple[str, str]] = None
         self._terminal_cache_hit: bool = False
         self._terminal_cache_value: Optional[str] = None
+        # Cache browser URL to avoid spawning osascript every poll.
+        # Only re-fetch when AXTitle changes (tab switch changes title).
+        self._browser_cache_key: Optional[tuple[str, str]] = None
+        self._browser_cache_url: Optional[str] = None
+        self._browser_cache_incognito: Optional[bool] = None
 
     def start(self) -> bool:
         """Create the AW bucket and start the polling thread.
@@ -152,9 +157,17 @@ class MacOSWindowWatcher:
                 self._terminal_cache_hit = True
                 self._terminal_cache_value = tab_title
 
-        # For browsers, get URL via AppleScript (doesn't need Accessibility)
+        # For browsers, get URL via AppleScript (cached until AXTitle changes)
         if app_name in _URL_BROWSERS:
-            url, incognito = self._get_browser_url(app_name)
+            cache_key = (app_name, title)
+            if cache_key == self._browser_cache_key:
+                url = self._browser_cache_url
+                incognito = self._browser_cache_incognito
+            else:
+                url, incognito = self._get_browser_url(app_name)
+                self._browser_cache_key = cache_key
+                self._browser_cache_url = url
+                self._browser_cache_incognito = incognito
             if url:
                 result["url"] = url
             if incognito is not None:
