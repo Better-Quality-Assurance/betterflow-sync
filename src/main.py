@@ -774,6 +774,7 @@ class BetterFlowApp:
             on_end_break=self._on_end_break,
             on_cancel_login=self._on_cancel_login,
             on_install_update=self._on_install_update,
+            on_tray_died=self._on_tray_died,
         )
         self.tray.set_config(self.config)
 
@@ -1371,6 +1372,21 @@ class BetterFlowApp:
         logger.info("Quit requested")
         self._shutdown_event.set()
         self.tray.stop()
+
+    def _on_tray_died(self) -> None:
+        """Handle dead tray icon (ghost process).
+
+        When the NSStatusItem is deallocated but the NSApplication run loop
+        keeps spinning, we get a ghost process with scheduler jobs still
+        firing (sync, break reminders, notifications) but no visible icon.
+
+        We run _shutdown() to clean up resources, then os._exit(1) because
+        the main thread is stuck in pystray's run_blocking() which will
+        never return from the dead Cocoa event loop.
+        """
+        logger.critical("Tray icon died — force-exiting to prevent ghost process")
+        self._shutdown()
+        os._exit(1)
 
     def _signal_handler(self, signum, frame) -> None:
         """Handle shutdown signals."""

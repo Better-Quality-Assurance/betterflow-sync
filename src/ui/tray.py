@@ -313,6 +313,7 @@ class TrayIcon:
         on_end_break: Optional[Callable[[], None]] = None,
         on_cancel_login: Optional[Callable[[], None]] = None,
         on_install_update: Optional[Callable[[str], None]] = None,
+        on_tray_died: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -332,6 +333,7 @@ class TrayIcon:
             on_end_break: Callback when user ends break early
             on_cancel_login: Callback when user cancels in-progress login
             on_install_update: Callback when user clicks Install & Restart (receives asset URL)
+            on_tray_died: Callback when the tray icon becomes invalid (ghost process detection)
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
@@ -351,6 +353,7 @@ class TrayIcon:
         self._on_end_break = on_end_break
         self._on_cancel_login = on_cancel_login
         self._on_install_update = on_install_update
+        self._on_tray_died = on_tray_died
 
         self.model = TrayModel()
 
@@ -367,6 +370,13 @@ class TrayIcon:
         self._sync_now_cooldown = 5.0
         self._sync_now_last: float = 0.0
         self._sync_now_lock = threading.Lock()
+
+        # Icon rendering cache: skip PIL + NSImage when (hour, minute, color) unchanged
+        self._last_icon_key: Optional[tuple] = None
+        self._last_icon_image: Optional[Image.Image] = None
+
+        # Menu snapshot cache: skip rebuild when model state unchanged
+        self._last_menu_hash: Optional[int] = None
 
     def _snapshot_model(self) -> dict:
         """Take a consistent snapshot of all model fields under lock."""
@@ -1024,12 +1034,44 @@ class TrayIcon:
         except AttributeError:
             pass  # Icon was stopped concurrently
 
+    def _check_tray_health(self) -> bool:
+        """Check whether the tray icon is still alive.
+
+        On macOS, the NSStatusItem can be deallocated while the NSApplication
+        run loop keeps spinning, creating a ghost process with no visible icon.
+        Returns True if healthy, False if the icon is dead.
+        """
+        icon = self._icon
+        if icon is None:
+            return False
+
+        if platform.system() == "Darwin":
+            try:
+                status_item = getattr(icon, "_status_item", None)
+                if status_item is None:
+                    return False
+                button = status_item.button()
+                if button is None:
+                    return False
+            except Exception:
+                return False
+
+        return True
+
     def tick_clock(self) -> None:
         """Called periodically to advance the clock-face icon hands."""
+        if not self._check_tray_health():
+            logger.error("Tray icon is dead — triggering shutdown")
+            if self._on_tray_died:
+                self._on_tray_died()
+            return
         self._update_icon()
 
     def _update_icon(self) -> None:
         """Update the tray icon image and menu.
+
+        Skips the expensive PIL render + NSImage conversion when the clock
+        hands and state color haven't changed since the last call.
 
         On macOS, image updates are dispatched to the main thread via
         performSelectorOnMainThread because AppKit calls from background
@@ -1041,16 +1083,24 @@ class TrayIcon:
         with self.model.lock:
             state = self.model.state
         color = STATE_COLORS.get(state, STATE_COLORS[TrayState.STARTING])
-        new_image = create_icon_image(color)
 
-        if platform.system() == "Darwin":
-            try:
-                self._set_icon_main_thread(new_image)
-            except Exception:
-                logger.debug("Main-thread icon update failed, using fallback")
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        icon_key = (_now.hour % 12, _now.minute, color)
+
+        if icon_key != self._last_icon_key:
+            new_image = create_icon_image(color)
+            self._last_icon_key = icon_key
+            self._last_icon_image = new_image
+
+            if platform.system() == "Darwin":
+                try:
+                    self._set_icon_main_thread(new_image)
+                except Exception:
+                    logger.debug("Main-thread icon update failed, using fallback")
+                    self._icon.icon = new_image
+            else:
                 self._icon.icon = new_image
-        else:
-            self._icon.icon = new_image
 
         self._update_menu()
 
@@ -1098,11 +1148,31 @@ class TrayIcon:
             logger.debug("pystray _status_item unavailable, falling back to icon assignment")
             self._icon.icon = pil_img
 
+    @staticmethod
+    def _make_hashable(obj: object) -> object:
+        """Convert a snapshot value to a hashable form for change detection."""
+        if isinstance(obj, dict):
+            return tuple(sorted((k, TrayIcon._make_hashable(v)) for k, v in obj.items()))
+        if isinstance(obj, list):
+            return tuple(TrayIcon._make_hashable(i) for i in obj)
+        return obj
+
     def _update_menu(self) -> None:
-        """Update the tray menu (debounced: max once per second)."""
+        """Update the tray menu (debounced: max once per second).
+
+        Skips the rebuild entirely if the model snapshot hasn't changed.
+        """
         icon = self._icon
         if not icon:
             return
+
+        # Snapshot and hash — skip rebuild if nothing changed
+        snap = self._snapshot_model()
+        snap_hash = hash(TrayIcon._make_hashable(snap))
+        if snap_hash == self._last_menu_hash:
+            return
+        self._last_menu_hash = snap_hash
+
         now = time.monotonic()
         with self._menu_lock:
             elapsed = now - self._menu_last_rebuild
