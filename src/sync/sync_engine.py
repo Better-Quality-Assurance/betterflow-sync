@@ -18,18 +18,20 @@ except ImportError:
 
 try:
     from ..config import Config, PrivacySettings
-    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
+    from .call_detector import CallDetector, CallEvent
 except ImportError:
     from config import Config, PrivacySettings
-    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT
+    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from sync.daily_time_tracker import DailyTimeTracker
+    from sync.call_detector import CallDetector, CallEvent
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ class SyncStats:
     events_queued: int = 0
     buckets_synced: int = 0
     gaps_filled: int = 0
+    calls_detected: int = 0
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -128,6 +131,13 @@ class SyncEngine:
         self._time_tracker = time_tracker or DailyTimeTracker()
         self._has_input_data = False  # Set to True when input buckets exist
         self._current_afk_events: list[AWEvent] = []  # AFK events for current sync cycle
+
+        # Call/meeting detection
+        self._call_detector: Optional[CallDetector] = (
+            CallDetector(min_duration=config.call_detection.min_call_duration)
+            if config.call_detection.enabled
+            else None
+        )
 
     def _create_engagement_thresholds(self) -> EngagementThresholds:
         """Create EngagementThresholds from config."""
@@ -304,6 +314,7 @@ class SyncEngine:
 
         # Sync window buckets with gap-filling
         all_events = []
+        call_events: list[dict] = []
         pending_checkpoints: list[tuple[str, datetime, Optional[int]]] = []
         for bucket in window_buckets:
             try:
@@ -320,6 +331,19 @@ class SyncEngine:
 
                     filled = self._fill_window_gaps(raw_events, afk_events)
                     stats.gaps_filled += filled
+
+                    # Feed raw events to call detector
+                    if self._call_detector:
+                        for ev in raw_events:
+                            ce = self._call_detector.process_event(
+                                app=ev.app or "",
+                                title=ev.title or "",
+                                url=ev.url,
+                                timestamp=ev.timestamp,
+                                duration=ev.duration,
+                            )
+                            if ce:
+                                call_events.append(self._make_call_bf_event(ce))
 
                     transformed, checkpoint = self._transform_and_checkpoint(
                         raw_events, bucket.id, bucket.type, stats
@@ -345,6 +369,15 @@ class SyncEngine:
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+
+        # Flush any ongoing call at sync boundary
+        if self._call_detector:
+            remaining = self._call_detector.flush()
+            if remaining:
+                call_events.append(self._make_call_bf_event(remaining))
+        if call_events:
+            stats.calls_detected += len(call_events)
+            all_events.extend(call_events)
 
         # Send events, then commit checkpoints only on success (N5)
         if all_events:
@@ -449,6 +482,24 @@ class SyncEngine:
                         self._sent_cache.popitem(last=False)
             else:
                 stats.events_filtered += 1
+
+        # Batch fraud assessment: one call per cycle instead of per-event.
+        # The fraud detector's underlying data changes once per record_window_metrics()
+        # call (guarded by sequence counter), so assessing once is equivalent.
+        if (
+            transformed
+            and bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
+            and self._has_input_data
+        ):
+            last_event = events[-1]  # sorted oldest-first, use newest for assessment
+            fraud = self._activity_analyzer.get_fraud_assessment(
+                last_event.timestamp, app=last_event.app
+            )
+            for ev in transformed:
+                if "activity_metrics" in ev:
+                    ev["fraud_score"] = fraud.score
+                    ev["fraud_signals"] = fraud.signals
+                    ev["activity_metrics"].update(fraud.extra_metrics)
 
         pending_checkpoint = None
         if events:
@@ -584,10 +635,9 @@ class SyncEngine:
                 if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
                     self._gap_filled_originals.popitem(last=False)
             filled += 1
-            logger.info(
-                f"Filling {gap_seconds:.1f}s window gap: event {current.id} "
-                f"({current.app}) duration {old_duration:.1f}s -> {new_duration:.1f}s"
-            )
+
+        if filled:
+            logger.debug(f"Filled {filled} window gap(s) across {len(window_events)} events")
 
         return filled
 
@@ -680,7 +730,8 @@ class SyncEngine:
         if project:
             result["project_id"] = project["id"]
 
-        # Add activity classification for window events (fraud detection)
+        # Add activity classification for window events
+        # (fraud assessment is batched per cycle in _transform_and_checkpoint)
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
             if self._has_input_data:
                 activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
@@ -688,12 +739,6 @@ class SyncEngine:
 
                 result["activity_state"] = activity_state
                 result["activity_metrics"] = activity_metrics.to_dict()
-
-                # Add fraud assessment from session-level signals
-                fraud = self._activity_analyzer.get_fraud_assessment(event.timestamp, app=app)
-                result["fraud_score"] = fraud.score
-                result["fraud_signals"] = fraud.signals
-                result["activity_metrics"].update(fraud.extra_metrics)
             else:
                 # No input watcher — use AFK data to determine activity
                 event_end = event.timestamp + timedelta(seconds=event.duration)
@@ -716,7 +761,6 @@ class SyncEngine:
                     delta = event.duration - prev_counted
                     if delta > 0:
                         self._time_tracker.add_active_time(delta, event_date)
-                        logger.debug(f"Time tracked: +{delta:.1f}s for event {event.id} (total today: {self._time_tracker.get_today_active_time()})")
                         self._time_cache[time_key] = event.duration
                         self._time_cache.move_to_end(time_key)
                         if len(self._time_cache) > self._TIME_CACHE_MAX:
@@ -825,6 +869,27 @@ class SyncEngine:
         except BetterFlowClientError as e:
             logger.warning(f"Failed to send private_time event: {e}")
             self.queue.enqueue([event])
+
+    def _make_call_bf_event(self, call_event: "CallEvent") -> dict:
+        """Convert a CallEvent into a BetterFlow event dict."""
+        import socket
+        hostname = socket.gethostname()
+        result: dict = {
+            "timestamp": call_event.start.isoformat(),
+            "duration": call_event.duration,
+            "bucket_id": f"bf-call-detector_{hostname}",
+            "bucket_type": BUCKET_TYPE_CALL,
+            "data": {
+                "app": call_event.app,
+                "call_type": call_event.call_type,
+                "status": "completed",
+            },
+        }
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            result["project_id"] = project["id"]
+        return result
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""

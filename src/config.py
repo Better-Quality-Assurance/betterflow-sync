@@ -22,6 +22,7 @@ __all__ = [
     "ReminderSettings",
     "EngagementConfig",
     "FraudDetectionConfig",
+    "CallDetectionSettings",
     "setup_logging",
     "get_machine_uuid",
     "DEFAULT_API_URL",
@@ -275,6 +276,14 @@ class FraudDetectionConfig:
 
 
 @dataclass
+class CallDetectionSettings:
+    """Call/meeting detection settings."""
+
+    enabled: bool = True
+    min_call_duration: int = 30  # Seconds; skip accidental opens
+
+
+@dataclass
 class AWSettings:
     """ActivityWatch connection settings."""
 
@@ -310,6 +319,7 @@ class Config:
     reminders: ReminderSettings = field(default_factory=ReminderSettings)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     fraud_detection: FraudDetectionConfig = field(default_factory=FraudDetectionConfig)
+    call_detection: CallDetectionSettings = field(default_factory=CallDetectionSettings)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -374,6 +384,7 @@ class Config:
         reminders_data = data.pop("reminders", {})
         engagement_data = data.pop("engagement", {})
         fraud_detection_data = data.pop("fraud_detection", {})
+        call_detection_data = data.pop("call_detection", {})
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
@@ -392,6 +403,7 @@ class Config:
             reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
             engagement=EngagementConfig(**engagement_data) if engagement_data else EngagementConfig(),
             fraud_detection=FraudDetectionConfig(**fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
+            call_detection=CallDetectionSettings(**call_detection_data) if call_detection_data else CallDetectionSettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -506,6 +518,13 @@ class Config:
                 self.fraud_detection.input_regularity_cv_threshold = float(fd["input_regularity_cv_threshold"])
             if "min_input_events_for_regularity" in fd:
                 self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
+
+        if "call_detection" in server_config:
+            cd = server_config["call_detection"]
+            if "enabled" in cd:
+                self.call_detection.enabled = self._to_bool(cd["enabled"])
+            if "min_call_duration" in cd:
+                self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
 
         self.save()
 

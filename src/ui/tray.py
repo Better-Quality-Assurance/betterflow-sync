@@ -602,8 +602,7 @@ class TrayIcon:
         # ── Version info ───────────────────────────────────────
         items.append(Item(f"v{_APP_VERSION} ({BUILD_DATE})", None, enabled=False))
 
-        if s["user_role"] in ("admin", "super-admin"):
-            items.append(Item("Quit", self._handle_quit))
+        items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
 

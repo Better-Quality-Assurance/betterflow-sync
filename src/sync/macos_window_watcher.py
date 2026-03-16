@@ -91,6 +91,10 @@ class MacOSWindowWatcher:
         logger.info(f"MacOSWindowWatcher started (bucket={self._bucket_id}, poll={self._poll_interval}s)")
         return True
 
+    def set_poll_interval(self, interval: float) -> None:
+        """Adjust poll rate (e.g. slower when AFK)."""
+        self._poll_interval = max(0.5, min(interval, 10.0))
+
     def stop(self) -> None:
         """Signal the thread to stop."""
         self._stop_event.set()

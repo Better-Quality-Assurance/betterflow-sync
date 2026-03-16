@@ -183,16 +183,16 @@ class TestBreakCallback:
 
     @patch("src.reminders.send_notification")
     @patch("src.reminders.time.monotonic")
-    def test_break_reminder_sends_notification_not_callback(self, mock_mono, mock_notify):
-        """Break reminder always sends notification (never auto-starts break)."""
+    def test_break_reminder_triggers_callback(self, mock_mono, mock_notify):
+        """Break reminder auto-starts break via callback instead of just notifying."""
         mock_mono.return_value = 0.0
         self.mgr.on_tracking_started()
 
         mock_mono.return_value = 7200.0
         self.mgr.check()
 
-        assert self.break_triggered is False
-        mock_notify.assert_called_once()
+        assert self.break_triggered is True
+        mock_notify.assert_not_called()
 
     @patch("src.reminders.send_notification")
     @patch("src.reminders.time.monotonic")
@@ -203,15 +203,16 @@ class TestBreakCallback:
 
         mock_mono.return_value = 7200.0
         self.mgr.check()
-        assert mock_notify.call_count == 1
+        assert self.break_triggered is True
 
-        # Mark break active
+        # Mark break active (normally done by start_break -> on_break_started)
         self.mgr.on_break_started()
+        self.break_triggered = False
 
-        # Another 2h passes - should not notify again during break
+        # Another 2h passes - should not trigger again during break
         mock_mono.return_value = 14400.0
         self.mgr.check()
-        assert mock_notify.call_count == 1
+        assert self.break_triggered is False
 
     @patch("src.reminders.send_notification")
     @patch("src.reminders.time.monotonic")
@@ -223,22 +224,41 @@ class TestBreakCallback:
         # Trigger break at 2h
         mock_mono.return_value = 7200.0
         self.mgr.check()
+        assert self.break_triggered is True
         self.mgr.on_break_started()
+        self.break_triggered = False
 
         # Break ends at 2h15m
         mock_mono.return_value = 8100.0
         self.mgr.on_break_ended()
-        notify_count_after_first = mock_notify.call_count
 
         # 1h after break ended - not yet
         mock_mono.return_value = 11700.0
         self.mgr.check()
-        assert mock_notify.call_count == notify_count_after_first
+        assert self.break_triggered is False
 
         # 2h after break ended - fires again
         mock_mono.return_value = 15300.0
         self.mgr.check()
-        assert mock_notify.call_count == notify_count_after_first + 1
+        assert self.break_triggered is True
+
+
+class TestBreakCallbackFallback:
+    """When no callback is wired, break reminder falls back to notification."""
+
+    @patch("src.reminders.send_notification")
+    @patch("src.reminders.time.monotonic")
+    def test_no_callback_sends_notification(self, mock_mono, mock_notify):
+        settings = ReminderSettings(break_reminders_enabled=True, break_interval_hours=2)
+        mgr = ReminderManager(settings, on_break_triggered=None)
+
+        mock_mono.return_value = 0.0
+        mgr.on_tracking_started()
+
+        mock_mono.return_value = 7200.0
+        mgr.check()
+
+        mock_notify.assert_called_once()
 
 
 class TestSettingsUpdate:

@@ -135,12 +135,15 @@ class ReminderManager:
             hours = int(elapsed // 3600)
             self._last_break_notification = now
 
-        # Send notification outside the lock to avoid holding it during I/O
-        logger.info(f"Break reminder sent ({hours}h elapsed)")
-        send_notification(
-            "Time for a Break",
-            f"You've been working for {hours}h - take a short break!",
-        )
+        # Fire outside the lock to avoid holding it during I/O
+        logger.info(f"Break reminder: {hours}h elapsed — auto-starting break")
+        if self._on_break_triggered:
+            self._on_break_triggered()
+        else:
+            send_notification(
+                "Time for a Break",
+                f"You've been working for {hours}h - take a short break!",
+            )
 
     def _check_private(self, now: float) -> None:
         with self._lock:

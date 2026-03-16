@@ -127,8 +127,13 @@ class SyncCoordinator:
         self._pre_break_private = False
         self._sync_lock = threading.Lock()
 
-        # Idle pause threshold (seconds) — stop syncing if AFK this long
+        # Idle pause threshold (seconds) — back off syncing if AFK this long
         self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
+        # Sync interval during idle (seconds) — slower than active but not stopped
+        self._IDLE_SYNC_INTERVAL = 300
+
+        # Dedup guard: skip _refresh_hours_today if fetched recently by _do_sync
+        self._last_hours_refresh: float = 0.0
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
@@ -201,19 +206,15 @@ class SyncCoordinator:
             id="sync_job",
             replace_existing=True,
         )
+        # Unified 60s tick replaces 5 separate jobs (timer coalescing)
+        if sys.platform == "darwin":
+            self._check_permissions()
         self.scheduler.add_job(
-            self._refresh_hours_today,
+            self._tick_60s,
             trigger=IntervalTrigger(seconds=60),
-            id="tray_time_job",
+            id="tick_60s",
             replace_existing=True,
         )
-        if self.reminder_manager:
-            self.scheduler.add_job(
-                self.reminder_manager.check,
-                trigger=IntervalTrigger(seconds=60),
-                id="reminder_check_job",
-                replace_existing=True,
-            )
         # Expire stale queue events daily
         self.scheduler.add_job(
             self._expire_old_queue_events,
@@ -233,29 +234,6 @@ class SyncCoordinator:
             self._fetch_trends,
             trigger=IntervalTrigger(minutes=30),
             id="trends_refresh_job",
-            replace_existing=True,
-        )
-        # Periodic permissions check (macOS only)
-        if sys.platform == "darwin":
-            self._check_permissions()
-            self.scheduler.add_job(
-                self._check_permissions,
-                trigger=IntervalTrigger(seconds=60),
-                id="permissions_check_job",
-                replace_existing=True,
-            )
-        # Check idle status every 60s — pause sync if AFK > 20 minutes
-        self.scheduler.add_job(
-            self._check_idle_status,
-            trigger=IntervalTrigger(seconds=60),
-            id="idle_check_job",
-            replace_existing=True,
-        )
-        # Refresh clock icon every minute so hands move
-        self.scheduler.add_job(
-            self.tray.tick_clock,
-            trigger=IntervalTrigger(seconds=60),
-            id="icon_refresh_job",
             replace_existing=True,
         )
         self.scheduler.start()
@@ -472,6 +450,21 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Permissions check failed: {e}")
 
+    def _tick_60s(self) -> None:
+        """Unified 60-second tick - one wakeup instead of five.
+
+        Order: tick_clock first (ghost detection), then idle check (may
+        pause sync), then hours refresh, then lightweight checks.
+        Each sub-task has its own try/except so one failure won't block others.
+        """
+        self.tray.tick_clock()
+        self._check_idle_status()
+        self._refresh_hours_today()
+        if self.reminder_manager:
+            self.reminder_manager.check()
+        if sys.platform == "darwin":
+            self._check_permissions()
+
     def _check_idle_status(self) -> None:
         """Check AFK bucket — pause sync if user idle for 20+ minutes."""
         if not self.logged_in:
@@ -507,20 +500,22 @@ class SyncCoordinator:
                     idle_start = latest.timestamp
                     logger.info(
                         f"User idle for {int(afk_duration)}s (>= {self._idle_pause_threshold}s) "
-                        f"— pausing sync"
+                        f"— backing off sync to {self._IDLE_SYNC_INTERVAL}s"
                     )
                     with self._state_lock:
                         self._idle_paused = True
                         self._idle_start = idle_start
-                    self.sync_engine.pause()
+                    # Back off sync interval instead of full pause — keeps
+                    # heartbeats and queue processing alive at reduced frequency.
+                    self.reschedule(self._IDLE_SYNC_INTERVAL)
                     self.tray.set_state(TrayState.PAUSED, "Idle")
                     if self._on_idle_pause:
                         self._on_idle_pause(True)
             else:
                 if was_idle_paused:
-                    logger.info("User active again — resuming sync after idle pause")
+                    logger.info("User active again — restoring normal sync interval")
                     self.clear_idle_pause(send_event=True)
-                    self.sync_engine.resume()
+                    self.reschedule(self.config.sync.interval_seconds)
                     self.tray.set_state(TrayState.SYNCING)
                     self.trigger_sync("idle_resume_sync")
 
@@ -542,10 +537,10 @@ class SyncCoordinator:
                     self.tray.set_state(TrayState.ON_BREAK)
                     return
 
+            # idle_paused: sync still runs at reduced interval (_IDLE_SYNC_INTERVAL)
+            # so no early return here — just update tray state
             with self._state_lock:
-                if self._idle_paused:
-                    self.tray.set_state(TrayState.PAUSED, "Idle")
-                    return
+                is_idle = self._idle_paused
 
             if self.paused_by_network:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
@@ -577,6 +572,8 @@ class SyncCoordinator:
                         needs_perms = self.tray.model.needs_permissions
                     if needs_perms:
                         self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
+                    elif is_idle:
+                        self.tray.set_state(TrayState.PAUSED, "Idle")
                     else:
                         self.tray.set_state(TrayState.SYNCING)
                 if stats.events_sent > 0:
@@ -631,6 +628,7 @@ class SyncCoordinator:
             )
             self._hours_today_seconds = max(0, total_seconds)
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            self._last_hours_refresh = time.monotonic()
             return self._hours_today_cache
         except Exception:
             return self._hours_today_cache
@@ -640,11 +638,15 @@ class SyncCoordinator:
 
         Always runs (even when paused/private) so the tray resets to
         ``0h 0m`` at midnight instead of showing yesterday's stale value.
+        Skips if _fetch_hours_today ran recently (e.g. from _do_sync).
         """
         try:
             if not self.logged_in:
                 logger.debug("_refresh_hours: skipped (not logged in)")
                 return
+
+            if time.monotonic() - self._last_hours_refresh < 30:
+                return  # _do_sync already refreshed recently
 
             hours = self._fetch_hours_today()
             self.tray.update_stats(hours_today=hours)
@@ -709,6 +711,9 @@ class BetterFlowApp:
 
         logger.info("BetterFlow starting...")
         logger.info(f"Using API URL: {self.config.api_url}")
+
+        # Clear stale notifications from previous session (crash/kill leaves them)
+        clear_notifications()
 
         # Initialize AW process manager
         self.aw_manager = AWManager(
@@ -1105,7 +1110,7 @@ class BetterFlowApp:
             send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
 
     def _on_idle_pause(self, paused: bool) -> None:
-        """Handle idle pause/resume — also pause/resume input watcher."""
+        """Handle idle pause/resume — also pause/resume input watcher and slow window polling."""
         if self.input_watcher:
             if paused:
                 self.input_watcher.stop()
@@ -1113,6 +1118,14 @@ class BetterFlowApp:
             else:
                 self.input_watcher.start()
                 logger.info("Input watcher resumed (user active)")
+        if self.window_watcher:
+            self.window_watcher.set_poll_interval(5.0 if paused else 1.0)
+        # Stop/start the break reminder timer so it doesn't fire during AFK
+        if self.reminder_manager:
+            if paused:
+                self.reminder_manager.on_tracking_stopped()
+            else:
+                self.reminder_manager.on_tracking_started()
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
@@ -1137,6 +1150,7 @@ class BetterFlowApp:
         """Handle system wake from sleep."""
         # Drop stale TCP connections from sleep (N3)
         self.bf.reset_session()
+        self.aw.reset_session()
         with self._pause_state_lock:
             user_paused = self._user_paused
             pre_sleep_private = self._pre_sleep_private

@@ -21,6 +21,7 @@ BUCKET_TYPE_AFK = "afkstatus"
 BUCKET_TYPE_AFK_ALT = "aw-watcher-afk"
 BUCKET_TYPE_WEB = "aw-watcher-web"
 BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
+BUCKET_TYPE_CALL = "call"
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,17 @@ class AWClient:
             raise AWClientError(f"ActivityWatch API error: {e}") from e
         except Exception as e:
             raise AWClientError(f"Unexpected error: {e}") from e
+
+    def reset_session(self) -> None:
+        """Drop pooled connections and create a fresh session.
+
+        Call after system wake to avoid stale TCP connections.
+        """
+        try:
+            self._session.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
 
     def is_running(self) -> bool:
         """Check if ActivityWatch server is running.
