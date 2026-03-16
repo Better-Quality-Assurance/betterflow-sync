@@ -1,7 +1,10 @@
 """Tests for get_machine_uuid() in config module."""
 
+import sys
 import uuid
 from unittest.mock import patch
+
+import pytest
 
 import src.config as config_module
 from src.config import _UUID_RE
@@ -108,6 +111,7 @@ class TestGetMachineUuid:
         finally:
             id_file.chmod(0o644)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="chmod read-only not enforced on Windows dirs")
     def test_handles_write_failure(self, tmp_path, monkeypatch):
         """Write failure still returns a UUID (graceful degradation)."""
         monkeypatch.setattr(
