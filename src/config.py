@@ -3,7 +3,10 @@
 import json
 import logging
 import os
+import re
 import sys
+import threading
+import uuid
 from dataclasses import dataclass, field, asdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -20,6 +23,7 @@ __all__ = [
     "EngagementConfig",
     "FraudDetectionConfig",
     "setup_logging",
+    "get_machine_uuid",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
     "MAX_QUEUE_SIZE",
@@ -89,6 +93,67 @@ DEFAULT_SYNC_INTERVAL = 30  # seconds
 DEFAULT_BATCH_SIZE = 100
 MAX_BATCH_SIZE = 1000
 MAX_QUEUE_SIZE = 100000  # ~1 week of events
+
+# Persistent machine UUID: cached in memory after first read.
+_machine_uuid_cache: Optional[str] = None
+_machine_uuid_lock = threading.Lock()
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def get_machine_uuid() -> str:
+    """Return a persistent UUID for this machine.
+
+    On first call, reads from (or generates and writes to) a `.machine_id`
+    file in the config directory. Subsequent calls return the in-memory
+    cache. The UUID survives app updates and hostname changes; it is only
+    lost on full uninstall.
+
+    Thread-safe: uses double-checked locking so the hot path (cache hit)
+    is lock-free while the one-time generation is serialized.
+    """
+    global _machine_uuid_cache
+
+    # Fast path: already cached, no lock needed.
+    if _machine_uuid_cache is not None:
+        return _machine_uuid_cache
+
+    with _machine_uuid_lock:
+        # Re-check under lock; another thread may have populated it.
+        if _machine_uuid_cache is not None:
+            return _machine_uuid_cache
+
+        config_dir = Path(user_config_dir(APP_NAME, APP_AUTHOR))
+        id_file = config_dir / ".machine_id"
+
+        try:
+            value = id_file.read_text(encoding="utf-8").strip()
+            if value and _UUID_RE.match(value):
+                _machine_uuid_cache = value
+                return value
+            if value:
+                logger.warning("machine_id file contains invalid UUID, regenerating")
+        except (OSError, UnicodeDecodeError) as e:
+            logger.debug(f"No existing machine ID file: {e}")
+
+        # Generate and persist a new UUID (atomic write: tmp + rename).
+        new_id = str(uuid.uuid4())
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            tmp_file = id_file.with_suffix(".tmp")
+            tmp_file.write_text(new_id, encoding="utf-8")
+            os.replace(tmp_file, id_file)
+        except OSError as e:
+            logger.warning(f"Failed to write machine ID file: {e}")
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        _machine_uuid_cache = new_id
+        return new_id
 
 
 @dataclass

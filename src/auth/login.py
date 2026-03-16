@@ -1,7 +1,6 @@
 """Login management and authentication flow."""
 
 import logging
-import platform
 import threading
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -12,14 +11,14 @@ from .keychain import KeychainManager, StoredCredentials
 try:
     from ..sync.bf_client import (
         BetterFlowClient,
-        AuthResult,
+        DeviceInfo,
         BetterFlowClientError,
         BetterFlowAuthError,
     )
 except ImportError:
     from sync.bf_client import (
         BetterFlowClient,
-        AuthResult,
+        DeviceInfo,
         BetterFlowClientError,
         BetterFlowAuthError,
     )
@@ -137,9 +136,11 @@ class LoginManager:
             )
 
         # Exchange code for token (with PKCE code_verifier)
-        device_name = f"sync:{platform.node()}"
+        device_info = DeviceInfo.collect()
+        device_name = f"sync:{device_info.machine_id[:12]}"
         result = self.bf.exchange_code(
-            auth_result.code, device_name, auth_result.code_verifier
+            auth_result.code, device_name, auth_result.code_verifier,
+            device_info=device_info,
         )
 
         if not result.success:

@@ -1,6 +1,5 @@
 """BetterFlow API client - syncs events to BetterFlow server."""
 
-import hashlib
 import logging
 import platform
 import uuid
@@ -11,12 +10,12 @@ import requests
 
 try:
     from .. import __version__
-    from ..config import DEFAULT_API_URL
+    from ..config import DEFAULT_API_URL, get_machine_uuid
     from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from .retry import RetryConfig
 except ImportError:
     from src import __version__
-    from config import DEFAULT_API_URL
+    from config import DEFAULT_API_URL, get_machine_uuid
     from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from sync.retry import RetryConfig
 
@@ -36,12 +35,17 @@ AGENT_VERSION = __version__
 
 @dataclass
 class DeviceInfo:
-    """Information about this device."""
+    """Information about this device.
+
+    All fields are resolved at ``collect()`` time so the object is a pure
+    data container with no hidden I/O.
+    """
 
     hostname: str
     os_name: str
     os_version: str
     agent_version: str
+    machine_id: str  # Persistent UUID, resolved once at collect() time
 
     @classmethod
     def collect(cls, agent_version: str = AGENT_VERSION) -> "DeviceInfo":
@@ -51,17 +55,12 @@ class DeviceInfo:
             os_name=platform.system(),
             os_version=platform.release(),
             agent_version=agent_version,
+            machine_id=get_machine_uuid(),
         )
 
     @property
     def device_name(self) -> str:
         return f"{self.hostname} ({self.os_name})"
-
-    @property
-    def machine_id(self) -> str:
-        """Generate a stable machine ID from hostname + OS."""
-        raw = f"{self.hostname}-{self.os_name}-{self.os_version}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
     @property
     def platform_key(self) -> str:
@@ -140,7 +139,11 @@ class BetterFlowClient(BaseApiClient):
     # =========================================================================
 
     def exchange_code(
-        self, code: str, device_name: str, code_verifier: Optional[str] = None
+        self,
+        code: str,
+        device_name: str,
+        code_verifier: Optional[str] = None,
+        device_info: Optional[DeviceInfo] = None,
     ) -> AuthResult:
         """Exchange an authorization code for a Sanctum token.
 
@@ -148,6 +151,7 @@ class BetterFlowClient(BaseApiClient):
             code: 64-char authorization code from browser flow
             device_name: Name for this device token
             code_verifier: PKCE code verifier (required for PKCE flow)
+            device_info: Pre-collected device info (avoids redundant collect)
 
         Returns:
             AuthResult with api_token on success
@@ -158,13 +162,15 @@ class BetterFlowClient(BaseApiClient):
             "Content-Type": "application/json",
             "User-Agent": self.USER_AGENT,
         }
-        device_info = DeviceInfo.collect()
+        if device_info is None:
+            device_info = DeviceInfo.collect()
         payload = {
             "code": code,
             "device_name": device_name,
             "platform": device_info.platform_key,
-            "os_version": platform.release(),
+            "os_version": device_info.os_version,
             "machine_id": device_info.machine_id,
+            "hostname": device_info.hostname,
             "agent_version": AGENT_VERSION,
         }
         if code_verifier:

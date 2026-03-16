@@ -22,14 +22,16 @@ from src.sync.bf_client import (
 class TestDeviceInfo:
     """Tests for DeviceInfo dataclass."""
 
-    def test_collect(self):
-        """Test collecting device information."""
+    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    def test_collect(self, _mock_uuid):
+        """Test collecting device information including machine_id."""
         info = DeviceInfo.collect(agent_version="1.2.3")
 
         assert info.agent_version == "1.2.3"
         assert info.hostname is not None
         assert info.os_name is not None
         assert info.os_version is not None
+        assert info.machine_id == "aaaabbbb-1111-2222-3333-444455556666"
 
     def test_to_dict(self):
         """Test converting to dictionary."""
@@ -39,6 +41,7 @@ class TestDeviceInfo:
             os_name="Darwin",
             os_version="23.0.0",
             agent_version="1.0.0",
+            machine_id="test-uuid",
         )
         result = asdict(info)
 
@@ -46,6 +49,38 @@ class TestDeviceInfo:
         assert result["os_name"] == "Darwin"
         assert result["os_version"] == "23.0.0"
         assert result["agent_version"] == "1.0.0"
+        assert result["machine_id"] == "test-uuid"
+
+    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    def test_collect_uses_persistent_uuid(self, _mock_uuid):
+        """Test collect() resolves machine_id from the persistent UUID."""
+        info = DeviceInfo.collect()
+        assert info.machine_id == "aaaabbbb-1111-2222-3333-444455556666"
+
+    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    def test_machine_id_stable_across_hostname_changes(self, _mock_uuid):
+        """Test machine_id stays the same when hostname changes."""
+        with patch("src.sync.bf_client.platform.node", return_value="MacBookPro"):
+            info_a = DeviceInfo.collect()
+        with patch("src.sync.bf_client.platform.node", return_value="Brads-MBP.local"):
+            info_b = DeviceInfo.collect()
+        assert info_a.hostname != info_b.hostname
+        assert info_a.machine_id == info_b.machine_id
+
+
+    @pytest.mark.parametrize("os_name,expected_key", [
+        ("Darwin", "darwin"),
+        ("Windows", "win32"),
+        ("Linux", "linux"),
+        ("FreeBSD", "linux"),  # Unknown OS falls back to linux
+    ])
+    def test_platform_key_mapping(self, os_name, expected_key):
+        """Test platform_key maps OS names correctly."""
+        info = DeviceInfo(
+            hostname="test", os_name=os_name, os_version="1.0",
+            agent_version="1.0.0", machine_id="test-uuid",
+        )
+        assert info.platform_key == expected_key
 
 
 class TestBetterFlowClient:
@@ -372,6 +407,24 @@ class TestBetterFlowClient:
             device_name="device",
             code_verifier="pkce-verifier-123",
         )
+
+    @responses.activate
+    @patch("src.sync.bf_client.get_machine_uuid", return_value="aabbccdd-1111-4222-8333-444455556666")
+    def test_exchange_code_sends_hostname_and_machine_uuid(self, _mock_uuid):
+        """Test exchange_code payload includes hostname and UUID-based machine_id."""
+        def check_payload(request):
+            data = json.loads(request.body)
+            assert "hostname" in data, "hostname missing from payload"
+            assert data["machine_id"] == "aabbccdd-1111-4222-8333-444455556666"
+            return (200, {}, json.dumps({"access_token": "tok", "user": {}}))
+
+        responses.add_callback(
+            responses.POST,
+            "https://betterflow.eu/api/v1/sync/auth/token",
+            callback=check_payload,
+        )
+
+        self.client.exchange_code(code="code", device_name="dev")
 
     @responses.activate
     def test_exchange_code_invalid_code(self):
