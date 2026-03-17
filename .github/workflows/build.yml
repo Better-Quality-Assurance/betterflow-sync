@@ -11,6 +11,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -18,7 +19,7 @@ jobs:
             artifact_name: BetterFlow.app
             asset_name: BetterFlow-macOS-arm64
             package_type: dmg
-          - os: macos-latest
+          - os: macos-14-large
             target_arch: x86_64
             artifact_name: BetterFlow.app
             asset_name: BetterFlow-macOS-x86_64
