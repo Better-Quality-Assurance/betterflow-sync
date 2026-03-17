@@ -9,6 +9,10 @@ from pathlib import Path
 
 block_cipher = None
 
+# Allow overriding target architecture via environment variable (e.g. x86_64, arm64)
+import os
+TARGET_ARCH = os.environ.get("TARGET_ARCH") or None
+
 # Read version from src/__init__.py (single source of truth)
 _version_file = Path(SPECPATH) / "src" / "__init__.py"
 _version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _version_file.read_text())
@@ -135,7 +139,7 @@ if is_mac:
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
-        target_arch=None,
+        target_arch=TARGET_ARCH,
         codesign_identity=None,
         entitlements_file=None,
         icon=str(resources_dir / "icon.icns") if (resources_dir / "icon.icns").exists() else None,
@@ -185,6 +189,6 @@ elif is_windows:
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
-        target_arch=None,
+        target_arch=TARGET_ARCH,
         icon=str(resources_dir / "icon.ico") if (resources_dir / "icon.ico").exists() else None,
     )

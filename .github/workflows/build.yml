@@ -14,11 +14,20 @@ jobs:
       matrix:
         include:
           - os: macos-latest
+            target_arch: arm64
             artifact_name: BetterFlow.app
-            asset_name: BetterFlow-macOS
+            asset_name: BetterFlow-macOS-arm64
+            package_type: dmg
+          - os: macos-latest
+            target_arch: x86_64
+            artifact_name: BetterFlow.app
+            asset_name: BetterFlow-macOS-x86_64
+            package_type: dmg
           - os: windows-latest
+            target_arch: ''
             artifact_name: BetterFlow.exe
             asset_name: BetterFlow-Windows
+            package_type: zip
 
     runs-on: ${{ matrix.os }}
 
@@ -46,6 +55,8 @@ jobs:
 
       - name: Build with PyInstaller
         run: pyinstaller build.spec --clean
+        env:
+          TARGET_ARCH: ${{ matrix.target_arch }}
 
       - name: List dist contents (macOS)
         if: runner.os == 'macOS'
@@ -55,11 +66,20 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: dir dist
 
-      - name: Create macOS ZIP
+      - name: Create macOS DMG
         if: runner.os == 'macOS'
         run: |
-          cd dist
-          zip -r "${{ matrix.asset_name }}.zip" "BetterFlow.app"
+          brew install create-dmg
+          create-dmg \
+            --volname "BetterFlow" \
+            --volicon "resources/icon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "BetterFlow.app" 150 190 \
+            --app-drop-link 450 185 \
+            "dist/${{ matrix.asset_name }}.dmg" \
+            "dist/BetterFlow.app"
 
       - name: Create Windows ZIP
         if: matrix.os == 'windows-latest'
@@ -71,7 +91,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}.zip
+          path: |
+            dist/${{ matrix.asset_name }}.dmg
+            dist/${{ matrix.asset_name }}.zip
           retention-days: 30
 
   release:
@@ -80,10 +102,16 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - name: Download macOS artifact
+      - name: Download macOS ARM artifact
         uses: actions/download-artifact@v4
         with:
-          name: BetterFlow-macOS
+          name: BetterFlow-macOS-arm64
+          path: ./artifacts
+
+      - name: Download macOS Intel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: BetterFlow-macOS-x86_64
           path: ./artifacts
 
       - name: Download Windows artifact
@@ -96,7 +124,8 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/BetterFlow-macOS.zip
+            artifacts/BetterFlow-macOS-arm64.dmg
+            artifacts/BetterFlow-macOS-x86_64.dmg
             artifacts/BetterFlow-Windows.zip
           draft: true
           generate_release_notes: true
