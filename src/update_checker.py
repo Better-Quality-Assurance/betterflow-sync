@@ -9,7 +9,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "betterqa/betterflow-sync"
+GITHUB_REPO = "Better-Quality-Assurance/betterflow-sync"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 
 # Valid update channels in order of stability
@@ -50,34 +50,73 @@ _ASSET_PATTERNS = {
 }
 
 
-def _find_platform_asset(release: dict) -> Optional[str]:
-    """Find the platform-specific ZIP download URL from a GitHub release."""
-    pattern = _ASSET_PATTERNS.get(platform.system())
+def _find_platform_asset(
+    release: dict,
+    system: Optional[str] = None,
+    arch: Optional[str] = None,
+) -> Optional[str]:
+    """Find the platform-specific download URL from a GitHub release.
+
+    On macOS: prefers architecture-specific DMG (arm64/x86_64), falls back to ZIP.
+    On Windows: matches ZIP assets.
+
+    Args:
+        release: GitHub release dict with "assets" list.
+        system: Override platform.system() for testing (e.g. "Darwin", "Windows").
+        arch: Override platform.machine() for testing (e.g. "arm64", "x86_64").
+    """
+    system = system or platform.system()
+    arch = arch or platform.machine()
+    pattern = _ASSET_PATTERNS.get(system)
     if not pattern:
         return None
-    for asset in release.get("assets", []):
+
+    assets = release.get("assets", [])
+    if system == "Darwin":
+        # Prefer arch-specific DMG
+        for asset in assets:
+            name = asset.get("name", "")
+            url = asset.get("browser_download_url")
+            if pattern in name and arch in name and name.endswith(".dmg") and url:
+                return url
+        # Fallback: any macOS DMG
+        for asset in assets:
+            name = asset.get("name", "")
+            url = asset.get("browser_download_url")
+            if pattern in name and name.endswith(".dmg") and url:
+                logger.debug(f"No arch-specific DMG for {arch}, using generic DMG")
+                return url
+
+    # Windows primary, macOS ZIP as last-resort fallback for non-standard releases
+    for asset in assets:
         name = asset.get("name", "")
-        if pattern in name and name.endswith(".zip"):
-            return asset.get("browser_download_url")
+        url = asset.get("browser_download_url")
+        if pattern in name and name.endswith(".zip") and url:
+            return url
     return None
 
 
 def check_for_update(
     current_version: str,
     channel: str = "stable",
-    callback: Optional[Callable] = None,
+    callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
 ) -> None:
     """Check GitHub for a newer release (runs in background thread).
 
     Args:
         current_version: Current app version (e.g. '1.0.0')
-        channel: Update channel — 'stable', 'beta', or 'canary'
+        channel: Update channel - 'stable', 'beta', or 'canary'
         callback: Optional fn(latest_version, download_url) called if update available
     """
 
     def _check():
         try:
-            if channel == "stable":
+            effective_channel = channel
+            if effective_channel not in UPDATE_CHANNELS:
+                logger.warning(f"Unknown update channel '{effective_channel}', defaulting to 'stable'")
+                effective_channel = "stable"
+
+            if effective_channel == "stable":
                 # Fast path: use /releases/latest for stable channel
                 resp = requests.get(
                     f"{RELEASES_URL}/latest",
@@ -85,8 +124,13 @@ def check_for_update(
                     timeout=10,
                 )
                 if resp.status_code != 200:
+                    logger.debug(f"Update check: GitHub API returned {resp.status_code}")
                     return
-                releases = [resp.json()]
+                try:
+                    releases = [resp.json()]
+                except (ValueError, RuntimeError):
+                    logger.debug("Update check: failed to parse GitHub API response")
+                    return
             else:
                 # Fetch recent releases and filter by channel
                 resp = requests.get(
@@ -96,8 +140,13 @@ def check_for_update(
                     timeout=10,
                 )
                 if resp.status_code != 200:
+                    logger.debug(f"Update check: GitHub API returned {resp.status_code}")
                     return
-                releases = resp.json()
+                try:
+                    releases = resp.json()
+                except (ValueError, RuntimeError):
+                    logger.debug("Update check: failed to parse GitHub API response")
+                    return
                 if not isinstance(releases, list):
                     return
 
@@ -105,7 +154,7 @@ def check_for_update(
             best = None
             best_tuple = None
             for rel in releases:
-                if not _matches_channel(rel, channel):
+                if not _matches_channel(rel, effective_channel):
                     continue
                 tag = rel.get("tag_name", "")
                 if not tag:
@@ -130,11 +179,11 @@ def check_for_update(
             latest_tag = best["tag_name"]
             html_url = best.get("html_url", "")
 
-            # Find platform-specific ZIP asset URL for self-update
+            # Find platform-specific asset URL for self-update (DMG or ZIP)
             asset_url = _find_platform_asset(best)
 
             logger.info(
-                f"Update available ({channel}): {current_version} -> {latest_tag} — {html_url}"
+                f"Update available ({effective_channel}): {current_version} -> {latest_tag} | {html_url}"
             )
 
             if callback:

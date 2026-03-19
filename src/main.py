@@ -902,13 +902,19 @@ class BetterFlowApp:
         except Exception:
             logger.exception("Failed to start system event listeners")
 
-        # Check for updates in background
+        # Check for updates in background (now + every 6 hours)
         try:
             if self.config.check_updates:
                 check_for_update(
                     _VERSION,
                     channel=self.config.update_channel,
                     callback=self._on_update_available,
+                )
+                self.coordinator.scheduler.add_job(
+                    self._periodic_update_check,
+                    trigger=IntervalTrigger(hours=6),
+                    id="update_check_job",
+                    replace_existing=True,
                 )
         except Exception:
             logger.exception("Failed to start update checker")
@@ -941,7 +947,7 @@ class BetterFlowApp:
 
     def _on_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
         """Handle update available notification."""
-        logger.info(f"Update available: v{version} — {url} (asset: {asset_url})")
+        logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
         if asset_url:
             send_notification(
@@ -953,6 +959,22 @@ class BetterFlowApp:
                 "BetterFlow Update",
                 f"Version {version} is available.",
             )
+
+    def _periodic_update_check(self) -> None:
+        """Re-check for updates (called periodically by scheduler)."""
+        if not self.config.check_updates:
+            return
+        with self.tray.model.lock:
+            if self.tray.model.update_in_progress:
+                return
+        try:
+            check_for_update(
+                _VERSION,
+                channel=self.config.update_channel,
+                callback=self._on_update_available,
+            )
+        except Exception:
+            logger.debug("Periodic update check failed", exc_info=True)
 
     def _on_install_update(self, asset_url: str) -> None:
         """Handle self-update: download, replace, relaunch."""

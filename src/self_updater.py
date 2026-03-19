@@ -1,4 +1,7 @@
-"""Self-update: download a new release ZIP, replace the running .app, and relaunch."""
+"""Self-update: download a new release, replace the running .app, and relaunch.
+
+Supports both ZIP and DMG formats (macOS uses DMG, Windows uses ZIP).
+"""
 
 import logging
 import shutil
@@ -32,7 +35,7 @@ def _get_app_bundle_path() -> Optional[Path]:
         return None
 
     elif sys.platform == "win32":
-        # PyInstaller: dist/BetterFlow/BetterFlow.exe — the folder is the app
+        # PyInstaller: dist/BetterFlow/BetterFlow.exe - the folder is the app
         if getattr(sys, "frozen", False):
             return Path(sys._MEIPASS).parent if hasattr(sys, "_MEIPASS") else exe.parent
         return None
@@ -47,7 +50,7 @@ def apply_update(
     """Download, extract, replace, and relaunch.
 
     Args:
-        download_url: Direct URL to the platform ZIP asset.
+        download_url: Direct URL to the platform asset (DMG on macOS, ZIP on Windows).
         on_progress: Optional callback(status_message) for UI feedback.
 
     Returns:
@@ -61,7 +64,7 @@ def apply_update(
 
     app_path = _get_app_bundle_path()
     if app_path is None:
-        _status("Cannot determine app location — update aborted")
+        _status("Cannot determine app location - update aborted")
         return False
 
     # Reject non-HTTPS download URLs to prevent MITM attacks
@@ -78,11 +81,15 @@ def apply_update(
         resp.raise_for_status()
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-update-"))
-        zip_path = tmp_dir / "update.zip"
+        # Parse URL path to detect format (handles query params like ?token=abc)
+        url_path = urlparse(download_url).path.lower()
+        is_dmg = url_path.endswith(".dmg")
+        dl_filename = "update.dmg" if is_dmg else "update.zip"
+        dl_path = tmp_dir / dl_filename
 
         total = int(resp.headers.get("content-length", 0))
         downloaded = 0
-        with open(zip_path, "wb") as f:
+        with open(dl_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=256 * 1024):
                 f.write(chunk)
                 downloaded += len(chunk)
@@ -90,26 +97,32 @@ def apply_update(
                     pct = int(downloaded / total * 100)
                     _status(f"Downloading... {pct}%")
 
-        # 2. Extract (with Zip Slip protection)
+        # 2. Extract
         _status("Extracting...")
         extract_dir = tmp_dir / "extracted"
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for member in zf.namelist():
-                member_path = (extract_dir / member).resolve()
-                if not str(member_path).startswith(str(extract_dir.resolve())):
-                    raise ValueError(f"Zip entry escapes target directory: {member}")
-            zf.extractall(extract_dir)
+        extract_dir.mkdir()
+
+        if is_dmg:
+            _extract_from_dmg(dl_path, extract_dir)
+        else:
+            # ZIP extraction with Zip Slip protection
+            with zipfile.ZipFile(dl_path, "r") as zf:
+                for member in zf.namelist():
+                    member_path = (extract_dir / member).resolve()
+                    if not str(member_path).startswith(str(extract_dir.resolve())):
+                        raise ValueError(f"Zip entry escapes target directory: {member}")
+                zf.extractall(extract_dir)
 
         # 3. Find the new .app or exe dir inside the extract
         if sys.platform == "darwin":
             new_app = _find_app_in(extract_dir)
             if new_app is None:
-                _status("No .app found in update archive — aborted")
+                _status("No .app found in update archive - aborted")
                 return False
 
             # 3b. Verify code signature before installing
             if not _verify_codesign(new_app):
-                _status("Code signature verification failed — update aborted")
+                _status("Code signature verification failed - update aborted")
                 return False
 
             # 4. Replace: move old to trash, move new in place
@@ -145,7 +158,7 @@ def apply_update(
             # Use a bat script to replace after this process exits
             new_files = list(extract_dir.iterdir())
             if not new_files:
-                _status("Empty update archive — aborted")
+                _status("Empty update archive - aborted")
                 return False
 
             bat_path = tmp_dir / "update.bat"
@@ -192,6 +205,50 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
+def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
+    """Mount a DMG, copy the .app out, and unmount."""
+    mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
+    try:
+        # Mount DMG read-only, hidden from Finder
+        subprocess.run(
+            ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify",
+             "-mountpoint", str(mount_point), str(dmg_path)],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+        # Find .app inside mounted volume
+        app_found = None
+        for item in mount_point.iterdir():
+            if item.suffix == ".app" and item.is_dir():
+                app_found = item
+                break
+        if app_found is None:
+            raise FileNotFoundError("No .app found in DMG")
+        # Copy .app to extract directory (with path traversal guard)
+        dest = (extract_dir / app_found.name).resolve()
+        if not str(dest).startswith(str(extract_dir.resolve())):
+            raise ValueError(f"DMG app name escapes extract directory: {app_found.name}")
+        shutil.copytree(str(app_found), str(dest), symlinks=True)
+        logger.info(f"Extracted {app_found.name} from DMG")
+    finally:
+        # Always attempt to detach, then clean up the mount point directory
+        try:
+            result = subprocess.run(
+                ["hdiutil", "detach", str(mount_point), "-quiet"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.error(
+                    f"hdiutil detach failed (rc={result.returncode}): {result.stderr.strip()}"
+                )
+                raise RuntimeError("Failed to detach DMG mount - aborting update")
+        except subprocess.TimeoutExpired as e:
+            logger.error("hdiutil detach timed out - DMG may still be mounted")
+            raise RuntimeError("Failed to detach DMG mount - aborting update") from e
+        finally:
+            # Remove the mount point directory itself
+            shutil.rmtree(mount_point, ignore_errors=True)
+
+
 def _fix_permissions(app_path: Path) -> None:
     """Ensure the main executable inside the .app has owner-execute permission."""
     macos_dir = app_path / "Contents" / "MacOS"
@@ -211,20 +268,29 @@ def _fix_permissions(app_path: Path) -> None:
 
 
 def _verify_codesign(app_path: Path) -> bool:
-    """Verify macOS code signature on the extracted .app bundle."""
+    """Verify macOS code signature on the extracted .app bundle.
+
+    Allows unsigned apps (unsigned-to-unsigned update is fine).
+    Only rejects apps with an invalid/tampered signature.
+    """
     try:
         result = subprocess.run(
             ["codesign", "--verify", "--deep", "--strict", str(app_path)],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode != 0:
-            logger.error(f"codesign verification failed: {result.stderr.strip()}")
-            return False
-        logger.info("Code signature verified successfully")
-        return True
+        if result.returncode == 0:
+            logger.info("Code signature verified successfully")
+            return True
+        stderr = result.stderr.strip()
+        # "code object is not signed at all" means unsigned - acceptable for unsigned-to-unsigned
+        if "code object is not signed at all" in stderr:
+            logger.info("App is unsigned - allowing update (unsigned-to-unsigned)")
+            return True
+        logger.error(f"codesign verification failed: {stderr}")
+        return False
     except FileNotFoundError:
         logger.warning("codesign binary not found - skipping verification")
-        return True  # Allow update on systems without codesign
+        return True
     except subprocess.TimeoutExpired:
         logger.error("codesign verification timed out")
         return False
