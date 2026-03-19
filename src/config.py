@@ -323,6 +323,7 @@ class Config:
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
+    auto_install_updates: bool = False
     update_channel: str = "stable"
     debug_mode: bool = False
 

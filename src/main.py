@@ -810,6 +810,7 @@ class BetterFlowApp:
         self._pause_state_lock = threading.Lock()
         self._user_paused = False
         self._pre_sleep_private = False
+        self._pending_update_asset_url: Optional[str] = None
         self._login_lock = threading.Lock()
 
     def run(self) -> None:
@@ -945,11 +946,34 @@ class BetterFlowApp:
         """Open System Settings to Accessibility permission pane."""
         open_accessibility_settings()
 
+    def _try_auto_install(self) -> None:
+        """Auto-install a pending update if conditions are met."""
+        url = self._pending_update_asset_url
+        if not url or not self.config.auto_install_updates:
+            return
+        with self.tray.model.lock:
+            if self.tray.model.update_in_progress:
+                return
+        self._pending_update_asset_url = None
+        logger.info("Auto-installing pending update (user is idle)")
+        send_notification("BetterFlow Update", "Installing update, app will restart shortly.")
+        self._on_install_update(url)
+
     def _on_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
         """Handle update available notification."""
         logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
-        if asset_url:
+        if asset_url and self.config.auto_install_updates:
+            if self.coordinator._idle_paused:
+                self._pending_update_asset_url = asset_url
+                self._try_auto_install()
+            else:
+                self._pending_update_asset_url = asset_url
+                send_notification(
+                    "BetterFlow Update",
+                    f"Version {version} available. Will install when you're away.",
+                )
+        elif asset_url:
             send_notification(
                 "BetterFlow Update",
                 f"Version {version} is available. Click 'Install & Restart' in the menu.",
@@ -978,6 +1002,7 @@ class BetterFlowApp:
 
     def _on_install_update(self, asset_url: str) -> None:
         """Handle self-update: download, replace, relaunch."""
+        self._pending_update_asset_url = None
         try:
             from .self_updater import apply_update_async
         except ImportError:
@@ -1148,6 +1173,8 @@ class BetterFlowApp:
                 self.reminder_manager.on_tracking_stopped()
             else:
                 self.reminder_manager.on_tracking_started()
+        if paused:
+            self._try_auto_install()
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
@@ -1206,6 +1233,7 @@ class BetterFlowApp:
         self.sync_engine.pause()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
         self.reminder_manager.on_tracking_stopped()
+        self._try_auto_install()
 
     def _on_screen_unlock(self) -> None:
         """Handle screen unlock — resume tracking."""
