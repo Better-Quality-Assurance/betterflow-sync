@@ -522,11 +522,35 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Idle check error: {e}")
 
+    _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         if not self._sync_lock.acquire(blocking=False):
             logger.debug("Sync already in progress, skipping")
             return
+
+        # Watchdog timer: if _do_sync is still running after the deadline,
+        # discard pooled connections so the next request creates a fresh TCP
+        # connection. threading.Timer uses Event.wait() internally — the timer
+        # thread is suspended during macOS sleep, then fires immediately on
+        # wake when the kernel resumes userspace threads. This is the backstop
+        # for cases where the sleep notification was missed.
+        watchdog_cancelled = threading.Event()
+
+        def _watchdog():
+            if watchdog_cancelled.is_set():
+                return
+            logger.error("_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE)
+            try:
+                self.bf.reset_session()
+                self.aw.reset_session()
+            except Exception:
+                pass
+
+        watchdog = threading.Timer(self._DO_SYNC_DEADLINE, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             if self.sync_engine.is_private:
                 self.tray.set_state(TrayState.PRIVATE)
@@ -585,8 +609,9 @@ class SyncCoordinator:
                 )
 
             # Fetch hours from server (source of truth after sync)
+            hours = self._fetch_hours_today()
             self.tray.update_stats(
-                hours_today=self._fetch_hours_today(),
+                hours_today=hours,
                 last_sync=datetime.now().strftime("%H:%M"),
                 queue_size=self.queue.size(),
             )
@@ -615,6 +640,8 @@ class SyncCoordinator:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
         finally:
+            watchdog_cancelled.set()
+            watchdog.cancel()
             self._sync_lock.release()
 
     def _fetch_hours_today(self) -> str:
@@ -630,7 +657,8 @@ class SyncCoordinator:
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             self._last_hours_refresh = time.monotonic()
             return self._hours_today_cache
-        except Exception:
+        except Exception as e:
+            logger.debug(f"_fetch_hours_today failed: {e}")
             return self._hours_today_cache
 
     def _refresh_hours_today(self) -> None:
@@ -1197,6 +1225,10 @@ class BetterFlowApp:
         self.coordinator.paused_by_network = False
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
+        # Discard pooled idle connections so the next post-wake request
+        # creates a fresh TCP connection rather than reusing a stale one.
+        self.bf.reset_session()
+        self.aw.reset_session()
         self.tray.set_state(TrayState.PAUSED, "Sleeping")
         self.reminder_manager.on_tracking_stopped()
         logger.info("Tracking paused (system sleep)")
@@ -1237,6 +1269,9 @@ class BetterFlowApp:
         logger.info("Screen locked — pausing tracking")
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
+        # Reset sessions in case Wi-Fi disconnects on lock
+        self.bf.reset_session()
+        self.aw.reset_session()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
         self.reminder_manager.on_tracking_stopped()
         self._try_auto_install()

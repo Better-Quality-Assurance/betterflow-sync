@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import socket
+import threading
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -110,6 +111,7 @@ class BaseApiClient:
         self.retry_config = retry_config or self.DEFAULT_RETRY_CONFIG
         self._session = session or requests.Session()
         self._owns_session = session is None  # Track if we created the session
+        self._session_lock = threading.Lock()
 
     @property
     def web_base_url(self) -> str:
@@ -194,7 +196,8 @@ class BaseApiClient:
 
         def do_request() -> dict:
             try:
-                session = self._session
+                with self._session_lock:
+                    session = self._session
                 if session is None:
                     raise BetterFlowClientError("Client has been closed")
                 response = session.request(method, url, **kwargs)
@@ -274,14 +277,23 @@ class BaseApiClient:
 
         Call after laptop wake to avoid stale TCP connections that would
         block the first request with a 30s timeout.
+
+        Thread-safe: the lock ensures do_request() snapshots either the
+        old or the new session, never a partially-swapped reference.
         """
-        if self._owns_session and self._session is not None:
+        with self._session_lock:
+            old = self._session
+            was_owned = self._owns_session
+            self._session = requests.Session()
+            self._owns_session = True
+        # Close outside lock to avoid holding it during I/O.
+        # Only close the old session if we owned it - don't destroy
+        # an injected session the caller still holds a reference to.
+        if old is not None and was_owned:
             try:
-                self._session.close()
+                old.close()
             except Exception:
                 pass
-        self._session = requests.Session()
-        self._owns_session = True
 
     def set_credentials(self, token: str, device_id: str) -> None:
         """Set authentication credentials."""
@@ -298,18 +310,26 @@ class BaseApiClient:
         try:
             self._request("GET", "health", retry=False)
             return True
+        except BetterFlowAuthError:
+            return True  # Server is reachable; auth is a separate concern
         except BetterFlowClientError:
             try:
                 self._request("GET", "events/status", retry=False)
+                return True
+            except BetterFlowAuthError:
                 return True
             except BetterFlowClientError:
                 return False
 
     def close(self) -> None:
         """Close the session if we own it."""
-        if self._owns_session and self._session is not None:
-            self._session.close()
+        with self._session_lock:
+            if not self._owns_session:
+                return
+            session = self._session
             self._session = None
+        if session is not None:
+            session.close()
 
     def __del__(self) -> None:
         try:

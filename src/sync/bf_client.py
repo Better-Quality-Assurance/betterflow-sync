@@ -177,7 +177,11 @@ class BetterFlowClient(BaseApiClient):
             payload["code_verifier"] = code_verifier
 
         try:
-            response = self._session.post(
+            with self._session_lock:
+                session = self._session
+            if session is None:
+                return AuthResult(success=False, error="Client has been closed")
+            response = session.post(
                 url,
                 json=payload,
                 headers=headers,
@@ -315,12 +319,12 @@ class BetterFlowClient(BaseApiClient):
         return f"{offset[:3]}:{offset[3:]}"  # "+03:00"
 
     def get_status(self) -> dict:
-        """Get sync status."""
-        return self._request("GET", "events/status")
+        """Get sync status (non-critical, short timeout)."""
+        return self._request("GET", "events/status", retry=False, timeout_override=10)
 
     def get_trends(self) -> dict:
-        """Get weekly/monthly trend summaries."""
-        return self._request("GET", "events/trends")
+        """Get weekly/monthly trend summaries (non-critical, short timeout)."""
+        return self._request("GET", "events/trends", retry=False, timeout_override=10)
 
     # =========================================================================
     # Configuration

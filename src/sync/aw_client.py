@@ -125,6 +125,7 @@ class AWClient:
         self.base_url = f"http://{host}:{port}/api/0/"
         self.timeout = timeout
         self._session = requests.Session()
+        self._session_lock = threading.Lock()
         self._buckets_lock = threading.Lock()
         self._buckets_cache: Optional[dict[str, "AWBucket"]] = None
         self._buckets_cache_time: float = 0.0
@@ -135,8 +136,12 @@ class AWClient:
         url = urljoin(self.base_url, endpoint)
         kwargs["timeout"] = timeout if timeout is not None else self.timeout
 
+        with self._session_lock:
+            session = self._session
+        if session is None:
+            raise AWClientError("AWClient has been closed")
         try:
-            response = self._session.request(method, url, **kwargs)
+            response = session.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json() if response.content else {}
         except requests.exceptions.ConnectionError as e:
@@ -152,12 +157,17 @@ class AWClient:
         """Drop pooled connections and create a fresh session.
 
         Call after system wake to avoid stale TCP connections.
+        Thread-safe: swaps the reference under lock, closes old outside.
         """
+        with self._session_lock:
+            old = self._session
+            if old is None:
+                return  # already closed, do not resurrect
+            self._session = requests.Session()
         try:
-            self._session.close()
+            old.close()
         except Exception:
             pass
-        self._session = requests.Session()
 
     def is_running(self) -> bool:
         """Check if ActivityWatch server is running.
@@ -294,11 +304,19 @@ class AWClient:
         return info.get("hostname", "unknown")
 
     def close(self) -> None:
-        """Close the session. The session object remains valid after close()
-        (it just won't reuse connections), so in-flight requests on other
-        threads will get ConnectionError rather than AttributeError."""
-        if self._session is not None:
-            self._session.close()
+        """Close the session and null out the reference.
+
+        Thread-safe: acquires _session_lock so concurrent _request()
+        calls snapshot either the live session or None.
+        """
+        with self._session_lock:
+            session = self._session
+            self._session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         try:
