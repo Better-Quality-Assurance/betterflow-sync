@@ -150,8 +150,10 @@ def apply_update(
             # 5. Relaunch
             _status("Restarting...")
             subprocess.Popen(["open", str(app_path)])
-            # Exit current process
-            sys.exit(0)
+            # Exit current process — os._exit works from any thread,
+            # unlike sys.exit which only raises SystemExit in the calling thread.
+            import os
+            os._exit(0)
 
         elif sys.platform == "win32":
             # Windows: extract contains BetterFlow.exe + supporting files
@@ -176,7 +178,8 @@ def apply_update(
                 ["cmd", "/c", str(bat_path)],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            sys.exit(0)
+            import os
+            os._exit(0)
 
         return True
 
