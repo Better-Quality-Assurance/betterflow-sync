@@ -811,6 +811,7 @@ class BetterFlowApp:
         self._user_paused = False
         self._pre_sleep_private = False
         self._pending_update_asset_url: Optional[str] = None
+        self._pending_update_lock = threading.Lock()
         self._login_lock = threading.Lock()
 
     def run(self) -> None:
@@ -948,15 +949,16 @@ class BetterFlowApp:
 
     def _try_auto_install(self) -> None:
         """Auto-install a pending update if conditions are met."""
-        url = self._pending_update_asset_url
-        if not url or not self.config.auto_install_updates:
-            return
-        with self.tray.model.lock:
-            if self.tray.model.update_in_progress:
+        with self._pending_update_lock:
+            url = self._pending_update_asset_url
+            if not url or not self.config.auto_install_updates:
                 return
-        self._pending_update_asset_url = None
+            with self.tray.model.lock:
+                if self.tray.model.update_in_progress:
+                    return
+            self._pending_update_asset_url = None
         logger.info("Auto-installing pending update (user is idle)")
-        send_notification("BetterFlow Update", "Installing update, app will restart shortly.")
+        send_notification("BetterFlow Update", "Downloading update, app will restart when complete.")
         self._on_install_update(url)
 
     def _on_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
@@ -964,11 +966,11 @@ class BetterFlowApp:
         logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
         if asset_url and self.config.auto_install_updates:
-            if self.coordinator._idle_paused:
+            with self._pending_update_lock:
                 self._pending_update_asset_url = asset_url
+            if self.coordinator.idle_paused:
                 self._try_auto_install()
             else:
-                self._pending_update_asset_url = asset_url
                 send_notification(
                     "BetterFlow Update",
                     f"Version {version} available. Will install when you're away.",
@@ -1002,7 +1004,6 @@ class BetterFlowApp:
 
     def _on_install_update(self, asset_url: str) -> None:
         """Handle self-update: download, replace, relaunch."""
-        self._pending_update_asset_url = None
         try:
             from .self_updater import apply_update_async
         except ImportError:
@@ -1016,7 +1017,12 @@ class BetterFlowApp:
                 with self.tray.model.lock:
                     self.tray.model.update_in_progress = False
                 self.tray._update_menu()
-                send_notification("Update Failed", "Self-update failed. Try again later.")
+                if self.config.auto_install_updates:
+                    with self._pending_update_lock:
+                        self._pending_update_asset_url = asset_url
+                    send_notification("Update Failed", "Will retry next idle period.")
+                else:
+                    send_notification("Update Failed", "Self-update failed. Try again later.")
 
         apply_update_async(asset_url, on_progress=on_progress, on_complete=on_complete)
 
