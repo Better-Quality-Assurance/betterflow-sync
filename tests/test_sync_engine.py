@@ -677,3 +677,17 @@ class TestSyncCoordinatorBreak:
         with patch("src.main.send_notification") as mock_notify:
             self.coordinator.end_break(silent=True)
             mock_notify.assert_not_called()
+
+
+class TestConfigDefaultCategories:
+    """Tests for default_categories save/load round-trip."""
+
+    def test_save_load_roundtrip_restores_default_categories(self, tmp_path, monkeypatch):
+        """default_categories must come from dataclass defaults, not config.json."""
+        monkeypatch.setattr(Config, "get_config_dir", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(Config, "get_config_file", classmethod(lambda cls: tmp_path / "config.json"))
+        config = Config()
+        assert "Claude" in config.privacy.default_categories
+        config.save()
+        loaded = Config.load()
+        assert "Claude" in loaded.privacy.default_categories

@@ -704,15 +704,20 @@ class SyncEngine:
 
             if app and privacy.auto_categorize:
                 category = self._get_category(app)
+                should_persist = False
                 if category is None:
                     # DB miss - try fallback map
                     category = privacy.default_categories.get(app)
-                    if category and app not in self._persisted_fallbacks:
-                        self._persisted_fallbacks.add(app)
-                        try:
-                            self.queue.set_category(app, category, source='fallback')
-                        except Exception as exc:
-                            logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
+                    if category:
+                        with self._category_cache_lock:
+                            if app not in self._persisted_fallbacks:
+                                self._persisted_fallbacks.add(app)
+                                should_persist = True
+                if should_persist:
+                    try:
+                        self.queue.set_category(app, category, source='fallback')
+                    except Exception as exc:
+                        logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
                 if category:
                     data["app_category"] = category
 
