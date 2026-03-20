@@ -520,7 +520,15 @@ class Config:
             if "default_categories" in collection:
                 cats = collection["default_categories"]
                 if isinstance(cats, dict):
-                    self.privacy.default_categories = cats
+                    valid = {
+                        k: v for k, v in cats.items()
+                        if isinstance(k, str) and isinstance(v, str) and k and v
+                    }
+                    # Merge: server entries override matching keys but
+                    # built-in defaults survive for apps the server doesn't mention.
+                    merged = dict(self.privacy.default_categories)
+                    merged.update(valid)
+                    self.privacy.default_categories = merged
 
         if "tracking" in server_config:
             tracking = server_config["tracking"]
@@ -540,9 +548,12 @@ class Config:
                 if 5 <= val <= 120:
                     self.sync.idle_pause_minutes = val
             if "min_window_event_seconds" in sync:
-                val = float(sync["min_window_event_seconds"])
-                if 0 <= val <= 30:
-                    self.sync.min_window_event_seconds = val
+                try:
+                    val = float(sync["min_window_event_seconds"])
+                    if 0 <= val <= 30:
+                        self.sync.min_window_event_seconds = val
+                except (TypeError, ValueError):
+                    logger.warning("Invalid min_window_event_seconds from server, ignoring")
 
         if "engagement" in server_config:
             eng = server_config["engagement"]

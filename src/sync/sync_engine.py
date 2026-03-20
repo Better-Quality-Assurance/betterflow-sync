@@ -1,6 +1,7 @@
 """Sync engine - orchestrates data flow from ActivityWatch to BetterFlow."""
 
 import logging
+import math
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -122,6 +123,9 @@ class SyncEngine:
         # Populated lazily; invalidated when categories are refreshed.
         self._category_cache: Optional[dict[str, str]] = None
         self._category_cache_lock = threading.Lock()
+        # Track which fallback categories have been persisted to DB this session.
+        # Prevents repeated writes after cache invalidation.
+        self._persisted_fallbacks: set[str] = set()
 
         # Activity analysis for fraud detection (DIP)
         self._activity_analyzer = activity_analyzer or ActivityAnalyzer(
@@ -221,23 +225,22 @@ class SyncEngine:
         """Look up category for an app, using thread-safe in-memory cache (M3).
 
         Lookup order: DB cache -> config fallback map.
-        Fallback hits are persisted with source='fallback' so the server
-        can override them later (unlike source='user' which is sticky).
+        Pure lookup - does not write to the database.
         """
-        fallback_hit = None
         with self._category_cache_lock:
             if self._category_cache is None:
                 self._category_cache = self.queue.get_all_categories()
             cached = self._category_cache.get(app_name)
-            if cached:
+            if cached is not None:
                 return cached
-            fallback_hit = self.config.privacy.default_categories.get(app_name)
-            if fallback_hit:
-                self._category_cache[app_name] = fallback_hit
-        # Persist outside lock to avoid I/O under _category_cache_lock
-        if fallback_hit:
-            self.queue.set_category(app_name, fallback_hit, source='fallback')
-        return fallback_hit
+            fallback = self.config.privacy.default_categories.get(app_name)
+            if fallback is not None:
+                self._category_cache[app_name] = fallback
+            return fallback
+
+    def _persist_fallback_category(self, app_name: str, category: str) -> None:
+        """Persist a fallback category hit to DB so the server can override it later."""
+        self.queue.set_category(app_name, category, source='fallback')
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -245,6 +248,7 @@ class SyncEngine:
             server_config = self.bf.get_config()
             self.config.update_from_server(server_config)
             self._config_fetched = True
+            self.invalidate_category_cache()
             logger.info("Server configuration applied")
 
             # Update activity analyzer thresholds from new config
@@ -671,6 +675,11 @@ class SyncEngine:
         if app and app in privacy.exclude_apps:
             return None
 
+        # Reject non-finite durations (NaN/inf from corrupt AW data)
+        if not math.isfinite(event.duration):
+            logger.warning(f"Skipping event id={event.id} with non-finite duration={event.duration}")
+            return None
+
         # Skip very short events.
         # Window/web events use a configurable minimum (default 5s) to filter
         # sub-second flickers. AFK/input events keep the 0.5s floor since they
@@ -706,6 +715,10 @@ class SyncEngine:
                 category = self._get_category(app)
                 if category:
                     data["app_category"] = category
+                    # Persist fallback hits to DB (once per app per session)
+                    if app not in self._persisted_fallbacks and app in self.config.privacy.default_categories:
+                        self._persist_fallback_category(app, category)
+                        self._persisted_fallbacks.add(app)
 
             if self._display_tracker is not None and privacy.track_display_info:
                 ds = self._display_tracker.state

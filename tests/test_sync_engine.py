@@ -136,14 +136,48 @@ class TestSyncEngine:
         result = self.engine._get_category("Claude")
         assert result == "development"
 
-    def test_get_category_fallback_persists_with_source(self):
-        """Test that fallback category is persisted with source='fallback'."""
+    def test_get_category_fallback_does_not_write_db(self):
+        """Test that _get_category is a pure lookup (no DB write)."""
         self.queue.get_all_categories.return_value = {}
         self.engine._category_cache = None
 
         self.engine._get_category("Claude")
 
+        self.queue.set_category.assert_not_called()
+
+    def test_transform_event_persists_fallback_category(self):
+        """Test that fallback categories are persisted with source='fallback' via _transform_event."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "Claude", "title": "Chat"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert result is not None
+        assert result["data"]["app_category"] == "development"
         self.queue.set_category.assert_called_once_with("Claude", "development", source="fallback")
+
+    def test_transform_event_persists_fallback_only_once(self):
+        """Test that repeated events for the same app don't re-persist fallback."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        for i in range(3):
+            event = AWEvent(
+                id=i + 10,
+                timestamp=datetime.now(timezone.utc),
+                duration=60,
+                data={"app": "Claude", "title": "Chat"},
+            )
+            self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        # Only one DB write despite three events
+        self.queue.set_category.assert_called_once()
 
     def test_get_category_db_value_takes_precedence(self):
         """Test that a DB-cached value takes precedence over fallback."""
@@ -153,6 +187,46 @@ class TestSyncEngine:
         result = self.engine._get_category("Claude")
         assert result == "productivity"
         self.queue.set_category.assert_not_called()
+
+    def test_get_category_double_miss_returns_none(self):
+        """Test that _get_category returns None when both DB and fallback miss."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        result = self.engine._get_category("SomeObscureApp")
+        assert result is None
+
+    def test_get_category_empty_string_in_db_is_not_bypassed(self):
+        """Test that an empty-string category from DB is returned (not treated as miss)."""
+        self.queue.get_all_categories.return_value = {"Claude": ""}
+        self.engine._category_cache = None
+
+        result = self.engine._get_category("Claude")
+        assert result == ""
+
+    def test_transform_event_nan_duration_returns_none(self):
+        """Test that NaN duration is rejected (would crash timedelta otherwise)."""
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=float("nan"),
+            data={"app": "Test"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert result is None
+
+    def test_transform_event_inf_duration_returns_none(self):
+        """Test that infinite duration is rejected."""
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=float("inf"),
+            data={"app": "Test"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert result is None
 
     def test_transform_event_filters_excluded_apps(self):
         """Test that excluded apps are filtered."""

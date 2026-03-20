@@ -500,10 +500,13 @@ class OfflineQueue:
     ) -> None:
         """Set or update a single app category.
 
+        User overrides (source='user') are never clobbered by server or
+        fallback writes.  Priority: user > server > fallback.
+
         Args:
             app_name: Application name
             category: Category string
-            source: 'server' or 'user'
+            source: 'server', 'user', or 'fallback'
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
@@ -512,8 +515,14 @@ class OfflineQueue:
                 INSERT INTO app_categories (app_name, category, source, updated_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(app_name) DO UPDATE SET
-                    category = excluded.category,
-                    source = excluded.source,
+                    category = CASE
+                        WHEN app_categories.source = 'user' THEN app_categories.category
+                        ELSE excluded.category
+                    END,
+                    source = CASE
+                        WHEN app_categories.source = 'user' THEN 'user'
+                        ELSE excluded.source
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (app_name, category, source, now),
@@ -525,32 +534,26 @@ class OfflineQueue:
         Args:
             mappings: Dict mapping app_name -> category from server
         """
+        if not mappings:
+            # Empty server response means "no opinion" - leave existing entries.
+            return
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
-            # Remove old server and fallback categories not in the new mapping.
-            # User overrides are preserved via ON CONFLICT below.
+            # Clear server and fallback entries; user overrides survive because
+            # they have source='user' and the DELETE only targets the other two.
             cursor.execute(
                 "DELETE FROM app_categories WHERE source IN ('server', 'fallback')"
             )
-            # Insert new server categories (overrides fallback, preserves user)
-            if mappings:
-                cursor.executemany(
-                    """
-                    INSERT INTO app_categories (app_name, category, source, updated_at)
-                    VALUES (?, ?, 'server', ?)
-                    ON CONFLICT(app_name) DO UPDATE SET
-                        category = CASE
-                            WHEN app_categories.source = 'user' THEN app_categories.category
-                            ELSE excluded.category
-                        END,
-                        source = CASE
-                            WHEN app_categories.source = 'user' THEN 'user'
-                            ELSE 'server'
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    [(app, cat, now) for app, cat in mappings.items()],
-                )
+            # Insert new server categories.  Any remaining conflict is a 'user'
+            # row, which we preserve via DO NOTHING.
+            cursor.executemany(
+                """
+                INSERT INTO app_categories (app_name, category, source, updated_at)
+                VALUES (?, ?, 'server', ?)
+                ON CONFLICT(app_name) DO NOTHING
+                """,
+                [(app, cat, now) for app, cat in mappings.items()],
+            )
 
     def close(self) -> None:
         """Close all tracked database connections.
