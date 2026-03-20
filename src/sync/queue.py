@@ -527,11 +527,12 @@ class OfflineQueue:
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
-            # Remove old server categories not in the new mapping
+            # Remove old server and fallback categories not in the new mapping.
+            # User overrides are preserved via ON CONFLICT below.
             cursor.execute(
-                "DELETE FROM app_categories WHERE source = 'server'"
+                "DELETE FROM app_categories WHERE source IN ('server', 'fallback')"
             )
-            # Insert new server categories
+            # Insert new server categories (overrides fallback, preserves user)
             if mappings:
                 cursor.executemany(
                     """

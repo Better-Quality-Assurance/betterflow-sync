@@ -227,7 +227,56 @@ class PrivacySettings:
             "Keychain Access",
             "System Preferences",
             "System Settings",
+            # macOS system agents
+            "SecurityAgent",
+            "UserNotificationCenter",
+            "loginwindow",
+            "ScreenSaverEngine",
+            "CoreServicesUIAgent",
+            "AirPlayUIAgent",
+            "SystemUIServer",
+            # Auto-updaters
+            "Microsoft AutoUpdate",
+            "Software Update",
         ]
+    )
+    default_categories: dict[str, str] = field(
+        default_factory=lambda: {
+            # Development
+            "Claude": "development",
+            "ChatGPT": "development",
+            "Copilot": "development",
+            "Cursor": "development",
+            "Warp": "development",
+            "iTerm2": "development",
+            "Docker Desktop": "development",
+            "Postman": "development",
+            # Productivity
+            "Calendar": "productivity",
+            "Reminders": "productivity",
+            "Notes": "productivity",
+            "Notion": "productivity",
+            "Microsoft Word": "productivity",
+            "Microsoft Excel": "productivity",
+            "Preview": "productivity",
+            # Communication
+            "WhatsApp": "communication",
+            "Telegram": "communication",
+            "Messages": "communication",
+            "FaceTime": "communication",
+            "Discord": "communication",
+            # Social
+            "Twitter": "social",
+            "LinkedIn": "social",
+            # Browsing
+            "Brave Browser": "browsing",
+            "Arc": "browsing",
+            "Comet": "browsing",
+            # Uncategorized (known but not classifiable)
+            "Finder": "uncategorized",
+            "Unknown": "uncategorized",
+            "Activity Monitor": "uncategorized",
+        }
     )
 
 
@@ -239,6 +288,7 @@ class SyncSettings:
     batch_size: int = DEFAULT_BATCH_SIZE
     compress: bool = True  # Use gzip compression
     idle_pause_minutes: int = 20  # Pause sync after this many minutes AFK
+    min_window_event_seconds: float = 5.0  # Drop window/web events shorter than this
 
 
 @dataclass
@@ -467,6 +517,10 @@ class Config:
                 self.privacy.auto_categorize = self._to_bool(collection["auto_categorize"])
             if "track_display_info" in collection:
                 self.privacy.track_display_info = self._to_bool(collection["track_display_info"])
+            if "default_categories" in collection:
+                cats = collection["default_categories"]
+                if isinstance(cats, dict):
+                    self.privacy.default_categories = cats
 
         if "tracking" in server_config:
             tracking = server_config["tracking"]
@@ -485,6 +539,10 @@ class Config:
                 val = int(sync["idle_pause_minutes"])
                 if 5 <= val <= 120:
                     self.sync.idle_pause_minutes = val
+            if "min_window_event_seconds" in sync:
+                val = float(sync["min_window_event_seconds"])
+                if 0 <= val <= 30:
+                    self.sync.min_window_event_seconds = val
 
         if "engagement" in server_config:
             eng = server_config["engagement"]

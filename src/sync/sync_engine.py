@@ -218,11 +218,26 @@ class SyncEngine:
             self._category_cache = None
 
     def _get_category(self, app_name: str) -> Optional[str]:
-        """Look up category for an app, using thread-safe in-memory cache (M3)."""
+        """Look up category for an app, using thread-safe in-memory cache (M3).
+
+        Lookup order: DB cache -> config fallback map.
+        Fallback hits are persisted with source='fallback' so the server
+        can override them later (unlike source='user' which is sticky).
+        """
+        fallback_hit = None
         with self._category_cache_lock:
             if self._category_cache is None:
                 self._category_cache = self.queue.get_all_categories()
-            return self._category_cache.get(app_name)
+            cached = self._category_cache.get(app_name)
+            if cached:
+                return cached
+            fallback_hit = self.config.privacy.default_categories.get(app_name)
+            if fallback_hit:
+                self._category_cache[app_name] = fallback_hit
+        # Persist outside lock to avoid I/O under _category_cache_lock
+        if fallback_hit:
+            self.queue.set_category(app_name, fallback_hit, source='fallback')
+        return fallback_hit
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -656,8 +671,14 @@ class SyncEngine:
         if app and app in privacy.exclude_apps:
             return None
 
-        # Skip very short events (< 0.5 second — those that round to 0)
-        if event.duration < 0.5:
+        # Skip very short events.
+        # Window/web events use a configurable minimum (default 5s) to filter
+        # sub-second flickers. AFK/input events keep the 0.5s floor since they
+        # have legitimately short durations (e.g. input telemetry at 1s).
+        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+            if event.duration < self.config.sync.min_window_event_seconds:
+                return None
+        elif event.duration < 0.5:
             return None
 
         # Build data object

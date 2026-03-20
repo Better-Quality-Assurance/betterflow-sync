@@ -78,17 +78,81 @@ class TestSyncEngine:
 
         assert "ActivityWatch is not running" in stats.errors
 
-    def test_transform_event_filters_short_events(self):
-        """Test that very short events are filtered."""
+    def test_transform_event_filters_short_window_events(self):
+        """Test that window events below min_window_event_seconds (5s) are filtered."""
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
-            duration=0.4,  # Less than 0.5 seconds
+            duration=4.0,  # Below default 5s threshold
             data={"app": "Test"},
         )
 
         result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
         assert result is None
+
+    def test_transform_event_short_input_not_filtered(self):
+        """Test that short input events (< 5s) are NOT filtered (only window events are)."""
+        event = AWEvent(
+            id=2,
+            timestamp=datetime.now(timezone.utc),
+            duration=1.0,  # Below 5s but above 0.5s
+            data={"presses": 10, "clicks": 5, "scrolls": 2},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_INPUT)
+        assert result is not None
+        assert result["data"]["presses"] == 10
+
+    def test_transform_event_short_afk_not_filtered(self):
+        """Test that short AFK events (< 5s) are NOT filtered."""
+        event = AWEvent(
+            id=3,
+            timestamp=datetime.now(timezone.utc),
+            duration=2.0,  # Below 5s but above 0.5s
+            data={"status": "not-afk"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_AFK)
+        assert result is not None
+        assert result["data"]["status"] == "not-afk"
+
+    def test_transform_event_window_at_threshold_passes(self):
+        """Test that a window event exactly at the 5s threshold passes."""
+        event = AWEvent(
+            id=4,
+            timestamp=datetime.now(timezone.utc),
+            duration=5.0,
+            data={"app": "Firefox", "title": "Test"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert result is not None
+
+    def test_get_category_returns_fallback(self):
+        """Test that _get_category returns fallback from default_categories when DB cache is empty."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        result = self.engine._get_category("Claude")
+        assert result == "development"
+
+    def test_get_category_fallback_persists_with_source(self):
+        """Test that fallback category is persisted with source='fallback'."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        self.engine._get_category("Claude")
+
+        self.queue.set_category.assert_called_once_with("Claude", "development", source="fallback")
+
+    def test_get_category_db_value_takes_precedence(self):
+        """Test that a DB-cached value takes precedence over fallback."""
+        self.queue.get_all_categories.return_value = {"Claude": "productivity"}
+        self.engine._category_cache = None
+
+        result = self.engine._get_category("Claude")
+        assert result == "productivity"
+        self.queue.set_category.assert_not_called()
 
     def test_transform_event_filters_excluded_apps(self):
         """Test that excluded apps are filtered."""
