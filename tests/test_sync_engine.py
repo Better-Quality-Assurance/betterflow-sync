@@ -128,21 +128,13 @@ class TestSyncEngine:
         result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
         assert result is not None
 
-    def test_get_category_returns_fallback(self):
-        """Test that _get_category returns fallback from default_categories when DB cache is empty."""
+    def test_get_category_db_only_returns_none_for_unmapped(self):
+        """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}
         self.engine._category_cache = None
 
         result = self.engine._get_category("Claude")
-        assert result == "development"
-
-    def test_get_category_fallback_does_not_write_db(self):
-        """Test that _get_category is a pure lookup (no DB write)."""
-        self.queue.get_all_categories.return_value = {}
-        self.engine._category_cache = None
-
-        self.engine._get_category("Claude")
-
+        assert result is None
         self.queue.set_category.assert_not_called()
 
     def test_transform_event_persists_fallback_category(self):
@@ -203,6 +195,40 @@ class TestSyncEngine:
 
         result = self.engine._get_category("Claude")
         assert result == ""
+
+    def test_db_sourced_category_not_repersisted_as_fallback(self):
+        """Test that a DB-sourced category does NOT trigger fallback persistence."""
+        self.queue.get_all_categories.return_value = {"Claude": "productivity"}
+        self.engine._category_cache = None
+
+        event = AWEvent(
+            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            data={"app": "Claude", "title": "Chat"},
+        )
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert result["data"]["app_category"] == "productivity"
+        self.queue.set_category.assert_not_called()
+
+    def test_persisted_fallbacks_cleared_on_shutdown(self):
+        """_persisted_fallbacks must be cleared on shutdown for clean re-login."""
+        self.queue.get_all_categories.return_value = {}
+        self.engine._category_cache = None
+
+        event = AWEvent(
+            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            data={"app": "Claude", "title": "Chat"},
+        )
+        self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        assert "Claude" in self.engine._persisted_fallbacks
+
+        self.engine.shutdown()
+        assert len(self.engine._persisted_fallbacks) == 0
+
+    def test_invalidate_cache_clears_persisted_fallbacks(self):
+        """invalidate_category_cache must also clear _persisted_fallbacks."""
+        self.engine._persisted_fallbacks.add("Claude")
+        self.engine.invalidate_category_cache()
+        assert len(self.engine._persisted_fallbacks) == 0
 
     def test_transform_event_nan_duration_returns_none(self):
         """Test that NaN duration is rejected (would crash timedelta otherwise)."""

@@ -464,6 +464,10 @@ class Config:
         config_file.parent.mkdir(parents=True, exist_ok=True)
 
         data = asdict(self)
+        # default_categories are built-in client defaults; server overrides
+        # live in the DB via sync_categories.  Don't persist to avoid unbounded
+        # growth and inability for the server to retract entries.
+        data.get("privacy", {}).pop("default_categories", None)
         tmp_file = config_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:

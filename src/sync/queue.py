@@ -508,6 +508,8 @@ class OfflineQueue:
             category: Category string
             source: 'server', 'user', or 'fallback'
         """
+        if not app_name or not category:
+            return
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
             cursor.execute(

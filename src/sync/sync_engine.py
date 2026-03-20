@@ -220,27 +220,18 @@ class SyncEngine:
         """Clear the in-memory category cache so next lookup re-reads from DB."""
         with self._category_cache_lock:
             self._category_cache = None
+            self._persisted_fallbacks.clear()
 
     def _get_category(self, app_name: str) -> Optional[str]:
-        """Look up category for an app, using thread-safe in-memory cache (M3).
+        """Look up category for an app from DB cache only (M3).
 
-        Lookup order: DB cache -> config fallback map.
-        Pure lookup - does not write to the database.
+        Returns None if the app has no DB-sourced category.
+        Does NOT consult the fallback map - callers handle that explicitly.
         """
         with self._category_cache_lock:
             if self._category_cache is None:
                 self._category_cache = self.queue.get_all_categories()
-            cached = self._category_cache.get(app_name)
-            if cached is not None:
-                return cached
-            fallback = self.config.privacy.default_categories.get(app_name)
-            if fallback is not None:
-                self._category_cache[app_name] = fallback
-            return fallback
-
-    def _persist_fallback_category(self, app_name: str, category: str) -> None:
-        """Persist a fallback category hit to DB so the server can override it later."""
-        self.queue.set_category(app_name, category, source='fallback')
+            return self._category_cache.get(app_name)
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -713,12 +704,17 @@ class SyncEngine:
 
             if app and privacy.auto_categorize:
                 category = self._get_category(app)
+                if category is None:
+                    # DB miss - try fallback map
+                    category = privacy.default_categories.get(app)
+                    if category and app not in self._persisted_fallbacks:
+                        self._persisted_fallbacks.add(app)
+                        try:
+                            self.queue.set_category(app, category, source='fallback')
+                        except Exception as exc:
+                            logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
                 if category:
                     data["app_category"] = category
-                    # Persist fallback hits to DB (once per app per session)
-                    if app not in self._persisted_fallbacks and app in self.config.privacy.default_categories:
-                        self._persist_fallback_category(app, category)
-                        self._persisted_fallbacks.add(app)
 
             if self._display_tracker is not None and privacy.track_display_info:
                 ds = self._display_tracker.state
@@ -1176,5 +1172,9 @@ class SyncEngine:
 
         # Free fraud detector accumulators
         self._activity_analyzer.clear()
+        # Clear session-scoped category state for clean re-login
+        with self._category_cache_lock:
+            self._category_cache = None
+            self._persisted_fallbacks.clear()
         # Close time tracker
         self._time_tracker.close()
