@@ -90,6 +90,7 @@ class SetupWizard:
         self._login_state: Optional[LoginState] = None
         self._closing = False
         self._spinner_after_id: Optional[str] = None
+        self._spinner_angle: int = 0
         self._permissions_refresh_id: Optional[str] = None
         self._button_id = itertools.count(1)
 

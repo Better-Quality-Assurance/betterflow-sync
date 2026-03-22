@@ -400,7 +400,11 @@ class SyncEngine:
         # retry succeeds, advancing the checkpoint would lose them.
         if all_events:
             self._send_events(all_events, stats)
-        if stats.events_sent == len(all_events):
+            if stats.events_sent == len(all_events):
+                for bucket_id, ts, event_id in pending_checkpoints:
+                    self.queue.set_checkpoint(bucket_id, ts, event_id)
+        elif pending_checkpoints:
+            # All events were dedup-filtered (already sent); safe to advance.
             for bucket_id, ts, event_id in pending_checkpoints:
                 self.queue.set_checkpoint(bucket_id, ts, event_id)
 
@@ -949,7 +953,7 @@ class SyncEngine:
                     if result.accepted_ids:
                         accepted_set = set(result.accepted_ids)
                         failed = [e for e in batch if e.get("id") not in accepted_set]
-                        stats.events_sent += len(result.accepted_ids)
+                        stats.events_sent += len(batch) - len(failed)
                         if failed:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
@@ -1111,8 +1115,8 @@ class SyncEngine:
         the update warning rather than silently skipping it.
         """
         try:
-            cur = tuple(int(x) for x in current.split(".")[:3])
-            min_ = tuple(int(x) for x in minimum.split(".")[:3])
+            cur = tuple(int(x.split("-")[0]) for x in current.split(".")[:3])
+            min_ = tuple(int(x.split("-")[0]) for x in minimum.split(".")[:3])
             return cur < min_
         except (ValueError, AttributeError):
             logger.warning(f"Cannot parse version strings: current={current!r}, minimum={minimum!r}")

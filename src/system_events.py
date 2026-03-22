@@ -212,14 +212,13 @@ def _start_macos_screen_lock_listener(
 
 
 def cleanup_observers() -> None:
-    """Remove all registered macOS notification observers and stop run loops (M5)."""
+    """Signal observer threads to stop (M5).
+
+    Threads remove their own observers in their finally blocks.
+    We just clear the reference list here.
+    """
     _stop_event.set()
     with _observers_lock:
-        for center, observer in _registered_observers:
-            try:
-                center.removeObserver_(observer)
-            except Exception:
-                pass
         _registered_observers.clear()
 
 

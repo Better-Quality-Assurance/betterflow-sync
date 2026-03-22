@@ -1087,9 +1087,10 @@ class BetterFlowApp:
         self.login_manager.cancel_login()
 
         def do_browser_login():
-            # Wait briefly for the cancelled flow to release the lock
-            if not self._login_lock.acquire(timeout=3):
+            # Wait for any in-progress logout/login to release the lock
+            if not self._login_lock.acquire(timeout=15):
                 logger.warning("Could not acquire login lock after cancel")
+                self.tray.set_state(TrayState.ERROR, "Login busy, please try again")
                 return
             try:
                 self.coordinator.logged_in = False

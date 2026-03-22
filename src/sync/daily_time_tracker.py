@@ -52,7 +52,15 @@ class DailyTimeTracker:
         self._load()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get thread-local database connection."""
+        """Get thread-local database connection.
+
+        Recreates the connection if it was closed by close().
+        """
+        if hasattr(self._local, "connection"):
+            try:
+                self._local.connection.execute("SELECT 1")
+            except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+                del self._local.connection
         if not hasattr(self._local, "connection"):
             conn = sqlite3.connect(str(self._db_path))
             conn.row_factory = sqlite3.Row

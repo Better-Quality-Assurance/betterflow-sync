@@ -544,10 +544,10 @@ class OfflineQueue:
             )
 
     def close(self) -> None:
-        """Close all tracked database connections.
+        """Permanently close all tracked database connections.
 
-        After close(), any thread calling _get_connection() will create
-        a fresh connection (the old closed handles are removed from tracking).
+        After close(), any call to _get_connection() will raise
+        sqlite3.ProgrammingError.  The queue cannot be reopened.
         """
         with self._connections_lock:
             self._closed = True  # inside lock to prevent new connections
