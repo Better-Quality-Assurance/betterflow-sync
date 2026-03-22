@@ -204,18 +204,19 @@ class DailyTimeTracker:
             if target_date == self._today:
                 return timedelta(seconds=self._today_seconds)
 
-            with self._cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT active_seconds FROM daily_active_time
-                    WHERE date = ?
-                    """,
-                    (target_date.isoformat(),),
-                )
-                row = cursor.fetchone()
-                if row:
-                    return timedelta(seconds=float(row["active_seconds"]))
-                return timedelta(seconds=0)
+        # SQLite query outside lock — thread-local connection, no contention
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT active_seconds FROM daily_active_time
+                WHERE date = ?
+                """,
+                (target_date.isoformat(),),
+            )
+            row = cursor.fetchone()
+            if row:
+                return timedelta(seconds=float(row["active_seconds"]))
+            return timedelta(seconds=0)
 
     def _persist_date(self, target_date: date, seconds: float) -> None:
         """Persist a specific date's data to SQLite (no lock required)."""
@@ -255,22 +256,17 @@ class DailyTimeTracker:
         logger.info(f"Day rollover to {new_date}, loaded {loaded:.1f}s")
 
     def _persist(self) -> None:
-        """Save current state to SQLite."""
-        if self._today is None:
-            return
+        """Save current state to SQLite.
 
-        now = datetime.now(timezone.utc).isoformat()
-        with self._cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO daily_active_time (date, active_seconds, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(date) DO UPDATE SET
-                    active_seconds = excluded.active_seconds,
-                    updated_at = excluded.updated_at
-                """,
-                (self._today.isoformat(), self._today_seconds, now),
-            )
+        Snapshots values under _lock to avoid reading stale state
+        if a day rollover occurs concurrently.
+        """
+        with self._lock:
+            today = self._today
+            seconds = self._today_seconds
+        if today is None:
+            return
+        self._persist_date(today, seconds)
 
     def close(self) -> None:
         """Close all database connections (from all threads)."""

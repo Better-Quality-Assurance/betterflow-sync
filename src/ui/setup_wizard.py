@@ -611,9 +611,9 @@ class SetupWizard:
             except ImportError:
                 from autostart import set_auto_start
             set_auto_start(True)
-            self._config.auto_start = True
         except Exception:
             pass  # Non-critical — user can enable manually
+        self._config.auto_start = True
 
         self._result = SetupResult(
             completed=True,
