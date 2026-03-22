@@ -1142,11 +1142,12 @@ class BetterFlowApp:
         self.coordinator.paused_by_network = False
         # Flush idle event if idle-paused, then clear state
         self.coordinator.clear_idle_pause(send_event=True)
-        self.sync_engine.pause()
-        self.tray.set_paused(True)
-        # End break after pausing — prevents brief resume window where events could sync
+        # End break first (it may call resume internally), then re-pause
+        # so the user-initiated pause always wins.
         if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True)
+        self.sync_engine.pause()
+        self.tray.set_paused(True)
         self.reminder_manager.on_tracking_stopped()
         send_notification("Tracking Paused", "Your activity is no longer being recorded.", sound=False)
         logger.info("Tracking paused")
@@ -1179,11 +1180,12 @@ class BetterFlowApp:
                 self._user_paused = True
             self.coordinator.paused_by_network = False
             self.coordinator.clear_idle_pause(send_event=True)
+            # End break first (it may call resume internally), then re-pause
+            if self.coordinator.is_on_break:
+                self.coordinator.end_break(silent=True)
             self.sync_engine.set_private_mode(True)
             self.sync_engine.pause()
             self.tray.set_paused(True)
-            if self.coordinator.is_on_break:
-                self.coordinator.end_break(silent=True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
             send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)

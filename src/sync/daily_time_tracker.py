@@ -198,6 +198,9 @@ class DailyTimeTracker:
         Args:
             new_date: The new date to track.
         """
+        # Flush the old day's data before discarding it
+        self._persist()
+
         logger.info(
             f"Day rollover: {self._today} ({self._today_seconds:.1f}s) -> {new_date}"
         )

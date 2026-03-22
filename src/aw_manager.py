@@ -115,10 +115,6 @@ def _download_aw_binaries(install_dir: str) -> bool:
         os.close(fd)
         req = urllib.request.Request(url, headers={"User-Agent": "BetterFlow-Sync"})
         with urllib.request.urlopen(req, timeout=120) as response:
-            if response.status != 200:
-                logger.error(f"Download failed: HTTP {response.status} for {url}")
-                return False
-            import shutil
             with open(tmp_zip, "wb") as f:
                 shutil.copyfileobj(response, f)
 
