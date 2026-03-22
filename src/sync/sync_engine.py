@@ -394,11 +394,13 @@ class SyncEngine:
             stats.calls_detected += len(call_events)
             all_events.extend(call_events)
 
-        # Send events, then commit checkpoints only on success (N5)
+        # Send events, then commit checkpoints only on full success (N5).
+        # Conservative: only advance checkpoints when all events were sent.
+        # Partial sends queue unsent events, but if those expire before
+        # retry succeeds, advancing the checkpoint would lose them.
         if all_events:
             self._send_events(all_events, stats)
-        # Commit checkpoints after send (or if nothing to send, still advance)
-        if stats.events_sent > 0 or not all_events:
+        if stats.events_sent == len(all_events):
             for bucket_id, ts, event_id in pending_checkpoints:
                 self.queue.set_checkpoint(bucket_id, ts, event_id)
 

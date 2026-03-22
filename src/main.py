@@ -838,6 +838,7 @@ class BetterFlowApp:
         self._pause_state_lock = threading.Lock()
         self._user_paused = False
         self._pre_sleep_private = False
+        self._pre_lock_private = False
         self._pending_update_asset_url: Optional[str] = None
         self._pending_update_lock = threading.Lock()
         self._login_lock = threading.Lock()
@@ -1271,7 +1272,7 @@ class BetterFlowApp:
     def _on_screen_lock(self) -> None:
         """Handle screen lock — treat as AFK."""
         with self._pause_state_lock:
-            self._pre_sleep_private = self.sync_engine.is_private
+            self._pre_lock_private = self.sync_engine.is_private
         logger.info("Screen locked — pausing tracking")
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
@@ -1286,14 +1287,14 @@ class BetterFlowApp:
         """Handle screen unlock — resume tracking."""
         with self._pause_state_lock:
             user_paused = self._user_paused
-            pre_sleep_private = self._pre_sleep_private
+            pre_lock_private = self._pre_lock_private
         if user_paused:
             logger.info("Screen unlocked — staying paused (user-initiated pause active)")
             return
         if self.coordinator.is_on_break:
             logger.info("Screen unlocked — staying on break")
             return
-        if pre_sleep_private:
+        if pre_lock_private:
             logger.info("Screen unlocked — restoring private time")
             self.sync_engine.resume()  # undo the lock pause
             self.sync_engine.set_private_mode(True)
@@ -1325,7 +1326,10 @@ class BetterFlowApp:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
             else:
                 logger.info("Network offline — pausing sync immediately")
-                self.sync_engine.pause()
+                with self._pause_state_lock:
+                    already_paused = self._user_paused
+                if not already_paused:
+                    self.sync_engine.pause()
                 self.coordinator.paused_by_network = True
                 self.tray.set_state(TrayState.QUEUED, "Offline")
 
@@ -1591,7 +1595,7 @@ class SingleInstanceLock:
 
     def release(self) -> None:
         """Release the lock and clean up."""
-        if self._file:
+        if self._file and self._path:
             try:
                 if sys.platform == "win32":
                     import msvcrt

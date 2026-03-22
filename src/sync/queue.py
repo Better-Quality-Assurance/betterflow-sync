@@ -91,7 +91,7 @@ class OfflineQueue:
                 conn = sqlite3.connect(str(self.db_path))
                 conn.row_factory = sqlite3.Row
                 self._connections.append(conn)
-            self._local.connection = conn
+                self._local.connection = conn  # assign inside lock
         return self._local.connection
 
     @contextmanager
@@ -180,7 +180,6 @@ class OfflineQueue:
         now = time.monotonic()
         if now - self._last_integrity_check < self._integrity_check_interval:
             return True
-        self._last_integrity_check = now
         try:
             with self._cursor() as cursor:
                 cursor.execute("PRAGMA quick_check")
@@ -188,6 +187,7 @@ class OfflineQueue:
                 if result[0] != "ok":
                     logger.error(f"SQLite quick_check failed: {result[0]}")
                     return False
+            self._last_integrity_check = now  # only advance on success
             return True
         except sqlite3.DatabaseError as e:
             logger.error(f"SQLite integrity check error: {e}")

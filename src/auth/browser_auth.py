@@ -207,11 +207,13 @@ class BrowserAuthFlow:
         """
         self._authorize_url_base = authorize_url_base
         self._server: Optional[HTTPServer] = None
+        self._server_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
     def cancel(self) -> None:
         """Cancel a running auth flow, unblocking start() immediately."""
-        server = self._server
+        with self._server_lock:
+            server = self._server
         if server is not None:
             with server.lock:
                 server.callback_received.set()
@@ -227,7 +229,9 @@ class BrowserAuthFlow:
         code_verifier, code_challenge = generate_pkce_pair()
 
         # Create server on random port
-        self._server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        with self._server_lock:
+            self._server = server
         self._server.lock = threading.Lock()
         self._server.auth_code = None
         self._server.auth_error = None
@@ -276,6 +280,9 @@ class BrowserAuthFlow:
             return AuthFlowResult(success=False, error=error)
         finally:
             # Always shut down server and clean up thread
-            self._server.shutdown()
+            with self._server_lock:
+                server = self._server
+                self._server = None
+            server.shutdown()
             if self._thread is not None:
                 self._thread.join(timeout=2.0)  # Wait up to 2s for thread to finish

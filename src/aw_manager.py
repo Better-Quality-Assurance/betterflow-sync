@@ -132,7 +132,7 @@ def _download_aw_binaries(install_dir: str) -> bool:
         with zipfile.ZipFile(tmp_zip, "r") as zf:
             for info in zf.infolist():
                 basename = os.path.basename(info.filename)
-                original_name = basename.replace(ext, "") if ext else basename
+                original_name = basename.removesuffix(ext) if ext else basename
                 if original_name in AW_TO_BF_NAMES and not info.is_dir():
                     launchers[original_name] = info.filename
 
