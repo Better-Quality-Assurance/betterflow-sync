@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields as dc_fields, asdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -447,14 +447,19 @@ class Config:
         }:
             data["api_url"] = DEFAULT_API_URL
 
+        def _safe(dc_cls, d):
+            """Strip unknown keys before constructing a dataclass."""
+            valid = {f.name for f in dc_fields(dc_cls)}
+            return dc_cls(**{k: v for k, v in d.items() if k in valid})
+
         return cls(
-            aw=AWSettings(**aw_data) if aw_data else AWSettings(),
-            sync=SyncSettings(**sync_data) if sync_data else SyncSettings(),
-            privacy=PrivacySettings(**privacy_data) if privacy_data else PrivacySettings(),
-            reminders=ReminderSettings(**reminders_data) if reminders_data else ReminderSettings(),
-            engagement=EngagementConfig(**engagement_data) if engagement_data else EngagementConfig(),
-            fraud_detection=FraudDetectionConfig(**fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
-            call_detection=CallDetectionSettings(**call_detection_data) if call_detection_data else CallDetectionSettings(),
+            aw=_safe(AWSettings, aw_data) if aw_data else AWSettings(),
+            sync=_safe(SyncSettings, sync_data) if sync_data else SyncSettings(),
+            privacy=_safe(PrivacySettings, privacy_data) if privacy_data else PrivacySettings(),
+            reminders=_safe(ReminderSettings, reminders_data) if reminders_data else ReminderSettings(),
+            engagement=_safe(EngagementConfig, engagement_data) if engagement_data else EngagementConfig(),
+            fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
+            call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -548,9 +553,12 @@ class Config:
             if "batch_size" in sync:
                 self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
             if "idle_pause_minutes" in sync:
-                val = int(sync["idle_pause_minutes"])
-                if 5 <= val <= 120:
-                    self.sync.idle_pause_minutes = val
+                try:
+                    val = int(sync["idle_pause_minutes"])
+                    if 5 <= val <= 120:
+                        self.sync.idle_pause_minutes = val
+                except (TypeError, ValueError):
+                    pass
             if "min_window_event_seconds" in sync:
                 try:
                     val = float(sync["min_window_event_seconds"])
@@ -561,44 +569,53 @@ class Config:
 
         if "engagement" in server_config:
             eng = server_config["engagement"]
-            if "sustained_typing_presses" in eng:
-                self.engagement.sustained_typing_presses = int(eng["sustained_typing_presses"])
-            if "window_changes_min" in eng:
-                self.engagement.window_changes_min = int(eng["window_changes_min"])
-            if "scroll_threshold" in eng:
-                self.engagement.scroll_threshold = int(eng["scroll_threshold"])
-            if "combined_presses_min" in eng:
-                self.engagement.combined_presses_min = int(eng["combined_presses_min"])
-            if "combined_scrolls_min" in eng:
-                self.engagement.combined_scrolls_min = int(eng["combined_scrolls_min"])
-            if "window_minutes" in eng:
-                self.engagement.window_minutes = max(1, int(eng["window_minutes"]))
+            try:
+                if "sustained_typing_presses" in eng:
+                    self.engagement.sustained_typing_presses = int(eng["sustained_typing_presses"])
+                if "window_changes_min" in eng:
+                    self.engagement.window_changes_min = int(eng["window_changes_min"])
+                if "scroll_threshold" in eng:
+                    self.engagement.scroll_threshold = int(eng["scroll_threshold"])
+                if "combined_presses_min" in eng:
+                    self.engagement.combined_presses_min = int(eng["combined_presses_min"])
+                if "combined_scrolls_min" in eng:
+                    self.engagement.combined_scrolls_min = int(eng["combined_scrolls_min"])
+                if "window_minutes" in eng:
+                    self.engagement.window_minutes = max(1, int(eng["window_minutes"]))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid engagement config from server: {e}")
 
         if "fraud_detection" in server_config:
             fd = server_config["fraud_detection"]
-            if "keystroke_cv_threshold" in fd:
-                self.fraud_detection.keystroke_cv_threshold = float(fd["keystroke_cv_threshold"])
-            if "min_windows_for_variance" in fd:
-                self.fraud_detection.min_windows_for_variance = max(2, int(fd["min_windows_for_variance"]))
-            if "mouse_only_streak_threshold" in fd:
-                self.fraud_detection.mouse_only_streak_threshold = max(1, int(fd["mouse_only_streak_threshold"]))
-            if "min_app_diversity" in fd:
-                self.fraud_detection.min_app_diversity = max(1, int(fd["min_app_diversity"]))
-            if "app_diversity_min_minutes" in fd:
-                self.fraud_detection.app_diversity_min_minutes = max(1, int(fd["app_diversity_min_minutes"]))
-            if "click_keystroke_ratio_threshold" in fd:
-                self.fraud_detection.click_keystroke_ratio_threshold = float(fd["click_keystroke_ratio_threshold"])
-            if "input_regularity_cv_threshold" in fd:
-                self.fraud_detection.input_regularity_cv_threshold = float(fd["input_regularity_cv_threshold"])
-            if "min_input_events_for_regularity" in fd:
-                self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
+            try:
+                if "keystroke_cv_threshold" in fd:
+                    self.fraud_detection.keystroke_cv_threshold = float(fd["keystroke_cv_threshold"])
+                if "min_windows_for_variance" in fd:
+                    self.fraud_detection.min_windows_for_variance = max(2, int(fd["min_windows_for_variance"]))
+                if "mouse_only_streak_threshold" in fd:
+                    self.fraud_detection.mouse_only_streak_threshold = max(1, int(fd["mouse_only_streak_threshold"]))
+                if "min_app_diversity" in fd:
+                    self.fraud_detection.min_app_diversity = max(1, int(fd["min_app_diversity"]))
+                if "app_diversity_min_minutes" in fd:
+                    self.fraud_detection.app_diversity_min_minutes = max(1, int(fd["app_diversity_min_minutes"]))
+                if "click_keystroke_ratio_threshold" in fd:
+                    self.fraud_detection.click_keystroke_ratio_threshold = float(fd["click_keystroke_ratio_threshold"])
+                if "input_regularity_cv_threshold" in fd:
+                    self.fraud_detection.input_regularity_cv_threshold = float(fd["input_regularity_cv_threshold"])
+                if "min_input_events_for_regularity" in fd:
+                    self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid fraud_detection config from server: {e}")
 
         if "call_detection" in server_config:
             cd = server_config["call_detection"]
             if "enabled" in cd:
                 self.call_detection.enabled = self._to_bool(cd["enabled"])
             if "min_call_duration" in cd:
-                self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
+                try:
+                    self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
+                except (TypeError, ValueError):
+                    pass
 
         self.save()
 

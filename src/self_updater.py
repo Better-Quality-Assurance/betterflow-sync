@@ -165,8 +165,11 @@ def apply_update(
 
             bat_path = tmp_dir / "update.bat"
             exe_path = app_path / "BetterFlow.exe"
-            # Paths are from tempfile.mkdtemp (safe) and validated app_path,
-            # but quote defensively against spaces in install paths.
+            # Validate paths contain no characters that could break batch quoting
+            for p in (str(extract_dir), str(app_path), str(exe_path), str(tmp_dir)):
+                if '"' in p or "%" in p:
+                    _status("Update aborted: install path contains unsupported characters")
+                    return False
             bat_content = '@echo off\r\n'
             bat_content += 'timeout /t 2 /nobreak >nul\r\n'
             bat_content += f'xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"\r\n'

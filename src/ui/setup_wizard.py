@@ -340,7 +340,11 @@ class SetupWizard:
 
         # Start login in background
         def do_login():
-            state = self._login_manager.login_via_browser()
+            try:
+                state = self._login_manager.login_via_browser()
+            except Exception as exc:
+                logger.exception("Login thread raised unexpectedly")
+                state = LoginState(logged_in=False, error=str(exc))
             if self._closing:
                 return
             try:

@@ -111,7 +111,14 @@ def _download_aw_binaries(install_dir: str) -> bool:
     try:
         fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
-        urllib.request.urlretrieve(url, tmp_zip)
+        req = urllib.request.Request(url, headers={"User-Agent": "BetterFlow-Sync"})
+        with urllib.request.urlopen(req, timeout=120) as response:
+            if response.status != 200:
+                logger.error(f"Download failed: HTTP {response.status} for {url}")
+                return False
+            import shutil
+            with open(tmp_zip, "wb") as f:
+                shutil.copyfileobj(response, f)
 
         size_mb = os.path.getsize(tmp_zip) / (1024 * 1024)
         logger.info(f"Downloaded {size_mb:.1f} MB, extracting binaries...")
@@ -159,7 +166,10 @@ def _download_aw_binaries(install_dir: str) -> bool:
                     if source_base == os.path.basename(launcher_path):
                         rel_name = branded_name + ext
 
-                    target_path = os.path.join(target_root, rel_name)
+                    target_path = os.path.realpath(os.path.join(target_root, rel_name))
+                    if not target_path.startswith(os.path.realpath(target_root) + os.sep):
+                        logger.warning(f"ZIP member escapes target dir: {rel_name}")
+                        continue
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     with zf.open(member) as src, open(target_path, "wb") as dst:
                         shutil.copyfileobj(src, dst)
@@ -487,23 +497,6 @@ class AWManager:
 
         logger.error(f"Tracker server not ready after {STARTUP_TIMEOUT}s")
         return False
-
-    def _is_process_running(self, name: str) -> bool:
-        """Check if a process with this name is already running (outside our management)."""
-        try:
-            if platform.system() == "Windows":
-                result = subprocess.run(
-                    ["tasklist", "/FI", f"IMAGENAME eq {name}.exe"],
-                    capture_output=True, text=True,
-                )
-                return name.lower() in result.stdout.lower()
-            else:
-                result = subprocess.run(
-                    ["pgrep", "-f", name], capture_output=True, text=True
-                )
-                return result.returncode == 0
-        except Exception:
-            return False
 
     def _port_in_use(self) -> bool:
         """Check if something is listening on the tracker port."""

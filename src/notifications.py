@@ -59,11 +59,16 @@ def _send_macos(title: str, message: str, sound: bool) -> None:
         f'display notification "{safe_message}" '
         f'with title "{safe_title}"{sound_clause}'
     )
-    subprocess.run(
+    result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
         timeout=5,
     )
+    if result.returncode != 0:
+        logger.debug(
+            f"osascript notification failed (exit {result.returncode}): "
+            f"{result.stderr.decode(errors='replace')[:200]}"
+        )
 
 
 def _send_windows(title: str, message: str) -> None:

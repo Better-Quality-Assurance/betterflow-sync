@@ -977,13 +977,17 @@ class BetterFlowApp:
 
     def _try_auto_install(self) -> None:
         """Auto-install a pending update if conditions are met."""
+        # Snapshot model state before acquiring _pending_update_lock to
+        # avoid nested lock acquisition (model.lock then _pending_update_lock
+        # elsewhere would deadlock with the reverse order here).
+        with self.tray.model.lock:
+            update_in_progress = self.tray.model.update_in_progress
+        if update_in_progress:
+            return
         with self._pending_update_lock:
             url = self._pending_update_asset_url
             if not url or not self.config.auto_install_updates:
                 return
-            with self.tray.model.lock:
-                if self.tray.model.update_in_progress:
-                    return
             self._pending_update_asset_url = None
         logger.info("Auto-installing pending update (user is idle)")
         send_notification("BetterFlow Update", "Downloading update, app will restart when complete.")
@@ -1249,6 +1253,8 @@ class BetterFlowApp:
             return
         if pre_sleep_private:
             logger.info("System wake — restoring private time")
+            self.sync_engine.resume()  # undo the sleep pause
+            self.sync_engine.set_private_mode(True)
             self.tray.set_state(TrayState.PRIVATE)
             return
         self.sync_engine.resume()
@@ -1289,6 +1295,8 @@ class BetterFlowApp:
             return
         if pre_sleep_private:
             logger.info("Screen unlocked — restoring private time")
+            self.sync_engine.resume()  # undo the lock pause
+            self.sync_engine.set_private_mode(True)
             self.tray.set_state(TrayState.PRIVATE)
             return
         logger.info("Screen unlocked — resuming tracking")
@@ -1454,6 +1462,8 @@ class BetterFlowApp:
             # Phase 2 — browser auth (lock NOT held; at most one flow can run
             # because the tray state prevents the user from clicking Login again).
             state = self.login_manager.login_via_browser()
+            if self._shutdown_event.is_set():
+                return
             if state.logged_in:
                 self.coordinator.logged_in = True
                 self.tray.set_user(state.user_email, state.user_name, state.user_role)
@@ -1549,12 +1559,17 @@ class SingleInstanceLock:
 
     def __init__(self):
         self._file = None
-        self._path = os.path.join(
-            Config.get_config_dir(), ".betterflow.lock"
-        )
+        self._path: Optional[str] = None
 
     def acquire(self) -> bool:
         """Try to acquire the lock. Returns True on success."""
+        if self._path is None:
+            try:
+                self._path = os.path.join(
+                    Config.get_config_dir(), ".betterflow.lock"
+                )
+            except Exception:
+                return True  # fail open - don't block startup
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         self._file = open(self._path, "a+")  # noqa: SIM115
         try:

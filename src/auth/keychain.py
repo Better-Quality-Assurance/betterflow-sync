@@ -67,8 +67,11 @@ def _store_to_file(credentials: StoredCredentials) -> bool:
     try:
         cred_file = _credentials_file()
         cred_file.parent.mkdir(parents=True, exist_ok=True)
-        cred_file.write_text(credentials.to_json())
-        os.chmod(cred_file, stat.S_IRUSR | stat.S_IWUSR)  # 600
+        fd = os.open(cred_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, credentials.to_json().encode())
+        finally:
+            os.close(fd)
         logger.info(f"Credentials stored to file for {credentials.user_email}")
         return True
     except Exception as e:
@@ -125,11 +128,12 @@ class KeychainManager:
         try:
             data = keyring.get_password(self.service_name, ACCOUNT_NAME)
             if data:
-                return StoredCredentials.from_json(data)
+                try:
+                    return StoredCredentials.from_json(data)
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.warning(f"Invalid credential format in keychain: {e}")
         except (KeyringError, Exception) as e:
             logger.debug(f"Keychain read failed: {e}")
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"Invalid credential format in keychain: {e}")
 
         # Try file fallback
         return _load_from_file()

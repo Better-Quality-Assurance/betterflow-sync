@@ -457,4 +457,4 @@ def _safe_call(fn: Callable, *args) -> None:
     try:
         fn(*args)
     except Exception:
-        logger.exception(f"Error in system event callback {fn.__name__}")
+        logger.exception(f"Error in system event callback {getattr(fn, '__name__', repr(fn))}")

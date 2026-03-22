@@ -219,6 +219,8 @@ class BetterFlowClient(BaseApiClient):
         try:
             self._request("POST", "revoke")
             return True
+        except BetterFlowAuthError:
+            return True  # Token already invalid — effectively revoked
         except BetterFlowClientError:
             return False
 

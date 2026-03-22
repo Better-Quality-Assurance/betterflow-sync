@@ -198,6 +198,7 @@ class MacOSInputWatcher:
                 "CGEventTapCreate returned None — Accessibility permission "
                 "may not be granted. Input tracking disabled."
             )
+            self._loop_ready.set()  # unblock stop() immediately
             return
 
         self._tap_ref = tap

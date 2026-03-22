@@ -120,6 +120,8 @@ class LoginManager:
         logger.info(f"Using authorize URL: {authorize_url}")
         flow = BrowserAuthFlow(authorize_url)
         with self._flow_lock:
+            if self._active_flow is not None:
+                return LoginState(logged_in=False, error="Login already in progress")
             self._active_flow = flow
 
         logger.info("Starting browser auth flow (with PKCE)...")

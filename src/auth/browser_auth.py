@@ -211,8 +211,10 @@ class BrowserAuthFlow:
 
     def cancel(self) -> None:
         """Cancel a running auth flow, unblocking start() immediately."""
-        if self._server is not None:
-            self._server.callback_received.set()
+        server = self._server
+        if server is not None:
+            with server.lock:
+                server.callback_received.set()
 
     def start(self) -> AuthFlowResult:
         """Run the full auth flow and return the authorization code.

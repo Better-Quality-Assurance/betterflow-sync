@@ -2,7 +2,9 @@
 
 import logging
 import math
+import socket
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -96,6 +98,7 @@ class SyncEngine:
 
         # Clock skew: track server-vs-local time offset (seconds, positive = server ahead)
         self._server_time_offset: Optional[float] = None
+        self._hostname = socket.gethostname()
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates -
@@ -250,6 +253,8 @@ class SyncEngine:
 
             if self._on_config_updated:
                 self._on_config_updated()
+        except BetterFlowAuthError:
+            raise
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
 
@@ -767,6 +772,7 @@ class SyncEngine:
 
         # Add activity classification for window events
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
+        activity_state: str | None = None
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
             if self._has_input_data:
                 activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
@@ -907,8 +913,7 @@ class SyncEngine:
 
     def _make_call_bf_event(self, call_event: "CallEvent") -> dict:
         """Convert a CallEvent into a BetterFlow event dict."""
-        import socket
-        hostname = socket.gethostname()
+        hostname = self._hostname
         result: dict = {
             "timestamp": call_event.start.isoformat(),
             "duration": call_event.duration,
@@ -957,10 +962,11 @@ class SyncEngine:
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
-                # Queue remaining unsent batches before re-raising.
-                # Start from i+1: the current batch (i) was already sent to
-                # the server and may have been processed before the 401.
-                for remaining in batches[i + 1:]:
+                # Queue the current batch and all remaining unsent batches
+                # before re-raising.  A 401 means the server rejected the
+                # request, so batch i was NOT processed.  Re-sending is safe
+                # because the server uses idempotency keys.
+                for remaining in batches[i:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
                 stats.errors.append(f"Authentication error: {e}")
@@ -988,13 +994,12 @@ class SyncEngine:
             return
 
         # Process queue in batches
-        import time as _time
-        deadline = _time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
+        deadline = time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
         batch_size = self.config.sync.batch_size
         processed = 0
         max_per_cycle = batch_size * 10  # Max 10 batches per cycle
 
-        while processed < max_per_cycle and _time.monotonic() < deadline:
+        while processed < max_per_cycle and time.monotonic() < deadline:
             queued = self.queue.dequeue(batch_size)
             if not queued:
                 break
@@ -1018,14 +1023,18 @@ class SyncEngine:
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
                         stats.events_sent += len(succeeded_ids)
+                        self._queue_consecutive_failures = 0
                     if failed_ids:
                         self.queue.increment_retry(failed_ids)
-                    self._queue_consecutive_failures = 0
                     processed += len(succeeded_ids)
                 else:
                     self.queue.increment_retry(event_ids)
                     self._apply_queue_backoff()
                     break
+            except BetterFlowAuthError:
+                # Auth errors won't self-heal with retries; re-raise so
+                # the caller's auth handler can trigger re-login.
+                raise
             except BetterFlowClientError:
                 self.queue.increment_retry(event_ids)
                 self._apply_queue_backoff()
@@ -1070,7 +1079,11 @@ class SyncEngine:
             server_time_str = response.get("server_time")
             if server_time_str:
                 try:
-                    server_time = datetime.fromisoformat(server_time_str)
+                    server_time = datetime.fromisoformat(
+                        server_time_str.replace("Z", "+00:00")
+                    )
+                    if server_time.tzinfo is None:
+                        server_time = server_time.replace(tzinfo=timezone.utc)
                     local_time = datetime.now(timezone.utc)
                     self._server_time_offset = (server_time - local_time).total_seconds()
                     if abs(self._server_time_offset) > 300:

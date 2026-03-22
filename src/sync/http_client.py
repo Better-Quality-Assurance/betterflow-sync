@@ -122,20 +122,21 @@ class BaseApiClient:
         if self._web_base_url:
             return self._web_base_url
         parsed = urlparse(self.api_url)
-        host = parsed.hostname or ""
-        port = f":{parsed.port}" if parsed.port else ""
         return f"{parsed.scheme}://{parsed.netloc}"
 
     def _get_headers(self) -> dict:
-        """Get request headers with authentication."""
+        """Get request headers with authentication (thread-safe)."""
+        with self._session_lock:
+            token = self.token
+            device_id = self.device_id
         headers = {
             "Accept": "application/json",
             "User-Agent": self.USER_AGENT,
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        if self.device_id:
-            headers["X-Device-ID"] = self.device_id
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if device_id:
+            headers["X-Device-ID"] = device_id
         return headers
 
     def _request(
@@ -296,14 +297,16 @@ class BaseApiClient:
                 pass
 
     def set_credentials(self, token: str, device_id: str) -> None:
-        """Set authentication credentials."""
-        self.token = token
-        self.device_id = device_id
+        """Set authentication credentials (thread-safe)."""
+        with self._session_lock:
+            self.token = token
+            self.device_id = device_id
 
     def clear_credentials(self) -> None:
-        """Clear authentication credentials."""
-        self.token = None
-        self.device_id = None
+        """Clear authentication credentials (thread-safe)."""
+        with self._session_lock:
+            self.token = None
+            self.device_id = None
 
     def is_reachable(self) -> bool:
         """Check if BetterFlow API is reachable."""

@@ -85,13 +85,13 @@ class OfflineQueue:
                 del self._local.connection
                 need_new = True
         if need_new:
-            if self._closed:
-                raise sqlite3.ProgrammingError("OfflineQueue has been closed")
-            conn = sqlite3.connect(str(self.db_path))
-            conn.row_factory = sqlite3.Row
-            self._local.connection = conn
             with self._connections_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("OfflineQueue has been closed")
+                conn = sqlite3.connect(str(self.db_path))
+                conn.row_factory = sqlite3.Row
                 self._connections.append(conn)
+            self._local.connection = conn
         return self._local.connection
 
     @contextmanager
@@ -253,7 +253,9 @@ class OfflineQueue:
             List of QueuedEvent objects
         """
         # Periodic integrity check (N2)
-        self.check_integrity()
+        if not self.check_integrity():
+            logger.error("[queue] Skipping dequeue due to integrity failure")
+            return []
         with self._cursor() as cursor:
             cursor.execute(
                 """
@@ -334,22 +336,6 @@ class OfflineQueue:
             if count > 0:
                 logger.warning(f"Removed {count} events that exceeded max retries")
             return count
-
-    def _remove_oldest(self, count: int) -> int:
-        """Remove the oldest events from the queue."""
-        with self._cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM queued_events
-                WHERE id IN (
-                    SELECT id FROM queued_events
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                )
-                """,
-                (count,),
-            )
-            return cursor.rowcount
 
     def size(self) -> int:
         """Get the current queue size."""
@@ -564,6 +550,7 @@ class OfflineQueue:
         a fresh connection (the old closed handles are removed from tracking).
         """
         with self._connections_lock:
+            self._closed = True  # inside lock to prevent new connections
             for conn in self._connections:
                 try:
                     conn.close()
@@ -575,5 +562,3 @@ class OfflineQueue:
         # which _get_connection detects via hasattr and replaces.
         if hasattr(self._local, "connection"):
             del self._local.connection
-        # Mark as closed so _get_connection can detect stale handles
-        self._closed = True

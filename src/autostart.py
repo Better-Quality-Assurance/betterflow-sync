@@ -108,6 +108,9 @@ def _set_windows(enabled: bool) -> bool:
     )
     try:
         if enabled:
+            if not getattr(sys, "frozen", False):
+                logger.warning("Auto-start not supported in dev mode on Windows")
+                return False
             winreg.SetValueEx(key, _WIN_VALUE_NAME, 0, winreg.REG_SZ, sys.executable)
             logger.info("Added registry Run key for auto-start")
         else:

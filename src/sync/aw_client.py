@@ -158,6 +158,8 @@ class AWClient:
 
         Call after system wake to avoid stale TCP connections.
         Thread-safe: swaps the reference under lock, closes old outside.
+        Also invalidates the bucket cache since monotonic clock pauses
+        during macOS sleep, making the TTL check unreliable after wake.
         """
         with self._session_lock:
             old = self._session
@@ -168,6 +170,9 @@ class AWClient:
             old.close()
         except Exception:
             pass
+        with self._buckets_lock:
+            self._buckets_cache = None
+            self._buckets_cache_time = 0.0
 
     def is_running(self) -> bool:
         """Check if ActivityWatch server is running.

@@ -52,11 +52,36 @@ def _prevent_termination() -> None:
         proc_info = Foundation.NSProcessInfo.processInfo()
         proc_info.setAutomaticTerminationSupportEnabled_(False)
         proc_info.disableSuddenTermination()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"_prevent_termination failed: {e}")
 
 
 __all__ = ["TrayIcon", "TrayState", "TrayModel", "STATE_COLORS", "create_icon_image", "ProjectDict"]
+
+
+# ── macOS main-thread menu dispatch ──────────────────────────────
+# AppKit is NOT thread-safe. NSMenu must be built and assigned on the main
+# thread.  This helper NSObject receives a timer callback on the main
+# run-loop and calls pystray's internal _update_menu() which does
+# NSMenu construction + NSStatusItem.setMenu: safely.
+_MenuProxy: type | None = None
+
+if platform.system() == "Darwin":
+    try:
+        import Foundation as _Foundation
+        import objc as _objc
+
+        class _MenuProxy(_Foundation.NSObject):  # type: ignore[no-redef]
+            """NSObject that triggers a pystray menu rebuild on the main thread."""
+
+            _pystray_icon = _objc.ivar()
+
+            def rebuildMenu_(self, timer) -> None:  # noqa: ANN001
+                icon = self._pystray_icon
+                if icon is not None:
+                    icon._update_menu()
+    except ImportError:
+        pass
 
 
 class ProjectDict(TypedDict):
@@ -365,6 +390,9 @@ class TrayIcon:
         self._menu_last_rebuild: float = 0.0
         self._menu_pending: bool = False
         self._menu_lock = threading.Lock()
+
+        # macOS main-thread proxy for menu rebuilds (lazily bound to pystray icon)
+        self._menu_proxy: object | None = None
 
         # Sync Now cooldown (5 seconds)
         self._sync_now_cooldown = 5.0
@@ -720,12 +748,16 @@ class TrayIcon:
             new_mode = self.model.private_mode
             on_break = self.model.on_break
             paused = self.model.paused
-        if new_mode:
-            self.set_state(TrayState.PRIVATE)
+        # Let the callback set the authoritative tray state (it calls
+        # set_paused / set_state), avoiding a race where we set PRIVATE
+        # here and the callback immediately overwrites with PAUSED.
         if self._on_private_toggle:
             self._on_private_toggle(new_mode)
-        if not new_mode:
-            if on_break:
+        else:
+            # No callback: set state ourselves
+            if new_mode:
+                self.set_state(TrayState.PRIVATE)
+            elif on_break:
                 self.set_state(TrayState.ON_BREAK)
             elif paused:
                 self.set_state(TrayState.PAUSED)
@@ -917,18 +949,16 @@ class TrayIcon:
         """Set paused state."""
         with self.model.lock:
             self.model.paused = paused
+            on_break = self.model.on_break
+            private = self.model.private_mode
         if paused:
             self.set_state(TrayState.PAUSED)
+        elif on_break:
+            self.set_state(TrayState.ON_BREAK)
+        elif private:
+            self.set_state(TrayState.PRIVATE)
         else:
-            with self.model.lock:
-                on_break = self.model.on_break
-                private = self.model.private_mode
-            if on_break:
-                self.set_state(TrayState.ON_BREAK)
-            elif private:
-                self.set_state(TrayState.PRIVATE)
-            else:
-                self.set_state(TrayState.SYNCING)
+            self.set_state(TrayState.SYNCING)
 
     def update_stats(
         self,
@@ -994,6 +1024,10 @@ class TrayIcon:
                 # Only set start time if not already tracking this project
                 if self.model.project_started_at is None:
                     self.model.project_started_at = time.monotonic()
+            elif not projects:
+                # Explicit clear when the project list is emptied (e.g. logout)
+                self.model.current_project = None
+                self.model.project_started_at = None
         self._update_menu()
 
     def set_active_time(self, active_time) -> None:
@@ -1165,20 +1199,22 @@ class TrayIcon:
         if not icon:
             return
 
-        # Snapshot and hash — skip rebuild if nothing changed
+        # Snapshot and hash — must be checked inside _menu_lock to prevent
+        # two threads from both passing the hash check concurrently.
         snap = self._snapshot_model()
         snap_hash = hash(TrayIcon._make_hashable(snap))
-        if snap_hash == self._last_menu_hash:
-            return
-        self._last_menu_hash = snap_hash
 
         now = time.monotonic()
         with self._menu_lock:
+            if snap_hash == self._last_menu_hash:
+                return
+            self._last_menu_hash = snap_hash
+
             elapsed = now - self._menu_last_rebuild
             if elapsed >= self._menu_debounce_interval:
                 self._menu_last_rebuild = now
                 self._menu_pending = False
-                self._icon.menu = self._create_menu()
+                self._apply_menu(self._create_menu())
             elif not self._menu_pending:
                 self._menu_pending = True
                 delay = self._menu_debounce_interval - elapsed
@@ -1192,7 +1228,48 @@ class TrayIcon:
             self._menu_pending = False
             self._menu_last_rebuild = time.monotonic()
             if self._icon:
-                self._icon.menu = self._create_menu()
+                self._apply_menu(self._create_menu())
+
+    def _apply_menu(self, new_menu: "pystray.Menu") -> None:
+        """Apply a pystray menu, dispatching to the main thread on macOS.
+
+        AppKit is not thread-safe; building NSMenu items and calling
+        NSStatusItem.setMenu: from a background thread causes re-entrant
+        ffi_closure recursion that hangs the app.
+        """
+        if not self._icon:
+            return
+
+        if platform.system() != "Darwin" or threading.current_thread() is threading.main_thread():
+            self._icon.menu = new_menu
+            return
+
+        # Background thread on macOS: set the menu descriptor (pure Python,
+        # thread-safe) and dispatch the NSMenu rebuild to the main thread.
+        self._icon._menu = new_menu
+        try:
+            self._dispatch_menu_rebuild()
+        except Exception:
+            logger.debug("Main-thread menu dispatch failed, falling back", exc_info=True)
+            self._icon.menu = new_menu
+
+    def _dispatch_menu_rebuild(self) -> None:
+        """Schedule pystray's _update_menu on the main run-loop via NSTimer."""
+        import Foundation
+
+        if self._menu_proxy is None and _MenuProxy is not None:
+            self._menu_proxy = _MenuProxy.alloc().init()
+        proxy = self._menu_proxy
+        if proxy is None:
+            self._icon._update_menu()
+            return
+        proxy._pystray_icon = self._icon
+        timer = Foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.0, proxy, b"rebuildMenu:", None, False,
+        )
+        Foundation.NSRunLoop.mainRunLoop().addTimer_forMode_(
+            timer, Foundation.NSDefaultRunLoopMode,
+        )
 
     def start(self) -> None:
         """Start the tray icon in a background thread."""
