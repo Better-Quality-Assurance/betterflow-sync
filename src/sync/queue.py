@@ -68,6 +68,7 @@ class OfflineQueue:
         self._closed = False
         self._last_integrity_check: float = time.monotonic()
         self._integrity_check_interval: float = 3600.0  # 1 hour
+        self._integrity_lock = threading.Lock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -177,9 +178,10 @@ class OfflineQueue:
         Returns True if database is healthy, False if corruption detected.
         Automatically resets the database on corruption.
         """
-        now = time.monotonic()
-        if now - self._last_integrity_check < self._integrity_check_interval:
-            return True
+        with self._integrity_lock:
+            now = time.monotonic()
+            if now - self._last_integrity_check < self._integrity_check_interval:
+                return True
         try:
             with self._cursor() as cursor:
                 cursor.execute("PRAGMA quick_check")
@@ -187,7 +189,8 @@ class OfflineQueue:
                 if result[0] != "ok":
                     logger.error(f"SQLite quick_check failed: {result[0]}")
                     return False
-            self._last_integrity_check = now  # only advance on success
+            with self._integrity_lock:
+                self._last_integrity_check = now  # only advance on success
             return True
         except sqlite3.DatabaseError as e:
             logger.error(f"SQLite integrity check error: {e}")
@@ -349,7 +352,7 @@ class OfflineQueue:
 
     def capacity_percent(self) -> float:
         """Get current queue capacity as a percentage (0.0 to 1.0)."""
-        return self.size() / self.max_size
+        return min(self.size() / self.max_size, 1.0)
 
     def is_near_capacity(self, threshold: float = 0.8) -> bool:
         """Check if queue is approaching capacity.

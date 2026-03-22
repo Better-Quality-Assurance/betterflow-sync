@@ -130,10 +130,12 @@ class MacOSInputWatcher:
 
         if self._tap_thread and self._tap_thread.is_alive():
             self._tap_thread.join(timeout=3.0)
+        if self._tap_thread and not self._tap_thread.is_alive():
+            self._tap_thread = None
         if self._emit_thread and self._emit_thread.is_alive():
             self._emit_thread.join(timeout=3.0)
-        self._tap_thread = None
-        self._emit_thread = None
+        if self._emit_thread and not self._emit_thread.is_alive():
+            self._emit_thread = None
         logger.info("MacOSInputWatcher stopped")
 
     def _event_callback(self, proxy, event_type, event, refcon):

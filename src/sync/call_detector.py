@@ -54,6 +54,8 @@ _DEFAULT_GRACE_PERIOD = 30.0
 
 def _match_native(app: str, title: str) -> Optional[str]:
     """Return display name if (app, title) matches a native call pattern."""
+    if not title:
+        title = ""
     for app_substr, title_re, name in _NATIVE_PATTERNS:
         if app_substr.lower() in app.lower() and (title_re is None or title_re.search(title)):
             return name

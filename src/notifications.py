@@ -51,8 +51,8 @@ def _send_macos(title: str, message: str, sound: bool) -> None:
     UserNotifications framework. The deprecated NSUserNotificationCenter
     API was removed because it causes ghost notifications on macOS 13+.
     """
-    safe_title = title.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
-    safe_message = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+    safe_title = title[:200].replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+    safe_message = message[:500].replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
 
     sound_clause = ' sound name "default"' if sound else ""
     script = (

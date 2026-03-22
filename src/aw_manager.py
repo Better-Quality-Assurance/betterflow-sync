@@ -10,10 +10,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -166,10 +168,13 @@ def _download_aw_binaries(install_dir: str) -> bool:
                     if source_base == os.path.basename(launcher_path):
                         rel_name = branded_name + ext
 
-                    target_path = os.path.realpath(os.path.join(target_root, rel_name))
-                    if not target_path.startswith(os.path.realpath(target_root) + os.sep):
+                    target_path = Path(os.path.realpath(os.path.join(target_root, rel_name)))
+                    try:
+                        target_path.relative_to(os.path.realpath(target_root))
+                    except ValueError:
                         logger.warning(f"ZIP member escapes target dir: {rel_name}")
                         continue
+                    target_path = str(target_path)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     with zf.open(member) as src, open(target_path, "wb") as dst:
                         shutil.copyfileobj(src, dst)
@@ -513,9 +518,10 @@ class AWManager:
     def _get_latest_window_event_age(self) -> Optional[float]:
         """Return seconds since the most recent window event, or None on error."""
         try:
+            hostname = urllib.parse.quote(platform.node(), safe="")
             url = (
                 f"http://localhost:{self.aw_port}/api/0/buckets/"
-                f"aw-watcher-window_{platform.node()}/events?limit=1"
+                f"aw-watcher-window_{hostname}/events?limit=1"
             )
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=3) as resp:

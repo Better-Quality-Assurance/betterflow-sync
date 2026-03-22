@@ -72,7 +72,10 @@ def _store_to_file(credentials: StoredCredentials) -> bool:
             os.write(fd, credentials.to_json().encode())
         finally:
             os.close(fd)
-        logger.info(f"Credentials stored to file for {credentials.user_email}")
+        logger.warning(
+            "Credentials stored UNENCRYPTED to %s — configure system keychain to avoid this",
+            cred_file,
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to store credentials to file: {e}")

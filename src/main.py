@@ -1085,6 +1085,10 @@ class BetterFlowApp:
         """
         # Cancel any in-progress flow so the lock is released
         self.login_manager.cancel_login()
+        # Don't pile up login threads if one is already waiting for the lock
+        if self._login_lock.locked():
+            logger.debug("Login already in progress, cancel requested")
+            return
 
         def do_browser_login():
             # Wait for any in-progress logout/login to release the lock

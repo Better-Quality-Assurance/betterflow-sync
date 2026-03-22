@@ -148,7 +148,8 @@ class DailyTimeTracker:
                 self._reset_for_new_day(event_date)
 
             self._today_seconds += seconds
-            self._persist()
+        # Persist outside the lock to avoid blocking callers with SQLite I/O
+        self._persist()
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active time for today.

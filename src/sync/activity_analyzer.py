@@ -230,8 +230,6 @@ class FraudSignalDetector:
         mean = sum(self._window_press_counts) / n
         if mean == 0:
             return 0, None
-        if n < 2:
-            return 0, None
 
         # Sample variance (N-1) - we have a sample of windows, not the population
         variance = sum((x - mean) ** 2 for x in self._window_press_counts) / (n - 1)
