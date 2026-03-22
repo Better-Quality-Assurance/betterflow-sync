@@ -1024,8 +1024,8 @@ class TrayIcon:
                 # Only set start time if not already tracking this project
                 if self.model.project_started_at is None:
                     self.model.project_started_at = time.monotonic()
-            elif not projects:
-                # Explicit clear when the project list is emptied (e.g. logout)
+            else:
+                # Clear current project when none is selected or list is emptied
                 self.model.current_project = None
                 self.model.project_started_at = None
         self._update_menu()

@@ -575,7 +575,10 @@ class ActivityAnalyzer:
 
     def clear(self) -> None:
         """Clear all stored events and reset session-level fraud tracking."""
-        self._input_events.clear()
-        self._window_events.clear()
+        # Atomic swap instead of .clear() to avoid RuntimeError if
+        # _compute_metrics is iterating the old list concurrently.
+        self._input_events = []
+        self._window_events = []
         self._fraud_detector.clear()
         self._last_fraud_seq = 0
+        self._fraud_reset_date = None

@@ -142,8 +142,8 @@ class CallDetector:
             self._left_at = timestamp
             return None
 
-        # Check if grace period expired
-        gap = (timestamp - self._left_at).total_seconds()
+        # Check if grace period expired (guard against out-of-order timestamps)
+        gap = max(0.0, (timestamp - self._left_at).total_seconds())
         if gap >= self._grace_period:
             # Grace expired: end the call (end time = when user left)
             return self._end_call()
