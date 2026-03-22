@@ -142,13 +142,24 @@ class DailyTimeTracker:
         if seconds <= 0:
             return
 
+        rollover_date = None
+        rollover_seconds = 0.0
         with self._lock:
             # Check for day rollover
             if self._today != event_date:
-                self._reset_for_new_day(event_date)
+                # Capture old day's data for out-of-lock persist
+                rollover_date = self._today
+                rollover_seconds = self._today_seconds
+                # Swap in-memory state immediately
+                self._today = event_date
+                self._today_seconds = 0.0
 
             self._today_seconds += seconds
-        # Persist outside the lock to avoid blocking callers with SQLite I/O
+
+        # All SQLite I/O happens outside the lock
+        if rollover_date is not None:
+            self._persist_date(rollover_date, rollover_seconds)
+            self._load_new_day(event_date)
         self._persist()
 
     def get_today_active_time(self) -> timedelta:
@@ -159,9 +170,25 @@ class DailyTimeTracker:
         Returns:
             timedelta with today's total active time.
         """
+        rollover_date = None
+        rollover_seconds = 0.0
         with self._lock:
-            self._check_day_rollover()
-            return timedelta(seconds=self._today_seconds)
+            current_date = self._get_local_date()
+            if self._today != current_date:
+                rollover_date = self._today
+                rollover_seconds = self._today_seconds
+                self._today = current_date
+                self._today_seconds = 0.0
+            result = self._today_seconds
+
+        if rollover_date is not None:
+            self._persist_date(rollover_date, rollover_seconds)
+            self._load_new_day(current_date)
+            # Re-read in case _load_new_day updated the value
+            with self._lock:
+                result = self._today_seconds
+
+        return timedelta(seconds=result)
 
     def get_active_time_for_date(self, target_date: date) -> timedelta:
         """Get active time for a specific date.
@@ -190,23 +217,26 @@ class DailyTimeTracker:
                     return timedelta(seconds=float(row["active_seconds"]))
                 return timedelta(seconds=0)
 
-    def _reset_for_new_day(self, new_date: date) -> None:
-        """Reset counter for new day.
+    def _persist_date(self, target_date: date, seconds: float) -> None:
+        """Persist a specific date's data to SQLite (no lock required)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO daily_active_time (date, active_seconds, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    active_seconds = excluded.active_seconds,
+                    updated_at = excluded.updated_at
+                """,
+                (target_date.isoformat(), seconds, now),
+            )
 
-        Persists any existing data before switching to the new date.
+    def _load_new_day(self, new_date: date) -> None:
+        """Load existing data for a new day into memory (no lock required).
 
-        Args:
-            new_date: The new date to track.
+        Updates _today_seconds under _lock after loading from SQLite.
         """
-        # Flush the old day's data before discarding it
-        self._persist()
-
-        logger.info(
-            f"Day rollover: {self._today} ({self._today_seconds:.1f}s) -> {new_date}"
-        )
-        self._today = new_date
-
-        # Load any existing data for the new date
         with self._cursor() as cursor:
             cursor.execute(
                 """
@@ -216,16 +246,13 @@ class DailyTimeTracker:
                 (new_date.isoformat(),),
             )
             row = cursor.fetchone()
-            if row:
-                self._today_seconds = float(row["active_seconds"])
-            else:
-                self._today_seconds = 0.0
+            loaded = float(row["active_seconds"]) if row else 0.0
 
-    def _check_day_rollover(self) -> None:
-        """Check if we need to roll over to a new day."""
-        current_date = self._get_local_date()
-        if self._today != current_date:
-            self._reset_for_new_day(current_date)
+        with self._lock:
+            # Only update if we're still on the same date (no further rollover)
+            if self._today == new_date:
+                self._today_seconds += loaded
+        logger.info(f"Day rollover to {new_date}, loaded {loaded:.1f}s")
 
     def _persist(self) -> None:
         """Save current state to SQLite."""

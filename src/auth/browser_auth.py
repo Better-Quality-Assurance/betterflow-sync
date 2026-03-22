@@ -228,15 +228,17 @@ class BrowserAuthFlow:
         state = secrets.token_urlsafe(32)
         code_verifier, code_challenge = generate_pkce_pair()
 
-        # Create server on random port
+        # Create server on random port — fully initialize attributes
+        # before storing in self._server so cancel() never sees a
+        # partially-constructed object.
         server = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        server.lock = threading.Lock()
+        server.auth_code = None
+        server.auth_error = None
+        server.expected_state = state
+        server.callback_received = threading.Event()
         with self._server_lock:
             self._server = server
-        self._server.lock = threading.Lock()
-        self._server.auth_code = None
-        self._server.auth_error = None
-        self._server.expected_state = state
-        self._server.callback_received = threading.Event()
 
         port = self._server.server_address[1]
         logger.info(f"Callback server listening on port {port}")

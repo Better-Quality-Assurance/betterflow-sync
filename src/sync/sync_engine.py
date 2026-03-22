@@ -1030,7 +1030,7 @@ class SyncEngine:
                     # Partial success: remove accepted, increment retry on rest
                     accepted_set = set(result.accepted_ids)
                     succeeded_ids = [eid for eid, ev in zip(event_ids, events)
-                                     if ev.get("id") in accepted_set]
+                                     if ev.get("id") in accepted_set or ev.get("id") is None]
                     failed_ids = [eid for eid in event_ids if eid not in succeeded_ids]
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
@@ -1071,9 +1071,7 @@ class SyncEngine:
                 cmd_type = cmd.get("type")
                 if cmd_type == "pause":
                     logger.info(f"Server requested pause: {cmd.get('reason')}")
-                    self._advance_checkpoints_to_now("server_pause")
-                    with self._state_lock:
-                        self._paused = True
+                    self.pause()
                 elif cmd_type == "deregister":
                     logger.warning(f"Device revoked: {cmd.get('reason')}")
                     self._advance_checkpoints_to_now("server_deregister")
