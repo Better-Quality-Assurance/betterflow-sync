@@ -13,6 +13,11 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
+try:
+    from ..ui.permissions import check_accessibility
+except ImportError:
+    from ui.permissions import check_accessibility
+
 logger = logging.getLogger(__name__)
 
 # Quartz event type constants (defined here to avoid import at module level)
@@ -79,6 +84,12 @@ class MacOSInputWatcher:
             )
         except ImportError:
             logger.warning("Quartz not available — input tracking disabled")
+            return False
+
+        if not check_accessibility():
+            logger.warning(
+                "Process does NOT have Accessibility permission — input tracking disabled"
+            )
             return False
 
         try:

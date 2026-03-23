@@ -493,9 +493,19 @@ class SyncEngine:
                 stats.events_filtered += 1
                 continue
 
-            transformed_event = self._transform_event(event, bucket_id, bucket_type)
-            if transformed_event:
-                transformed.append(transformed_event)
+            if (
+                bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
+                and not self._has_input_data
+            ):
+                transformed_events = self._transform_window_event_without_input(
+                    event, bucket_id, bucket_type
+                )
+            else:
+                transformed_event = self._transform_event(event, bucket_id, bucket_type)
+                transformed_events = [transformed_event] if transformed_event else []
+
+            if transformed_events:
+                transformed.extend(transformed_events)
                 # LRU insert: add/move to end, evict oldest if over capacity
                 with self._cache_lock:
                     self._sent_cache[cache_key] = event.duration
@@ -529,6 +539,102 @@ class SyncEngine:
             pending_checkpoint = (bucket_id, newest.timestamp, newest.id)
 
         return transformed, pending_checkpoint
+
+    @staticmethod
+    def _overlap_range(
+        start: datetime,
+        end: datetime,
+        other_start: datetime,
+        other_end: datetime,
+    ) -> Optional[tuple[datetime, datetime]]:
+        """Return the overlapped range, if any."""
+        overlap_start = max(start, other_start)
+        overlap_end = min(end, other_end)
+        if overlap_end <= overlap_start:
+            return None
+
+        return overlap_start, overlap_end
+
+    def _active_ranges_from_afk(self, event: AWEvent) -> list[tuple[datetime, datetime]]:
+        """Return the non-AFK slices for a window/web event."""
+        event_start = event.timestamp
+        event_end = event.timestamp + timedelta(seconds=event.duration)
+        afk_ranges: list[tuple[datetime, datetime]] = []
+
+        for afk_event in self._current_afk_events:
+            if afk_event.status != "afk":
+                continue
+
+            afk_start = afk_event.timestamp
+            afk_end = afk_event.timestamp + timedelta(seconds=afk_event.duration)
+            overlap = self._overlap_range(event_start, event_end, afk_start, afk_end)
+            if overlap is not None:
+                afk_ranges.append(overlap)
+
+        if not afk_ranges:
+            return [(event_start, event_end)]
+
+        afk_ranges.sort(key=lambda item: item[0])
+        merged_afk: list[tuple[datetime, datetime]] = []
+        for start, end in afk_ranges:
+            if not merged_afk or start > merged_afk[-1][1]:
+                merged_afk.append((start, end))
+            else:
+                merged_afk[-1] = (merged_afk[-1][0], max(merged_afk[-1][1], end))
+
+        active_ranges: list[tuple[datetime, datetime]] = []
+        cursor = event_start
+        for afk_start, afk_end in merged_afk:
+            if afk_start > cursor:
+                active_ranges.append((cursor, afk_start))
+            cursor = max(cursor, afk_end)
+            if cursor >= event_end:
+                break
+
+        if cursor < event_end:
+            active_ranges.append((cursor, event_end))
+
+        return active_ranges
+
+    def _transform_window_event_without_input(
+        self,
+        event: AWEvent,
+        bucket_id: str,
+        bucket_type: str,
+    ) -> list[dict]:
+        """Transform only the non-AFK slices of a long window/web event."""
+        active_ranges = self._active_ranges_from_afk(event)
+        if not active_ranges:
+            logger.info(
+                "Window event fully overlapped by AFK; skipping counted segment: "
+                f"event={event.timestamp.isoformat()}->"
+                f"{(event.timestamp + timedelta(seconds=event.duration)).isoformat()}"
+            )
+            return []
+
+        transformed: list[dict] = []
+        for idx, (segment_start, segment_end) in enumerate(active_ranges):
+            duration = round((segment_end - segment_start).total_seconds(), 2)
+            if duration <= 0:
+                continue
+
+            segment_event = AWEvent(
+                id=event.id,
+                timestamp=segment_start,
+                duration=duration,
+                data=event.data,
+            )
+            transformed_event = self._transform_event(
+                segment_event,
+                bucket_id,
+                bucket_type,
+                forced_activity_state="active",
+                custom_event_id=f"{event.id}:{idx}",
+            )
+            if transformed_event:
+                transformed.append(transformed_event)
+
+        return transformed
 
     def _sync_bucket(
         self, bucket_id: str, bucket_type: str, stats: SyncStats
@@ -614,6 +720,17 @@ class SyncEngine:
         # If we exhausted events without reaching ``end``, gap is uncovered
         return cursor >= end
 
+    @staticmethod
+    def _status_at(timestamp: datetime, afk_events: list[AWEvent]) -> str | None:
+        """Return the AFK status covering ``timestamp``, if any."""
+        for ev in afk_events:
+            ev_start = ev.timestamp
+            ev_end = ev.timestamp + timedelta(seconds=ev.duration)
+            if ev_start <= timestamp < ev_end:
+                return ev.status
+
+        return None
+
     def _fill_window_gaps(
         self,
         window_events: list[AWEvent],
@@ -673,7 +790,12 @@ class SyncEngine:
         return filled
 
     def _transform_event(
-        self, event: AWEvent, bucket_id: str, bucket_type: str
+        self,
+        event: AWEvent,
+        bucket_id: str,
+        bucket_type: str,
+        forced_activity_state: Optional[str] = None,
+        custom_event_id: Optional[str] = None,
     ) -> Optional[dict]:
         """Transform an ActivityWatch event to BetterFlow format.
 
@@ -772,7 +894,7 @@ class SyncEngine:
         duration = max(0, round(event.duration, 2))
 
         result = {
-            "id": event.id,
+            "id": custom_event_id if custom_event_id is not None else event.id,
             "timestamp": timestamp.isoformat(),
             "duration": duration,
             "bucket_id": bucket_id,
@@ -790,7 +912,10 @@ class SyncEngine:
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
         activity_state: str | None = None
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            if self._has_input_data:
+            if forced_activity_state is not None:
+                activity_state = forced_activity_state
+                result["activity_state"] = activity_state
+            elif self._has_input_data:
                 activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
                 activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
 
@@ -804,9 +929,22 @@ class SyncEngine:
                 # daily counter for the entire AFK period.
                 event_end = event.timestamp + timedelta(seconds=event.duration)
                 has_afk = bool(self._current_afk_events)
-                is_active = has_afk and self._is_active_during(
-                    event.timestamp, event_end, self._current_afk_events
-                )
+                is_active = False
+                if has_afk:
+                    is_active = self._is_active_during(
+                        event.timestamp, event_end, self._current_afk_events
+                    )
+
+                    # When the input watcher is unavailable, AFK heartbeats are the
+                    # only liveness signal we have. Treat a window event as active
+                    # when its end still falls inside a not-afk span, even if the
+                    # AFK bucket doesn't fully cover the window start.
+                    if not is_active:
+                        probe_time = event_end - timedelta(milliseconds=1)
+                        is_active = (
+                            self._status_at(probe_time, self._current_afk_events)
+                            == "not-afk"
+                        )
                 if is_active:
                     activity_state = "active"
                 else:
@@ -819,12 +957,12 @@ class SyncEngine:
                     )
                 result["activity_state"] = activity_state
 
-            # Track active time (only "active" events count).
-            # Use delta to avoid double-counting re-fetched events whose
-            # duration grew via heartbeat extension or gap-filling.
-            if activity_state == "active":
+            # Track counted time for any event that is not explicitly inactive.
+            # This keeps live hours aligned with "time on the machine" while
+            # still stopping the counter after prolonged no-input periods.
+            if activity_state is not None and activity_state != "inactive":
                 event_date = event.timestamp.astimezone().date()
-                time_key = (bucket_id, event.id)
+                time_key = (bucket_id, result["id"])
                 time_delta = 0.0
                 with self._cache_lock:
                     prev_counted = self._time_cache.get(time_key, 0.0)

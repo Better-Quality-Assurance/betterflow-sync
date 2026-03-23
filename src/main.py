@@ -701,12 +701,15 @@ class SyncCoordinator:
         try:
             status = self.bf.get_status()
             summary = status.get("data", {}).get("today_summary", {})
-            # Use active_seconds (actual tracked activity) instead of
-            # total_seconds which is the arrival-to-departure time span
-            # and inflates the counter during idle/AFK periods.
-            total_seconds = int(
-                summary.get("active_seconds", summary.get("total_seconds", 0))
-            )
+            tracked_seconds = summary.get("tracked_seconds")
+
+            if tracked_seconds is None:
+                # Older backends still expose only active_seconds, which is too
+                # strict for the new "count tracked time until AFK" rule.
+                total_seconds = int(self.sync_engine.get_today_active_time().total_seconds())
+            else:
+                total_seconds = int(tracked_seconds)
+
             self._hours_today_seconds = max(0, total_seconds)
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)
             self._last_hours_refresh = time.monotonic()
@@ -1260,11 +1263,14 @@ class BetterFlowApp:
         """Handle idle pause/resume — also pause/resume input watcher and slow window polling."""
         if self.input_watcher:
             if paused:
-                self.input_watcher.stop()
-                logger.info("Input watcher stopped (user idle)")
+                # Keep the event tap alive while AFK. Restarting the macOS input
+                # watcher after long idle periods has proven unreliable on some
+                # installs and can leave the sync engine with no input telemetry.
+                logger.info("Input watcher left running (user idle)")
             else:
-                self.input_watcher.start()
-                logger.info("Input watcher resumed (user active)")
+                if not self.input_watcher.is_running:
+                    self.input_watcher.start()
+                    logger.info("Input watcher resumed (user active)")
         if self.window_watcher:
             self.window_watcher.set_poll_interval(5.0 if paused else 2.0)
         # Stop/start the break reminder timer so it doesn't fire during AFK

@@ -128,6 +128,107 @@ class TestSyncEngine:
         result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
         assert result is not None
 
+    def test_status_at_returns_covering_afk_status(self):
+        """_status_at should return the status covering a timestamp."""
+        now = datetime.now(timezone.utc)
+        afk_events = [
+            AWEvent(
+                id=10,
+                timestamp=now - timedelta(minutes=5),
+                duration=600,
+                data={"status": "not-afk"},
+            ),
+        ]
+
+        status = self.engine._status_at(now, afk_events)
+
+        assert status == "not-afk"
+
+    def test_transform_event_uses_not_afk_fallback_without_input(self):
+        """Window events should stay active when AFK data says not-afk at event end."""
+        self.engine._has_input_data = False
+        now = datetime.now(timezone.utc)
+        self.engine._current_afk_events = [
+            AWEvent(
+                id=11,
+                timestamp=now - timedelta(minutes=1),
+                duration=120,
+                data={"status": "not-afk"},
+            ),
+        ]
+        event = AWEvent(
+            id=12,
+            timestamp=now,
+            duration=30.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert result["activity_state"] == "active"
+
+    def test_transform_and_checkpoint_splits_window_around_afk(self):
+        """Long window events should count only their non-AFK slices."""
+        self.engine._has_input_data = False
+        now = datetime.now(timezone.utc)
+        self.engine._current_afk_events = [
+            AWEvent(
+                id=20,
+                timestamp=now + timedelta(seconds=30),
+                duration=30,
+                data={"status": "afk"},
+            ),
+        ]
+        event = AWEvent(
+            id=21,
+            timestamp=now,
+            duration=90.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+        stats = Mock(events_filtered=0)
+
+        transformed, checkpoint = self.engine._transform_and_checkpoint(
+            [event],
+            "bucket-123",
+            BUCKET_TYPE_WINDOW,
+            stats,
+        )
+
+        assert checkpoint == ("bucket-123", now, 21)
+        assert len(transformed) == 2
+        assert transformed[0]["id"] == "21:0"
+        assert transformed[0]["duration"] == 30.0
+        assert transformed[1]["id"] == "21:1"
+        assert transformed[1]["duration"] == 30.0
+        assert all(item["activity_state"] == "active" for item in transformed)
+        assert self.time_tracker.add_active_time.call_count == 2
+
+    def test_transform_and_checkpoint_counts_full_window_without_afk(self):
+        """Without AFK overlap, no-input windows should still count fully."""
+        self.engine._has_input_data = False
+        self.engine._current_afk_events = []
+        now = datetime.now(timezone.utc)
+        event = AWEvent(
+            id=22,
+            timestamp=now,
+            duration=60.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+        stats = Mock(events_filtered=0)
+
+        transformed, _ = self.engine._transform_and_checkpoint(
+            [event],
+            "bucket-123",
+            BUCKET_TYPE_WINDOW,
+            stats,
+        )
+
+        assert len(transformed) == 1
+        assert transformed[0]["duration"] == 60.0
+        assert transformed[0]["activity_state"] == "active"
+        self.time_tracker.add_active_time.assert_called_once()
+
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}
@@ -349,8 +450,8 @@ class TestSyncEngine:
         args = self.time_tracker.add_active_time.call_args[0]
         assert args[0] == 60  # duration
 
-    def test_transform_event_does_not_track_idle_active_time(self):
-        """Test that idle-active events don't add time to tracker when input data exists."""
+    def test_transform_event_tracks_idle_active_time(self):
+        """Test that idle-active events still add counted time to tracker."""
         self.engine._has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "idle-active"
 
@@ -363,8 +464,7 @@ class TestSyncEngine:
 
         self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
 
-        # Should not call add_active_time
-        self.time_tracker.add_active_time.assert_not_called()
+        self.time_tracker.add_active_time.assert_called_once()
 
     def test_transform_event_no_input_data_uses_afk_for_active(self):
         """Test that without input data, AFK 'not-afk' events mark window as active."""
