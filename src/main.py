@@ -319,11 +319,26 @@ class SyncCoordinator:
         )
         logger.info(f"Auto-break started ({duration}m)")
 
-    def end_break(self, silent: bool = False) -> None:
-        """End the auto-break: resume sync, restore pre-break tray state."""
+    def end_break(self, silent: bool = False, force: bool = False) -> None:
+        """End the auto-break: resume sync, restore pre-break tray state.
+
+        Args:
+            silent: If True, skip the "Break Over" notification.
+            force: If True, skip the minimum duration guard (for user-initiated end).
+        """
         with self._break_lock:
             if not self._on_break:
                 return
+            # Guard: don't auto-end a break that just started (< 60s).
+            # Prevents notification spam from scheduler races or rapid state transitions.
+            if not force and self._break_start:
+                elapsed = (datetime.now(timezone.utc) - self._break_start).total_seconds()
+                if elapsed < 60:
+                    logger.warning(
+                        f"Ignoring premature end_break after {elapsed:.0f}s "
+                        f"(minimum 60s, silent={silent})"
+                    )
+                    return
             self._on_break = False
             break_start = self._break_start
             self._break_start = None
@@ -1172,7 +1187,7 @@ class BetterFlowApp:
 
     def _on_end_break(self) -> None:
         """Handle user ending break early from tray menu."""
-        self.coordinator.end_break()
+        self.coordinator.end_break(force=True)
 
     def _on_pause(self) -> None:
         """Handle pause action."""
