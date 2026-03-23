@@ -552,17 +552,26 @@ class SyncEngine:
     def _get_afk_events_for_range(
         self, start: datetime, end: datetime
     ) -> list[AWEvent]:
-        """Fetch AFK events covering [start, end] from all AFK buckets."""
+        """Fetch AFK events covering [start, end] from all AFK buckets.
+
+        Looks back up to 24 hours before ``start`` to catch long-running
+        AFK events whose timestamp predates the query range but whose
+        duration extends into it (ActivityWatch filters by timestamp only).
+        """
         try:
             afk_buckets = self.aw.get_afk_buckets()
         except AWClientError:
             return []
 
+        # Look back to capture AFK events that started earlier but are
+        # still active during [start, end].
+        lookback_start = start - timedelta(hours=24)
+
         all_afk: list[AWEvent] = []
         for bucket in afk_buckets:
             try:
                 events = self.aw.get_events(
-                    bucket.id, start=start, end=end, limit=5000
+                    bucket.id, start=lookback_start, end=end, limit=5000
                 )
                 all_afk.extend(events)
             except AWClientError:
@@ -794,12 +803,20 @@ class SyncEngine:
                 # to "active" when AFK data was missing, which inflated the
                 # daily counter for the entire AFK period.
                 event_end = event.timestamp + timedelta(seconds=event.duration)
-                if self._current_afk_events and self._is_active_during(
+                has_afk = bool(self._current_afk_events)
+                is_active = has_afk and self._is_active_during(
                     event.timestamp, event_end, self._current_afk_events
-                ):
+                )
+                if is_active:
                     activity_state = "active"
                 else:
                     activity_state = "inactive"
+                    logger.info(
+                        f"Window event classified inactive: has_afk={has_afk}, "
+                        f"has_input={self._has_input_data}, "
+                        f"afk_count={len(self._current_afk_events)}, "
+                        f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+                    )
                 result["activity_state"] = activity_state
 
             # Track active time (only "active" events count).
