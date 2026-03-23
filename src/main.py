@@ -269,15 +269,15 @@ class SyncCoordinator:
         """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
         # Read engine state BEFORE acquiring _break_lock to preserve lock ordering:
         # SyncEngine._state_lock must never be acquired while _break_lock is held.
-        # These snapshots may be slightly stale (concurrent pause/resume can change
-        # them between the read and the lock). A missed break start is recoverable
-        # (scheduler retries); a stale private-mode capture is a rare edge case.
-        already_paused = self.sync_engine.is_paused
+        # Snapshot twice: once outside the lock, then re-check inside to close the
+        # TOCTOU window where user could pause between read and lock acquisition.
         pre_break_private = self.sync_engine.is_private
         with self._break_lock:
             if self._on_break:
                 return
-            # Don't start a break if tracking is already paused
+            # Re-read is_paused inside the lock to close the race window.
+            # Safe because _break_lock never nests inside _state_lock elsewhere.
+            already_paused = self.sync_engine.is_paused
             if already_paused:
                 return
             self._on_break = True
@@ -329,6 +329,12 @@ class SyncCoordinator:
         with self._break_lock:
             if not self._on_break:
                 return
+            # State corruption guard: _break_start should always be set
+            if not self._break_start:
+                logger.warning("end_break: _break_start is None (state corruption)")
+                # Still allow forced calls to clear the break flag
+                if not force:
+                    return
             # Guard: don't auto-end a break that just started (< 60s).
             # Prevents notification spam from scheduler races or rapid state transitions.
             if not force and self._break_start:
@@ -489,19 +495,22 @@ class SyncCoordinator:
         if sys.platform != "darwin":
             return None
         try:
-            import subprocess
-            out = subprocess.check_output(
+            import subprocess as _sp
+            out = _sp.check_output(
                 ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
                 timeout=5,
                 text=True,
             )
             for line in out.splitlines():
                 if "HIDIdleTime" in line and "=" in line:
-                    # Format: "HIDIdleTime" = 1234567890
                     val = line.split("=")[-1].strip()
-                    return int(val) / 1_000_000_000  # nanoseconds → seconds
-        except Exception:
-            pass
+                    try:
+                        return int(val) / 1_000_000_000  # nanoseconds -> seconds
+                    except ValueError:
+                        logger.debug(f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}")
+                        return None
+        except Exception as e:
+            logger.debug(f"_get_system_idle_seconds failed: {e}")
         return None
 
     def _check_idle_status(self) -> None:
@@ -756,16 +765,19 @@ class SyncCoordinator:
 
     def reset_trends(self) -> None:
         """Reset cached trends and hours to placeholder values."""
-        self._hours_today_seconds = 0
-        self._hours_today_cache = "0h 0m"
-        self._trends_cache = {
-            "hours_this_week": "---",
-            "hours_this_month": "---",
-            "daily_avg_this_week": "---",
-        }
+        with self._state_lock:
+            self._hours_today_seconds = 0
+            self._hours_today_cache = "0h 0m"
+            self._trends_cache = {
+                "hours_this_week": "---",
+                "hours_this_month": "---",
+                "daily_avg_this_week": "---",
+            }
         self.tray.update_stats(
             hours_today="0h 0m",
-            **self._trends_cache,
+            hours_this_week="---",
+            hours_this_month="---",
+            daily_avg_this_week="---",
         )
 
     def _expire_old_queue_events(self) -> None:
@@ -1202,7 +1214,7 @@ class BetterFlowApp:
         # End break first (it may call resume internally), then re-pause
         # so the user-initiated pause always wins.
         if self.coordinator.is_on_break:
-            self.coordinator.end_break(silent=True)
+            self.coordinator.end_break(silent=True, force=True)
         self.sync_engine.pause()
         self.tray.set_paused(True)
         self.reminder_manager.on_tracking_stopped()
@@ -1239,7 +1251,7 @@ class BetterFlowApp:
             self.coordinator.clear_idle_pause(send_event=True)
             # End break first (it may call resume internally), then re-pause
             if self.coordinator.is_on_break:
-                self.coordinator.end_break(silent=True)
+                self.coordinator.end_break(silent=True, force=True)
             self.sync_engine.set_private_mode(True)
             self.sync_engine.pause()
             self.tray.set_paused(True)
@@ -1389,6 +1401,10 @@ class BetterFlowApp:
             # Don't interrupt an in-flight sync (N4) - let it complete or timeout
             if self.coordinator.sync_in_progress:
                 logger.info("Network offline — sync in progress, will pause after completion")
+                with self._pause_state_lock:
+                    already_paused = self._user_paused
+                if not already_paused:
+                    self.sync_engine.pause()
                 self.coordinator.paused_by_network = True
                 self.tray.set_state(TrayState.QUEUED, "Offline")
             else:
@@ -1511,7 +1527,7 @@ class BetterFlowApp:
 
                 # Cancel any active break before stopping
                 if self.coordinator.is_on_break:
-                    self.coordinator.end_break(silent=True)
+                    self.coordinator.end_break(silent=True, force=True)
 
                 # End server session before stopping
                 self.sync_engine.shutdown()

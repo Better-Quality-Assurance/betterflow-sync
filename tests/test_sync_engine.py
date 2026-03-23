@@ -469,6 +469,7 @@ class TestSyncEngine:
     def test_transform_event_no_input_data_uses_afk_for_active(self):
         """Test that without input data, AFK 'not-afk' events mark window as active."""
         self.engine._has_input_data = False
+        self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is active during this window
         self.engine._current_afk_events = [
@@ -485,6 +486,7 @@ class TestSyncEngine:
     def test_transform_event_no_input_data_uses_afk_for_inactive(self):
         """Test that without input data, AFK 'afk' events mark window as inactive."""
         self.engine._has_input_data = False
+        self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is idle during this window
         self.engine._current_afk_events = [
@@ -498,15 +500,35 @@ class TestSyncEngine:
         assert result["activity_state"] == "inactive"
         self.time_tracker.add_active_time.assert_not_called()
 
-    def test_transform_event_no_input_data_no_afk_defaults_inactive(self):
-        """Test that without input data AND no AFK events, defaults to inactive.
+    def test_transform_event_no_input_data_no_afk_watcher_defaults_active(self):
+        """Test that without AFK watcher, defaults to active.
 
-        When no data source can confirm activity, conservatively assume
-        inactive to avoid inflating the daily counter (e.g. when the AFK
-        watcher has crashed and the user is away).
+        When the AFK watcher is completely down, window events still prove
+        the user was at the computer. Defaulting to inactive would cause
+        silent zero-hour days which is worse than slightly inflated counts.
         """
         self.engine._has_input_data = False
         self.engine._current_afk_events = []
+        self.engine._afk_watcher_available = False
+        event = AWEvent(
+            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            data={"app": "Firefox", "title": "Test"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert result["activity_state"] == "active"
+
+    def test_transform_event_no_input_data_afk_watcher_no_events_defaults_inactive(self):
+        """Test that with AFK watcher running but no matching events, defaults to inactive.
+
+        When the AFK watcher is available but has no events covering this
+        window event's time range, the user was genuinely idle.
+        """
+        self.engine._has_input_data = False
+        self.engine._current_afk_events = []
+        self.engine._afk_watcher_available = True
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
             data={"app": "Firefox", "title": "Test"},
@@ -740,6 +762,7 @@ class TestSyncCoordinatorBreak:
     def test_end_break_clears_flag(self):
         """end_break clears _on_break."""
         self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
         self.coordinator._pre_break_paused = False
         self.coordinator._pre_break_private = False
         self.coordinator.end_break()
@@ -749,6 +772,7 @@ class TestSyncCoordinatorBreak:
     def test_end_break_restores_paused_state(self):
         """end_break should not resume if app was paused before break."""
         self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
         self.coordinator._pre_break_paused = True
         self.coordinator._pre_break_private = False
 
@@ -765,6 +789,7 @@ class TestSyncCoordinatorBreak:
         This ensures both flags are consistent: paused=False, private=True.
         """
         self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
         self.coordinator._pre_break_paused = False
         self.coordinator._pre_break_private = True
 
@@ -777,12 +802,49 @@ class TestSyncCoordinatorBreak:
     def test_end_break_silent_no_notification(self):
         """end_break(silent=True) should not send notification."""
         self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
         self.coordinator._pre_break_paused = False
         self.coordinator._pre_break_private = False
 
         with patch("src.main.send_notification") as mock_notify:
             self.coordinator.end_break(silent=True)
             mock_notify.assert_not_called()
+
+    def test_end_break_too_soon_rejected_without_force(self):
+        """end_break() is a no-op when called < 60s after start (scheduler race guard)."""
+        self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=10)
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = False
+
+        self.coordinator.end_break(force=False)
+
+        assert self.coordinator._on_break is True
+        self.sync_engine.resume.assert_not_called()
+
+    def test_end_break_force_bypasses_60s_guard(self):
+        """end_break(force=True) succeeds even when < 60s have elapsed."""
+        self.coordinator._on_break = True
+        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = False
+
+        self.coordinator.end_break(force=True)
+
+        assert self.coordinator._on_break is False
+        self.sync_engine.resume.assert_called_once()
+
+    def test_end_break_no_timestamp_without_force_rejected(self):
+        """end_break() is a no-op when _break_start is None and force=False."""
+        self.coordinator._on_break = True
+        self.coordinator._break_start = None
+        self.coordinator._pre_break_paused = False
+        self.coordinator._pre_break_private = False
+
+        self.coordinator.end_break(force=False)
+
+        assert self.coordinator._on_break is True
+        self.sync_engine.resume.assert_not_called()
 
 
 class TestConfigDefaultCategories:

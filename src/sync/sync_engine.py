@@ -138,6 +138,7 @@ class SyncEngine:
         self._time_tracker = time_tracker or DailyTimeTracker()
         self._has_input_data = False  # Set to True when input buckets exist
         self._current_afk_events: list[AWEvent] = []  # AFK events for current sync cycle
+        self._afk_watcher_available = False  # True when AFK buckets exist this cycle
 
         # Call/meeting detection
         self._call_detector: Optional[CallDetector] = (
@@ -309,6 +310,11 @@ class SyncEngine:
         except AWClientError as e:
             stats.errors.append(f"Failed to get buckets: {e}")
             return stats
+
+        # Track whether AFK watcher is running so _transform_event can
+        # distinguish "watcher down" (default active) from "genuinely idle".
+        with self._state_lock:
+            self._afk_watcher_available = bool(afk_buckets)
 
         # Fetch input events for activity analysis before processing window events
         # Use 2x engagement window to ensure coverage for rolling window calculations
@@ -660,9 +666,11 @@ class SyncEngine:
     ) -> list[AWEvent]:
         """Fetch AFK events covering [start, end] from all AFK buckets.
 
-        Looks back up to 24 hours before ``start`` to catch long-running
-        AFK events whose timestamp predates the query range but whose
-        duration extends into it (ActivityWatch filters by timestamp only).
+        Looks back up to 10 minutes before ``start`` to catch AFK events
+        whose timestamp predates the query range but whose duration extends
+        into it (ActivityWatch filters by timestamp only). 10 minutes is
+        more than enough to bridge any AFK heartbeat gap; larger lookbacks
+        risk hitting the limit=5000 cap on busy machines.
         """
         try:
             afk_buckets = self.aw.get_afk_buckets()
@@ -671,7 +679,7 @@ class SyncEngine:
 
         # Look back to capture AFK events that started earlier but are
         # still active during [start, end].
-        lookback_start = start - timedelta(hours=24)
+        lookback_start = start - timedelta(minutes=10)
 
         all_afk: list[AWEvent] = []
         for bucket in afk_buckets:
@@ -679,6 +687,11 @@ class SyncEngine:
                 events = self.aw.get_events(
                     bucket.id, start=lookback_start, end=end, limit=5000
                 )
+                if len(events) == 5000:
+                    logger.warning(
+                        f"AFK bucket {bucket.id} returned max 5000 events; "
+                        f"activity classification for tail of window may be inaccurate"
+                    )
                 all_afk.extend(events)
             except AWClientError:
                 pass
@@ -825,6 +838,7 @@ class SyncEngine:
             return None
 
         # Build data object
+        result_bucket_type = bucket_type  # may be overridden for AFK-as-break
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
@@ -876,9 +890,11 @@ class SyncEngine:
                     data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
-            # Send AFK periods as "break" bucket_type for chart display
+            # Send AFK periods as "break" bucket_type for chart display.
+            # Use a separate variable so the original bucket_type is preserved
+            # for the activity classification logic below.
             if event.status == "afk":
-                bucket_type = "break"
+                result_bucket_type = "break"
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection
             data["presses"] = event.presses
@@ -898,7 +914,7 @@ class SyncEngine:
             "timestamp": timestamp.isoformat(),
             "duration": duration,
             "bucket_id": bucket_id,
-            "bucket_type": bucket_type,
+            "bucket_type": result_bucket_type,
             "data": data,
         }
 
@@ -922,36 +938,47 @@ class SyncEngine:
                 result["activity_state"] = activity_state
                 result["activity_metrics"] = activity_metrics.to_dict()
             else:
-                # No input watcher — use AFK data to determine activity.
-                # Default to "inactive" unless AFK data confirms the user
-                # was actively at the keyboard.  Previously this defaulted
-                # to "active" when AFK data was missing, which inflated the
-                # daily counter for the entire AFK period.
+                # No input watcher - use AFK data to determine activity.
                 event_end = event.timestamp + timedelta(seconds=event.duration)
                 has_afk = bool(self._current_afk_events)
-                is_active = False
-                if has_afk:
+
+                # Note: _afk_watcher_available is written under _state_lock but
+                # read here without it. This is safe: both write and read happen
+                # on the scheduler thread (guarded by _sync_lock), and CPython
+                # bool assignment is atomic for the edge case of a future caller.
+                if not self._afk_watcher_available:
+                    # AFK watcher is completely down - can't classify.
+                    # Default to "active" since window events prove the user
+                    # was at the computer.
+                    activity_state = "active"
+                    logger.debug(
+                        f"AFK watcher unavailable; classifying window event as active: "
+                        f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+                    )
+                elif has_afk:
                     is_active = self._is_active_during(
                         event.timestamp, event_end, self._current_afk_events
                     )
-
-                    # When the input watcher is unavailable, AFK heartbeats are the
-                    # only liveness signal we have. Treat a window event as active
-                    # when its end still falls inside a not-afk span, even if the
-                    # AFK bucket doesn't fully cover the window start.
+                    # Fallback: treat as active when event end falls inside
+                    # a not-afk span, even if AFK doesn't fully cover start.
                     if not is_active:
                         probe_time = event_end - timedelta(milliseconds=1)
                         is_active = (
                             self._status_at(probe_time, self._current_afk_events)
                             == "not-afk"
                         )
-                if is_active:
-                    activity_state = "active"
+                    activity_state = "active" if is_active else "inactive"
+                    if not is_active:
+                        logger.debug(
+                            f"Window event classified inactive: "
+                            f"afk_count={len(self._current_afk_events)}, "
+                            f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+                        )
                 else:
+                    # AFK watcher is running and confirms user was idle
                     activity_state = "inactive"
-                    logger.info(
-                        f"Window event classified inactive: has_afk={has_afk}, "
-                        f"has_input={self._has_input_data}, "
+                    logger.debug(
+                        f"Window event classified inactive: "
                         f"afk_count={len(self._current_afk_events)}, "
                         f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
                     )
