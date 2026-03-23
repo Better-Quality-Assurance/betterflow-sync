@@ -465,8 +465,36 @@ class SyncCoordinator:
         if sys.platform == "darwin":
             self._check_permissions()
 
+    @staticmethod
+    def _get_system_idle_seconds() -> Optional[float]:
+        """Query macOS HIDIdleTime for system-level idle duration.
+
+        Returns seconds since last keyboard/mouse input, or None on failure.
+        """
+        if sys.platform != "darwin":
+            return None
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                timeout=5,
+                text=True,
+            )
+            for line in out.splitlines():
+                if "HIDIdleTime" in line and "=" in line:
+                    # Format: "HIDIdleTime" = 1234567890
+                    val = line.split("=")[-1].strip()
+                    return int(val) / 1_000_000_000  # nanoseconds → seconds
+        except Exception:
+            pass
+        return None
+
     def _check_idle_status(self) -> None:
-        """Check AFK bucket — pause sync if user idle for 20+ minutes."""
+        """Check AFK bucket — pause sync if user idle for 20+ minutes.
+
+        Falls back to macOS system idle time when AFK buckets are
+        unavailable (e.g. bf-idle-tracker not running).
+        """
         if not self.logged_in:
             return
 
@@ -482,22 +510,31 @@ class SyncCoordinator:
                     return
 
         try:
+            is_afk = False
+            afk_duration = 0.0
+            idle_start: Optional[datetime] = None
+
             afk_buckets = self.aw.get_afk_buckets()
-            if not afk_buckets:
-                return
-
-            events = self.aw.get_events(afk_buckets[0].id, limit=1)
-            if not events:
-                return
-
-            latest = events[0]
-            is_afk = latest.status == "afk"
-            afk_duration = latest.duration
+            if afk_buckets:
+                events = self.aw.get_events(afk_buckets[0].id, limit=1)
+                if events:
+                    latest = events[0]
+                    is_afk = latest.status == "afk"
+                    afk_duration = latest.duration
+                    idle_start = latest.timestamp
+            else:
+                # Fallback: query macOS system idle time when AFK watcher
+                # is unavailable (e.g. bf-idle-tracker crashed or not started).
+                system_idle = self._get_system_idle_seconds()
+                if system_idle is not None:
+                    is_afk = True
+                    afk_duration = system_idle
+                    idle_start = datetime.now(timezone.utc) - timedelta(seconds=system_idle)
 
             if is_afk and afk_duration >= self._idle_pause_threshold:
                 if not was_idle_paused:
-                    # Use the AFK event's own timestamp as idle start
-                    idle_start = latest.timestamp
+                    if idle_start is None:
+                        idle_start = datetime.now(timezone.utc)
                     logger.info(
                         f"User idle for {int(afk_duration)}s (>= {self._idle_pause_threshold}s) "
                         f"— backing off sync to {self._IDLE_SYNC_INTERVAL}s"
@@ -648,10 +685,12 @@ class SyncCoordinator:
         """Fetch today's tracked hours from API (source of truth)."""
         try:
             status = self.bf.get_status()
+            summary = status.get("data", {}).get("today_summary", {})
+            # Use active_seconds (actual tracked activity) instead of
+            # total_seconds which is the arrival-to-departure time span
+            # and inflates the counter during idle/AFK periods.
             total_seconds = int(
-                status.get("data", {})
-                .get("today_summary", {})
-                .get("total_seconds", 0)
+                summary.get("active_seconds", summary.get("total_seconds", 0))
             )
             self._hours_today_seconds = max(0, total_seconds)
             self._hours_today_cache = self._format_hours(self._hours_today_seconds)

@@ -788,14 +788,18 @@ class SyncEngine:
                 result["activity_state"] = activity_state
                 result["activity_metrics"] = activity_metrics.to_dict()
             else:
-                # No input watcher — use AFK data to determine activity
+                # No input watcher — use AFK data to determine activity.
+                # Default to "inactive" unless AFK data confirms the user
+                # was actively at the keyboard.  Previously this defaulted
+                # to "active" when AFK data was missing, which inflated the
+                # daily counter for the entire AFK period.
                 event_end = event.timestamp + timedelta(seconds=event.duration)
-                if self._current_afk_events and not self._is_active_during(
+                if self._current_afk_events and self._is_active_during(
                     event.timestamp, event_end, self._current_afk_events
                 ):
-                    activity_state = "inactive"
-                else:
                     activity_state = "active"
+                else:
+                    activity_state = "inactive"
                 result["activity_state"] = activity_state
 
             # Track active time (only "active" events count).

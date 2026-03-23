@@ -398,8 +398,13 @@ class TestSyncEngine:
         assert result["activity_state"] == "inactive"
         self.time_tracker.add_active_time.assert_not_called()
 
-    def test_transform_event_no_input_data_no_afk_defaults_active(self):
-        """Test that without input data AND no AFK events, defaults to active."""
+    def test_transform_event_no_input_data_no_afk_defaults_inactive(self):
+        """Test that without input data AND no AFK events, defaults to inactive.
+
+        When no data source can confirm activity, conservatively assume
+        inactive to avoid inflating the daily counter (e.g. when the AFK
+        watcher has crashed and the user is away).
+        """
         self.engine._has_input_data = False
         self.engine._current_afk_events = []
         event = AWEvent(
@@ -410,7 +415,8 @@ class TestSyncEngine:
         result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
 
         assert result is not None
-        assert result["activity_state"] == "active"
+        assert result["activity_state"] == "inactive"
+        self.time_tracker.add_active_time.assert_not_called()
 
     def test_transform_event_input_bucket_no_activity_state(self):
         """Test that input events don't get activity state."""
