@@ -1,0 +1,95 @@
+name: Sync Downloads Metadata
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional release tag to sync manually, for example v1.4.2
+        required: false
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve release payload
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_RELEASE_JSON: ${{ toJson(github.event.release) }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${EVENT_RELEASE_JSON:-}" ] && [ "${EVENT_RELEASE_JSON}" != "null" ]; then
+            printf '%s' "${EVENT_RELEASE_JSON}" > release.json
+          elif [ -n "${INPUT_RELEASE_TAG:-}" ]; then
+            gh api "repos/${REPO}/releases/tags/${INPUT_RELEASE_TAG}" > release.json
+          else
+            echo "No published release payload or manual release_tag provided" >&2
+            exit 1
+          fi
+
+          jq -e '
+            {
+              version: (.tag_name | sub("^v"; "")),
+              tag_name: .tag_name,
+              release_name: (.name // .tag_name),
+              published_at,
+              release_url: .html_url,
+              changelog_markdown: (.body // ""),
+              macos_arm64_url: ([.assets[] | select(.name == "BetterFlow-macOS-arm64.dmg") | .browser_download_url] | first // ""),
+              macos_x64_url: ([.assets[] | select(.name == "BetterFlow-macOS-x86_64.dmg") | .browser_download_url] | first // ""),
+              windows_url: ([.assets[] | select(.name == "BetterFlow-Windows.zip") | .browser_download_url] | first // "")
+            }
+          ' release.json > payload.json
+
+          jq -e '
+            (.version | length) > 0 and
+            (.published_at | length) > 0 and
+            (.release_url | length) > 0 and
+            (.release_name | length) > 0 and
+            (.macos_arm64_url | length) > 0 and
+            (.macos_x64_url | length) > 0 and
+            (.windows_url | length) > 0
+          ' payload.json > /dev/null
+
+          {
+            echo "version=$(jq -r '.version' payload.json)"
+            echo "tag_name=$(jq -r '.tag_name' payload.json)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Sync release metadata to backend
+        env:
+          BACKEND_URL: ${{ secrets.DOWNLOADS_SYNC_BACKEND_URL }}
+          RELEASE_SYNC_TOKEN: ${{ secrets.DOWNLOADS_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BACKEND_URL:-}" ]; then
+            echo "Missing DOWNLOADS_SYNC_BACKEND_URL secret" >&2
+            exit 1
+          fi
+
+          if [ -z "${RELEASE_SYNC_TOKEN:-}" ]; then
+            echo "Missing DOWNLOADS_SYNC_TOKEN secret" >&2
+            exit 1
+          fi
+
+          curl --fail --show-error --silent \
+            -X POST \
+            "${BACKEND_URL%/}/api/internal/releases/desktop" \
+            -H "Content-Type: application/json" \
+            -H "X-Release-Token: ${RELEASE_SYNC_TOKEN}" \
+            --data @payload.json
+
+      - name: Upload payload for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloads-sync-payload-${{ steps.release.outputs.tag_name || github.run_id }}
+          path: payload.json
+          retention-days: 7
