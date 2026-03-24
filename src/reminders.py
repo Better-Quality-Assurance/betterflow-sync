@@ -3,7 +3,6 @@
 import logging
 import threading
 import time
-from typing import Callable, Optional
 
 try:
     from .config import ReminderSettings
@@ -26,10 +25,8 @@ class ReminderManager:
     def __init__(
         self,
         settings: ReminderSettings,
-        on_break_triggered: Optional[Callable[[], None]] = None,
     ) -> None:
         self._settings = settings
-        self._on_break_triggered = on_break_triggered
         self._lock = threading.Lock()
 
         # Break-time state (protected by _lock)
@@ -136,14 +133,11 @@ class ReminderManager:
             self._last_break_notification = now
 
         # Fire outside the lock to avoid holding it during I/O
-        logger.info(f"Break reminder: {hours}h elapsed — auto-starting break")
-        if self._on_break_triggered:
-            self._on_break_triggered()
-        else:
-            send_notification(
-                "Time for a Break",
-                f"You've been working for {hours}h - take a short break!",
-            )
+        logger.info(f"Break reminder: {hours}h elapsed")
+        send_notification(
+            "Time for a Break",
+            f"You've been working for {hours}h - take a short break!",
+        )
 
     def _check_private(self, now: float) -> None:
         with self._lock:

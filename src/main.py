@@ -909,10 +909,7 @@ class BetterFlowApp:
         self.coordinator._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
-        self.reminder_manager = ReminderManager(
-            self.config.reminders,
-            on_break_triggered=self.coordinator.start_break,
-        )
+        self.reminder_manager = ReminderManager(self.config.reminders)
         self.coordinator.reminder_manager = self.reminder_manager
 
         # State
