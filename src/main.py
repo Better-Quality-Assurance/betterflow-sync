@@ -191,55 +191,70 @@ class SyncCoordinator:
             self.sync_engine.send_idle_event(idle_start)
 
     def start(self) -> None:
-        """Run the initial sync and start the periodic scheduler."""
+        """Start the scheduler and queue startup work without blocking UI."""
         # BackgroundScheduler.shutdown() is terminal -- create a fresh one
         # if the previous scheduler was shut down (e.g. after logout/re-login).
         if not self.scheduler.running:
             self.scheduler = BackgroundScheduler()
+            self.scheduler.add_job(
+                self._do_sync,
+                trigger=IntervalTrigger(seconds=self.config.sync.interval_seconds),
+                id="sync_job",
+                replace_existing=True,
+            )
+            # Unified 60s tick replaces 5 separate jobs (timer coalescing)
+            self.scheduler.add_job(
+                self._tick_60s,
+                trigger=IntervalTrigger(seconds=60),
+                id="tick_60s",
+                replace_existing=True,
+            )
+            # Expire stale queue events daily
+            self.scheduler.add_job(
+                self._expire_old_queue_events,
+                trigger=IntervalTrigger(hours=24),
+                id="queue_expire_job",
+                replace_existing=True,
+            )
+            # Refresh app categories every 6 hours
+            self.scheduler.add_job(
+                self.fetch_categories,
+                trigger=IntervalTrigger(hours=6),
+                id="category_refresh_job",
+                replace_existing=True,
+            )
+            # Refresh weekly/monthly trends every 30 minutes
+            self.scheduler.add_job(
+                self._fetch_trends,
+                trigger=IntervalTrigger(minutes=30),
+                id="trends_refresh_job",
+                replace_existing=True,
+            )
+            self.scheduler.start()
+            logger.info(
+                f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
+            )
 
-        self._do_sync()
-        self._fetch_trends()
-
+        now = datetime.now(timezone.utc)
         self.scheduler.add_job(
             self._do_sync,
-            trigger=IntervalTrigger(seconds=self.config.sync.interval_seconds),
-            id="sync_job",
+            trigger=DateTrigger(run_date=now),
+            id="startup_sync",
             replace_existing=True,
         )
-        # Unified 60s tick replaces 5 separate jobs (timer coalescing)
-        if sys.platform == "darwin":
-            self._check_permissions()
-        self.scheduler.add_job(
-            self._tick_60s,
-            trigger=IntervalTrigger(seconds=60),
-            id="tick_60s",
-            replace_existing=True,
-        )
-        # Expire stale queue events daily
-        self.scheduler.add_job(
-            self._expire_old_queue_events,
-            trigger=IntervalTrigger(hours=24),
-            id="queue_expire_job",
-            replace_existing=True,
-        )
-        # Refresh app categories every 6 hours
-        self.scheduler.add_job(
-            self.fetch_categories,
-            trigger=IntervalTrigger(hours=6),
-            id="category_refresh_job",
-            replace_existing=True,
-        )
-        # Refresh weekly/monthly trends every 30 minutes
         self.scheduler.add_job(
             self._fetch_trends,
-            trigger=IntervalTrigger(minutes=30),
-            id="trends_refresh_job",
+            trigger=DateTrigger(run_date=now),
+            id="startup_trends",
             replace_existing=True,
         )
-        self.scheduler.start()
-        logger.info(
-            f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
-        )
+        if sys.platform == "darwin":
+            self.scheduler.add_job(
+                self._check_permissions,
+                trigger=DateTrigger(run_date=now),
+                id="startup_permissions",
+                replace_existing=True,
+            )
 
     def stop(self) -> None:
         """Shut down the scheduler if running."""
@@ -911,6 +926,151 @@ class BetterFlowApp:
         self._pending_update_asset_url: Optional[str] = None
         self._pending_update_lock = threading.Lock()
         self._login_lock = threading.Lock()
+        self._startup_thread: Optional[threading.Thread] = None
+        self._system_events_started = False
+        self._system_events_lock = threading.Lock()
+        self._update_jobs_started = False
+        self._update_jobs_lock = threading.Lock()
+
+    def _set_startup_status(self, message: str) -> None:
+        """Keep the tray visible while background startup progresses."""
+        self.tray.set_state(TrayState.STARTING, message)
+
+    def _start_watchers(self) -> None:
+        """Start in-process watchers after the tracker server is available."""
+        if self.window_watcher:
+            self.window_watcher.start()
+        if self.input_watcher:
+            self.input_watcher.start()
+
+    def _ensure_system_event_listener(self) -> None:
+        """Start system event listeners once without blocking tray startup."""
+        with self._system_events_lock:
+            if self._system_events_started:
+                return
+            self._system_events_started = True
+        try:
+            from urllib.parse import urlparse
+
+            parsed_api = urlparse(self.config.api_url)
+            api_host = parsed_api.hostname or ""
+            api_port = parsed_api.port or (443 if parsed_api.scheme == "https" else 80)
+            start_system_event_listener(
+                on_sleep=self._on_system_sleep,
+                on_wake=self._on_system_wake,
+                on_shutdown=self._on_system_shutdown,
+                on_network_change=self._on_network_change,
+                on_screen_lock=self._on_screen_lock,
+                on_screen_unlock=self._on_screen_unlock,
+                reachability_host=api_host,
+                reachability_port=api_port,
+            )
+        except Exception:
+            logger.exception("Failed to start system event listeners")
+
+    def _ensure_update_checks_started(self) -> None:
+        """Kick off update checks once after the tray is already visible."""
+        if not self.config.check_updates:
+            return
+        with self._update_jobs_lock:
+            if self._update_jobs_started:
+                return
+            self._update_jobs_started = True
+        try:
+            check_for_update(
+                _VERSION,
+                channel=self.config.update_channel,
+                callback=self._on_update_available,
+            )
+            if self.coordinator.scheduler.running:
+                self.coordinator.scheduler.add_job(
+                    self._periodic_update_check,
+                    trigger=IntervalTrigger(hours=6),
+                    id="update_check_job",
+                    replace_existing=True,
+                )
+        except Exception:
+            logger.exception("Failed to start update checker")
+
+    def _finish_logged_in_startup(
+        self,
+        state,
+        *,
+        send_greeting: bool,
+        initial_permissions_delay_seconds: float = 5.0,
+    ) -> None:
+        """Complete post-login startup work after the tray is already visible."""
+        if self._shutdown_event.is_set():
+            return
+
+        self.coordinator.logged_in = True
+        self.tray.set_user(state.user_email, state.user_name, state.user_role)
+        self._set_startup_status("Loading your workspace...")
+
+        try:
+            self.sync_engine.fetch_server_config()
+        except Exception:
+            logger.exception("Failed to fetch server configuration during startup")
+
+        self.coordinator.fetch_projects()
+        self.coordinator.fetch_categories()
+        self._check_stale_session()
+        self.coordinator.start()
+        if self.config.check_updates and self.coordinator.scheduler.running:
+            self.coordinator.scheduler.add_job(
+                self._periodic_update_check,
+                trigger=IntervalTrigger(hours=6),
+                id="update_check_job",
+                replace_existing=True,
+            )
+        self._ensure_update_checks_started()
+
+        if send_greeting:
+            first_name = (state.user_name or "").split()[0] if state.user_name else ""
+            greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
+            send_notification(greeting, _day_greeting())
+
+        if sys.platform == "darwin" and self.coordinator.scheduler.running:
+            self.coordinator.scheduler.add_job(
+                self._check_permissions_initial,
+                "date",
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=initial_permissions_delay_seconds),
+                id="permissions_initial_check",
+                replace_existing=True,
+            )
+
+    def _background_startup(self, wizard_login_state=None) -> None:
+        """Restore session and services without delaying tray visibility."""
+        if not self._login_lock.acquire(timeout=1):
+            logger.warning("Startup init skipped: login lock busy")
+            return
+        try:
+            self._set_startup_status("Restoring session...")
+            if wizard_login_state and wizard_login_state.logged_in:
+                state = wizard_login_state
+            else:
+                state = self.login_manager.try_auto_login()
+            if self._shutdown_event.is_set():
+                return
+
+            self._set_startup_status("Starting trackers...")
+            self.aw_manager.start()
+            if self._shutdown_event.is_set():
+                return
+
+            self._start_watchers()
+            self._ensure_system_event_listener()
+
+            if state.logged_in:
+                self._finish_logged_in_startup(state, send_greeting=True)
+            else:
+                self.coordinator.logged_in = False
+                self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+                self._ensure_update_checks_started()
+
+            logger.info("Background startup complete")
+        finally:
+            self._login_lock.release()
 
     def run(self) -> None:
         """Run the application."""
@@ -945,81 +1105,16 @@ class BetterFlowApp:
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
 
-        # Try auto-login first (keychain), unless wizard already logged in
-        if wizard_login_state and wizard_login_state.logged_in:
-            state = wizard_login_state
-        else:
-            state = self.login_manager.try_auto_login()
+        self._set_startup_status("Starting...")
+        self._startup_thread = threading.Thread(
+            target=self._background_startup,
+            args=(wizard_login_state,),
+            daemon=True,
+            name="startup-thread",
+        )
+        self._startup_thread.start()
 
-        # Start bundled ActivityWatch
-        self.aw_manager.start()
-
-        # Start in-process watchers (after AW server is up)
-        if self.window_watcher:
-            self.window_watcher.start()
-        if self.input_watcher:
-            self.input_watcher.start()
-
-        if state.logged_in:
-            self.coordinator.logged_in = True
-            self.tray.set_user(state.user_email, state.user_name, state.user_role)
-            self.sync_engine.fetch_server_config()
-            self.coordinator.fetch_projects()
-            self.coordinator.fetch_categories()
-            self._check_stale_session()
-            self.coordinator.start()
-            first_name = (state.user_name or "").split()[0] if state.user_name else ""
-            greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
-            send_notification(greeting, _day_greeting())
-            # Check permissions after scheduler starts (non-blocking, 5s delay)
-            self.coordinator.scheduler.add_job(
-                self._check_permissions_initial,
-                "date",
-                run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
-                id="permissions_initial_check",
-                replace_existing=True,
-            )
-        else:
-            self.coordinator.logged_in = False
-            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
-
-        # Start system event listeners (non-critical: don't let failures prevent tray)
-        try:
-            from urllib.parse import urlparse
-            parsed_api = urlparse(self.config.api_url)
-            api_host = parsed_api.hostname or ""
-            api_port = parsed_api.port or (443 if parsed_api.scheme == "https" else 80)
-            start_system_event_listener(
-                on_sleep=self._on_system_sleep,
-                on_wake=self._on_system_wake,
-                on_shutdown=self._on_system_shutdown,
-                on_network_change=self._on_network_change,
-                on_screen_lock=self._on_screen_lock,
-                on_screen_unlock=self._on_screen_unlock,
-                reachability_host=api_host,
-                reachability_port=api_port,
-            )
-        except Exception:
-            logger.exception("Failed to start system event listeners")
-
-        # Check for updates in background (now + every 6 hours)
-        try:
-            if self.config.check_updates:
-                check_for_update(
-                    _VERSION,
-                    channel=self.config.update_channel,
-                    callback=self._on_update_available,
-                )
-                self.coordinator.scheduler.add_job(
-                    self._periodic_update_check,
-                    trigger=IntervalTrigger(hours=6),
-                    id="update_check_job",
-                    replace_existing=True,
-                )
-        except Exception:
-            logger.exception("Failed to start update checker")
-
-        logger.info("BetterFlow running")
+        logger.info("BetterFlow tray starting")
         try:
             self.tray.run_blocking()
         finally:
@@ -1170,13 +1265,11 @@ class BetterFlowApp:
                 self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
                 state = self.login_manager.login_via_browser()
                 if state.logged_in:
-                    self.coordinator.logged_in = True
-                    self.tray.set_user(state.user_email, state.user_name, state.user_role)
-                    self.sync_engine.fetch_server_config()
-                    self.coordinator.fetch_projects()
-                    self.coordinator.fetch_categories()
-                    if not self.coordinator.scheduler.running:
-                        self.coordinator.start()
+                    self._finish_logged_in_startup(
+                        state,
+                        send_greeting=False,
+                        initial_permissions_delay_seconds=1.0,
+                    )
                     first_name = (state.user_name or "").split()[0] if state.user_name else ""
                     greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
                     send_notification(greeting, _day_greeting())
@@ -1552,12 +1645,11 @@ class BetterFlowApp:
             if self._shutdown_event.is_set():
                 return
             if state.logged_in:
-                self.coordinator.logged_in = True
-                self.tray.set_user(state.user_email, state.user_name, state.user_role)
-                self.sync_engine.fetch_server_config()
-                self.coordinator.fetch_projects()
-                self.coordinator.fetch_categories()
-                self.coordinator.start()
+                self._finish_logged_in_startup(
+                    state,
+                    send_greeting=False,
+                    initial_permissions_delay_seconds=1.0,
+                )
                 first_name = (state.user_name or "").split()[0] if state.user_name else ""
                 greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
                 send_notification(greeting, _day_greeting())
