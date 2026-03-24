@@ -137,6 +137,7 @@ class SyncEngine:
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
         self._has_input_data = False  # Set to True when input buckets exist
+        self._latest_input_at: Optional[datetime] = None
         self._current_afk_events: list[AWEvent] = []  # AFK events for current sync cycle
         self._afk_watcher_available = False  # True when AFK buckets exist this cycle
 
@@ -316,9 +317,13 @@ class SyncEngine:
         with self._state_lock:
             self._afk_watcher_available = bool(afk_buckets)
 
-        # Fetch input events for activity analysis before processing window events
-        # Use 2x engagement window to ensure coverage for rolling window calculations
-        input_lookback_minutes = self.config.engagement.window_minutes * 2
+        # Fetch input events for activity analysis before processing window events.
+        # The lookback must cover both the engagement window and the full AFK
+        # grace period so we can cap counted time at last_input + afk_timeout.
+        input_lookback_minutes = max(
+            self.config.engagement.window_minutes * 2,
+            self.config.aw.afk_timeout_minutes + 2,
+        )
         input_events_for_analysis: list[AWEvent] = []
         for bucket in input_buckets:
             try:
@@ -332,6 +337,14 @@ class SyncEngine:
                 pass
         self._activity_analyzer.add_input_events(input_events_for_analysis)
         self._has_input_data = len(input_events_for_analysis) > 0
+        self._latest_input_at = None
+        for ev in input_events_for_analysis:
+            if ev.presses <= 0 and ev.clicks <= 0 and ev.scrolls <= 0:
+                continue
+
+            event_end = ev.timestamp + timedelta(seconds=ev.duration)
+            if self._latest_input_at is None or event_end > self._latest_input_at:
+                self._latest_input_at = event_end
 
         # Sync window buckets with gap-filling
         all_events = []
@@ -499,11 +512,8 @@ class SyncEngine:
                 stats.events_filtered += 1
                 continue
 
-            if (
-                bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
-                and not self._has_input_data
-            ):
-                transformed_events = self._transform_window_event_without_input(
+            if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+                transformed_events = self._transform_window_event_with_timeout(
                     event, bucket_id, bucket_type
                 )
             else:
@@ -602,19 +612,59 @@ class SyncEngine:
 
         return active_ranges
 
-    def _transform_window_event_without_input(
+    def _cap_ranges_to_input_timeout(
+        self,
+        ranges: list[tuple[datetime, datetime]],
+    ) -> list[tuple[datetime, datetime]]:
+        """Cap counted ranges at last confirmed input + AFK timeout."""
+        if self._latest_input_at is None:
+            return []
+
+        timeout_cutoff = self._latest_input_at + timedelta(
+            minutes=self.config.aw.afk_timeout_minutes
+        )
+        capped: list[tuple[datetime, datetime]] = []
+        for start, end in ranges:
+            if start >= timeout_cutoff:
+                continue
+
+            capped_end = min(end, timeout_cutoff)
+            if capped_end > start:
+                capped.append((start, capped_end))
+
+        return capped
+
+    def _transform_window_event_with_timeout(
         self,
         event: AWEvent,
         bucket_id: str,
         bucket_type: str,
     ) -> list[dict]:
-        """Transform only the non-AFK slices of a long window/web event."""
-        active_ranges = self._active_ranges_from_afk(event)
+        """Transform only the countable slices of a long window/web event."""
+        event_start = event.timestamp
+        event_end = event.timestamp + timedelta(seconds=event.duration)
+        ranges: list[tuple[datetime, datetime]] = [(event_start, event_end)]
+
+        if not self._has_input_data:
+            ranges = self._active_ranges_from_afk(event)
+
+        if self._has_input_data:
+            active_ranges = self._cap_ranges_to_input_timeout(ranges)
+        else:
+            active_ranges = ranges
+        if not active_ranges and self._has_input_data:
+            logger.info(
+                "Window event skipped after inactivity cutoff: "
+                f"event={event.timestamp.isoformat()}->"
+                f"{event_end.isoformat()}"
+            )
+            return []
+
         if not active_ranges:
             logger.info(
-                "Window event fully overlapped by AFK; skipping counted segment: "
+                "Window event skipped after inactivity cutoff/AFK overlap: "
                 f"event={event.timestamp.isoformat()}->"
-                f"{(event.timestamp + timedelta(seconds=event.duration)).isoformat()}"
+                f"{event_end.isoformat()}"
             )
             return []
 
@@ -634,7 +684,7 @@ class SyncEngine:
                 segment_event,
                 bucket_id,
                 bucket_type,
-                forced_activity_state="active",
+                forced_activity_state=None if self._has_input_data else "active",
                 custom_event_id=f"{event.id}:{idx}",
             )
             if transformed_event:

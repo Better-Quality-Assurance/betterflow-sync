@@ -172,6 +172,7 @@ class TestSyncEngine:
         """Long window events should count only their non-AFK slices."""
         self.engine._has_input_data = False
         now = datetime.now(timezone.utc)
+        self.engine._latest_input_at = now
         self.engine._current_afk_events = [
             AWEvent(
                 id=20,
@@ -207,6 +208,7 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""
         self.engine._has_input_data = False
+        self.engine._latest_input_at = datetime.now(timezone.utc)
         self.engine._current_afk_events = []
         now = datetime.now(timezone.utc)
         event = AWEvent(
@@ -228,6 +230,53 @@ class TestSyncEngine:
         assert transformed[0]["duration"] == 60.0
         assert transformed[0]["activity_state"] == "active"
         self.time_tracker.add_active_time.assert_called_once()
+
+    def test_transform_and_checkpoint_caps_counting_at_input_timeout(self):
+        """Counted time must stop at last_input + afk_timeout."""
+        self.engine._has_input_data = True
+        self.engine._latest_input_at = datetime.now(timezone.utc)
+        now = self.engine._latest_input_at - timedelta(minutes=5)
+        event = AWEvent(
+            id=23,
+            timestamp=now,
+            duration=20 * 60.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+        stats = Mock(events_filtered=0)
+
+        transformed, _ = self.engine._transform_and_checkpoint(
+            [event],
+            "bucket-123",
+            BUCKET_TYPE_WINDOW,
+            stats,
+        )
+
+        assert len(transformed) == 1
+        assert transformed[0]["duration"] == 15 * 60.0
+        self.time_tracker.add_active_time.assert_called_once()
+        assert self.time_tracker.add_active_time.call_args[0][0] == 15 * 60.0
+
+    def test_transform_and_checkpoint_skips_window_after_timeout(self):
+        """A window fully beyond last_input + afk_timeout must not count."""
+        self.engine._has_input_data = True
+        self.engine._latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+        event = AWEvent(
+            id=24,
+            timestamp=datetime.now(timezone.utc),
+            duration=120.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+        stats = Mock(events_filtered=0)
+
+        transformed, _ = self.engine._transform_and_checkpoint(
+            [event],
+            "bucket-123",
+            BUCKET_TYPE_WINDOW,
+            stats,
+        )
+
+        assert transformed == []
+        self.time_tracker.add_active_time.assert_not_called()
 
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
