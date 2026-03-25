@@ -799,7 +799,7 @@ class TestSyncCoordinatorBreak:
     def test_start_break_sets_flag(self):
         """start_break sets _on_break."""
         self.coordinator.start_break()
-        assert self.coordinator._on_break is True
+        assert self.coordinator.break_mgr._on_break is True
         self.sync_engine.pause.assert_called_once()
 
     def test_double_start_break_is_idempotent(self):
@@ -810,20 +810,20 @@ class TestSyncCoordinatorBreak:
 
     def test_end_break_clears_flag(self):
         """end_break clears _on_break."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = False
         self.coordinator.end_break()
-        assert self.coordinator._on_break is False
+        assert self.coordinator.break_mgr._on_break is False
         self.sync_engine.resume.assert_called_once()
 
     def test_end_break_restores_paused_state(self):
         """end_break should not resume if app was paused before break."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
-        self.coordinator._pre_break_paused = True
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._pre_break_paused = True
+        self.coordinator.break_mgr._pre_break_private = False
 
         self.coordinator.end_break()
 
@@ -837,10 +837,10 @@ class TestSyncCoordinatorBreak:
         end_break() must un-pause it (resume) before re-applying private mode.
         This ensures both flags are consistent: paused=False, private=True.
         """
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = True
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = True
 
         self.coordinator.end_break()
 
@@ -850,49 +850,49 @@ class TestSyncCoordinatorBreak:
 
     def test_end_break_silent_no_notification(self):
         """end_break(silent=True) should not send notification."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = False
 
-        with patch("src.main.send_notification") as mock_notify:
+        with patch("src.break_manager.send_notification") as mock_notify:
             self.coordinator.end_break(silent=True)
             mock_notify.assert_not_called()
 
     def test_end_break_too_soon_rejected_without_force(self):
         """end_break() is a no-op when called < 60s after start (scheduler race guard)."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=10)
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=10)
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = False
 
         self.coordinator.end_break(force=False)
 
-        assert self.coordinator._on_break is True
+        assert self.coordinator.break_mgr._on_break is True
         self.sync_engine.resume.assert_not_called()
 
     def test_end_break_force_bypasses_60s_guard(self):
         """end_break(force=True) succeeds even when < 60s have elapsed."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = datetime.now(timezone.utc) - timedelta(seconds=5)
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=5)
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = False
 
         self.coordinator.end_break(force=True)
 
-        assert self.coordinator._on_break is False
+        assert self.coordinator.break_mgr._on_break is False
         self.sync_engine.resume.assert_called_once()
 
     def test_end_break_no_timestamp_without_force_rejected(self):
         """end_break() is a no-op when _break_start is None and force=False."""
-        self.coordinator._on_break = True
-        self.coordinator._break_start = None
-        self.coordinator._pre_break_paused = False
-        self.coordinator._pre_break_private = False
+        self.coordinator.break_mgr._on_break = True
+        self.coordinator.break_mgr._break_start = None
+        self.coordinator.break_mgr._pre_break_paused = False
+        self.coordinator.break_mgr._pre_break_private = False
 
         self.coordinator.end_break(force=False)
 
-        assert self.coordinator._on_break is True
+        assert self.coordinator.break_mgr._on_break is True
         self.sync_engine.resume.assert_not_called()
 
 

@@ -92,13 +92,13 @@ def _start_macos_power_listener(
         def handleSleep_(self, notification):
             if not state["sleeping"]:
                 state["sleeping"] = True
-                logger.info("System sleep detected — pausing")
+                logger.info("System sleep detected on %s - pausing", threading.current_thread().name)
                 _safe_call(on_sleep)
 
         def handleWake_(self, notification):
             if state["sleeping"]:
                 state["sleeping"] = False
-                logger.info("System wake detected — resuming")
+                logger.info("System wake detected on %s - resuming", threading.current_thread().name)
                 _safe_call(on_wake)
 
         def handleShutdown_(self, notification):
@@ -141,11 +141,11 @@ def _start_macos_power_listener(
 
         logger.debug("macOS power event listener started")
         try:
-            # NSWorkspace.notificationCenter() delivers on the main thread,
-            # not on the observer's thread.  NSRunLoop.runMode_beforeDate_
-            # returns immediately here (no run-loop sources) causing 100% CPU.
-            # Block with _stop_event.wait() instead — the observer is retained
-            # by the notification center regardless of run-loop state.
+            # NSWorkspace.notificationCenter() delivers notifications via
+            # pystray's NSApplication run loop on the main thread, not on
+            # this observer thread.  A run loop here would spin at 100% CPU
+            # with no sources.  _stop_event.wait() keeps the thread alive
+            # (retaining the observer ref) while the main thread dispatches.
             _stop_event.wait()
         finally:
             center.removeObserver_(observer)
@@ -181,6 +181,8 @@ def _start_macos_screen_lock_listener(
                 _safe_call(on_unlock)
 
     def run_loop():
+        from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+
         observer = _LockObserver.alloc().init()
         center = NSDistributedNotificationCenter.defaultCenter()
 
@@ -199,11 +201,16 @@ def _start_macos_screen_lock_listener(
 
         logger.debug("macOS screen lock listener started")
         try:
-            # NSDistributedNotificationCenter delivers on the main thread's
-            # run loop, not on this background thread.  runMode_beforeDate_
-            # returns immediately here (no run-loop sources) causing 100% CPU.
-            # Block with _stop_event.wait() instead.
-            _stop_event.wait()
+            # NSDistributedNotificationCenter requires an active run loop
+            # on the observer thread to deliver notifications (unlike
+            # NSWorkspace.notificationCenter which uses the main thread).
+            # Run the loop in 5s intervals so _stop_event can interrupt.
+            loop = NSRunLoop.currentRunLoop()
+            while not _stop_event.is_set():
+                loop.runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(5.0),
+                )
         finally:
             center.removeObserver_(observer)
 

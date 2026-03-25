@@ -4,12 +4,14 @@ Supports both ZIP and DMG formats (macOS uses DMG, Windows uses ZIP).
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
@@ -120,8 +122,8 @@ def apply_update(
                 _status("No .app found in update archive - aborted")
                 return False
 
-            # 3b. Verify code signature before installing
-            if not _verify_codesign(new_app):
+            # 3b. Verify code signature and downgrade protection
+            if not _verify_codesign(new_app, current_app_path=app_path):
                 _status("Code signature verification failed - update aborted")
                 return False
 
@@ -273,11 +275,61 @@ def _fix_permissions(app_path: Path) -> None:
                     logger.warning(f"Failed to set execute permission on {tracker}")
 
 
-def _verify_codesign(app_path: Path) -> bool:
+@dataclass(frozen=True)
+class _SigningInfo:
+    is_signed: bool
+    team_id: Optional[str]
+    version: Optional[str]
+
+
+def _get_signing_info(app_path: Path) -> _SigningInfo:
+    """Extract signing and version info from a macOS .app bundle."""
+    is_signed = False
+    team_id = None
+    version = None
+
+    # Get signing info via codesign
+    try:
+        result = subprocess.run(
+            ["codesign", "--display", "--verbose=2", str(app_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        stderr = result.stderr  # codesign writes to stderr
+        if result.returncode == 0:
+            is_signed = True
+            # Extract TeamIdentifier from output like "TeamIdentifier=ABC123XYZ"
+            match = re.search(r"TeamIdentifier=(\S+)", stderr)
+            if match and match.group(1) != "not set":
+                team_id = match.group(1)
+        elif "code object is not signed at all" in stderr:
+            is_signed = False
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Get version from Info.plist
+    plist_path = app_path / "Contents" / "Info.plist"
+    if plist_path.exists():
+        try:
+            result = subprocess.run(
+                ["defaults", "read", str(plist_path), "CFBundleShortVersionString"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                version = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    return _SigningInfo(is_signed=is_signed, team_id=team_id, version=version)
+
+
+def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) -> bool:
     """Verify macOS code signature on the extracted .app bundle.
 
-    Allows unsigned apps (unsigned-to-unsigned update is fine).
-    Only rejects apps with an invalid/tampered signature.
+    Checks:
+    1. Signature integrity (tampered signatures rejected)
+    2. Signed->unsigned downgrade rejected
+    3. Team ID mismatch rejected
+    4. Version downgrade rejected
     """
     try:
         result = subprocess.run(
@@ -286,20 +338,60 @@ def _verify_codesign(app_path: Path) -> bool:
         )
         if result.returncode == 0:
             logger.info("Code signature verified successfully")
-            return True
-        stderr = result.stderr.strip()
-        # "code object is not signed at all" means unsigned - acceptable for unsigned-to-unsigned
-        if "code object is not signed at all" in stderr:
-            logger.info("App is unsigned - allowing update (unsigned-to-unsigned)")
-            return True
-        logger.error(f"codesign verification failed: {stderr}")
-        return False
+        else:
+            stderr = result.stderr.strip()
+            if "code object is not signed at all" in stderr:
+                logger.info("New app is unsigned")
+            else:
+                logger.error(f"codesign verification failed: {stderr}")
+                return False
     except FileNotFoundError:
         logger.warning("codesign binary not found - skipping verification")
         return True
     except subprocess.TimeoutExpired:
         logger.error("codesign verification timed out")
         return False
+
+    # Downgrade protection: compare against current app if provided
+    if current_app_path is not None:
+        current = _get_signing_info(current_app_path)
+        new = _get_signing_info(app_path)
+
+        # Reject signed -> unsigned downgrade
+        if current.is_signed and not new.is_signed:
+            logger.error("Rejecting update: current app is signed but update is unsigned")
+            return False
+
+        # Reject team ID mismatch
+        if current.team_id and new.team_id and current.team_id != new.team_id:
+            logger.error(
+                f"Rejecting update: team ID mismatch (current={current.team_id}, new={new.team_id})"
+            )
+            return False
+
+        # Reject version downgrade
+        if current.version and new.version:
+            try:
+                from packaging.version import Version
+                if Version(new.version) < Version(current.version):
+                    logger.error(
+                        f"Rejecting update: version downgrade ({current.version} -> {new.version})"
+                    )
+                    return False
+            except Exception:
+                # packaging not available or invalid version strings - compare as tuples
+                try:
+                    cur_parts = tuple(int(x) for x in current.version.split("."))
+                    new_parts = tuple(int(x) for x in new.version.split("."))
+                    if new_parts < cur_parts:
+                        logger.error(
+                            f"Rejecting update: version downgrade ({current.version} -> {new.version})"
+                        )
+                        return False
+                except ValueError:
+                    logger.warning("Could not compare versions, allowing update")
+
+    return True
 
 
 def apply_update_async(

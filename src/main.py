@@ -29,6 +29,11 @@ try:
     from .ui.permissions import check_accessibility, open_accessibility_settings
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
+    from .break_manager import BreakManager
+    from .idle_manager import IdleManager
+    from .hours_tracker import HoursTracker
+    from .update_handler import UpdateHandler
+    from .system_event_handler import SystemEventHandler
 except ImportError:
     from src import __version__
     from auth import KeychainManager, LoginManager
@@ -42,6 +47,11 @@ except ImportError:
     from ui.permissions import check_accessibility, open_accessibility_settings
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
+    from break_manager import BreakManager
+    from idle_manager import IdleManager
+    from hours_tracker import HoursTracker
+    from update_handler import UpdateHandler
+    from system_event_handler import SystemEventHandler
 
 # Import send_notification at module level so tests can patch src.main.send_notification
 try:
@@ -50,6 +60,11 @@ except ImportError:
     from notifications import send_notification, clear_notifications  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
+
+# Lock ordering (acquire outer-to-inner, never reverse):
+#   _shutdown_lock > _login_lock > _sync_lock > _break_lock
+#   > _state_lock > _pause_state_lock > _pending_update_lock
+#   > tray.model.lock
 
 
 def _greeting() -> str:
@@ -105,41 +120,21 @@ class SyncCoordinator:
         self.reminder_manager = reminder_manager
 
         self.scheduler = BackgroundScheduler()
-        self._hours_today_seconds = 0
-        self._hours_today_cache = "0h 0m"
         self._last_tick: Optional[datetime] = None
-        self._trends_cache: dict[str, str] = {
-            "hours_this_week": "---",
-            "hours_this_month": "---",
-            "daily_avg_this_week": "---",
-        }
 
-        # Flags set by the app layer — protected by _state_lock
+        # Flags set by the app layer - protected by _state_lock
         self._logged_in = False
         self._paused_by_network = False
-        self._on_break = False
-        self._break_start: Optional[datetime] = None
-        self._idle_paused = False
-        self._idle_start: Optional[datetime] = None
         self._state_lock = threading.Lock()
-        self._break_lock = threading.Lock()
-        self._pre_break_paused = False
-        self._pre_break_private = False
         self._sync_lock = threading.Lock()
 
-        # Idle pause threshold (seconds) — back off syncing if AFK this long
-        self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
-        # Sync interval during idle (seconds) — slower than active but not stopped
-        self._IDLE_SYNC_INTERVAL = 300
-
-        # Dedup guard: skip _refresh_hours_today if fetched recently by _do_sync
-        self._last_hours_refresh: float = 0.0
+        # Sub-managers (own their locks)
+        self.break_mgr = BreakManager(sync_engine, tray, self.scheduler, config, reminder_manager)
+        self.idle_mgr = IdleManager(sync_engine, tray, aw, config)
+        self.hours = HoursTracker(bf, sync_engine, tray)
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
-
-        # Optional callback to pause/resume input watcher on idle
-        self._on_idle_pause: Optional[Callable[[bool], None]] = None
 
     @property
     def logged_in(self) -> bool:
@@ -163,32 +158,13 @@ class SyncCoordinator:
 
     @property
     def idle_paused(self) -> bool:
-        with self._state_lock:
-            return self._idle_paused
+        return self.idle_mgr.idle_paused
 
     def clear_idle_pause(self, send_event: bool = True) -> None:
-        """Clear idle pause state and optionally send the idle_time event.
-
-        Called by the app layer on manual resume, screen unlock, wake, etc.
-        """
-        with self._state_lock:
-            was_paused = self._idle_paused
-            idle_start = self._idle_start
-            self._idle_paused = False
-            self._idle_start = None
-        if was_paused and send_event and idle_start:
-            self.sync_engine.send_idle_event(idle_start)
-        if was_paused and self._on_idle_pause:
-            self._on_idle_pause(False)
+        self.idle_mgr.clear_idle_pause(send_event=send_event)
 
     def flush_idle_event(self) -> None:
-        """Send idle_time event for current idle period (e.g. on shutdown)."""
-        with self._state_lock:
-            idle_start = self._idle_start
-            self._idle_start = None
-            self._idle_paused = False
-        if idle_start:
-            self.sync_engine.send_idle_event(idle_start)
+        self.idle_mgr.flush_idle_event()
 
     def start(self) -> None:
         """Start the scheduler and queue startup work without blocking UI."""
@@ -276,143 +252,13 @@ class SyncCoordinator:
 
     @property
     def is_on_break(self) -> bool:
-        """Thread-safe read of break state."""
-        with self._break_lock:
-            return self._on_break
+        return self.break_mgr.is_on_break
 
     def start_break(self) -> None:
-        """Begin an auto-break: pause sync, amber tray, schedule auto-resume."""
-        # Read engine state BEFORE acquiring _break_lock to preserve lock ordering:
-        # SyncEngine._state_lock must never be acquired while _break_lock is held.
-        # Snapshot twice: once outside the lock, then re-check inside to close the
-        # TOCTOU window where user could pause between read and lock acquisition.
-        pre_break_private = self.sync_engine.is_private
-        with self._break_lock:
-            if self._on_break:
-                return
-            # Re-read is_paused inside the lock to close the race window.
-            # Safe because _break_lock never nests inside _state_lock elsewhere.
-            already_paused = self.sync_engine.is_paused
-            if already_paused:
-                return
-            self._on_break = True
-            self._break_start = datetime.now(timezone.utc)
-            self._pre_break_paused = False
-            self._pre_break_private = pre_break_private
-
-        self.sync_engine.pause()
-        duration = self.config.reminders.break_duration_minutes
-
-        with self.tray.model.lock:
-            self.tray.model.on_break = True
-            self.tray.model.break_minutes_left = duration
-        self.tray.set_state(TrayState.ON_BREAK)
-
-        if self.reminder_manager:
-            self.reminder_manager.on_break_started()
-
-        # Schedule auto-resume (timezone-aware to avoid APScheduler deprecation warning)
-        run_date = datetime.now(timezone.utc) + timedelta(minutes=duration)
-        if self.scheduler.running:
-            self.scheduler.add_job(
-                self.end_break,
-                trigger=DateTrigger(run_date=run_date),
-                id="auto_break_end",
-                replace_existing=True,
-            )
-            # Countdown job updates minutes-left every 60s
-            self.scheduler.add_job(
-                self._update_break_countdown,
-                trigger=IntervalTrigger(seconds=60),
-                id="break_countdown",
-                replace_existing=True,
-            )
-
-        send_notification(
-            "Break Time",
-            f"Tracking paused for {duration} minutes. Enjoy your break!",
-        )
-        logger.info(f"Auto-break started ({duration}m)")
+        self.break_mgr.start_break()
 
     def end_break(self, silent: bool = False, force: bool = False) -> None:
-        """End the auto-break: resume sync, restore pre-break tray state.
-
-        Args:
-            silent: If True, skip the "Break Over" notification.
-            force: If True, skip the minimum duration guard (for user-initiated end).
-        """
-        with self._break_lock:
-            if not self._on_break:
-                return
-            # State corruption guard: _break_start should always be set
-            if not self._break_start:
-                logger.warning("end_break: _break_start is None (state corruption)")
-                # Still allow forced calls to clear the break flag
-                if not force:
-                    return
-            # Guard: don't auto-end a break that just started (< 60s).
-            # Prevents notification spam from scheduler races or rapid state transitions.
-            if not force and self._break_start:
-                elapsed = (datetime.now(timezone.utc) - self._break_start).total_seconds()
-                if elapsed < 60:
-                    logger.warning(
-                        f"Ignoring premature end_break after {elapsed:.0f}s "
-                        f"(minimum 60s, silent={silent})"
-                    )
-                    return
-            self._on_break = False
-            break_start = self._break_start
-            self._break_start = None
-            pre_break_paused = self._pre_break_paused
-            pre_break_private = self._pre_break_private
-
-        # Send break event to backend
-        if break_start:
-            self.sync_engine.send_break_event(break_start)
-
-        with self.tray.model.lock:
-            self.tray.model.on_break = False
-            self.tray.model.break_minutes_left = 0
-
-        # Restore pre-break state instead of blindly resuming
-        if pre_break_private:
-            # Engine was paused by start_break(); un-pause it then re-enable private
-            # mode so both flags are consistent (paused=False, private=True).
-            self.sync_engine.resume()
-            self.sync_engine.set_private_mode(True)
-            self.tray.set_state(TrayState.PRIVATE)
-        elif pre_break_paused:
-            self.tray.set_state(TrayState.PAUSED)
-        else:
-            self.sync_engine.resume()
-            self.tray.set_state(TrayState.SYNCING)
-
-        if self.reminder_manager:
-            self.reminder_manager.on_break_ended()
-            if not pre_break_paused and not pre_break_private:
-                self.reminder_manager.on_tracking_started()
-
-        # Remove scheduled jobs
-        if self.scheduler.running:
-            for job_id in ("auto_break_end", "break_countdown"):
-                try:
-                    self.scheduler.remove_job(job_id)
-                except Exception:
-                    logger.debug("Could not remove break job %s (already gone)", job_id)
-
-        if not silent:
-            send_notification(
-                "Break Over",
-                "Tracking resumed - welcome back!",
-            )
-        logger.info("Auto-break ended")
-
-    def _update_break_countdown(self) -> None:
-        """Decrement the break minutes-left counter for tray display."""
-        with self.tray.model.lock:
-            if self.tray.model.break_minutes_left > 0:
-                self.tray.model.break_minutes_left -= 1
-        self.tray._update_menu()
+        self.break_mgr.end_break(silent=silent, force=force)
 
     def fetch_projects(self) -> None:
         """Fetch available projects from API and set on tray."""
@@ -501,102 +347,13 @@ class SyncCoordinator:
         if sys.platform == "darwin":
             self._check_permissions()
 
-    @staticmethod
-    def _get_system_idle_seconds() -> Optional[float]:
-        """Query macOS HIDIdleTime for system-level idle duration.
-
-        Returns seconds since last keyboard/mouse input, or None on failure.
-        """
-        if sys.platform != "darwin":
-            return None
-        try:
-            import subprocess as _sp
-            out = _sp.check_output(
-                ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
-                timeout=5,
-                text=True,
-            )
-            for line in out.splitlines():
-                if "HIDIdleTime" in line and "=" in line:
-                    val = line.split("=")[-1].strip()
-                    try:
-                        return int(val) / 1_000_000_000  # nanoseconds -> seconds
-                    except ValueError:
-                        logger.debug(f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}")
-                        return None
-        except Exception as e:
-            logger.debug(f"_get_system_idle_seconds failed: {e}")
-        return None
-
     def _check_idle_status(self) -> None:
-        """Check AFK bucket — pause sync if user idle for 20+ minutes.
-
-        Falls back to macOS system idle time when AFK buckets are
-        unavailable (e.g. bf-idle-tracker not running).
-        """
-        if not self.logged_in:
-            return
-
-        with self._state_lock:
-            was_idle_paused = self._idle_paused
-
-        # When not idle-paused, skip if user/break/private already paused sync
-        if not was_idle_paused:
-            if self.sync_engine.is_paused or self.sync_engine.is_private:
-                return
-            with self._break_lock:
-                if self._on_break:
-                    return
-
-        try:
-            is_afk = False
-            afk_duration = 0.0
-            idle_start: Optional[datetime] = None
-
-            afk_buckets = self.aw.get_afk_buckets()
-            if afk_buckets:
-                events = self.aw.get_events(afk_buckets[0].id, limit=1)
-                if events:
-                    latest = events[0]
-                    is_afk = latest.status == "afk"
-                    afk_duration = latest.duration
-                    idle_start = latest.timestamp
-            else:
-                # Fallback: query macOS system idle time when AFK watcher
-                # is unavailable (e.g. bf-idle-tracker crashed or not started).
-                system_idle = self._get_system_idle_seconds()
-                if system_idle is not None:
-                    is_afk = system_idle >= self._idle_pause_threshold
-                    afk_duration = system_idle
-                    idle_start = datetime.now(timezone.utc) - timedelta(seconds=system_idle)
-
-            if is_afk and afk_duration >= self._idle_pause_threshold:
-                if not was_idle_paused:
-                    if idle_start is None:
-                        idle_start = datetime.now(timezone.utc)
-                    logger.info(
-                        f"User idle for {int(afk_duration)}s (>= {self._idle_pause_threshold}s) "
-                        f"— backing off sync to {self._IDLE_SYNC_INTERVAL}s"
-                    )
-                    with self._state_lock:
-                        self._idle_paused = True
-                        self._idle_start = idle_start
-                    # Back off sync interval instead of full pause — keeps
-                    # heartbeats and queue processing alive at reduced frequency.
-                    self.reschedule(self._IDLE_SYNC_INTERVAL)
-                    self.tray.set_state(TrayState.PAUSED, "Idle")
-                    if self._on_idle_pause:
-                        self._on_idle_pause(True)
-            else:
-                if was_idle_paused:
-                    logger.info("User active again — restoring normal sync interval")
-                    self.clear_idle_pause(send_event=True)
-                    self.reschedule(self.config.sync.interval_seconds)
-                    self.tray.set_state(TrayState.SYNCING)
-                    self.trigger_sync("idle_resume_sync")
-
-        except Exception as e:
-            logger.debug(f"Idle check error: {e}")
+        self.idle_mgr.check_idle_status(
+            logged_in=self.logged_in,
+            is_on_break=self.is_on_break,
+            reschedule=self.reschedule,
+            trigger_sync=self.trigger_sync,
+        )
 
     _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
 
@@ -632,10 +389,9 @@ class SyncCoordinator:
                 self.tray.set_state(TrayState.PRIVATE)
                 return
 
-            with self._break_lock:
-                if self._on_break:
-                    self.tray.set_state(TrayState.ON_BREAK)
-                    return
+            if self.break_mgr.is_on_break:
+                self.tray.set_state(TrayState.ON_BREAK)
+                return
 
             # idle_paused: sync still runs at reduced interval (_IDLE_SYNC_INTERVAL)
             # so no early return here — just update tray state
@@ -721,84 +477,16 @@ class SyncCoordinator:
             self._sync_lock.release()
 
     def _fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API (source of truth)."""
-        try:
-            status = self.bf.get_status()
-            summary = status.get("data", {}).get("today_summary", {})
-            tracked_seconds = summary.get("tracked_seconds")
-
-            if tracked_seconds is None:
-                # Older backends still expose only active_seconds, which is too
-                # strict for the new "count tracked time until AFK" rule.
-                total_seconds = int(self.sync_engine.get_today_active_time().total_seconds())
-            else:
-                total_seconds = int(tracked_seconds)
-
-            clamped = max(0, total_seconds)
-            formatted = self._format_hours(clamped)
-            with self._state_lock:
-                self._hours_today_seconds = clamped
-                self._hours_today_cache = formatted
-            self._last_hours_refresh = time.monotonic()
-            return formatted
-        except Exception as e:
-            logger.debug(f"_fetch_hours_today failed: {e}")
-            return self._hours_today_cache
+        return self.hours.fetch_hours_today()
 
     def _refresh_hours_today(self) -> None:
-        """Refresh tray hours from server.
-
-        Always runs (even when paused/private) so the tray resets to
-        ``0h 0m`` at midnight instead of showing yesterday's stale value.
-        Skips if _fetch_hours_today ran recently (e.g. from _do_sync).
-        """
-        try:
-            if not self.logged_in:
-                logger.debug("_refresh_hours: skipped (not logged in)")
-                return
-
-            if time.monotonic() - self._last_hours_refresh < 30:
-                return  # _do_sync already refreshed recently
-
-            hours = self._fetch_hours_today()
-            self.tray.update_stats(hours_today=hours)
-        except Exception as e:
-            logger.warning(f"Failed to refresh tray hours: {e}")
+        self.hours.refresh_hours_today(logged_in=self.logged_in)
 
     def _fetch_trends(self) -> None:
-        """Fetch weekly/monthly trend data from server."""
-        try:
-            if not self.logged_in:
-                return
-            response = self.bf.get_trends()
-            data = response.get("data", {})
-            cache = {
-                "hours_this_week": self._format_hours(int(data.get("week_total_seconds", 0))),
-                "hours_this_month": self._format_hours(int(data.get("month_total_seconds", 0))),
-                "daily_avg_this_week": self._format_hours(int(data.get("week_daily_avg_seconds", 0))),
-            }
-            with self._state_lock:
-                self._trends_cache = cache
-            self.tray.update_stats(**cache)
-        except Exception as e:
-            logger.debug(f"Failed to fetch trends: {e}")
+        self.hours.fetch_trends(logged_in=self.logged_in)
 
     def reset_trends(self) -> None:
-        """Reset cached trends and hours to placeholder values."""
-        with self._state_lock:
-            self._hours_today_seconds = 0
-            self._hours_today_cache = "0h 0m"
-            self._trends_cache = {
-                "hours_this_week": "---",
-                "hours_this_month": "---",
-                "daily_avg_this_week": "---",
-            }
-        self.tray.update_stats(
-            hours_today="0h 0m",
-            hours_this_week="---",
-            hours_this_month="---",
-            daily_avg_this_week="---",
-        )
+        self.hours.reset()
 
     def _expire_old_queue_events(self) -> None:
         """Remove queue events older than 30 days."""
@@ -809,10 +497,7 @@ class SyncCoordinator:
 
     @staticmethod
     def _format_hours(total_seconds: int) -> str:
-        """Format accumulated seconds as `Xh Ym` for tray display."""
-        hours = int(total_seconds) // 3600
-        minutes = (int(total_seconds) % 3600) // 60
-        return f"{hours}h {minutes}m"
+        return HoursTracker.format_hours(total_seconds)
 
 class BetterFlowApp:
     """Main application orchestrator.
@@ -911,28 +596,36 @@ class BetterFlowApp:
             aw_manager=self.aw_manager,
         )
         self.coordinator._on_auth_error = self._on_login
-        self.coordinator._on_idle_pause = self._on_idle_pause
+        self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(self.config.reminders)
         self.coordinator.reminder_manager = self.reminder_manager
+        self.coordinator.break_mgr.reminder_manager = self.reminder_manager
 
         # State
         self._shutdown_done = False
         self._shutdown_lock = threading.Lock()
         self._shutdown_event = threading.Event()
-        self._pause_state_lock = threading.Lock()
-        self._user_paused = False
-        self._pre_sleep_private = False
-        self._pre_lock_private = False
-        self._pending_update_asset_url: Optional[str] = None
-        self._pending_update_lock = threading.Lock()
+        self._pause_state_lock = threading.RLock()
         self._login_lock = threading.Lock()
         self._startup_thread: Optional[threading.Thread] = None
         self._system_events_started = False
         self._system_events_lock = threading.Lock()
-        self._update_jobs_started = False
-        self._update_jobs_lock = threading.Lock()
+
+        # Sub-handlers
+        self.update_handler = UpdateHandler(self.tray, self.config, self.coordinator, _VERSION)
+        self.sys_events = SystemEventHandler(
+            sync_engine=self.sync_engine,
+            tray=self.tray,
+            coordinator=self.coordinator,
+            reminder_manager=self.reminder_manager,
+            bf=self.bf,
+            aw=self.aw,
+            pause_state_lock=self._pause_state_lock,
+            shutdown_fn=self._shutdown,
+        )
+        self.sys_events.update_handler = self.update_handler
 
     def _set_startup_status(self, message: str) -> None:
         """Keep the tray visible while background startup progresses."""
@@ -971,28 +664,7 @@ class BetterFlowApp:
             logger.exception("Failed to start system event listeners")
 
     def _ensure_update_checks_started(self) -> None:
-        """Kick off update checks once after the tray is already visible."""
-        if not self.config.check_updates:
-            return
-        with self._update_jobs_lock:
-            if self._update_jobs_started:
-                return
-            self._update_jobs_started = True
-        try:
-            check_for_update(
-                _VERSION,
-                channel=self.config.update_channel,
-                callback=self._on_update_available,
-            )
-            if self.coordinator.scheduler.running:
-                self.coordinator.scheduler.add_job(
-                    self._periodic_update_check,
-                    trigger=IntervalTrigger(hours=6),
-                    id="update_check_job",
-                    replace_existing=True,
-                )
-        except Exception:
-            logger.exception("Failed to start update checker")
+        self.update_handler.ensure_update_checks_started()
 
     def _finish_logged_in_startup(
         self,
@@ -1136,87 +808,10 @@ class BetterFlowApp:
         open_accessibility_settings()
 
     def _try_auto_install(self) -> None:
-        """Auto-install a pending update if conditions are met."""
-        # Snapshot model state before acquiring _pending_update_lock to
-        # avoid nested lock acquisition (model.lock then _pending_update_lock
-        # elsewhere would deadlock with the reverse order here).
-        with self.tray.model.lock:
-            update_in_progress = self.tray.model.update_in_progress
-        if update_in_progress:
-            return
-        with self._pending_update_lock:
-            url = self._pending_update_asset_url
-            if not url or not self.config.auto_install_updates:
-                return
-            self._pending_update_asset_url = None
-        logger.info("Auto-installing pending update (user is idle)")
-        send_notification("BetterFlow Update", "Downloading update, app will restart when complete.")
-        self._on_install_update(url)
-
-    def _on_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
-        """Handle update available notification."""
-        logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
-        self.tray.set_update_available(version, url, asset_url)
-        if asset_url and self.config.auto_install_updates:
-            with self._pending_update_lock:
-                self._pending_update_asset_url = asset_url
-            if self.coordinator.idle_paused:
-                self._try_auto_install()
-            else:
-                send_notification(
-                    "BetterFlow Update",
-                    f"Version {version} available. Will install when you're away.",
-                )
-        elif asset_url:
-            send_notification(
-                "BetterFlow Update",
-                f"Version {version} is available. Click 'Install & Restart' in the menu.",
-            )
-        else:
-            send_notification(
-                "BetterFlow Update",
-                f"Version {version} is available.",
-            )
-
-    def _periodic_update_check(self) -> None:
-        """Re-check for updates (called periodically by scheduler)."""
-        if not self.config.check_updates:
-            return
-        with self.tray.model.lock:
-            if self.tray.model.update_in_progress:
-                return
-        try:
-            check_for_update(
-                _VERSION,
-                channel=self.config.update_channel,
-                callback=self._on_update_available,
-            )
-        except Exception:
-            logger.debug("Periodic update check failed", exc_info=True)
+        self.update_handler.try_auto_install()
 
     def _on_install_update(self, asset_url: str) -> None:
-        """Handle self-update: download, replace, relaunch."""
-        try:
-            from .self_updater import apply_update_async
-        except ImportError:
-            from self_updater import apply_update_async
-
-        def on_progress(status: str) -> None:
-            self.tray.set_update_progress(status)
-
-        def on_complete(success: bool) -> None:
-            if not success:
-                with self.tray.model.lock:
-                    self.tray.model.update_in_progress = False
-                self.tray._update_menu()
-                if self.config.auto_install_updates:
-                    with self._pending_update_lock:
-                        self._pending_update_asset_url = asset_url
-                    send_notification("Update Failed", "Will retry next idle period.")
-                else:
-                    send_notification("Update Failed", "Self-update failed. Try again later.")
-
-        apply_update_async(asset_url, on_progress=on_progress, on_complete=on_complete)
+        self.update_handler.on_install_update(asset_url)
 
     def _check_stale_session(self) -> None:
         """Check if previous session is still active on server (forgot to clock out)."""
@@ -1295,7 +890,7 @@ class BetterFlowApp:
     def _on_pause(self) -> None:
         """Handle pause action."""
         with self._pause_state_lock:
-            self._user_paused = True
+            self.sys_events._user_paused = True
         self.coordinator.paused_by_network = False
         # Flush idle event if idle-paused, then clear state
         self.coordinator.clear_idle_pause(send_event=True)
@@ -1312,7 +907,7 @@ class BetterFlowApp:
     def _on_resume(self) -> None:
         """Handle resume action."""
         with self._pause_state_lock:
-            self._user_paused = False
+            self.sys_events._user_paused = False
         self.coordinator.paused_by_network = False
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.resume()
@@ -1334,7 +929,7 @@ class BetterFlowApp:
         if private:
             logger.info("Private time started — recording paused")
             with self._pause_state_lock:
-                self._user_paused = True
+                self.sys_events._user_paused = True
             self.coordinator.paused_by_network = False
             self.coordinator.clear_idle_pause(send_event=True)
             # End break first (it may call resume internally), then re-pause
@@ -1349,7 +944,7 @@ class BetterFlowApp:
         else:
             logger.info("Private time ended — recording resumed")
             with self._pause_state_lock:
-                self._user_paused = False
+                self.sys_events._user_paused = False
             self.coordinator.paused_by_network = False
             self.coordinator.clear_idle_pause(send_event=True)
             self.sync_engine.set_private_mode(False)
@@ -1391,108 +986,22 @@ class BetterFlowApp:
         self.coordinator.trigger_sync()
 
     def _on_system_sleep(self) -> None:
-        """Handle system sleep / lid close."""
-        with self._pause_state_lock:
-            self._pre_sleep_private = self.sync_engine.is_private
-        self.coordinator.paused_by_network = False
-        self.coordinator.clear_idle_pause(send_event=True)
-        self.sync_engine.pause()
-        # Discard pooled idle connections so the next post-wake request
-        # creates a fresh TCP connection rather than reusing a stale one.
-        self.bf.reset_session()
-        self.aw.reset_session()
-        self.tray.set_state(TrayState.PAUSED, "Sleeping")
-        self.reminder_manager.on_tracking_stopped()
-        logger.info("Tracking paused (system sleep)")
+        self.sys_events.on_system_sleep()
 
     def _on_system_wake(self) -> None:
-        """Handle system wake from sleep."""
-        # Drop stale TCP connections from sleep (N3)
-        self.bf.reset_session()
-        self.aw.reset_session()
-        with self._pause_state_lock:
-            user_paused = self._user_paused
-            pre_sleep_private = self._pre_sleep_private
-        if user_paused:
-            logger.info("System wake — staying paused (user-initiated pause active)")
-            return
-        if self.coordinator.is_on_break:
-            logger.info("System wake — staying on break")
-            return
-        if pre_sleep_private:
-            logger.info("System wake — restoring private time")
-            self.sync_engine.resume()  # undo the sleep pause
-            self.sync_engine.set_private_mode(True)
-            self.tray.set_state(TrayState.PRIVATE)
-            return
-        self.sync_engine.resume()
-        self.tray.set_state(TrayState.SYNCING)
-        self.reminder_manager.on_tracking_started()
-        logger.info("Tracking resumed (system wake)")
-        self.coordinator.trigger_sync("wake_sync")
+        self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
-        """Handle system shutdown / restart."""
-        logger.info("System shutdown detected — shutting down")
-        self._shutdown()
+        self.sys_events.on_system_shutdown()
 
     def _on_screen_lock(self) -> None:
-        """Handle screen lock — treat as AFK."""
-        with self._pause_state_lock:
-            self._pre_lock_private = self.sync_engine.is_private
-        logger.info("Screen locked — pausing tracking")
-        self.coordinator.clear_idle_pause(send_event=True)
-        self.sync_engine.pause()
-        # Reset sessions in case Wi-Fi disconnects on lock
-        self.bf.reset_session()
-        self.aw.reset_session()
-        self.tray.set_state(TrayState.PAUSED, "Screen locked")
-        self.reminder_manager.on_tracking_stopped()
-        self._try_auto_install()
+        self.sys_events.on_screen_lock()
 
     def _on_screen_unlock(self) -> None:
-        """Handle screen unlock — resume tracking."""
-        with self._pause_state_lock:
-            user_paused = self._user_paused
-            pre_lock_private = self._pre_lock_private
-        if user_paused:
-            logger.info("Screen unlocked — staying paused (user-initiated pause active)")
-            return
-        if self.coordinator.is_on_break:
-            logger.info("Screen unlocked — staying on break")
-            return
-        if pre_lock_private:
-            logger.info("Screen unlocked — restoring private time")
-            self.sync_engine.resume()  # undo the lock pause
-            self.sync_engine.set_private_mode(True)
-            self.tray.set_state(TrayState.PRIVATE)
-            return
-        logger.info("Screen unlocked — resuming tracking")
-        self.sync_engine.resume()
-        self.tray.set_state(TrayState.SYNCING)
-        self.reminder_manager.on_tracking_started()
-        self.coordinator.trigger_sync("unlock_sync")
-        send_notification("Welcome back!", _day_greeting(), sound=False)
+        self.sys_events.on_screen_unlock()
 
     def _on_network_change(self, is_online: bool) -> None:
-        """Handle network connectivity change."""
-        if is_online:
-            logger.info("Network back online — triggering sync to flush queue")
-            if self.coordinator.paused_by_network:
-                with self._pause_state_lock:
-                    user_paused = self._user_paused
-                if not user_paused:
-                    self.sync_engine.resume()
-                self.coordinator.paused_by_network = False
-            self.coordinator.trigger_sync("network_sync")
-        else:
-            logger.info("Network offline - pausing sync")
-            with self._pause_state_lock:
-                already_paused = self._user_paused
-            if not already_paused:
-                self.sync_engine.pause()
-            self.coordinator.paused_by_network = True
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+        self.sys_events.on_network_change(is_online)
 
     def _on_export_logs(self) -> None:
         """Export logs and redacted config to a zip file on the Desktop."""
