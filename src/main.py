@@ -769,12 +769,14 @@ class SyncCoordinator:
                 return
             response = self.bf.get_trends()
             data = response.get("data", {})
-            self._trends_cache = {
+            cache = {
                 "hours_this_week": self._format_hours(int(data.get("week_total_seconds", 0))),
                 "hours_this_month": self._format_hours(int(data.get("month_total_seconds", 0))),
                 "daily_avg_this_week": self._format_hours(int(data.get("week_daily_avg_seconds", 0))),
             }
-            self.tray.update_stats(**self._trends_cache)
+            with self._state_lock:
+                self._trends_cache = cache
+            self.tray.update_stats(**cache)
         except Exception as e:
             logger.debug(f"Failed to fetch trends: {e}")
 
