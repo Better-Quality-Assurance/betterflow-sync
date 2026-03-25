@@ -1570,11 +1570,14 @@ class BetterFlowApp:
             self.reminder_manager.update_settings(self.config.reminders)
         elif key == "update_channel":
             self.config.update_channel = value
-            check_for_update(
-                _VERSION,
-                channel=value,
-                callback=self._on_update_available,
-            )
+            try:
+                check_for_update(
+                    _VERSION,
+                    channel=value,
+                    callback=self._on_update_available,
+                )
+            except Exception:
+                logger.warning("Failed to check for updates after channel change")
         else:
             logger.warning(f"Unknown preference key: {key}")
             return
