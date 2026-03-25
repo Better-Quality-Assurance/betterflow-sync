@@ -398,7 +398,7 @@ class SyncCoordinator:
                 try:
                     self.scheduler.remove_job(job_id)
                 except Exception:
-                    pass
+                    logger.debug("Could not remove break job %s (already gone)", job_id)
 
         if not silent:
             send_notification(
@@ -622,7 +622,7 @@ class SyncCoordinator:
                 self.bf.reset_session()
                 self.aw.reset_session()
             except Exception:
-                pass
+                logger.debug("Session reset after watchdog timeout failed", exc_info=True)
 
         watchdog = threading.Timer(self._DO_SYNC_DEADLINE, _watchdog)
         watchdog.daemon = True
@@ -1232,7 +1232,7 @@ class BetterFlowApp:
                 try:
                     self.bf.end_session("crash_recovery")
                 except Exception:
-                    pass
+                    logger.debug("Failed to end stale session during crash recovery", exc_info=True)
         except Exception as e:
             logger.debug(f"Stale session check failed: {e}")
 
@@ -1709,7 +1709,7 @@ class BetterFlowApp:
                     from system_events import cleanup_observers
                 cleanup_observers()
         except Exception:
-            pass
+            logger.debug("cleanup_observers failed during shutdown", exc_info=True)
         self.aw.close()
         self.bf.close()
         self.queue.close()
