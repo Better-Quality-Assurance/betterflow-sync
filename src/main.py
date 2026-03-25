@@ -1668,10 +1668,13 @@ class BetterFlowApp:
         os._exit(1)
 
     def _signal_handler(self, signum, frame) -> None:
-        """Handle shutdown signals."""
-        logger.info(f"Received signal {signum}")
+        """Handle shutdown signals (async-signal-safe).
+
+        Only set the shutdown event here. Avoid logging (logging lock may be
+        held) and avoid non-trivial work (e.g. tray.stop). The main loop
+        observes _shutdown_event and performs full cleanup.
+        """
         self._shutdown_event.set()
-        self.tray.stop()
 
     # -- Lifecycle --------------------------------------------------------
 
