@@ -566,7 +566,7 @@ class SyncCoordinator:
                 # is unavailable (e.g. bf-idle-tracker crashed or not started).
                 system_idle = self._get_system_idle_seconds()
                 if system_idle is not None:
-                    is_afk = True
+                    is_afk = system_idle >= self._idle_pause_threshold
                     afk_duration = system_idle
                     idle_start = datetime.now(timezone.utc) - timedelta(seconds=system_idle)
 
