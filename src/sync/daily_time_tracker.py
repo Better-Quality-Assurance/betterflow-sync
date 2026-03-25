@@ -252,7 +252,7 @@ class DailyTimeTracker:
         with self._lock:
             # Only update if we're still on the same date (no further rollover)
             if self._today == new_date:
-                self._today_seconds += loaded
+                self._today_seconds = max(self._today_seconds, loaded)
         logger.info(f"Day rollover to {new_date}, loaded {loaded:.1f}s")
 
     def _persist(self) -> None:
