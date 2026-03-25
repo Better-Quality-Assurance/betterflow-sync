@@ -734,10 +734,13 @@ class SyncCoordinator:
             else:
                 total_seconds = int(tracked_seconds)
 
-            self._hours_today_seconds = max(0, total_seconds)
-            self._hours_today_cache = self._format_hours(self._hours_today_seconds)
+            clamped = max(0, total_seconds)
+            formatted = self._format_hours(clamped)
+            with self._state_lock:
+                self._hours_today_seconds = clamped
+                self._hours_today_cache = formatted
             self._last_hours_refresh = time.monotonic()
-            return self._hours_today_cache
+            return formatted
         except Exception as e:
             logger.debug(f"_fetch_hours_today failed: {e}")
             return self._hours_today_cache
