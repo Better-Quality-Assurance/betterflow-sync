@@ -4,7 +4,7 @@ This repo can push published desktop release metadata to the BetterFlow backend 
 
 ## Trigger
 
-The workflow [`.github/workflows/sync-downloads.yml`](/Users/mac/workstation/betterqa/betterflow-sync/.github/workflows/sync-downloads.yml) runs when a GitHub release is `published`.
+The workflow [`.github/workflows/sync-downloads.yml`](.github/workflows/sync-downloads.yml) runs when a GitHub release is `published`.
 
 It can also be run manually with `workflow_dispatch` and a `release_tag` input to backfill or repair release metadata.
 
