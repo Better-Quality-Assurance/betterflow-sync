@@ -1013,13 +1013,6 @@ class BetterFlowApp:
         self.coordinator.fetch_categories()
         self._check_stale_session()
         self.coordinator.start()
-        if self.config.check_updates and self.coordinator.scheduler.running:
-            self.coordinator.scheduler.add_job(
-                self._periodic_update_check,
-                trigger=IntervalTrigger(hours=6),
-                id="update_check_job",
-                replace_existing=True,
-            )
         self._ensure_update_checks_started()
 
         if send_greeting:
