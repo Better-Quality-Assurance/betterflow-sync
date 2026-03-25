@@ -1483,23 +1483,13 @@ class BetterFlowApp:
                 self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
         else:
-            # Don't interrupt an in-flight sync (N4) - let it complete or timeout
-            if self.coordinator.sync_in_progress:
-                logger.info("Network offline — sync in progress, will pause after completion")
-                with self._pause_state_lock:
-                    already_paused = self._user_paused
-                if not already_paused:
-                    self.sync_engine.pause()
-                self.coordinator.paused_by_network = True
-                self.tray.set_state(TrayState.QUEUED, "Offline")
-            else:
-                logger.info("Network offline — pausing sync immediately")
-                with self._pause_state_lock:
-                    already_paused = self._user_paused
-                if not already_paused:
-                    self.sync_engine.pause()
-                self.coordinator.paused_by_network = True
-                self.tray.set_state(TrayState.QUEUED, "Offline")
+            logger.info("Network offline - pausing sync")
+            with self._pause_state_lock:
+                already_paused = self._user_paused
+            if not already_paused:
+                self.sync_engine.pause()
+            self.coordinator.paused_by_network = True
+            self.tray.set_state(TrayState.QUEUED, "Offline")
 
     def _on_export_logs(self) -> None:
         """Export logs and redacted config to a zip file on the Desktop."""
