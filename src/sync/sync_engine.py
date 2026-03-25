@@ -618,7 +618,7 @@ class SyncEngine:
     ) -> list[tuple[datetime, datetime]]:
         """Cap counted ranges at last confirmed input + AFK timeout."""
         if self._latest_input_at is None:
-            return []
+            return list(ranges)
 
         timeout_cutoff = self._latest_input_at + timedelta(
             minutes=self.config.aw.afk_timeout_minutes
