@@ -200,7 +200,7 @@ class BetterFlowClient(BaseApiClient):
             return AuthResult(
                 success=True,
                 api_token=data["access_token"],
-                device_id=device_name,
+                device_id=data.get("device_id") or device_name,
                 user_email=user.get("email"),
                 user_name=user.get("name"),
                 user_role=user.get("role", "user"),

@@ -1091,6 +1091,7 @@ class SyncEngine:
         if duration < 1:
             return
         event = {
+            "id": f"break_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
             "bucket_type": "break_time",
@@ -1115,6 +1116,7 @@ class SyncEngine:
         if duration < 1:
             return
         event = {
+            "id": f"idle_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
             "bucket_type": "idle_time",
@@ -1143,6 +1145,7 @@ class SyncEngine:
         if duration < 1:
             return
         event = {
+            "id": f"private_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
             "bucket_type": "private_time",
