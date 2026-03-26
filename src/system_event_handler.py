@@ -70,7 +70,10 @@ class SystemEventHandler:
         except ImportError:
             from ui.tray import TrayState
 
-        from .main import _day_greeting
+        try:
+            from .main import _day_greeting
+        except ImportError:
+            from main import _day_greeting
 
         self.bf.reset_session()
         self.aw.reset_session()
