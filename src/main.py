@@ -395,8 +395,7 @@ class SyncCoordinator:
 
             # idle_paused: sync still runs at reduced interval (_IDLE_SYNC_INTERVAL)
             # so no early return here — just update tray state
-            with self._state_lock:
-                is_idle = self._idle_paused
+            is_idle = self.idle_paused
 
             if self.paused_by_network:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
