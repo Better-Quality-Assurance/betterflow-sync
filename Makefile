@@ -52,7 +52,7 @@ build-windows: download-aw
 
 # Run the application (development)
 run:
-	python -m src.main
+	.venv-arm64/bin/python -m src.main
 
 # Create macOS DMG (requires create-dmg)
 dmg: build-mac
@@ -66,7 +66,7 @@ dmg: build-mac
 		--app-drop-link 450 185 \
 		"dist/BetterFlow.dmg" \
 		"dist/BetterFlow.app"
-	rm -f "dist/BetterFlow"
+	rm -rf "dist/BetterFlow"
 	@# Set custom file icon on the DMG so it shows BetterFlow logo in Finder
 	python3 -c "\
 	import Cocoa, os; \

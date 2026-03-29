@@ -50,7 +50,7 @@ class StoredCredentials:
         parsed = json.loads(data)
         return cls(
             api_token=parsed["api_token"],
-            device_id=parsed["device_id"],
+            device_id=str(parsed["device_id"]),
             user_email=parsed["user_email"],
             user_name=parsed.get("user_name", ""),
             user_role=parsed.get("user_role", "user"),

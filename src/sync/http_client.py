@@ -136,7 +136,7 @@ class BaseApiClient:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if device_id:
-            headers["X-Device-ID"] = device_id
+            headers["X-Device-ID"] = str(device_id)
         return headers
 
     def _request(
