@@ -642,6 +642,10 @@ class BetterFlowApp:
 
     def _start_watchers(self) -> None:
         """Start in-process watchers after the tracker server is available."""
+        if sys.platform == "darwin":
+            if not check_accessibility() or not check_input_monitoring():
+                logger.info("Missing macOS permissions, attempting TCC grant")
+                grant_tcc_permissions()
         if self.window_watcher:
             self.window_watcher.start()
         if self.input_watcher:

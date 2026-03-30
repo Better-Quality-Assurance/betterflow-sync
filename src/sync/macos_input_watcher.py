@@ -14,9 +14,9 @@ from datetime import datetime, timezone
 from typing import Optional
 
 try:
-    from ..ui.permissions import check_accessibility
+    from ..ui.permissions import check_accessibility, check_input_monitoring
 except ImportError:
-    from ui.permissions import check_accessibility
+    from ui.permissions import check_accessibility, check_input_monitoring
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,11 @@ class MacOSInputWatcher:
         if not check_accessibility():
             logger.warning(
                 "Process does NOT have Accessibility permission — input tracking disabled"
+            )
+            return False
+        if not check_input_monitoring():
+            logger.warning(
+                "Process does NOT have Input Monitoring permission — keypress tracking disabled"
             )
             return False
         try:
