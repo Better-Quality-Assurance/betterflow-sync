@@ -157,10 +157,13 @@ class MacOSWindowWatcher:
                 self._terminal_cache_hit = True
                 self._terminal_cache_value = tab_title
 
-        # For browsers, get URL via AppleScript (cached until AXTitle changes)
+        # For browsers, get URL via AppleScript (cached until AXTitle changes).
+        # When Accessibility is missing, title is always empty so the cache
+        # key never changes — skip the cache entirely in that case to avoid
+        # returning a stale URL for every Chrome poll.
         if app_name in _URL_BROWSERS:
             cache_key = (app_name, title)
-            if cache_key == self._browser_cache_key:
+            if title and cache_key == self._browser_cache_key:
                 url = self._browser_cache_url
                 incognito = self._browser_cache_incognito
             else:
