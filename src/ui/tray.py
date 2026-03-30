@@ -1139,26 +1139,31 @@ class TrayIcon:
 
         Converts a PIL image to NSImage and dispatches setImage: to the
         main thread run loop where AppKit can properly render it.
+
+        Wrapped in an autorelease pool so NSData/NSImage temporaries
+        created on background threads are freed promptly.
         """
         import AppKit
         import Foundation
         import io
+        import objc
 
-        thickness = 22
-        try:
-            thickness = max(int(self._icon._status_bar.thickness()), 22)
-        except Exception:
-            pass
+        with objc.autorelease_pool():
+            thickness = 22
+            try:
+                thickness = max(int(self._icon._status_bar.thickness()), 22)
+            except Exception:
+                pass
 
-        sz = thickness
-        if pil_img.size != (sz, sz):
-            pil_img = pil_img.resize((sz, sz), Image.LANCZOS)
+            sz = thickness
+            if pil_img.size != (sz, sz):
+                pil_img = pil_img.resize((sz, sz), Image.LANCZOS)
 
-        buf = io.BytesIO()
-        pil_img.save(buf, "png")
-        ns_data = Foundation.NSData(buf.getvalue())
-        ns_img = AppKit.NSImage.alloc().initWithData_(ns_data)
-        ns_img.setSize_(Foundation.NSSize(sz, sz))
+            buf = io.BytesIO()
+            pil_img.save(buf, "png")
+            ns_data = Foundation.NSData(buf.getvalue())
+            ns_img = AppKit.NSImage.alloc().initWithData_(ns_data)
+            ns_img.setSize_(Foundation.NSSize(sz, sz))
 
         # Update pystray internal state to prevent stale-image redraws
         try:

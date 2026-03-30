@@ -247,27 +247,43 @@ class MacOSWindowWatcher:
 
     def _run(self) -> None:
         """Poll loop: get active window via PyObjC, post heartbeat."""
+        try:
+            import objc
+            _has_objc = True
+        except ImportError:
+            _has_objc = False
+
         while not self._stop_event.wait(self._poll_interval):
             try:
-                data = self._get_active_window()
-                if not data or not data.get("app"):
-                    continue
-
-                # Build heartbeat data matching AW window watcher format
-                heartbeat_data = {
-                    "app": data["app"],
-                    "title": data.get("title", ""),
-                }
-                if data.get("url"):
-                    heartbeat_data["url"] = data["url"]
-                if data.get("incognito") is not None:
-                    heartbeat_data["incognito"] = data["incognito"]
-
-                timestamp = datetime.now(timezone.utc).isoformat()
-                self._aw.post_heartbeat(
-                    self._bucket_id, timestamp, heartbeat_data,
-                    pulsetime=self._poll_interval + 1.0,
-                )
-
+                # Wrap each iteration in an autorelease pool so that
+                # ObjC objects created by NSWorkspace / Accessibility
+                # APIs are freed at the end of each poll cycle.
+                # Without this, every ObjC object leaks (~11 MB/sec).
+                if _has_objc:
+                    with objc.autorelease_pool():
+                        self._poll_once()
+                else:
+                    self._poll_once()
             except Exception as e:
                 logger.warning(f"Window watcher poll error: {e}")
+
+    def _poll_once(self) -> None:
+        """Single poll iteration: get active window, post heartbeat."""
+        data = self._get_active_window()
+        if not data or not data.get("app"):
+            return
+
+        heartbeat_data = {
+            "app": data["app"],
+            "title": data.get("title", ""),
+        }
+        if data.get("url"):
+            heartbeat_data["url"] = data["url"]
+        if data.get("incognito") is not None:
+            heartbeat_data["incognito"] = data["incognito"]
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self._aw.post_heartbeat(
+            self._bucket_id, timestamp, heartbeat_data,
+            pulsetime=self._poll_interval + 1.0,
+        )

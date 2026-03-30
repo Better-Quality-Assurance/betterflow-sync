@@ -749,6 +749,12 @@ class BetterFlowApp:
         """Run the application."""
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        # Ignore SIGPIPE to prevent silent death when writing to a socket
+        # whose remote end was closed (e.g. network drops mid-request).
+        # Python normally sets SIG_IGN at startup, but PyInstaller's
+        # bootloader or Rosetta 2 translation can reset it to SIG_DFL.
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         # First-run setup wizard
         wizard_login_state = None
