@@ -91,7 +91,6 @@ class MacOSInputWatcher:
                 "Process does NOT have Accessibility permission — input tracking disabled"
             )
             return False
-
         try:
             self._aw.create_bucket(self._bucket_id, "aw-watcher-input", self._hostname)
         except Exception as e:

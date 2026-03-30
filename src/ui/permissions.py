@@ -1,6 +1,6 @@
 """macOS permission checking utilities.
 
-Uses pyobjc (preferred) or ctypes to check Accessibility permission.
+Uses pyobjc (preferred) or ctypes to check macOS privacy permissions.
 Returns True on non-macOS platforms.
 
 After a fresh build the app's code signature changes. macOS may show
@@ -73,6 +73,34 @@ def check_accessibility() -> bool:
     return False
 
 
+def check_input_monitoring(prompt: bool = False) -> bool:
+    """Check if Input Monitoring permission is granted.
+
+    Keypress capture on modern macOS requires the ListenEvent / Input
+    Monitoring privacy permission in addition to Accessibility.
+
+    Args:
+        prompt: When True, ask macOS to show the permission prompt if needed.
+    """
+    if not _IS_MACOS:
+        return True
+
+    try:
+        from Quartz import (
+            CGPreflightListenEventAccess,
+            CGRequestListenEventAccess,
+        )
+
+        if CGPreflightListenEventAccess():
+            return True
+        if prompt:
+            return bool(CGRequestListenEventAccess())
+    except Exception as e:
+        logger.debug(f"Input Monitoring check failed: {e}")
+
+    return False
+
+
 def open_accessibility_settings() -> None:
     """Open System Settings to Accessibility pane."""
     if not _IS_MACOS:
@@ -85,3 +113,81 @@ def open_accessibility_settings() -> None:
         ])
     except Exception as e:
         logger.warning(f"Failed to open Accessibility settings: {e}")
+
+
+def open_input_monitoring_settings() -> None:
+    """Open System Settings to Input Monitoring pane."""
+    if not _IS_MACOS:
+        return
+
+    try:
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+        ])
+    except Exception as e:
+        logger.warning(f"Failed to open Input Monitoring settings: {e}")
+
+
+_BUNDLE_ID = "co.betterqa.betterflow"
+
+
+def grant_tcc_permissions() -> bool:
+    """Grant Accessibility and Input Monitoring via TCC database with admin auth.
+
+    Shows the native macOS password dialog ("Allow Always" style).
+    Returns True if the grant succeeded.
+    """
+    if not _IS_MACOS:
+        return True
+
+    services = []
+    if not check_accessibility():
+        services.append("kTCCServiceAccessibility")
+    if not check_input_monitoring():
+        services.append("kTCCServiceListenEvent")
+
+    if not services:
+        return True
+
+    # Build SQL statements for each missing permission
+    sql_parts = []
+    for svc in services:
+        sql_parts.append(
+            f"INSERT OR REPLACE INTO access "
+            f"(service, client, client_type, auth_value, auth_reason, auth_version, "
+            f"indirect_object_identifier_type, indirect_object_identifier, flags, last_modified) "
+            f"VALUES ('{svc}', '{_BUNDLE_ID}', 0, 2, 3, 1, 0, 'UNUSED', 0, "
+            f"CAST(strftime('%s','now') AS INTEGER));"
+        )
+    sql = " ".join(sql_parts)
+
+    # Use osascript to show the native admin password prompt and run sqlite3 as root
+    script = (
+        f'do shell script '
+        f'"sqlite3 \\"/Library/Application Support/com.apple.TCC/TCC.db\\" '
+        f'\\"{sql}\\"" '
+        f'with administrator privileges'
+    )
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            logger.info("TCC permissions granted via admin auth")
+            return True
+        else:
+            stderr = result.stderr.strip()
+            if "User canceled" in stderr or "-128" in stderr:
+                logger.info("User cancelled admin auth for TCC grant")
+            else:
+                logger.warning(f"TCC grant failed: {stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("TCC grant timed out waiting for admin auth")
+        return False
+    except Exception as e:
+        logger.warning(f"TCC grant error: {e}")
+        return False

@@ -171,6 +171,7 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_splits_window_around_afk(self):
         """Long window events should count only their non-AFK slices."""
         self.engine._has_input_data = False
+        self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         self.engine._latest_input_at = now
         self.engine._current_afk_events = [
@@ -208,6 +209,7 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""
         self.engine._has_input_data = False
+        self.engine._afk_watcher_available = True
         self.engine._latest_input_at = datetime.now(timezone.utc)
         self.engine._current_afk_events = []
         now = datetime.now(timezone.utc)
@@ -259,6 +261,7 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_skips_window_after_timeout(self):
         """A window fully beyond last_input + afk_timeout must not count."""
         self.engine._has_input_data = True
+        self.engine._afk_watcher_available = False
         self.engine._latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
         event = AWEvent(
             id=24,
@@ -277,6 +280,39 @@ class TestSyncEngine:
 
         assert transformed == []
         self.time_tracker.add_active_time.assert_not_called()
+
+    def test_transform_and_checkpoint_uses_afk_when_input_is_stale(self):
+        """AFK data should remain authoritative when input watcher goes stale."""
+        now = datetime.now(timezone.utc)
+        self.engine._has_input_data = True
+        self.engine._afk_watcher_available = True
+        self.engine._latest_input_at = now - timedelta(minutes=30)
+        self.engine._current_afk_events = [
+            AWEvent(
+                id=25,
+                timestamp=now - timedelta(minutes=40),
+                duration=40 * 60.0,
+                data={"status": "not-afk"},
+            ),
+        ]
+        event = AWEvent(
+            id=26,
+            timestamp=now - timedelta(minutes=5),
+            duration=300.0,
+            data={"app": "Terminal", "title": "Work"},
+        )
+        stats = Mock(events_filtered=0)
+
+        transformed, _ = self.engine._transform_and_checkpoint(
+            [event],
+            "bucket-123",
+            BUCKET_TYPE_WINDOW,
+            stats,
+        )
+
+        assert len(transformed) == 1
+        assert transformed[0]["duration"] == 300.0
+        self.time_tracker.add_active_time.assert_called_once()
 
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""

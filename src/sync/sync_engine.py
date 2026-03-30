@@ -643,12 +643,13 @@ class SyncEngine:
         """Transform only the countable slices of a long window/web event."""
         event_start = event.timestamp
         event_end = event.timestamp + timedelta(seconds=event.duration)
-        ranges: list[tuple[datetime, datetime]] = [(event_start, event_end)]
-
-        if not self._has_input_data:
+        ranges: list[tuple[datetime, datetime]]
+        if self._afk_watcher_available:
             ranges = self._active_ranges_from_afk(event)
+        else:
+            ranges = [(event_start, event_end)]
 
-        if self._has_input_data:
+        if self._has_input_data and not self._afk_watcher_available:
             active_ranges = self._cap_ranges_to_input_timeout(ranges)
         else:
             active_ranges = ranges

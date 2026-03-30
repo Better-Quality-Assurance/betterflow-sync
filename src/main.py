@@ -26,7 +26,13 @@ try:
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
     from .system_events import start_system_event_listener
-    from .ui.permissions import check_accessibility, open_accessibility_settings
+    from .ui.permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        grant_tcc_permissions,
+        open_accessibility_settings,
+        open_input_monitoring_settings,
+    )
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
     from .break_manager import BreakManager
@@ -44,7 +50,13 @@ except ImportError:
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
     from system_events import start_system_event_listener
-    from ui.permissions import check_accessibility, open_accessibility_settings
+    from ui.permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        grant_tcc_permissions,
+        open_accessibility_settings,
+        open_input_monitoring_settings,
+    )
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
     from break_manager import BreakManager
@@ -224,13 +236,9 @@ class SyncCoordinator:
             id="startup_trends",
             replace_existing=True,
         )
-        if sys.platform == "darwin":
-            self.scheduler.add_job(
-                self._check_permissions,
-                trigger=DateTrigger(run_date=now),
-                id="startup_permissions",
-                replace_existing=True,
-            )
+        # Permissions check removed — macOS AXIsProcessTrusted() is unreliable
+        # after rebuilds (returns False even when toggle is ON in System Settings).
+        # Watchers handle missing permissions gracefully on their own.
 
     def stop(self) -> None:
         """Shut down the scheduler if running."""
@@ -298,21 +306,25 @@ class SyncCoordinator:
         return self._sync_lock.locked()
 
     def _check_permissions(self) -> None:
-        """Check macOS Accessibility permission and update tray state."""
+        """Check macOS tracking permissions and update tray state."""
         try:
-            granted = check_accessibility()
+            has_accessibility = check_accessibility()
+            granted = has_accessibility
             high_priority = (
                 TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
                 TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
                 TrayState.WAITING_AUTH,
             )
             with self.tray.model.lock:
+                previous_needs_permissions = self.tray.model.needs_permissions
+                previous_hours_today = self.tray.model.hours_today
                 self.tray.model.needs_permissions = not granted
                 current_state = self.tray.model.state
                 if not granted:
+                    self.tray.model.hours_today = "---"
                     if current_state not in high_priority:
                         self.tray.model.state = TrayState.NEEDS_PERMISSIONS
-                        self.tray.model.status_text = "Permissions Required"
+                        self.tray.model.status_text = "Limited Tracking"
                         should_update_icon = True
                     else:
                         should_update_icon = False
@@ -322,11 +334,16 @@ class SyncCoordinator:
                         should_update_icon = True
                     else:
                         should_update_icon = False
+                should_update_menu = (
+                    previous_needs_permissions != self.tray.model.needs_permissions
+                    or previous_hours_today != self.tray.model.hours_today
+                )
             if should_update_icon:
                 self.tray._update_icon()
+            if should_update_icon or should_update_menu:
                 self.tray._update_menu()
             if not granted:
-                logger.debug("macOS permissions missing")
+                logger.debug("macOS Accessibility permission missing")
             elif should_update_icon:
                 logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
@@ -344,8 +361,6 @@ class SyncCoordinator:
         self._refresh_hours_today()
         if self.reminder_manager:
             self.reminder_manager.check()
-        if sys.platform == "darwin":
-            self._check_permissions()
 
     def _check_idle_status(self) -> None:
         self.idle_mgr.check_idle_status(
@@ -423,11 +438,7 @@ class SyncCoordinator:
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
                 else:
-                    with self.tray.model.lock:
-                        needs_perms = self.tray.model.needs_permissions
-                    if needs_perms:
-                        self.tray.set_state(TrayState.NEEDS_PERMISSIONS, "Permissions Required")
-                    elif is_idle:
+                    if is_idle:
                         self.tray.set_state(TrayState.PAUSED, "Idle")
                     else:
                         self.tray.set_state(TrayState.SYNCING)
@@ -439,10 +450,9 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed",
                 )
 
-            # Fetch hours from server (source of truth after sync)
             hours = self._fetch_hours_today()
             self.tray.update_stats(
-                hours_today=hours,
+                hours_today=hours if hours is not None else "---",
                 last_sync=datetime.now().strftime("%H:%M"),
                 queue_size=self.queue.size(),
             )
@@ -575,11 +585,11 @@ class BetterFlowApp:
             on_private_toggle=self._on_private_toggle,
             on_sync_now=self._on_sync_now,
             on_export_logs=self._on_export_logs,
-            on_open_permissions=self._on_open_permissions,
             on_start_break=self._on_start_break,
             on_end_break=self._on_end_break,
             on_cancel_login=self._on_cancel_login,
             on_install_update=self._on_install_update,
+            on_check_update=lambda: self.update_handler._periodic_update_check(),
             on_tray_died=self._on_tray_died,
         )
         self.tray.set_config(self.config)
@@ -696,14 +706,7 @@ class BetterFlowApp:
             greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
             send_notification(greeting, _day_greeting())
 
-        if sys.platform == "darwin" and self.coordinator.scheduler.running:
-            self.coordinator.scheduler.add_job(
-                self._check_permissions_initial,
-                "date",
-                run_date=datetime.now(timezone.utc) + timedelta(seconds=initial_permissions_delay_seconds),
-                id="permissions_initial_check",
-                replace_existing=True,
-            )
+        pass  # Permissions check removed — watchers handle missing perms gracefully
 
     def _background_startup(self, wizard_login_state=None) -> None:
         """Restore session and services without delaying tray visibility."""
@@ -787,24 +790,6 @@ class BetterFlowApp:
             self._shutdown()
 
     # -- Event handlers ---------------------------------------------------
-
-    def _check_permissions_initial(self) -> None:
-        """Run initial permissions check on macOS (delegates to coordinator)."""
-        if sys.platform != "darwin":
-            return
-        self.coordinator._check_permissions()
-        with self.tray.model.lock:
-            needs_perms = self.tray.model.needs_permissions
-        if needs_perms:
-            send_notification(
-                "BetterFlow",
-                "Grant Accessibility permission in "
-                "System Settings > Privacy & Security for window tracking.",
-            )
-
-    def _on_open_permissions(self) -> None:
-        """Open System Settings to Accessibility permission pane."""
-        open_accessibility_settings()
 
     def _try_auto_install(self) -> None:
         self.update_handler.try_auto_install()

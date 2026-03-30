@@ -333,11 +333,11 @@ class TrayIcon:
         on_private_toggle: Optional[Callable[[bool], None]] = None,
         on_sync_now: Optional[Callable[[], None]] = None,
         on_export_logs: Optional[Callable[[], None]] = None,
-        on_open_permissions: Optional[Callable[[], None]] = None,
         on_start_break: Optional[Callable[[], None]] = None,
         on_end_break: Optional[Callable[[], None]] = None,
         on_cancel_login: Optional[Callable[[], None]] = None,
         on_install_update: Optional[Callable[[str], None]] = None,
+        on_check_update: Optional[Callable[[], None]] = None,
         on_tray_died: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
@@ -353,7 +353,6 @@ class TrayIcon:
             on_private_toggle: Callback when private time is toggled (receives bool)
             on_sync_now: Callback to trigger an immediate sync
             on_export_logs: Callback to export logs to a zip file
-            on_open_permissions: Callback to open system permission settings
             on_start_break: Callback when user starts a manual break
             on_end_break: Callback when user ends break early
             on_cancel_login: Callback when user cancels in-progress login
@@ -373,11 +372,11 @@ class TrayIcon:
         self._on_private_toggle = on_private_toggle
         self._on_sync_now = on_sync_now
         self._on_export_logs = on_export_logs
-        self._on_open_permissions = on_open_permissions
         self._on_start_break = on_start_break
         self._on_end_break = on_end_break
         self._on_cancel_login = on_cancel_login
         self._on_install_update = on_install_update
+        self._on_check_update = on_check_update
         self._on_tray_died = on_tray_died
 
         self.model = TrayModel()
@@ -428,7 +427,6 @@ class TrayIcon:
                 "project_started_at": self.model.project_started_at,
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
-                "needs_permissions": self.model.needs_permissions,
                 "sync_interval": self.model.sync_interval,
                 "hash_titles": self.model.hash_titles,
                 "domain_only_urls": self.model.domain_only_urls,
@@ -470,8 +468,6 @@ class TrayIcon:
             items.append(Item(label, None, enabled=False))
 
         items.append(Item(f"App status: {self._get_status_text(s)}", None, enabled=False))
-        if s["needs_permissions"]:
-            items.append(Item("\u26a0 Enable Permissions...", self._handle_open_permissions))
         items.append(Item(f"Hours today: {s['hours_today']}", None, enabled=False))
         items.append(Item("Trends", pystray.Menu(
             Item(f"Hours this week: {s['hours_this_week']}", None, enabled=False),
@@ -498,8 +494,9 @@ class TrayIcon:
                     checked=lambda item, p=proj: self._is_current_project(p),
                     enabled=logged_in and not is_current,
                 ))
+            stop_label = f"  Stop ({s['hours_today']})"
             items.append(Item(
-                f"  Stop ({s['hours_today']})",
+                stop_label,
                 self._handle_stop_project,
                 enabled=logged_in and s["current_project"] is not None,
             ))
@@ -583,7 +580,7 @@ class TrayIcon:
         items.append(Item("Sync Now", self._handle_sync_now, enabled=logged_in))
 
         # ── Preferences submenu ─────────────────────────────
-        items.append(Item("Preferences", pystray.Menu(
+        pref_items = [
             Item(
                 "Launch at Login",
                 self._make_toggle_handler("auto_start", "auto_start"),
@@ -594,9 +591,32 @@ class TrayIcon:
                 self._make_toggle_handler("debug_mode", "debug_mode"),
                 checked=lambda item: self._is_pref("debug_mode"),
             ),
+            Item("─" * 20, None, enabled=False),
             Item("Export Logs", self._handle_export_logs),
             Item("Open Config File", self._handle_open_config),
-        ), enabled=logged_in))
+            Item("─" * 20, None, enabled=False),
+        ]
+
+        # Update items inside Preferences
+        if s["update_in_progress"]:
+            pref_items.append(Item(s["update_status"] or "Updating...", None, enabled=False))
+        elif s["update_version"]:
+            if s["update_asset_url"]:
+                pref_items.append(Item(
+                    f"Install v{s['update_version']} & Restart",
+                    self._handle_install_update,
+                ))
+            else:
+                pref_items.append(Item(
+                    f"Update available (v{s['update_version']})",
+                    self._handle_open_update,
+                ))
+        else:
+            pref_items.append(Item("Check for Update", self._handle_check_update))
+
+        pref_items.append(Item(f"v{_APP_VERSION} ({BUILD_DATE})", None, enabled=False))
+
+        items.append(Item("Preferences", pystray.Menu(*pref_items), enabled=logged_in))
 
         items.append(Item("─" * 20, None, enabled=False))
 
@@ -608,27 +628,6 @@ class TrayIcon:
             items.append(Item("Retry Login", self._handle_login))
         else:
             items.append(Item("Login", self._handle_login))
-
-        items.append(Item("─" * 20, None, enabled=False))
-
-        # ── Update available ──────────────────────────────────
-        if s["update_in_progress"]:
-            status = s["update_status"] or "Updating..."
-            items.append(Item(status, None, enabled=False))
-        elif s["update_version"]:
-            if s["update_asset_url"]:
-                items.append(Item(
-                    f"Install v{s['update_version']} & Restart",
-                    self._handle_install_update,
-                ))
-            else:
-                items.append(Item(
-                    f"Update available (v{s['update_version']})",
-                    self._handle_open_update,
-                ))
-
-        # ── Version info ───────────────────────────────────────
-        items.append(Item(f"v{_APP_VERSION} ({BUILD_DATE})", None, enabled=False))
 
         items.append(Item("Quit", self._handle_quit))
 
@@ -659,8 +658,6 @@ class TrayIcon:
             return "Error"
         elif state == TrayState.PAUSED:
             return "Paused"
-        elif state == TrayState.NEEDS_PERMISSIONS:
-            return "Permissions Required"
         elif state == TrayState.WAITING_AUTH:
             return "Waiting for login..."
         else:
@@ -712,11 +709,6 @@ class TrayIcon:
         """Handle cancel login menu click."""
         if self._on_cancel_login:
             self._on_cancel_login()
-
-    def _handle_open_permissions(self, icon, item) -> None:
-        """Handle open permissions menu click."""
-        if self._on_open_permissions:
-            self._on_open_permissions()
 
     def _handle_start_break(self, icon, item) -> None:
         """Handle start break menu click."""
@@ -805,6 +797,11 @@ class TrayIcon:
         """Handle log out menu click."""
         if self._on_logout:
             self._on_logout()
+
+    def _handle_check_update(self, icon, item) -> None:
+        """Trigger a manual update check."""
+        if self._on_check_update:
+            self._on_check_update()
 
     def _handle_open_update(self, icon, item) -> None:
         """Open the GitHub release page for the available update."""

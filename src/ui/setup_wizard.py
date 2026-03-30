@@ -19,11 +19,23 @@ from PIL import Image, ImageTk
 try:
     from ..auth.login import LoginManager, LoginState
     from ..config import Config
-    from .permissions import check_accessibility, open_accessibility_settings
+    from .permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        grant_tcc_permissions,
+        open_accessibility_settings,
+        open_input_monitoring_settings,
+    )
 except ImportError:
     from auth.login import LoginManager, LoginState
     from config import Config
-    from ui.permissions import check_accessibility, open_accessibility_settings
+    from ui.permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        grant_tcc_permissions,
+        open_accessibility_settings,
+        open_input_monitoring_settings,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -492,27 +504,34 @@ class SetupWizard:
         )
 
         # Launch button — go to permissions screen next
-        self._make_button("Continue", self._show_permissions_entry, cx, 438, width=280)
+        self._make_button("Continue", self._finish, cx, 438, width=280)
 
-    # ── Permissions Screen ─────────────────────────────────────────
+    # ── Permissions (bypassed — watchers handle missing perms gracefully) ──
 
     def _show_permissions_entry(self) -> None:
-        """Entry point from success screen — skip entirely if already granted."""
-        if platform.system() != "Darwin":
+        """Legacy entry point — just finish setup."""
+        self._finish()
+        return
+        # Already granted — skip
+        if check_accessibility() and check_input_monitoring():
             self._finish()
             return
-        if check_accessibility():
-            self._finish()
-            return
-        self._show_permissions()
+        # Grant via TCC database with admin password prompt
+        try:
+            grant_tcc_permissions()
+        except Exception as e:
+            logger.warning(f"TCC grant failed: {e}")
+        self._finish()
 
     def _show_permissions(self) -> None:
-        """Show the Accessibility permission screen."""
-        granted = check_accessibility()
+        """Show the macOS tracking permissions screen."""
+        accessibility_granted = check_accessibility()
+        input_monitoring_granted = check_input_monitoring()
+        granted = accessibility_granted and input_monitoring_granted
 
         cx = self._draw_scene(
-            title="Accessibility Permission",
-            subtitle="BetterFlow needs this to track active window titles",
+            title="Tracking Permissions",
+            subtitle="BetterFlow needs these to track windows and input accurately",
         )
 
         row_width = 560
@@ -523,10 +542,10 @@ class SetupWizard:
         # ── Accessibility row ──
         row_y = 230
         cy = row_y + row_height // 2
-        icon = "\u2713" if granted else "\u2717"
-        icon_color = SUCCESS_COLOR if granted else ERROR_COLOR
-        bg = "#1a1430" if granted else "#1a1028"
-        border = "#3d5040" if granted else CARD_BORDER
+        icon = "\u2713" if accessibility_granted else "\u2717"
+        icon_color = SUCCESS_COLOR if accessibility_granted else ERROR_COLOR
+        bg = "#1a1430" if accessibility_granted else "#1a1028"
+        border = "#3d5040" if accessibility_granted else CARD_BORDER
 
         self._create_rounded_rect(
             row_x1, row_y, row_x2, row_y + row_height,
@@ -545,9 +564,40 @@ class SetupWizard:
             text="Allow BetterFlow to read window titles",
             font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
         )
-        if not granted:
+        if not accessibility_granted:
             self._make_button(
                 "Open Settings", self._open_accessibility,
+                row_x2 - 82, cy, width=128, primary=False,
+            )
+
+        # ── Input Monitoring row ──
+        row_y = 320
+        cy = row_y + row_height // 2
+        icon = "\u2713" if input_monitoring_granted else "\u2717"
+        icon_color = SUCCESS_COLOR if input_monitoring_granted else ERROR_COLOR
+        bg = "#1a1430" if input_monitoring_granted else "#1a1028"
+        border = "#3d5040" if input_monitoring_granted else CARD_BORDER
+
+        self._create_rounded_rect(
+            row_x1, row_y, row_x2, row_y + row_height,
+            radius=12, fill=bg, outline=border, width=1,
+        )
+        self._canvas.create_text(
+            row_x1 + 32, cy, text=icon,
+            font=(FONT_FAMILY, 22, "bold"), fill=icon_color,
+        )
+        self._canvas.create_text(
+            row_x1 + 64, cy - 10, text="Input Monitoring",
+            font=(FONT_FAMILY, 14, "bold"), fill=TEXT_COLOR, anchor=tk.W,
+        )
+        self._canvas.create_text(
+            row_x1 + 64, cy + 14,
+            text="Allow BetterFlow to count keystrokes and clicks",
+            font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
+        )
+        if not input_monitoring_granted:
+            self._make_button(
+                "Open Settings", self._open_input_monitoring,
                 row_x2 - 82, cy, width=128, primary=False,
             )
 
@@ -589,7 +639,7 @@ class SetupWizard:
         if self._closing:
             return
         try:
-            if check_accessibility():
+            if check_accessibility() and check_input_monitoring():
                 self._show_permissions()
             else:
                 self._permissions_refresh_id = self._window.after(
@@ -601,6 +651,10 @@ class SetupWizard:
     def _open_accessibility(self) -> None:
         """Open macOS Accessibility settings."""
         open_accessibility_settings()
+
+    def _open_input_monitoring(self) -> None:
+        """Open macOS Input Monitoring settings."""
+        open_input_monitoring_settings()
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
