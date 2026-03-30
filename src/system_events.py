@@ -207,10 +207,14 @@ def _start_macos_screen_lock_listener(
             # Run the loop in 5s intervals so _stop_event can interrupt.
             loop = NSRunLoop.currentRunLoop()
             while not _stop_event.is_set():
-                loop.runMode_beforeDate_(
+                ran = loop.runMode_beforeDate_(
                     NSDefaultRunLoopMode,
                     NSDate.dateWithTimeIntervalSinceNow_(5.0),
                 )
+                if not ran:
+                    # Run loop has no active sources — sleep to prevent
+                    # 100% CPU spin (sources can vanish after invalidation).
+                    _stop_event.wait(5.0)
         finally:
             center.removeObserver_(observer)
 
@@ -291,10 +295,14 @@ def _start_macos_network_listener(
         # Use interruptible run loop instead of blocking loop.run()
         from Foundation import NSDate
         while not _stop_event.is_set():
-            loop.runMode_beforeDate_(
+            ran = loop.runMode_beforeDate_(
                 NSDefaultRunLoopMode,
                 NSDate.dateWithTimeIntervalSinceNow_(5.0),
             )
+            if not ran:
+                # Run loop has no active sources — sleep to prevent
+                # 100% CPU spin (sources can vanish after invalidation).
+                _stop_event.wait(5.0)
 
     thread = threading.Thread(target=run_loop, name="system-network-listener", daemon=True)
     thread.start()
