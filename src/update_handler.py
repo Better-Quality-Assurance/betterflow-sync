@@ -39,9 +39,9 @@ class UpdateHandler:
             self._update_jobs_started = True
 
         try:
-            from .version_check import check_for_update
+            from .update_checker import check_for_update
         except ImportError:
-            from version_check import check_for_update
+            from update_checker import check_for_update
 
         from apscheduler.triggers.interval import IntervalTrigger
 
@@ -110,9 +110,9 @@ class UpdateHandler:
                 return
 
         try:
-            from .version_check import check_for_update
+            from .update_checker import check_for_update
         except ImportError:
-            from version_check import check_for_update
+            from update_checker import check_for_update
 
         try:
             check_for_update(
