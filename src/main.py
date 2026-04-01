@@ -430,7 +430,11 @@ class SyncCoordinator:
 
             stats = self.sync_engine.sync()
 
-            if stats.success:
+            if stats.success or stats.events_sent > 0:
+                # Partial success: some buckets may fail but data still syncs
+                if stats.errors:
+                    for err in stats.errors:
+                        logger.warning(f"Partial sync: {err}")
                 if self.queue.is_near_capacity():
                     pct = int(self.queue.capacity_percent() * 100)
                     self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
@@ -445,6 +449,8 @@ class SyncCoordinator:
                 if stats.events_sent > 0:
                     logger.info(f"Sync complete: {stats.events_sent} events synced")
             else:
+                for err in stats.errors:
+                    logger.warning(f"Sync failed: {err}")
                 self.tray.set_state(
                     TrayState.ERROR,
                     stats.errors[0] if stats.errors else "Sync failed",
