@@ -140,8 +140,8 @@ class MacOSInputWatcher:
             try:
                 from CoreFoundation import CFRunLoopStop
                 CFRunLoopStop(self._run_loop)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("CFRunLoopStop failed during shutdown: %s", e)
 
         if self._tap_thread and self._tap_thread.is_alive():
             self._tap_thread.join(timeout=3.0)
@@ -233,21 +233,21 @@ class MacOSInputWatcher:
     def _run_emitter(self) -> None:
         """Periodically read counters and post events to AW."""
         while not self._stop_event.wait(self._emit_interval):
+            # Snapshot without zeroing — we only zero AFTER the post succeeds.
+            # Previously we zeroed under the lock and then posted: if the post
+            # failed, that batch's counters were lost forever. Now a failure
+            # leaves counters intact so the next cycle picks them up.
+            with self._lock:
+                presses = self._presses
+                clicks = self._clicks
+                scrolls = self._scrolls
+
+            # Skip zero-count events to avoid 8,640 idle events/day.
+            # AFK bucket already handles idle detection.
+            if presses == 0 and clicks == 0 and scrolls == 0:
+                continue
+
             try:
-                # Atomically swap out the counters
-                with self._lock:
-                    presses = self._presses
-                    clicks = self._clicks
-                    scrolls = self._scrolls
-                    self._presses = 0
-                    self._clicks = 0
-                    self._scrolls = 0
-
-                # Skip zero-count events to avoid 8,640 idle events/day.
-                # AFK bucket already handles idle detection.
-                if presses == 0 and clicks == 0 and scrolls == 0:
-                    continue
-
                 now = datetime.now(timezone.utc).isoformat()
                 self._aw.post_events(self._bucket_id, [{
                     "timestamp": now,
@@ -259,4 +259,14 @@ class MacOSInputWatcher:
                     },
                 }])
             except Exception as e:
-                logger.debug(f"Input emitter error: {e}")
+                # Leave the counters alone so the next tick re-sends them.
+                logger.warning("Input emitter post failed (will retry): %s", e)
+                continue
+
+            # Post succeeded — atomically subtract the counts we just sent.
+            # Subtracting (rather than zeroing) preserves any events the event
+            # tap recorded between the snapshot and this point.
+            with self._lock:
+                self._presses -= presses
+                self._clicks -= clicks
+                self._scrolls -= scrolls
