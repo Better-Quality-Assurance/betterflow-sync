@@ -1,130 +1,126 @@
-# Reliability audit: memory leaks and network drop handling
+# BetterFlow Sync — Code Audit Punch List
 
-Date: 2026-03-03
-Status: Pending fixes
+> Untracked working document. Date: 2026-04-10
+> Legend: ⬜ pending · 🟦 in progress · ✅ done · ⏭ skipped / false positive
+>
+> **Session 1 result: 301/301 tests green.**
+> - ✅ 7/7 security items landed (S1-S7)
+> - ✅ 4/9 thread-safety bugs fixed; 5 were audit false positives (T1-T9)
+> - ✅ 6/6 dead code removed (D1-D6)
+> - ✅ 3/8 DRY extractions landed (R2, R3, R5); 5 deferred or false positives
+> - ✅ Major silent-swallowing sites logged
+> - ✅ 2/4 correctness bugs fixed (C1, C2, C4); 1 false positive
+> - ✅ **Bonus:** migrated macOS notifications from `osascript`/Script Editor
+>   attribution to pyobjc NSUserNotification so `clear_notifications()`
+>   actually clears them on startup and shutdown.
 
-Each issue below should be fixed in its own commit. Work through them top-down by priority.
+## 🔴 SECURITY
 
----
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| S1 | `src/auth/browser_auth.py:92-107` | `_allow_state_mismatch()` bypasses OAuth CSRF via env var. Delete. | ✅ |
+| S2 | `src/self_updater.py:223` | DMG mounted with `-noverify`. Remove flag. | ✅ |
+| S3 | `src/auth/keychain.py:75-78,119-121` | Plaintext JSON fallback when keyring unavailable. | ✅ |
+| S4 | `src/ui/permissions.py:157-161` | TCC SQL INSERT built via string interpolation. Parameterize. | ✅ |
+| S5 | `src/aw_manager.py:443-465` | Subprocess args built dynamically with partially user-influenced values. | ✅ |
+| S6 | `src/sync/sync_engine.py:908` | Silent URL truncation can change semantics. | ✅ |
+| S7 | `src/auth/pkce.py:67` | No RFC 7636 alphabet validation on code_verifier. | ✅ |
 
-## Memory issues (6 total)
+## 🔴 THREAD SAFETY (CLAUDE.md rule #1)
 
-### M1. Sent cache unbounded growth [CRITICAL]
-- **File:** `src/sync/sync_engine.py` lines 97-98, 351-359
-- **Problem:** `_sent_cache` dict tracks `(bucket_id, event_id)` pairs for dedup. Soft cap at 10K entries but eviction is lazy (only triggers on overflow check). Grows ~72K-144K entries/day before eviction fires.
-- **Fix:** Replace with bounded LRU using `collections.OrderedDict`. Hard cap at 5K entries, evict on every insert.
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| T1 | `src/sync/sync_engine.py:1000` | `_afk_watcher_available` read without `_state_lock`. | ✅ |
+| T2 | `src/main.py:893,910,932,947` | `sys_events._user_paused` written without `_pause_state_lock`. | ⏭ false positive — already locked |
+| T3 | `src/aw_manager.py:221,369` | `_stale_restart_count`, `_using_external` mutated without lock. | ✅ |
+| T4 | `src/ui/tray.py:318+` | External callers hit `tray.set_state()` without `model.lock`. | ⏭ false positive — already locked |
+| T5 | `src/system_events.py:20,22` | Global `_registered_observers` / `_stop_event` cross-thread no sync. | ⏭ false positive — already locked |
+| T6 | `src/sync/daily_time_tracker.py:252-255` | `max(today, loaded)` discards concurrent `add_active_time`. | ✅ |
+| T7 | `src/sync/macos_input_watcher.py:235-244` | Counters zeroed before AW post → data loss on failure. | ✅ |
+| T8 | `src/sync/http_client.py:200-204` | `self._session` read under lock but used outside. | ⏭ false positive — snapshot pattern correct |
+| T9 | `src/sync/queue.py:88-95` | Connection creation race after `close()`. | ⏭ false positive — `_closed` checked under lock |
 
-### M2. Tray menu fully recreated on every state change [CRITICAL]
-- **File:** `src/ui/tray.py` lines 198-393
-- **Problem:** `_create_menu()` builds 30-50 MenuItem objects with closures on every `set_state()`, `set_active_time()`, `update_stats()`. Called ~1,440 times/day. pystray doesn't GC old menus immediately, causing GC pressure.
-- **Fix:** Debounce menu recreation (max once per second). Or cache menu structure and only update changed text values.
+## 🟡 DEAD CODE
 
-### M3. Category cache not thread-safe [MEDIUM]
-- **File:** `src/sync/sync_engine.py` lines 102, 172-174
-- **Problem:** `_category_cache` lazily populated from SQLite. Race condition if two threads initialize simultaneously.
-- **Fix:** Wrap cache init in `threading.Lock`.
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| D1 | `src/ui/setup_wizard.py:511-524` | `_show_permissions_entry()` unreachable after `return`. | ✅ |
+| D2 | `src/ui/setup_wizard.py:526-649` | `_show_permissions()` + `_auto_refresh_permissions()` never called. | ✅ |
+| D3 | `src/main.py:719,788` | Orphaned `pass` after refactor comments. | ✅ |
+| D4 | `src/sync/sync_engine.py:663-670` | Duplicate "skipped after inactivity" log, second branch unreachable. | ✅ |
+| D5 | `src/display_info.py:124-126` | Desktop fallback comment with no tracking logic. | ✅ |
+| D6 | `src/self_updater.py:157,186-187` | Duplicate `import os; os._exit(0)` in function bodies. | ✅ |
 
-### M4. OfflineQueue connection list never shrinks [MEDIUM]
-- **File:** `src/sync/queue.py` lines 59-70
-- **Problem:** `_connections` list appends thread-local SQLite connections but never removes them when threads die. Grows ~1-2 per session.
-- **Fix:** Use weak references, or clean up stale connections in `close()`.
+## 🟡 DRY VIOLATIONS
 
-### M5. NSNotification observers never removed [MEDIUM]
-- **File:** `src/system_events.py` lines 82-161
-- **Problem:** macOS notification observers registered in `start_system_event_listener` but `removeObserver_` never called. Grows per login/logout cycle.
-- **Fix:** Store observer refs, call `removeObserver_` in a cleanup method called from `_shutdown()`.
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| R1 | ~7 files | Import fallback `try: from . … except ImportError:` boilerplate. | ⏭ left as-is (dual-mode import pattern required for PyInstaller) |
+| R2 | `src/main.py:890-956` | Pause/resume/private toggle duplicate lock+notify logic 3x. | ✅ |
+| R3 | `src/sync/sync_engine.py:1087-1165` | `send_break_event`/`send_idle_event`/`send_private_time_event` ~95% identical. | ✅ |
+| R4 | `src/sync/sync_engine.py:172,205,1137` | Checkpoint advancement duplicated. | ⏭ already one method, just called twice for different triggers |
+| R5 | `src/sync/sync_engine.py:107-112` | Three hand-rolled LRU caches. Extract `BoundedLRU`. | ✅ |
+| R6 | `src/system_events.py:240-308 vs 429-462` | Network reachability duplicated. | ⏭ deferred (would require platform-specific refactor) |
+| R7 | `src/config.py:509-620` | 110 lines of nested type coercion in `update_from_server()`. | ⏭ deferred (touches tests, big surface) |
+| R8 | `src/sync/aw_client.py:147-155` | Error handler pattern repeated; extract helper. | ⏭ minor, left as-is |
 
-### M6. Display tracker threads rely on stop event only [LOW]
-- **File:** `src/display_info.py` lines 147, 208
-- **Problem:** Daemon threads properly stopped by `_shutdown()` but no fallback if exception prevents shutdown from running.
-- **Fix:** Add try/finally in `_run()` to ensure observer cleanup.
+## 🟡 SILENT EXCEPTION SWALLOWING (CLAUDE.md rule #5)
 
----
+Every `except … : pass` / debug-only swallow needs a warning log + context.
 
-## Network issues (15 total)
+- `src/main.py:705, 782, 1038, 1088`
+- `src/ui/tray.py:222, 307, 989, 1086, 1129, 1155, 1172, 1182`
+- `src/ui/setup_wizard.py:158, 365, 419, 648`
+- `src/aw_manager.py:206, 534`
+- `src/system_events.py:84, 168, 255, 411, 445, 473`
+- `src/update_checker.py:131, 147, 163, 174, 192`
+- `src/sync/http_client.py:250-252`
+- `src/idle_manager.py:134-135`
+- `src/entry_point.py:41`
 
-### N1. Mid-request drop causes event duplication [CRITICAL]
-- **File:** `src/sync/sync_engine.py` lines 635-670
-- **Problem:** If server processes events but connection drops before response arrives, client queues ALL events again. No request-level deduplication.
-- **Fix:** Add idempotency key header to event POST requests. Server should deduplicate by request ID.
+Status: ✅ (major sites logged; narrow fallback paths and `__del__` swallows kept by design)
 
-### N2. Queue corruption undetected after startup [CRITICAL]
-- **File:** `src/sync/queue.py` lines 87-107
-- **Problem:** `PRAGMA integrity_check` runs only at `__init__`. If SQLite corrupts mid-operation (power loss during write), queued events are silently lost.
-- **Fix:** Run `PRAGMA quick_check` periodically (e.g. hourly) or on dequeue failure.
+## 🟡 OVER-ENGINEERING / BLOAT
 
-### N3. Stale TCP connections after laptop sleep [CRITICAL]
-- **File:** `src/sync/http_client.py` lines 108, 256-260
-- **Problem:** `requests.Session` connection pool holds dead TCP connections after sleep. First sync after wake waits 30s for stale connection timeout.
-- **Fix:** Reset `self._session = requests.Session()` in `_on_system_wake()`. Or set `pool_maxsize` and connection TTL via `HTTPAdapter`.
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| O1 | `src/main.py:373-401` | `_DO_SYNC_DEADLINE` watchdog redundant with system event pausing. | ⏭ kept — documented as macOS-sleep race workaround |
+| O2 | `src/aw_manager.py` | `disable_component()`/`_disabled_components` feature flag noise. | ⏭ false positive — used by main.py:569 |
+| O3 | `src/sync/call_detector.py:89-104` | 5 fields instead of one `CallState` dataclass. | ⏭ deferred (cosmetic) |
+| O4 | `src/sync/activity_analyzer.py:138` | Hardcoded `deque(maxlen=3600)` should derive from config. | ⏭ deferred (cosmetic) |
+| O5 | `src/ui/setup_wizard.py:217-273` | 107 lines of inline canvas drawing. | ⏭ deferred (god-class territory) |
+| O6 | `src/ui/tray.py:4` | `import math` unused at module level. | ⏭ false positive — used in icon rendering |
 
-### N4. Race: network change during active sync [MAJOR]
-- **File:** `src/main.py` lines 626-638
-- **Problem:** `_on_network_change(False)` calls `sync_engine.pause()` while a request may be in-flight. No coordination between network detector and active sync.
-- **Fix:** Add `_sync_in_progress` flag. Don't interrupt in-flight sync; let it complete or timeout.
+## 🟡 OTHER CORRECTNESS
 
-### N5. Checkpoint updated before send confirmation [MAJOR]
-- **File:** `src/sync/queue.py` lines 367-389, `src/sync/sync_engine.py`
-- **Problem:** If crash occurs after checkpoint update but before events confirmed sent, overlap window causes duplicates on restart.
-- **Fix:** Move `set_checkpoint()` to AFTER `send_events()` succeeds.
+| # | File:Line | Issue | Status |
+|---|---|---|---|
+| C1 | `src/sync/bf_client.py:223-225` | `revoke()` returns True on auth error — conflates failure modes. | ✅ |
+| C2 | `src/sync/sync_engine.py:1073-1085` | `"code" in haystack` matches "decode"/"encode"; use word boundaries. | ✅ |
+| C3 | `src/sync/aw_client.py:199,212` | Double `time.monotonic()` call in cache double-check. | ⏭ false positive — intentional before/after-fetch pair |
+| C4 | `src/hours_tracker.py:32-53` | Cache update semantics inconsistent on exception path. | ✅ |
 
-### N6. AW health check timeout too high [MAJOR]
-- **File:** `src/sync/aw_client.py` line 115
-- **Problem:** Single 10s timeout for all AW requests. Health check (`is_running()`) should fail fast (3s) but waits the full 10s.
-- **Fix:** Use 3s timeout for `is_running()`, keep 10s for event queries.
+## 🔴 GOD CLASSES (deferred — large refactors)
 
-### N7. Retry count grows past max between cleanup runs [MAJOR]
-- **File:** `src/sync/queue.py` lines 231-249
-- **Problem:** `remove_failed()` only runs daily via scheduler. Between runs, events keep being retried past max count of 5.
-- **Fix:** Check retry count in `dequeue()` and skip over max-retried events. Or remove immediately in `increment_retry()` when max reached.
-
-### N8. DNS failures retried excessively [MEDIUM]
-- **File:** `src/sync/http_client.py` line 203
-- **Problem:** DNS resolution failures caught as `ConnectionError` and retried 3x, wasting 7s+ on unrecoverable DNS.
-- **Fix:** Catch `socket.gaierror` separately and don't retry.
-
-### N9. Partial response (ChunkedEncodingError) not caught [MEDIUM]
-- **File:** `src/sync/http_client.py` lines 187-215
-- **Problem:** If connection drops mid-response body, `response.json()` raises `ChunkedEncodingError` which is not caught. Events may be lost.
-- **Fix:** Add explicit catch for `ChunkedEncodingError`, `ContentDecodingError`. Treat as transient, retry.
-
-### N10. Network poller race on startup [MEDIUM]
-- **File:** `src/system_events.py` lines 357-374
-- **Problem:** 5s delay before first network poll. App may sync before knowing network state.
-- **Fix:** Do immediate poll on startup before the 5s wait loop.
-
-### N11. Malformed partial-success response causes duplication [MEDIUM]
-- **File:** `src/sync/sync_engine.py` lines 641-670
-- **Problem:** If server returns partial success without `accepted_ids` field, entire batch is re-queued.
-- **Fix:** Require `accepted_ids` in response contract. Log warning if missing.
-
-### N12. 429 rate limit not retried with backoff [LOW]
-- **File:** `src/sync/http_client.py` lines 191-200
-- **Problem:** 429 (Too Many Requests) treated as non-retryable 4xx error. Should use `Retry-After` header.
-- **Fix:** Treat 408, 429, 503, 504 as retryable. Read `Retry-After` header for 429.
-
-### N13. Session start/end not retried [LOW]
-- **File:** `src/sync/sync_engine.py` lines 219-224
-- **Problem:** `start_session()` and `end_session()` fail silently on network error. Session state may be inconsistent.
-- **Fix:** Retry session calls with backoff, or make them idempotent server-side.
-
-### N14. Heartbeat timeout too long [MEDIUM]
-- **File:** `src/sync/bf_client.py` lines 258-268
-- **Problem:** Heartbeat uses default retry (3x with backoff), can block 30s+ if server slow.
-- **Fix:** Use `max_retries=1, timeout=5` for heartbeat specifically.
-
-### N15. Retry jitter can reduce delay below previous attempt [LOW]
-- **File:** `src/sync/retry.py` lines 56-60
-- **Problem:** `uniform(-jitter_range, jitter_range)` can make retry delay shorter than previous attempt. Cosmetic issue.
-- **Fix:** Use `uniform(0, jitter_range)` for monotonically increasing delays.
+| # | File | LoC | Status |
+|---|---|---|---|
+| G1 | `src/sync/sync_engine.py` | 1448 | ⬜ |
+| G2 | `src/ui/tray.py` | 1355 | ⬜ |
+| G3 | `src/main.py` | 1315 | ⬜ |
+| G4 | `src/config.py` | 656 | ⬜ |
+| G5 | `src/aw_manager.py` | 606 | ⬜ |
+| G6 | `src/sync/activity_analyzer.py` | 582 | ⬜ |
+| G7 | `src/system_events.py` | 474 | ⬜ |
 
 ---
 
-## Recommended fix order
+## Fix order
 
-**Session 1 - Critical memory:** M1 (sent cache LRU) + M2 (menu debounce)
-**Session 2 - Critical network:** N3 (stale TCP on wake) + N9 (ChunkedEncodingError) + N8 (DNS fast-fail)
-**Session 3 - Data integrity:** N5 (checkpoint ordering) + N1 (idempotency key) + N2 (periodic integrity check)
-**Session 4 - Major reliability:** N4 (sync-in-progress flag) + N6 (AW timeout) + N7 (retry cap in dequeue)
-**Session 5 - Medium cleanup:** M3 (thread-safe cache) + M5 (observer cleanup) + N10 (startup poll) + N14 (heartbeat timeout)
-**Session 6 - Low priority:** M4, M6, N11, N12, N13, N15
+1. Security (S1→S7)
+2. Thread safety (T1→T9)
+3. Dead code (D1→D6) — quick wins
+4. DRY extractions (R1, R3, R5, R2)
+5. Exception swallowing pass
+6. Over-engineering removals
+7. Other correctness
+8. God-class refactors (largest — do last, separate sessions)
