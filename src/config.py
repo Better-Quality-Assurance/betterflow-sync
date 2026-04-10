@@ -150,8 +150,8 @@ def get_machine_uuid() -> str:
             logger.warning(f"Failed to write machine ID file: {e}")
             try:
                 tmp_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_err:
+                logger.debug("Cleanup of tmp machine-id file failed: %s", cleanup_err)
 
         _machine_uuid_cache = new_id
         return new_id
@@ -481,8 +481,8 @@ class Config:
         except (OSError, ValueError):
             try:
                 tmp_file.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_err:
+                logger.debug("Cleanup of tmp config file failed: %s", cleanup_err)
             raise
         logger.info(f"Config saved to {config_file}")
 
@@ -558,7 +558,7 @@ class Config:
                     if 5 <= val <= 120:
                         self.sync.idle_pause_minutes = val
                 except (TypeError, ValueError):
-                    pass
+                    logger.warning("Invalid idle_pause_minutes from server, ignoring")
             if "min_window_event_seconds" in sync:
                 try:
                     val = float(sync["min_window_event_seconds"])
@@ -615,7 +615,7 @@ class Config:
                 try:
                     self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
                 except (TypeError, ValueError):
-                    pass
+                    logger.warning("Invalid min_call_duration from server, ignoring")
 
         self.save()
 

@@ -38,8 +38,13 @@ if getattr(sys, "frozen", False) and sys.platform == "darwin":
                 "Running from the disk image will cause crashes.",
             )
             _root.destroy()
-        except Exception:
-            pass
+        except Exception as _e:
+            # tkinter can be missing or the display not ready. We can't
+            # log (logging isn't configured yet this early in startup),
+            # so surface the warning to stderr at least.
+            sys.stderr.write(
+                f"BetterFlow: failed to show DMG warning dialog: {_e}\n"
+            )
         sys.exit(1)
 
 # Now import and run the canonical app from main.py

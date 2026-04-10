@@ -132,7 +132,7 @@ class IdleManager:
                     trigger_sync("idle_resume_sync")
 
         except Exception as e:
-            logger.debug(f"Idle check error: {e}")
+            logger.warning("Idle check error: %s", e)
 
     @staticmethod
     def _get_system_idle_seconds() -> Optional[float]:

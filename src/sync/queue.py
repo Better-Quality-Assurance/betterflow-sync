@@ -557,8 +557,8 @@ class OfflineQueue:
             for conn in self._connections:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("OfflineQueue conn.close() raised: %s", e)
             self._connections.clear()
         # Clear the calling thread's reference; other threads will get
         # a sqlite3.ProgrammingError on next use of their stale handle,
