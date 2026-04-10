@@ -103,6 +103,7 @@ class HoursTracker:
         with self._state_lock:
             self._hours_today_seconds = 0
             self._hours_today_cache = "0h 0m"
+            self._last_hours_refresh = 0.0
             self._trends_cache = {
                 "hours_this_week": "---",
                 "hours_this_month": "---",

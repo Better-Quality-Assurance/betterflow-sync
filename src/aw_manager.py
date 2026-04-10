@@ -415,25 +415,26 @@ class AWManager:
 
     def set_afk_timeout(self, seconds: int) -> None:
         """Update AFK timeout and restart idle tracker if running."""
-        if seconds == self.afk_timeout:
-            return
+        with self._lifecycle_lock:
+            if seconds == self.afk_timeout:
+                return
 
-        self.afk_timeout = seconds
-        logger.info(f"AFK timeout updated to {seconds}s")
+            self.afk_timeout = seconds
+            logger.info(f"AFK timeout updated to {seconds}s")
 
-        # Restart idle tracker if it's currently running
-        proc = self._processes.get("bf-idle-tracker")
-        if proc and proc.poll() is None:
-            logger.info("Restarting bf-idle-tracker with new timeout")
-            proc.terminate()
-            try:
-                proc.wait(timeout=SHUTDOWN_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            # Restart idle tracker if it's currently running
+            proc = self._processes.get("bf-idle-tracker")
+            if proc and proc.poll() is None:
+                logger.info("Restarting bf-idle-tracker with new timeout")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
-            binaries_dir = self._get_binaries_dir()
-            if binaries_dir:
-                self._start_component("bf-idle-tracker", binaries_dir)
+                binaries_dir = self._get_binaries_dir()
+                if binaries_dir:
+                    self._start_component("bf-idle-tracker", binaries_dir)
 
     def _start_component(self, name: str, binaries_dir: str) -> bool:
         """Start a single tracker component."""
@@ -555,7 +556,8 @@ class AWManager:
             event_end = ts.timestamp() + duration
             age = time.time() - event_end
             return max(0, age)
-        except Exception:
+        except Exception as e:
+            logger.debug("_get_latest_window_event_age failed: %s", e)
             return None
 
     def _get_binaries_dir(self) -> Optional[str]:

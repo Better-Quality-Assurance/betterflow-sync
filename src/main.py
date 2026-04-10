@@ -506,10 +506,6 @@ class SyncCoordinator:
         except Exception as e:
             logger.debug(f"Failed to expire old queue events: {e}")
 
-    @staticmethod
-    def _format_hours(total_seconds: int) -> str:
-        return HoursTracker.format_hours(total_seconds)
-
 class BetterFlowApp:
     """Main application orchestrator.
 
@@ -833,13 +829,11 @@ class BetterFlowApp:
         """
         # Cancel any in-progress flow so the lock is released
         self.login_manager.cancel_login()
-        # Don't pile up login threads if one is already waiting for the lock
-        if self._login_lock.locked():
-            logger.debug("Login already in progress, cancel requested")
-            return
 
         def do_browser_login():
-            # Wait for any in-progress logout/login to release the lock
+            # Serialize login attempts via the lock. The previous
+            # locked() pre-check was a TOCTOU race; the timeout here
+            # is the correct guard against piling up login threads.
             if not self._login_lock.acquire(timeout=15):
                 logger.warning("Could not acquire login lock after cancel")
                 self.tray.set_state(TrayState.ERROR, "Login busy, please try again")
@@ -1129,6 +1123,10 @@ class BetterFlowApp:
 
             # Phase 2 — browser auth (lock NOT held; at most one flow can run
             # because the tray state prevents the user from clicking Login again).
+            # Guard: if an auth-error callback already triggered a re-login
+            # between lock release and here, skip the second browser window.
+            if self._shutdown_event.is_set() or self.coordinator.logged_in:
+                return
             state = self.login_manager.login_via_browser()
             if self._shutdown_event.is_set():
                 return

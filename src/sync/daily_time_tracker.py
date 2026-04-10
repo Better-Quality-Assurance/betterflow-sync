@@ -44,6 +44,7 @@ class DailyTimeTracker:
         self._local = threading.local()
         self._all_connections: list[sqlite3.Connection] = []
         self._conn_lock = threading.Lock()
+        self._closed = False
         self._today: Optional[date] = None
         self._today_seconds: float = 0.0
         self._lock = threading.Lock()
@@ -55,7 +56,12 @@ class DailyTimeTracker:
         """Get thread-local database connection.
 
         Recreates the connection if it was closed by close().
+        Raises sqlite3.ProgrammingError if close() has been called.
         """
+        with self._conn_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("DailyTimeTracker has been closed")
+
         if hasattr(self._local, "connection"):
             try:
                 self._local.connection.execute("SELECT 1")
@@ -64,9 +70,12 @@ class DailyTimeTracker:
         if not hasattr(self._local, "connection"):
             conn = sqlite3.connect(str(self._db_path))
             conn.row_factory = sqlite3.Row
-            self._local.connection = conn
             with self._conn_lock:
+                if self._closed:
+                    conn.close()
+                    raise sqlite3.ProgrammingError("DailyTimeTracker has been closed")
                 self._all_connections.append(conn)
+            self._local.connection = conn
         return self._local.connection
 
     @contextmanager
@@ -219,7 +228,13 @@ class DailyTimeTracker:
             return timedelta(seconds=0)
 
     def _persist_date(self, target_date: date, seconds: float) -> None:
-        """Persist a specific date's data to SQLite (no lock required)."""
+        """Persist a specific date's data to SQLite (no lock required).
+
+        Uses MAX semantics so two concurrent _persist() calls (each with a
+        monotonically-growing in-memory snapshot) never silently discard the
+        higher value.  The in-memory counter is the ground truth; the DB
+        value should never exceed it.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
             cursor.execute(
@@ -227,7 +242,7 @@ class DailyTimeTracker:
                 INSERT INTO daily_active_time (date, active_seconds, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(date) DO UPDATE SET
-                    active_seconds = excluded.active_seconds,
+                    active_seconds = MAX(excluded.active_seconds, daily_active_time.active_seconds),
                     updated_at = excluded.updated_at
                 """,
                 (target_date.isoformat(), seconds, now),
@@ -283,6 +298,7 @@ class DailyTimeTracker:
     def close(self) -> None:
         """Close all database connections (from all threads)."""
         with self._conn_lock:
+            self._closed = True
             for conn in self._all_connections:
                 try:
                     conn.close()

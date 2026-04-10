@@ -69,12 +69,20 @@ def _legacy_credentials_file() -> Path:
 
 
 def _purge_legacy_file() -> None:
-    """Remove any leftover plaintext credential file from old installs."""
+    """Remove any leftover plaintext credential file from old installs.
+
+    Uses a single unlink() call instead of exists()-then-unlink() to
+    eliminate the TOCTOU window where a symlink could be swapped in.
+    """
     legacy = _legacy_credentials_file()
     try:
-        if legacy.exists():
-            legacy.unlink()
-            logger.info("Removed legacy plaintext credential file at %s", legacy)
+        if legacy.is_symlink():
+            logger.warning("Legacy credential path is a symlink, refusing to unlink: %s", legacy)
+            return
+        legacy.unlink()
+        logger.info("Removed legacy plaintext credential file at %s", legacy)
+    except FileNotFoundError:
+        pass  # Already gone
     except OSError as e:
         # Log but don't raise — this is best-effort cleanup.
         logger.warning("Failed to remove legacy credential file %s: %s", legacy, e)

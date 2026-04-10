@@ -76,23 +76,36 @@ class OfflineQueue:
 
         Recreates the connection if the queue was closed and reopened,
         or if this thread's handle was closed by close().
+
+        The liveness probe runs outside the lock to avoid blocking other
+        threads during I/O. Connection creation and registration happen
+        under the lock with a second _closed check to prevent races.
         """
-        need_new = not hasattr(self._local, "connection")
-        if not need_new:
-            # Check if existing connection was closed
+        # Fast path: check existing connection outside the lock
+        with self._connections_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("OfflineQueue has been closed")
+            existing = getattr(self._local, "connection", None)
+
+        if existing is not None:
             try:
-                self._local.connection.execute("SELECT 1")
+                existing.execute("SELECT 1")
+                return existing
             except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-                del self._local.connection
-                need_new = True
-        if need_new:
-            with self._connections_lock:
-                if self._closed:
-                    raise sqlite3.ProgrammingError("OfflineQueue has been closed")
-                conn = sqlite3.connect(str(self.db_path))
-                conn.row_factory = sqlite3.Row
-                self._connections.append(conn)
-                self._local.connection = conn  # assign inside lock
+                # Stale connection — will create a new one below
+                if hasattr(self._local, "connection"):
+                    del self._local.connection
+
+        # Create connection outside the lock to avoid blocking other threads
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+
+        with self._connections_lock:
+            if self._closed:
+                conn.close()
+                raise sqlite3.ProgrammingError("OfflineQueue has been closed")
+            self._connections.append(conn)
+            self._local.connection = conn
         return self._local.connection
 
     @contextmanager
@@ -182,18 +195,23 @@ class OfflineQueue:
             now = time.monotonic()
             if now - self._last_integrity_check < self._integrity_check_interval:
                 return True
+            # Claim the slot immediately to prevent concurrent threads from
+            # also passing the threshold and running duplicate checks.
+            self._last_integrity_check = now
         try:
             with self._cursor() as cursor:
                 cursor.execute("PRAGMA quick_check")
                 result = cursor.fetchone()
                 if result[0] != "ok":
                     logger.error(f"SQLite quick_check failed: {result[0]}")
+                    with self._integrity_lock:
+                        self._last_integrity_check = 0.0  # reset so next call retries
                     return False
-            with self._integrity_lock:
-                self._last_integrity_check = now  # only advance on success
             return True
         except sqlite3.DatabaseError as e:
             logger.error(f"SQLite integrity check error: {e}")
+            with self._integrity_lock:
+                self._last_integrity_check = 0.0  # reset so next call retries
             return False
 
     def enqueue(self, events: list[dict]) -> int:

@@ -108,13 +108,16 @@ def apply_update(
         if is_dmg:
             _extract_from_dmg(dl_path, extract_dir)
         else:
-            # ZIP extraction with Zip Slip protection
+            # ZIP extraction with Zip Slip protection — extract member by
+            # member under validated paths (never use extractall after a
+            # separate validation pass: TOCTOU + case-insensitive FS risks).
+            extract_prefix = str(extract_dir.resolve()) + os.sep
             with zipfile.ZipFile(dl_path, "r") as zf:
                 for member in zf.namelist():
                     member_path = (extract_dir / member).resolve()
-                    if not str(member_path).startswith(str(extract_dir.resolve())):
+                    if not str(member_path).startswith(extract_prefix):
                         raise ValueError(f"Zip entry escapes target directory: {member}")
-                zf.extractall(extract_dir)
+                    zf.extract(member, extract_dir)
 
         # 3. Find the new .app or exe dir inside the extract
         if sys.platform == "darwin":
@@ -234,7 +237,7 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
             raise FileNotFoundError("No .app found in DMG")
         # Copy .app to extract directory (with path traversal guard)
         dest = (extract_dir / app_found.name).resolve()
-        if not str(dest).startswith(str(extract_dir.resolve())):
+        if not str(dest).startswith(str(extract_dir.resolve()) + os.sep):
             raise ValueError(f"DMG app name escapes extract directory: {app_found.name}")
         shutil.copytree(str(app_found), str(dest), symlinks=True)
         logger.info(f"Extracted {app_found.name} from DMG")
@@ -347,8 +350,8 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
                 logger.error(f"codesign verification failed: {stderr}")
                 return False
     except FileNotFoundError:
-        logger.warning("codesign binary not found - skipping verification")
-        return True
+        logger.error("codesign binary not found - update aborted (cannot verify signature)")
+        return False
     except subprocess.TimeoutExpired:
         logger.error("codesign verification timed out")
         return False
@@ -361,6 +364,11 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
         # Reject signed -> unsigned downgrade
         if current.is_signed and not new.is_signed:
             logger.error("Rejecting update: current app is signed but update is unsigned")
+            return False
+
+        # Reject team ID disappearance (could be a stripped/re-signed binary)
+        if current.team_id and not new.team_id:
+            logger.error("Rejecting update: current app has team ID but update does not")
             return False
 
         # Reject team ID mismatch

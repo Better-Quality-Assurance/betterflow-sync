@@ -207,17 +207,14 @@ class TestDailyTimeTracker:
         self.tracker.close()
         self.tracker.close()  # Should not raise
 
-    def test_adding_after_close_creates_new_connection(self):
-        """Adding time after close should work with new connection."""
+    def test_adding_after_close_raises(self):
+        """Adding time after close raises ProgrammingError (no silent reconnect)."""
+        import sqlite3
+
         self.tracker.add_active_time(60.0, self.today)
         self.tracker.close()
 
-        # Should create new connection automatically
-        self.tracker.add_active_time(60.0, self.today)
-
-        # Re-open to verify
-        new_tracker = DailyTimeTracker(db_path=self.db_path)
-        active_time = new_tracker.get_today_active_time()
-        new_tracker.close()
-
-        assert active_time == timedelta(seconds=120)
+        # After close() the tracker must not silently reopen -- doing so
+        # would leak connections during shutdown.
+        with pytest.raises(sqlite3.ProgrammingError):
+            self.tracker.add_active_time(60.0, self.today)

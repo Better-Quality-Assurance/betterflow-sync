@@ -63,7 +63,7 @@ MAX_TITLE_LENGTH = 1024
 MAX_URL_LENGTH = 2048
 
 
-class BoundedLRU(dict):
+class BoundedLRU:
     """Ordered dict with hard-capped size.
 
     Writes move the key to the end (most-recent). When the size exceeds
@@ -73,31 +73,36 @@ class BoundedLRU(dict):
 
     Not thread-safe on its own — callers must wrap operations in a lock
     when shared across threads, exactly as the original caches did.
+
+    Does NOT inherit from dict — callers must use the explicit API below.
     """
 
     def __init__(self, maxsize: int) -> None:
-        super().__init__()
         if maxsize <= 0:
             raise ValueError("maxsize must be positive")
         self._maxsize = maxsize
         self._od: OrderedDict = OrderedDict()
 
-    def get(self, key, default=None):  # type: ignore[override]
-        return self._od.get(key, default)
+    def get(self, key, default=None):
+        if key in self._od:
+            self._od.move_to_end(key)
+            return self._od[key]
+        return default
 
-    def __contains__(self, key) -> bool:  # type: ignore[override]
+    def __contains__(self, key) -> bool:
         return key in self._od
 
-    def __getitem__(self, key):  # type: ignore[override]
+    def __getitem__(self, key):
+        self._od.move_to_end(key)
         return self._od[key]
 
-    def __setitem__(self, key, value) -> None:  # type: ignore[override]
+    def __setitem__(self, key, value) -> None:
         self._od[key] = value
         self._od.move_to_end(key)
         if len(self._od) > self._maxsize:
             self._od.popitem(last=False)
 
-    def __len__(self) -> int:  # type: ignore[override]
+    def __len__(self) -> int:
         return len(self._od)
 
 

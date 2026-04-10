@@ -52,8 +52,7 @@ class DisplayTracker:
 
 def _start_macos_tracker() -> DisplayTracker:
     """Start a macOS display tracker using NSScreen and CGSGetActiveSpace."""
-    from AppKit import NSScreen, NSWorkspace, NSObject
-    from Foundation import NSRunLoop, NSDate
+    from AppKit import NSScreen
 
     # Try importing private Quartz APIs for space tracking
     _cgs_available = False
@@ -131,63 +130,25 @@ def _start_macos_tracker() -> DisplayTracker:
         except Exception as e:
             logger.debug(f"Desktop state update failed: {e}")
 
-    class _Observer(NSObject):
-        """Observes workspace notifications for space/screen changes."""
-
-        def spaceChanged_(self, notification) -> None:
-            _update_desktop_state()
-
-        def screenChanged_(self, notification) -> None:
-            _update_monitor_state()
-
     _stop_event = threading.Event()
 
     def _run() -> None:
-        observer = None
-        nc = None
         try:
-            observer = _Observer.alloc().init()
-            nc = NSWorkspace.sharedWorkspace().notificationCenter()
-
-            # Space change notification
-            nc.addObserver_selector_name_object_(
-                observer,
-                "spaceChanged:",
-                "NSWorkspaceActiveSpaceDidChangeNotification",
-                None,
-            )
-            # Screen parameters change (resolution, arrangement)
-            nc.addObserver_selector_name_object_(
-                observer,
-                "screenChanged:",
-                "NSApplicationDidChangeScreenParametersNotification",
-                None,
-            )
-
             # Initial state
             _update_monitor_state()
             _update_desktop_state()
 
-            # Poll mainScreen every 5s.
-            # NOTE: NSWorkspace notifications are delivered on the main thread,
-            # not on this background thread, so the observer callbacks won't
-            # fire here.  We use _stop_event.wait() for the polling interval
-            # instead of NSRunLoop.runMode_beforeDate_ (which returns
-            # immediately on a thread with no run-loop sources, causing 100%
-            # CPU spin).
+            # Poll mainScreen and desktop every 5s.
+            # NSWorkspace notifications are delivered on the main thread, not
+            # on this background thread, so observer-based callbacks cannot
+            # fire here. Polling is the only reliable approach.
             while not _stop_event.is_set():
                 _stop_event.wait(5.0)
                 if not _stop_event.is_set():
                     _update_monitor_state()
+                    _update_desktop_state()
         except Exception as e:
             logger.debug(f"macOS display tracker run loop failed: {e}")
-        finally:
-            # Ensure observer cleanup even if exception prevents normal shutdown (M6)
-            if nc is not None and observer is not None:
-                try:
-                    nc.removeObserver_(observer)
-                except Exception as e:
-                    logger.debug("removeObserver_ failed during shutdown: %s", e)
 
     def _stop() -> None:
         _stop_event.set()

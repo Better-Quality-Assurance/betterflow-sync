@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -549,9 +550,15 @@ class Config:
         if "sync" in server_config:
             sync = server_config["sync"]
             if "sync_interval_seconds" in sync:
-                self.sync.interval_seconds = max(30, sync["sync_interval_seconds"])
+                try:
+                    self.sync.interval_seconds = max(30, int(sync["sync_interval_seconds"]))
+                except (TypeError, ValueError):
+                    logger.warning("Invalid sync_interval_seconds from server, ignoring")
             if "batch_size" in sync:
-                self.sync.batch_size = min(sync["batch_size"], MAX_BATCH_SIZE)
+                try:
+                    self.sync.batch_size = max(1, min(int(sync["batch_size"]), MAX_BATCH_SIZE))
+                except (TypeError, ValueError):
+                    logger.warning("Invalid batch_size from server, ignoring")
             if "idle_pause_minutes" in sync:
                 try:
                     val = int(sync["idle_pause_minutes"])
@@ -571,15 +578,15 @@ class Config:
             eng = server_config["engagement"]
             try:
                 if "sustained_typing_presses" in eng:
-                    self.engagement.sustained_typing_presses = int(eng["sustained_typing_presses"])
+                    self.engagement.sustained_typing_presses = max(1, int(eng["sustained_typing_presses"]))
                 if "window_changes_min" in eng:
-                    self.engagement.window_changes_min = int(eng["window_changes_min"])
+                    self.engagement.window_changes_min = max(1, int(eng["window_changes_min"]))
                 if "scroll_threshold" in eng:
-                    self.engagement.scroll_threshold = int(eng["scroll_threshold"])
+                    self.engagement.scroll_threshold = max(1, int(eng["scroll_threshold"]))
                 if "combined_presses_min" in eng:
-                    self.engagement.combined_presses_min = int(eng["combined_presses_min"])
+                    self.engagement.combined_presses_min = max(1, int(eng["combined_presses_min"]))
                 if "combined_scrolls_min" in eng:
-                    self.engagement.combined_scrolls_min = int(eng["combined_scrolls_min"])
+                    self.engagement.combined_scrolls_min = max(1, int(eng["combined_scrolls_min"]))
                 if "window_minutes" in eng:
                     self.engagement.window_minutes = max(1, int(eng["window_minutes"]))
             except (TypeError, ValueError) as e:
@@ -589,7 +596,9 @@ class Config:
             fd = server_config["fraud_detection"]
             try:
                 if "keystroke_cv_threshold" in fd:
-                    self.fraud_detection.keystroke_cv_threshold = float(fd["keystroke_cv_threshold"])
+                    val = float(fd["keystroke_cv_threshold"])
+                    if math.isfinite(val) and val > 0:
+                        self.fraud_detection.keystroke_cv_threshold = val
                 if "min_windows_for_variance" in fd:
                     self.fraud_detection.min_windows_for_variance = max(2, int(fd["min_windows_for_variance"]))
                 if "mouse_only_streak_threshold" in fd:
@@ -599,9 +608,13 @@ class Config:
                 if "app_diversity_min_minutes" in fd:
                     self.fraud_detection.app_diversity_min_minutes = max(1, int(fd["app_diversity_min_minutes"]))
                 if "click_keystroke_ratio_threshold" in fd:
-                    self.fraud_detection.click_keystroke_ratio_threshold = float(fd["click_keystroke_ratio_threshold"])
+                    val = float(fd["click_keystroke_ratio_threshold"])
+                    if math.isfinite(val) and val > 0:
+                        self.fraud_detection.click_keystroke_ratio_threshold = val
                 if "input_regularity_cv_threshold" in fd:
-                    self.fraud_detection.input_regularity_cv_threshold = float(fd["input_regularity_cv_threshold"])
+                    val = float(fd["input_regularity_cv_threshold"])
+                    if math.isfinite(val) and val > 0:
+                        self.fraud_detection.input_regularity_cv_threshold = val
                 if "min_input_events_for_regularity" in fd:
                     self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
             except (TypeError, ValueError) as e:
