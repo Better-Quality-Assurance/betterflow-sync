@@ -13,6 +13,7 @@ import logging
 import platform
 import re
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -144,13 +145,30 @@ def open_input_monitoring_settings() -> None:
 _BUNDLE_ID = "co.betterqa.betterflow"
 
 
+def _tcc_grant_marker() -> Path:
+    """Path to the marker file that records the TCC grant was already attempted."""
+    try:
+        from src.config import Config
+    except ImportError:
+        from config import Config
+    return Config.get_data_dir() / ".tcc_grant_done"
+
+
 def grant_tcc_permissions() -> bool:
     """Grant Accessibility and Input Monitoring via TCC database with admin auth.
 
-    Shows the native macOS password dialog ("Allow Always" style).
-    Returns True if the grant succeeded.
+    Shows the native macOS password dialog once on first install. Subsequent
+    launches skip the prompt — if permissions are still missing, the user
+    must grant them manually via System Settings.
+
+    Returns True if the grant succeeded or was already attempted.
     """
     if not _IS_MACOS:
+        return True
+
+    marker = _tcc_grant_marker()
+    if marker.exists():
+        logger.debug("TCC grant already attempted, skipping admin prompt")
         return True
 
     services = []
@@ -160,6 +178,12 @@ def grant_tcc_permissions() -> bool:
         services.append("kTCCServiceListenEvent")
 
     if not services:
+        # Permissions already granted — write marker so we don't re-check.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError as e:
+            logger.debug("Could not write TCC marker: %s", e)
         return True
 
     # Defensive: refuse to interpolate anything we didn't hardcode ourselves.
@@ -217,3 +241,11 @@ def grant_tcc_permissions() -> bool:
     except Exception as e:
         logger.warning(f"TCC grant error: {e}")
         return False
+    finally:
+        # Mark the grant as attempted regardless of outcome so the user
+        # is never prompted again on subsequent launches.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError as exc:
+            logger.debug("Could not write TCC marker: %s", exc)
