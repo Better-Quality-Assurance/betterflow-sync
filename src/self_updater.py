@@ -4,6 +4,7 @@ Supports both ZIP and DMG formats (macOS uses DMG, Windows uses ZIP).
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -154,7 +155,6 @@ def apply_update(
             subprocess.Popen(["open", str(app_path)])
             # Exit current process — os._exit works from any thread,
             # unlike sys.exit which only raises SystemExit in the calling thread.
-            import os
             os._exit(0)
 
         elif sys.platform == "win32":
@@ -183,7 +183,6 @@ def apply_update(
                 ["cmd", "/c", str(bat_path)],
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            import os
             os._exit(0)
 
         return True
@@ -217,9 +216,11 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
     """Mount a DMG, copy the .app out, and unmount."""
     mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
     try:
-        # Mount DMG read-only, hidden from Finder
+        # Mount DMG read-only, hidden from Finder.
+        # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
+        # mount time. Signature verification still happens post-extract.
         subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify",
+            ["hdiutil", "attach", "-nobrowse", "-readonly",
              "-mountpoint", str(mount_point), str(dmg_path)],
             capture_output=True, text=True, timeout=60, check=True,
         )
@@ -303,8 +304,8 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
                 team_id = match.group(1)
         elif "code object is not signed at all" in stderr:
             is_signed = False
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning("codesign probe failed: %s", e)
 
     # Get version from Info.plist
     plist_path = app_path / "Contents" / "Info.plist"
@@ -316,8 +317,8 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
             )
             if result.returncode == 0:
                 version = result.stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("defaults read on Info.plist failed: %s", e)
 
     return _SigningInfo(is_signed=is_signed, team_id=team_id, version=version)
 
