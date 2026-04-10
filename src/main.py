@@ -30,8 +30,6 @@ try:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
-        open_accessibility_settings,
-        open_input_monitoring_settings,
     )
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
@@ -54,8 +52,6 @@ except ImportError:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
-        open_accessibility_settings,
-        open_input_monitoring_settings,
     )
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
@@ -716,8 +712,6 @@ class BetterFlowApp:
             greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
             send_notification(greeting, _day_greeting())
 
-        pass  # Permissions check removed — watchers handle missing perms gracefully
-
     def _background_startup(self, wizard_login_state=None) -> None:
         """Restore session and services without delaying tray visibility."""
         if not self._login_lock.acquire(timeout=1):
@@ -784,8 +778,8 @@ class BetterFlowApp:
                         from autostart import set_auto_start
                     if set_auto_start(True):
                         self.config.auto_start = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Auto-start enable failed (non-fatal): %s", e)
             self.config.save()
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
@@ -887,17 +881,26 @@ class BetterFlowApp:
         """Handle user ending break early from tray menu."""
         self.coordinator.end_break(force=True)
 
-    def _on_pause(self) -> None:
-        """Handle pause action."""
+    def _set_user_paused(self, paused: bool) -> None:
+        """Flip the user-paused flag under the shared lock."""
         with self._pause_state_lock:
-            self.sys_events._user_paused = True
+            self.sys_events._user_paused = paused
         self.coordinator.paused_by_network = False
-        # Flush idle event if idle-paused, then clear state
         self.coordinator.clear_idle_pause(send_event=True)
+
+    def _enter_paused_state(self) -> None:
+        """Common pre-work shared by pause, private-on, and break-pause:
+        flush idle state, cancel any running break, and pause the engine.
+        """
+        self._set_user_paused(True)
         # End break first (it may call resume internally), then re-pause
         # so the user-initiated pause always wins.
         if self.coordinator.is_on_break:
             self.coordinator.end_break(silent=True, force=True)
+
+    def _on_pause(self) -> None:
+        """Handle pause action."""
+        self._enter_paused_state()
         self.sync_engine.pause()
         self.tray.set_paused(True)
         self.reminder_manager.on_tracking_stopped()
@@ -906,10 +909,7 @@ class BetterFlowApp:
 
     def _on_resume(self) -> None:
         """Handle resume action."""
-        with self._pause_state_lock:
-            self.sys_events._user_paused = False
-        self.coordinator.paused_by_network = False
-        self.coordinator.clear_idle_pause(send_event=True)
+        self._set_user_paused(False)
         self.sync_engine.resume()
         self.tray.set_paused(False)
         self.reminder_manager.on_tracking_started()
@@ -928,13 +928,7 @@ class BetterFlowApp:
         """Handle private time toggle (also serves as pause/resume)."""
         if private:
             logger.info("Private time started — recording paused")
-            with self._pause_state_lock:
-                self.sys_events._user_paused = True
-            self.coordinator.paused_by_network = False
-            self.coordinator.clear_idle_pause(send_event=True)
-            # End break first (it may call resume internally), then re-pause
-            if self.coordinator.is_on_break:
-                self.coordinator.end_break(silent=True, force=True)
+            self._enter_paused_state()
             self.sync_engine.set_private_mode(True)
             self.sync_engine.pause()
             self.tray.set_paused(True)
@@ -943,10 +937,7 @@ class BetterFlowApp:
             send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
         else:
             logger.info("Private time ended — recording resumed")
-            with self._pause_state_lock:
-                self.sys_events._user_paused = False
-            self.coordinator.paused_by_network = False
-            self.coordinator.clear_idle_pause(send_event=True)
+            self._set_user_paused(False)
             self.sync_engine.set_private_mode(False)
             self.sync_engine.resume()
             self.tray.set_paused(False)
@@ -1276,15 +1267,15 @@ class SingleInstanceLock:
                     import msvcrt
                     try:
                         msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        logger.debug("msvcrt unlock failed: %s", e)
                 else:
                     import fcntl
                     fcntl.flock(self._file, fcntl.LOCK_UN)
                 self._file.close()
                 os.unlink(self._path)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("PidLock release raised: %s", e)
             self._file = None
 
     def __enter__(self):
