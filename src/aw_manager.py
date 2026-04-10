@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -215,8 +216,19 @@ class AWManager:
     """Manages lifecycle of bundled tracker processes."""
 
     def __init__(self, aw_port: int = 5600, afk_timeout: int = 600):
+        # Clamp to reasonable ranges. These values are baked into argv for
+        # the tracker binaries; bounding them prevents future config drift
+        # from producing nonsense or huge argv strings.
+        if not isinstance(aw_port, int) or not (1024 <= aw_port <= 65535):
+            raise ValueError(f"aw_port out of range: {aw_port!r}")
+        if not isinstance(afk_timeout, int) or not (30 <= afk_timeout <= 86400):
+            raise ValueError(f"afk_timeout out of range: {afk_timeout!r}")
         self.aw_port = aw_port
         self.afk_timeout = afk_timeout  # seconds
+        # Serializes every mutation of _processes, _using_external,
+        # _disabled_components, and _stale_restart_count so scheduler
+        # callbacks, tray callbacks, and shutdown never race.
+        self._lifecycle_lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen] = {}
         self._using_external = False
         # Components intentionally disabled for this app session.
@@ -225,15 +237,21 @@ class AWManager:
 
     def disable_component(self, name: str) -> None:
         """Prevent a component from being started/restarted."""
-        self._disabled_components.add(name)
+        with self._lifecycle_lock:
+            self._disabled_components.add(name)
 
     @property
     def is_managing(self) -> bool:
         """True if we started tracker processes (not using external)."""
-        return bool(self._processes) and not self._using_external
+        with self._lifecycle_lock:
+            return bool(self._processes) and not self._using_external
 
     def start(self) -> bool:
         """Start tracker components. Returns True if tracker is available."""
+        with self._lifecycle_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
@@ -280,64 +298,70 @@ class AWManager:
 
     def stop(self) -> None:
         """Stop all managed tracker processes."""
-        if self._using_external:
-            logger.debug("Using external tracker — nothing to stop")
-            return
+        with self._lifecycle_lock:
+            if self._using_external:
+                logger.debug("Using external tracker — nothing to stop")
+                return
 
-        if not self._processes:
-            return
+            if not self._processes:
+                return
 
-        logger.info("Stopping tracker components...")
+            logger.info("Stopping tracker components...")
 
-        # Stop watchers first, then server
-        stop_order = BF_WATCHERS + [BF_SERVER]
+            # Stop watchers first, then server
+            stop_order = BF_WATCHERS + [BF_SERVER]
 
-        for name in stop_order:
-            proc = self._processes.get(name)
-            if proc and proc.poll() is None:
-                logger.debug(f"Terminating {name} (PID {proc.pid})")
-                proc.terminate()
+            for name in stop_order:
+                proc = self._processes.get(name)
+                if proc and proc.poll() is None:
+                    logger.debug(f"Terminating {name} (PID {proc.pid})")
+                    proc.terminate()
 
-        # Wait for graceful shutdown
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT
-        for name in stop_order:
-            proc = self._processes.get(name)
-            if proc and proc.poll() is None:
-                remaining = max(0, deadline - time.monotonic())
-                try:
-                    proc.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"Force-killing {name} (PID {proc.pid})")
-                    proc.kill()
+            # Wait for graceful shutdown
+            deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+            for name in stop_order:
+                proc = self._processes.get(name)
+                if proc and proc.poll() is None:
+                    remaining = max(0, deadline - time.monotonic())
+                    try:
+                        proc.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Force-killing {name} (PID {proc.pid})")
+                        proc.kill()
 
-        self._processes.clear()
-        logger.info("Tracker components stopped")
+            self._processes.clear()
+            logger.info("Tracker components stopped")
 
     def check_health(self) -> bool:
         """Check if all managed components are still running."""
-        if self._using_external:
-            return self._port_in_use()
+        with self._lifecycle_lock:
+            if self._using_external:
+                return self._port_in_use()
 
-        if not self._processes:
-            return False
-
-        for name, proc in self._processes.items():
-            if name in self._disabled_components:
-                continue
-            if proc.poll() is not None:
-                logger.warning(f"{name} has exited (code {proc.returncode})")
+            if not self._processes:
                 return False
-        return True
+
+            for name, proc in self._processes.items():
+                if name in self._disabled_components:
+                    continue
+                if proc.poll() is not None:
+                    logger.warning(f"{name} has exited (code {proc.returncode})")
+                    return False
+            return True
 
     def restart_if_needed(self) -> bool:
         """Restart crashed or stalled components. Returns True if tracker is healthy."""
+        with self._lifecycle_lock:
+            return self._restart_if_needed_locked()
+
+    def _restart_if_needed_locked(self) -> bool:
         if self._using_external:
             if self._port_in_use():
                 return True
             # External tracker disappeared — try to start our own
             logger.warning("External tracker no longer running")
             self._using_external = False
-            return self.start()
+            return self._start_locked()
 
         if not self._processes:
             return False
