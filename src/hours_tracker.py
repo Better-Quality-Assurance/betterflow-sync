@@ -30,7 +30,13 @@ class HoursTracker:
         }
 
     def fetch_hours_today(self) -> str:
-        """Fetch today's tracked hours from API (source of truth)."""
+        """Fetch today's tracked hours from API (source of truth).
+
+        On failure, returns the most recently cached value and leaves the
+        internal state untouched — ``_last_hours_refresh`` is only bumped
+        on a successful fetch so the next retry isn't suppressed by the
+        30-second throttle.
+        """
         try:
             status = self.bf.get_status()
             summary = status.get("data", {}).get("today_summary", {})
@@ -46,11 +52,12 @@ class HoursTracker:
             with self._state_lock:
                 self._hours_today_seconds = clamped
                 self._hours_today_cache = formatted
-            self._last_hours_refresh = time.monotonic()
+                self._last_hours_refresh = time.monotonic()
             return formatted
         except Exception as e:
-            logger.debug(f"fetch_hours_today failed: {e}")
-            return self._hours_today_cache
+            logger.warning("fetch_hours_today failed, returning cached value: %s", e)
+            with self._state_lock:
+                return self._hours_today_cache
 
     def refresh_hours_today(self, *, logged_in: bool) -> None:
         """Refresh tray hours from server.
@@ -63,7 +70,9 @@ class HoursTracker:
                 logger.debug("_refresh_hours: skipped (not logged in)")
                 return
 
-            if time.monotonic() - self._last_hours_refresh < 30:
+            with self._state_lock:
+                last_refresh = self._last_hours_refresh
+            if time.monotonic() - last_refresh < 30:
                 return
 
             hours = self.fetch_hours_today()
