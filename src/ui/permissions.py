@@ -11,11 +11,23 @@ the permission off and on again in System Settings re-registers it.
 
 import logging
 import platform
+import re
 import subprocess
 
 logger = logging.getLogger(__name__)
 
 _IS_MACOS = platform.system() == "Darwin"
+
+# Whitelist of TCC services we will ever insert into TCC.db. Guards
+# grant_tcc_permissions() against accidental SQL injection if callers ever
+# route user input into the services list.
+_ALLOWED_TCC_SERVICES = frozenset({
+    "kTCCServiceAccessibility",
+    "kTCCServiceListenEvent",
+})
+
+# Reverse-DNS bundle ID format (letters, digits, dots, hyphens, underscores).
+_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$")
 
 
 def check_accessibility() -> bool:
@@ -53,8 +65,8 @@ def check_accessibility() -> bool:
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         if lib.AXIsProcessTrusted():
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ctypes AXIsProcessTrusted probe failed: %s", e)
 
     # Practical test: try reading the frontmost app name via AppleScript.
     # This actually exercises the Accessibility API and works even when
@@ -67,8 +79,8 @@ def check_accessibility() -> bool:
         if result.returncode == 0 and result.stdout.strip():
             logger.debug("AXIsProcessTrusted=False but AppleScript works, treating as granted")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("AppleScript accessibility probe failed: %s", e)
 
     return False
 
@@ -150,7 +162,21 @@ def grant_tcc_permissions() -> bool:
     if not services:
         return True
 
-    # Build SQL statements for each missing permission
+    # Defensive: refuse to interpolate anything we didn't hardcode ourselves.
+    # Both _ALLOWED_TCC_SERVICES and _BUNDLE_ID_RE are checked even though
+    # current callers only pass compile-time constants — this stops the
+    # pattern from silently becoming injectable if someone later threads
+    # user-controlled values through here.
+    for svc in services:
+        if svc not in _ALLOWED_TCC_SERVICES:
+            logger.error("Refusing to grant unknown TCC service %r", svc)
+            return False
+    if not _BUNDLE_ID_RE.match(_BUNDLE_ID):
+        logger.error("Refusing to grant TCC with malformed bundle id %r", _BUNDLE_ID)
+        return False
+
+    # Build SQL statements for each missing permission. Values are validated
+    # above, so string interpolation is safe here.
     sql_parts = []
     for svc in services:
         sql_parts.append(
