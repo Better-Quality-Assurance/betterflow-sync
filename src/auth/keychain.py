@@ -1,22 +1,20 @@
-"""Secure credential storage using system keychain with file fallback."""
+"""Secure credential storage using the system keychain."""
 
 import json
 import logging
-import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import keyring
-from keyring.errors import KeyringError
+from keyring.errors import KeyringError, PasswordDeleteError
 
 try:
     from .config_access import get_config_dir
 except ImportError:
     from config_access import get_config_dir
 
-__all__ = ["KeychainManager", "StoredCredentials"]
+__all__ = ["KeychainManager", "StoredCredentials", "KeychainUnavailableError"]
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +22,17 @@ SERVICE_NAME = "BetterFlow"
 ACCOUNT_NAME = "api_credentials"
 
 
+class KeychainUnavailableError(RuntimeError):
+    """Raised when the system keychain cannot be written to.
+
+    We deliberately do not fall back to a plaintext file — credentials must
+    live in the OS keychain (macOS Keychain / Windows Credential Manager).
+    """
+
+
 @dataclass
 class StoredCredentials:
-    """Credentials stored in keychain."""
+    """Credentials stored in the system keychain."""
 
     api_token: str
     device_id: str
@@ -57,105 +63,74 @@ class StoredCredentials:
         )
 
 
-def _credentials_file() -> Path:
-    """Get path to file-based credential storage (owner-only permissions)."""
+def _legacy_credentials_file() -> Path:
+    """Path to the legacy plaintext credential file (pre-2026-04)."""
     return get_config_dir() / ".credentials"
 
 
-def _store_to_file(credentials: StoredCredentials) -> bool:
-    """Store credentials to a file with restrictive permissions."""
+def _purge_legacy_file() -> None:
+    """Remove any leftover plaintext credential file from old installs."""
+    legacy = _legacy_credentials_file()
     try:
-        cred_file = _credentials_file()
-        cred_file.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(cred_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, credentials.to_json().encode())
-        finally:
-            os.close(fd)
-        logger.warning(
-            "Credentials stored UNENCRYPTED to %s — configure system keychain to avoid this",
-            cred_file,
-        )
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to store credentials to file: {e}")
-        return False
-
-
-def _load_from_file() -> Optional[StoredCredentials]:
-    """Load credentials from file."""
-    try:
-        cred_file = _credentials_file()
-        if cred_file.exists():
-            data = cred_file.read_text()
-            return StoredCredentials.from_json(data)
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to load credentials from file: {e}")
-        return None
-
-
-def _delete_file() -> bool:
-    """Delete credential file."""
-    try:
-        cred_file = _credentials_file()
-        if cred_file.exists():
-            cred_file.unlink()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to delete credential file: {e}")
-        return False
+        if legacy.exists():
+            legacy.unlink()
+            logger.info("Removed legacy plaintext credential file at %s", legacy)
+    except OSError as e:
+        # Log but don't raise — this is best-effort cleanup.
+        logger.warning("Failed to remove legacy credential file %s: %s", legacy, e)
 
 
 class KeychainManager:
-    """Manages secure credential storage with file fallback."""
+    """Manages secure credential storage in the system keychain only."""
 
     def __init__(self, service_name: str = SERVICE_NAME):
         self.service_name = service_name
 
     def store(self, credentials: StoredCredentials) -> bool:
-        """Store credentials in keychain, falling back to file."""
+        """Store credentials in the system keychain.
+
+        Returns False (and logs) if the keychain is unavailable — the caller
+        must surface this to the user. We never write plaintext to disk.
+        """
         try:
             keyring.set_password(
                 self.service_name, ACCOUNT_NAME, credentials.to_json()
             )
-            logger.info(f"Credentials stored for {credentials.user_email}")
-            _delete_file()  # Clean up file fallback if keychain works
-            return True
-        except (KeyringError, Exception) as e:
-            logger.warning(f"Keychain unavailable ({e}), using file fallback")
-            return _store_to_file(credentials)
+        except KeyringError as e:
+            logger.error("Keychain write failed — credentials NOT stored: %s", e)
+            return False
+        logger.info("Credentials stored for %s", credentials.user_email)
+        _purge_legacy_file()
+        return True
 
     def load(self) -> Optional[StoredCredentials]:
-        """Load credentials from keychain, falling back to file."""
+        """Load credentials from the system keychain."""
         try:
             data = keyring.get_password(self.service_name, ACCOUNT_NAME)
-            if data:
-                try:
-                    return StoredCredentials.from_json(data)
-                except (json.JSONDecodeError, KeyError, TypeError) as e:
-                    logger.warning(f"Invalid credential format in keychain: {e}")
-        except (KeyringError, Exception) as e:
-            logger.debug(f"Keychain read failed: {e}")
-
-        # Try file fallback
-        return _load_from_file()
+        except KeyringError as e:
+            logger.warning("Keychain read failed: %s", e)
+            return None
+        if not data:
+            return None
+        try:
+            return StoredCredentials.from_json(data)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.warning("Invalid credential format in keychain: %s", e)
+            return None
 
     def delete(self) -> bool:
-        """Delete stored credentials from both keychain and file."""
-        ok = True
+        """Delete stored credentials from the keychain."""
         try:
             keyring.delete_password(self.service_name, ACCOUNT_NAME)
             logger.info("Credentials deleted from keychain")
-        except keyring.errors.PasswordDeleteError:
+        except PasswordDeleteError:
+            # Already absent — treat as success.
             pass
-        except (KeyringError, Exception):
-            pass
-
-        if not _delete_file():
-            ok = False
-
-        return ok
+        except KeyringError as e:
+            logger.warning("Keychain delete failed: %s", e)
+            return False
+        _purge_legacy_file()
+        return True
 
     def has_credentials(self) -> bool:
         """Check if credentials are stored."""
