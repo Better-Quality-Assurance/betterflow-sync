@@ -1152,8 +1152,8 @@ class TrayIcon:
             thickness = 22
             try:
                 thickness = max(int(self._icon._status_bar.thickness()), 22)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("status bar thickness probe failed: %s", e)
 
             sz = thickness
             if pil_img.size != (sz, sz):

@@ -11,11 +11,24 @@ the permission off and on again in System Settings re-registers it.
 
 import logging
 import platform
+import re
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _IS_MACOS = platform.system() == "Darwin"
+
+# Whitelist of TCC services we will ever insert into TCC.db. Guards
+# grant_tcc_permissions() against accidental SQL injection if callers ever
+# route user input into the services list.
+_ALLOWED_TCC_SERVICES = frozenset({
+    "kTCCServiceAccessibility",
+    "kTCCServiceListenEvent",
+})
+
+# Reverse-DNS bundle ID format (letters, digits, dots, hyphens, underscores).
+_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$")
 
 
 def check_accessibility() -> bool:
@@ -53,8 +66,8 @@ def check_accessibility() -> bool:
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         if lib.AXIsProcessTrusted():
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ctypes AXIsProcessTrusted probe failed: %s", e)
 
     # Practical test: try reading the frontmost app name via AppleScript.
     # This actually exercises the Accessibility API and works even when
@@ -67,8 +80,8 @@ def check_accessibility() -> bool:
         if result.returncode == 0 and result.stdout.strip():
             logger.debug("AXIsProcessTrusted=False but AppleScript works, treating as granted")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("AppleScript accessibility probe failed: %s", e)
 
     return False
 
@@ -132,13 +145,30 @@ def open_input_monitoring_settings() -> None:
 _BUNDLE_ID = "co.betterqa.betterflow"
 
 
+def _tcc_grant_marker() -> Path:
+    """Path to the marker file that records the TCC grant was already attempted."""
+    try:
+        from src.config import Config
+    except ImportError:
+        from config import Config
+    return Config.get_data_dir() / ".tcc_grant_done"
+
+
 def grant_tcc_permissions() -> bool:
     """Grant Accessibility and Input Monitoring via TCC database with admin auth.
 
-    Shows the native macOS password dialog ("Allow Always" style).
-    Returns True if the grant succeeded.
+    Shows the native macOS password dialog once on first install. Subsequent
+    launches skip the prompt — if permissions are still missing, the user
+    must grant them manually via System Settings.
+
+    Returns True if the grant succeeded or was already attempted.
     """
     if not _IS_MACOS:
+        return True
+
+    marker = _tcc_grant_marker()
+    if marker.exists():
+        logger.debug("TCC grant already attempted, skipping admin prompt")
         return True
 
     services = []
@@ -148,9 +178,29 @@ def grant_tcc_permissions() -> bool:
         services.append("kTCCServiceListenEvent")
 
     if not services:
+        # Permissions already granted — write marker so we don't re-check.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError as e:
+            logger.debug("Could not write TCC marker: %s", e)
         return True
 
-    # Build SQL statements for each missing permission
+    # Defensive: refuse to interpolate anything we didn't hardcode ourselves.
+    # Both _ALLOWED_TCC_SERVICES and _BUNDLE_ID_RE are checked even though
+    # current callers only pass compile-time constants — this stops the
+    # pattern from silently becoming injectable if someone later threads
+    # user-controlled values through here.
+    for svc in services:
+        if svc not in _ALLOWED_TCC_SERVICES:
+            logger.error("Refusing to grant unknown TCC service %r", svc)
+            return False
+    if not _BUNDLE_ID_RE.match(_BUNDLE_ID):
+        logger.error("Refusing to grant TCC with malformed bundle id %r", _BUNDLE_ID)
+        return False
+
+    # Build SQL statements for each missing permission. Values are validated
+    # above, so string interpolation is safe here.
     sql_parts = []
     for svc in services:
         sql_parts.append(
@@ -191,3 +241,11 @@ def grant_tcc_permissions() -> bool:
     except Exception as e:
         logger.warning(f"TCC grant error: {e}")
         return False
+    finally:
+        # Mark the grant as attempted regardless of outcome so the user
+        # is never prompted again on subsequent launches.
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError as exc:
+            logger.debug("Could not write TCC marker: %s", exc)

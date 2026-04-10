@@ -10,7 +10,6 @@ Security features:
 
 import hmac
 import logging
-import os
 import secrets
 import threading
 import webbrowser
@@ -89,24 +88,6 @@ _ERROR_HTML = """\
 
 
 
-def _allow_state_mismatch() -> bool:
-    """Opt-in local-dev bypass for strict state matching.
-
-    Requires BOTH env vars to be set:
-    - BETTERFLOW_ALLOW_STATE_MISMATCH=1
-    - BETTERFLOW_ENV=development
-    This prevents accidental CSRF bypass in production builds.
-    """
-    if os.getenv("BETTERFLOW_ENV", "").strip().lower() != "development":
-        return False
-    return os.getenv("BETTERFLOW_ALLOW_STATE_MISMATCH", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 class _CallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler that captures the authorization callback."""
 
@@ -137,19 +118,6 @@ class _CallbackHandler(BaseHTTPRequestHandler):
                 (state or "").encode(), self.server.expected_state.encode()
             )
             if not state_ok:
-                if code and _allow_state_mismatch():
-                    logger.error(
-                        "State mismatch bypassed because "
-                        "BETTERFLOW_ALLOW_STATE_MISMATCH is enabled (dev only)"
-                    )
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html")
-                    self.end_headers()
-                    self.wfile.write(_SUCCESS_HTML.encode())
-                    self.server.auth_code = code
-                    self.server.callback_received.set()
-                    return
-
                 logger.warning("State parameter mismatch - possible CSRF attempt")
                 self.send_response(400)
                 self.send_header("Content-Type", "text/html")

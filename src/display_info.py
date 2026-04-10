@@ -120,10 +120,6 @@ def _start_macos_tracker() -> DisplayTracker:
                         _space_counter[0] += 1
                         _space_order[space] = _space_counter[0]
                     desktop_index = _space_order[space]
-            else:
-                # Fallback: no space ID available, but we still track changes
-                # via notification count
-                pass
 
             old = tracker._state
             tracker._state = DisplayState(
@@ -190,8 +186,8 @@ def _start_macos_tracker() -> DisplayTracker:
             if nc is not None and observer is not None:
                 try:
                     nc.removeObserver_(observer)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("removeObserver_ failed during shutdown: %s", e)
 
     def _stop() -> None:
         _stop_event.set()
@@ -352,8 +348,8 @@ def _start_windows_tracker() -> DisplayTracker:
                 try:
                     ctypes.windll.ole32.CoInitialize(None)  # type: ignore[attr-defined]
                     com_initialized = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("CoInitialize failed: %s", e)
 
             while not _stop_event.wait(2):
                 monitor_name, monitor_index = _get_monitor_info()
@@ -371,8 +367,8 @@ def _start_windows_tracker() -> DisplayTracker:
             if com_initialized:
                 try:
                     ctypes.windll.ole32.CoUninitialize()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("CoUninitialize failed: %s", e)
 
     def _stop() -> None:
         _stop_event.set()

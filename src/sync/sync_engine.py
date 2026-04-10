@@ -2,6 +2,7 @@
 
 import logging
 import math
+import re
 import socket
 import threading
 import time
@@ -20,7 +21,7 @@ except ImportError:
         AGENT_VERSION = "0.0.0"
 
 try:
-    from ..config import Config, PrivacySettings
+    from ..config import Config
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
@@ -28,7 +29,7 @@ try:
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
 except ImportError:
-    from config import Config, PrivacySettings
+    from config import Config
     from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
@@ -60,6 +61,44 @@ class SyncStats:
 MAX_APP_LENGTH = 256
 MAX_TITLE_LENGTH = 1024
 MAX_URL_LENGTH = 2048
+
+
+class BoundedLRU(dict):
+    """Ordered dict with hard-capped size.
+
+    Writes move the key to the end (most-recent). When the size exceeds
+    ``maxsize`` the oldest entry is evicted. This replaces three nearly
+    identical hand-rolled caches (_sent_cache, _gap_filled_originals,
+    _time_cache) that each duplicated the same eviction logic.
+
+    Not thread-safe on its own — callers must wrap operations in a lock
+    when shared across threads, exactly as the original caches did.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__()
+        if maxsize <= 0:
+            raise ValueError("maxsize must be positive")
+        self._maxsize = maxsize
+        self._od: OrderedDict = OrderedDict()
+
+    def get(self, key, default=None):  # type: ignore[override]
+        return self._od.get(key, default)
+
+    def __contains__(self, key) -> bool:  # type: ignore[override]
+        return key in self._od
+
+    def __getitem__(self, key):  # type: ignore[override]
+        return self._od[key]
+
+    def __setitem__(self, key, value) -> None:  # type: ignore[override]
+        self._od[key] = value
+        self._od.move_to_end(key)
+        if len(self._od) > self._maxsize:
+            self._od.popitem(last=False)
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self._od)
 
 
 class SyncEngine:
@@ -101,26 +140,21 @@ class SyncEngine:
         self._hostname = socket.gethostname()
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
-        # The lookback window re-fetches recent events for duration updates -
+        # The lookback window re-fetches recent events for duration updates —
         # we only re-send if the duration actually changed.
-        # Bounded LRU: evicts oldest on every insert once at capacity.
-        self._sent_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
-        self._SENT_CACHE_MAX = 5_000
+        self._sent_cache: BoundedLRU = BoundedLRU(maxsize=5_000)
         # Track original AW durations for gap-filled events to prevent re-send.
-        # Bounded LRU: evicts oldest once at capacity (same pattern as _sent_cache).
-        self._gap_filled_originals: OrderedDict[int, float] = OrderedDict()
-        self._GAP_ORIGINALS_MAX = 5_000
+        self._gap_filled_originals: BoundedLRU = BoundedLRU(maxsize=5_000)
+        # Time-tracking dedup: track last-counted duration per event to avoid
+        # double-counting when the lookback window re-fetches events with grown
+        # durations. Only the delta (new - old) is added to the time tracker.
+        self._time_cache: BoundedLRU = BoundedLRU(maxsize=5_000)
 
         # Thread safety: protects cross-thread mutable state
         self._state_lock = threading.Lock()
-        # Dedicated lock for _sent_cache (OrderedDict LRU ops are multi-step)
+        # Dedicated lock for all BoundedLRU caches (ops are multi-step and
+        # touched from the sync thread plus heartbeat thread).
         self._cache_lock = threading.Lock()
-
-        # Time tracking dedup: track last-counted duration per event to avoid
-        # double-counting when the lookback window re-fetches events with grown
-        # durations.  Only the delta (new - old) is added to the time tracker.
-        self._time_cache: OrderedDict[tuple[str, int], float] = OrderedDict()
-        self._TIME_CACHE_MAX = 5_000
 
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
@@ -172,8 +206,8 @@ class SyncEngine:
         if need_end_session:
             try:
                 self.bf.end_session("app_quit")
-            except BetterFlowClientError:
-                pass
+            except BetterFlowClientError as e:
+                logger.warning("end_session(app_quit) failed: %s", e)
         # Free fraud detector accumulators while paused
         self._activity_analyzer.clear()
 
@@ -208,8 +242,8 @@ class SyncEngine:
         if need_end_session:
             try:
                 self.bf.end_session("private_time")
-            except BetterFlowClientError:
-                pass
+            except BetterFlowClientError as e:
+                logger.warning("end_session(private_time) failed: %s", e)
 
     @property
     def is_private(self) -> bool:
@@ -333,8 +367,8 @@ class SyncEngine:
                     limit=1000,
                 )
                 input_events_for_analysis.extend(events)
-            except AWClientError:
-                pass
+            except AWClientError as e:
+                logger.debug("input bucket %s fetch failed: %s", bucket.id, e)
         self._activity_analyzer.add_input_events(input_events_for_analysis)
         self._has_input_data = len(input_events_for_analysis) > 0
         self._latest_input_at = None
@@ -522,12 +556,8 @@ class SyncEngine:
 
             if transformed_events:
                 transformed.extend(transformed_events)
-                # LRU insert: add/move to end, evict oldest if over capacity
                 with self._cache_lock:
                     self._sent_cache[cache_key] = event.duration
-                    self._sent_cache.move_to_end(cache_key)
-                    if len(self._sent_cache) > self._SENT_CACHE_MAX:
-                        self._sent_cache.popitem(last=False)
             else:
                 stats.events_filtered += 1
 
@@ -653,19 +683,12 @@ class SyncEngine:
             active_ranges = self._cap_ranges_to_input_timeout(ranges)
         else:
             active_ranges = ranges
-        if not active_ranges and self._has_input_data:
-            logger.info(
-                "Window event skipped after inactivity cutoff: "
-                f"event={event.timestamp.isoformat()}->"
-                f"{event_end.isoformat()}"
-            )
-            return []
-
         if not active_ranges:
             logger.info(
                 "Window event skipped after inactivity cutoff/AFK overlap: "
-                f"event={event.timestamp.isoformat()}->"
-                f"{event_end.isoformat()}"
+                "event=%s->%s",
+                event.timestamp.isoformat(),
+                event_end.isoformat(),
             )
             return []
 
@@ -744,8 +767,8 @@ class SyncEngine:
                         f"activity classification for tail of window may be inaccurate"
                     )
                 all_afk.extend(events)
-            except AWClientError:
-                pass
+            except AWClientError as e:
+                logger.debug("AFK bucket %s fetch failed: %s", bucket.id, e)
 
         all_afk.sort(key=lambda e: e.timestamp)
         return all_afk
@@ -843,9 +866,6 @@ class SyncEngine:
             # The gap-filled event is already sent with extended duration.
             with self._cache_lock:
                 self._gap_filled_originals[current.id] = old_duration
-                self._gap_filled_originals.move_to_end(current.id)
-                if len(self._gap_filled_originals) > self._GAP_ORIGINALS_MAX:
-                    self._gap_filled_originals.popitem(last=False)
             filled += 1
 
         if filled:
@@ -898,14 +918,16 @@ class SyncEngine:
             data["title"] = title[:MAX_TITLE_LENGTH] if title else title
             if event.url:
                 url = event.url
-                if privacy.collect_full_urls:
-                    data["url"] = url[:MAX_URL_LENGTH]
-                elif privacy.domain_only_urls:
+                # When the full URL exceeds MAX_URL_LENGTH we deliberately
+                # fall back to the domain rather than silent mid-string
+                # truncation — truncation can change semantics (e.g. turn a
+                # safe redirect target into an attacker-controlled one).
+                if privacy.collect_full_urls and len(url) <= MAX_URL_LENGTH:
+                    data["url"] = url
+                elif privacy.collect_full_urls or privacy.domain_only_urls:
                     domain = self._extract_domain(url)
-                    if domain:
-                        data["url"] = domain[:MAX_URL_LENGTH]
-                else:
-                    data["url"] = url[:MAX_URL_LENGTH]
+                    if domain and len(domain) <= MAX_URL_LENGTH:
+                        data["url"] = domain
 
                 if privacy.collect_page_category:
                     data["page_category"] = self._infer_page_category(event.url, event.title)
@@ -993,11 +1015,9 @@ class SyncEngine:
                 event_end = event.timestamp + timedelta(seconds=event.duration)
                 has_afk = bool(self._current_afk_events)
 
-                # Note: _afk_watcher_available is written under _state_lock but
-                # read here without it. This is safe: both write and read happen
-                # on the scheduler thread (guarded by _sync_lock), and CPython
-                # bool assignment is atomic for the edge case of a future caller.
-                if not self._afk_watcher_available:
+                with self._state_lock:
+                    afk_watcher_available = self._afk_watcher_available
+                if not afk_watcher_available:
                     # AFK watcher is completely down - can't classify.
                     # Default to "active" since window events prove the user
                     # was at the computer.
@@ -1048,9 +1068,6 @@ class SyncEngine:
                     if delta > 0:
                         time_delta = delta
                         self._time_cache[time_key] = event.duration
-                        self._time_cache.move_to_end(time_key)
-                        if len(self._time_cache) > self._TIME_CACHE_MAX:
-                            self._time_cache.popitem(last=False)
                 # Persist outside the cache lock to avoid blocking
                 # dedup checks with SQLite I/O
                 if time_delta > 0:
@@ -1067,36 +1084,62 @@ class SyncEngine:
         except Exception:
             return None
 
-    @staticmethod
-    def _infer_page_category(url: Optional[str], title: Optional[str]) -> str:
+    # Each category resolves to a precompiled word-boundary regex. Earlier
+    # entries win: "code" is checked before "review" so repo URLs aren't
+    # reclassified as reviews. Word boundaries prevent substring leaks —
+    # "code" won't match "decode"/"encode", "diff" won't match "different".
+    _PAGE_CATEGORY_RULES: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
+        (
+            category,
+            re.compile(
+                r"\b(?:" + "|".join(re.escape(kw) for kw in keywords) + r")\b",
+                re.IGNORECASE,
+            ),
+        )
+        for category, keywords in (
+            ("code", ("github", "gitlab", "bitbucket", "repo", "pull request", "merge request")),
+            ("review", ("review", "diff", "changes")),
+            ("documentation", ("docs", "confluence", "notion", "wiki")),
+            ("communication", ("mail", "inbox", "slack", "teams", "chat", "meet")),
+            ("planning", ("jira", "asana", "trello", "linear", "backlog", "sprint")),
+            ("design", ("figma", "miro", "canva", "adobe")),
+        )
+    )
+
+    @classmethod
+    def _infer_page_category(cls, url: Optional[str], title: Optional[str]) -> str:
         """Infer a coarse page category from URL/title."""
-        haystack = f"{url or ''} {title or ''}".lower()
-        patterns = {
-            "code": ["github", "gitlab", "bitbucket", "repo", "pull request", "merge request"],
-            "review": ["review", "diff", "changes"],
-            "documentation": ["docs", "confluence", "notion", "wiki"],
-            "communication": ["mail", "inbox", "slack", "teams", "chat", "meet"],
-            "planning": ["jira", "asana", "trello", "linear", "backlog", "sprint"],
-            "design": ["figma", "miro", "canva", "adobe"],
-        }
-        for category, keywords in patterns.items():
-            if any(keyword in haystack for keyword in keywords):
+        haystack = f"{url or ''} {title or ''}"
+        for category, pattern in cls._PAGE_CATEGORY_RULES:
+            if pattern.search(haystack):
                 return category
         return "other"
 
-    def send_break_event(self, start: datetime, end: Optional[datetime] = None) -> None:
-        """Send a break_time event covering the break duration."""
+    def _send_status_span(
+        self,
+        *,
+        kind: str,
+        start: datetime,
+        end: Optional[datetime] = None,
+    ) -> None:
+        """Send a duration event for a state-span (break/idle/private).
+
+        Consolidates three formerly-identical send_*_event helpers. The only
+        variation between them was the ``kind`` string used in the id prefix,
+        bucket_type, and data.status field.
+        """
         if end is None:
             end = datetime.now(timezone.utc)
         duration = (end - start).total_seconds()
         if duration < 1:
             return
+        bucket_type = f"{kind}_time"
         event = {
-            "id": f"break_{int(start.timestamp())}_{id(self)}",
+            "id": f"{kind}_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
-            "bucket_type": "break_time",
-            "data": {"status": "break"},
+            "bucket_type": bucket_type,
+            "data": {"status": kind},
         }
         with self._state_lock:
             project = self._current_project
@@ -1104,35 +1147,18 @@ class SyncEngine:
             event["project_id"] = project["id"]
         try:
             self.bf.send_events([event])
-            logger.info(f"Sent break_time event ({duration:.0f}s)")
+            logger.info("Sent %s event (%.0fs)", bucket_type, duration)
         except BetterFlowClientError as e:
-            logger.warning(f"Failed to send break_time event: {e}")
+            logger.warning("Failed to send %s event: %s", bucket_type, e)
             self.queue.enqueue([event])
+
+    def send_break_event(self, start: datetime, end: Optional[datetime] = None) -> None:
+        """Send a break_time event covering the break duration."""
+        self._send_status_span(kind="break", start=start, end=end)
 
     def send_idle_event(self, start: datetime, end: Optional[datetime] = None) -> None:
         """Send an idle_time event covering the idle duration."""
-        if end is None:
-            end = datetime.now(timezone.utc)
-        duration = (end - start).total_seconds()
-        if duration < 1:
-            return
-        event = {
-            "id": f"idle_{int(start.timestamp())}_{id(self)}",
-            "timestamp": start.isoformat(),
-            "duration": round(duration, 2),
-            "bucket_type": "idle_time",
-            "data": {"status": "idle"},
-        }
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            event["project_id"] = project["id"]
-        try:
-            self.bf.send_events([event])
-            logger.info(f"Sent idle_time event ({duration:.0f}s)")
-        except BetterFlowClientError as e:
-            logger.warning(f"Failed to send idle_time event: {e}")
-            self.queue.enqueue([event])
+        self._send_status_span(kind="idle", start=start, end=end)
 
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""
@@ -1141,27 +1167,7 @@ class SyncEngine:
                 start = self._private_start
         if not start:
             return
-        now = datetime.now(timezone.utc)
-        duration = (now - start).total_seconds()
-        if duration < 1:
-            return
-        event = {
-            "id": f"private_{int(start.timestamp())}_{id(self)}",
-            "timestamp": start.isoformat(),
-            "duration": round(duration, 2),
-            "bucket_type": "private_time",
-            "data": {"status": "private"},
-        }
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            event["project_id"] = project["id"]
-        try:
-            self.bf.send_events([event])
-            logger.info(f"Sent private_time event ({duration:.0f}s)")
-        except BetterFlowClientError as e:
-            logger.warning(f"Failed to send private_time event: {e}")
-            self.queue.enqueue([event])
+        self._send_status_span(kind="private", start=start)
 
     def _make_call_bf_event(self, call_event: "CallEvent") -> dict:
         """Convert a CallEvent into a BetterFlow event dict."""
@@ -1341,8 +1347,8 @@ class SyncEngine:
                             f"Clock skew detected: server time differs by "
                             f"{self._server_time_offset:.0f}s — timestamps may be inaccurate"
                         )
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    logger.debug("server_time parse failed: %s", e)
 
             # Re-fetch config if server says it changed
             if response.get("config_updated"):

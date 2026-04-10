@@ -215,13 +215,21 @@ class BetterFlowClient(BaseApiClient):
             return AuthResult(success=False, error=f"Invalid response: {e}")
 
     def revoke(self) -> bool:
-        """Revoke this device's token."""
+        """Revoke this device's token.
+
+        Returns True only when the server confirms the revoke. A 401/403
+        (BetterFlowAuthError) is not treated as success — it could be a
+        genuine auth failure rather than a prior revocation, and the
+        caller must know to keep a scheduled retry.
+        """
         try:
             self._request("POST", "revoke")
             return True
-        except BetterFlowAuthError:
-            return True  # Token already invalid — effectively revoked
-        except BetterFlowClientError:
+        except BetterFlowAuthError as e:
+            logger.warning("Revoke returned auth error: %s", e)
+            return False
+        except BetterFlowClientError as e:
+            logger.warning("Revoke failed: %s", e)
             return False
 
     # =========================================================================

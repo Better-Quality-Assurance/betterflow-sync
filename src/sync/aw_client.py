@@ -168,8 +168,8 @@ class AWClient:
             self._session = requests.Session()
         try:
             old.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Closing old AW session raised: %s", e)
         with self._buckets_lock:
             self._buckets_cache = None
             self._buckets_cache_time = 0.0
@@ -320,13 +320,14 @@ class AWClient:
         if session is not None:
             try:
                 session.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("AW session close failed: %s", e)
 
     def __del__(self) -> None:
         try:
             self.close()
         except Exception:
+            # __del__ must not raise; any error here is unrecoverable.
             pass
 
     def __enter__(self) -> "AWClient":

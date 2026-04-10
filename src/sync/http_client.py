@@ -248,8 +248,8 @@ class BaseApiClient:
                 error_detail = ""
                 try:
                     error_detail = e.response.json().get("message", "")
-                except Exception:
-                    pass
+                except (ValueError, AttributeError) as parse_err:
+                    logger.debug("HTTPError body parse failed: %s", parse_err)
                 raise BetterFlowClientError(
                     f"API error ({e.response.status_code}): {error_detail or str(e)}"
                 ) from e
@@ -293,8 +293,8 @@ class BaseApiClient:
         if old is not None and was_owned:
             try:
                 old.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Closing old HTTP session raised: %s", e)
 
     def set_credentials(self, token: str, device_id: str) -> None:
         """Set authentication credentials (thread-safe)."""
@@ -338,6 +338,8 @@ class BaseApiClient:
         try:
             self.close()
         except Exception:
+            # __del__ must not raise. We intentionally swallow here since
+            # the interpreter may already be tearing down when this runs.
             pass
 
     def __enter__(self) -> "BaseApiClient":

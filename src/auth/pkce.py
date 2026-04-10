@@ -16,9 +16,16 @@ Flow:
 
 import base64
 import hashlib
+import re
 import secrets
 
 __all__ = ["generate_pkce_pair", "compute_code_challenge"]
+
+# RFC 7636 §4.1: code_verifier = 43-128 chars from the unreserved URI set
+# (ALPHA / DIGIT / "-" / "." / "_" / "~"). Values outside this range MUST be
+# rejected — accepting them silently would leak subtle interoperability bugs
+# and hand tests/attackers a way to probe the server with malformed input.
+_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 
 
 def generate_pkce_pair() -> tuple[str, str]:
@@ -64,6 +71,8 @@ def compute_code_challenge(code_verifier: str) -> str:
         >>> compute_code_challenge("test_verifier")
         'jMT6fjXrOW2ua7Xcpa1R9sE9E5yQHcYf0ZCaCDrGx4k'
     """
+    if not _VERIFIER_RE.match(code_verifier):
+        raise ValueError("code_verifier must be 43-128 chars from [A-Za-z0-9._~-]")
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     # Base64URL encoding: replace +/ with -_, remove padding
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")

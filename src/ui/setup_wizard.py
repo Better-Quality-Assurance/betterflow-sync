@@ -19,23 +19,9 @@ from PIL import Image, ImageTk
 try:
     from ..auth.login import LoginManager, LoginState
     from ..config import Config
-    from .permissions import (
-        check_accessibility,
-        check_input_monitoring,
-        grant_tcc_permissions,
-        open_accessibility_settings,
-        open_input_monitoring_settings,
-    )
 except ImportError:
     from auth.login import LoginManager, LoginState
     from config import Config
-    from ui.permissions import (
-        check_accessibility,
-        check_input_monitoring,
-        grant_tcc_permissions,
-        open_accessibility_settings,
-        open_input_monitoring_settings,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +89,6 @@ class SetupWizard:
         self._closing = False
         self._spinner_after_id: Optional[str] = None
         self._spinner_angle: int = 0
-        self._permissions_refresh_id: Optional[str] = None
         self._button_id = itertools.count(1)
 
     def show(self) -> SetupResult:
@@ -155,15 +140,9 @@ class SetupWizard:
         if self._spinner_after_id is not None:
             try:
                 self._window.after_cancel(self._spinner_after_id)
-            except tk.TclError:
-                pass
+            except tk.TclError as e:
+                logger.debug("after_cancel on spinner failed: %s", e)
             self._spinner_after_id = None
-        if self._permissions_refresh_id is not None:
-            try:
-                self._window.after_cancel(self._permissions_refresh_id)
-            except tk.TclError:
-                pass
-            self._permissions_refresh_id = None
         self._canvas.configure(cursor="")
         self._canvas.delete("all")
         for widget in self._canvas.winfo_children():
@@ -172,12 +151,6 @@ class SetupWizard:
     def _on_close(self) -> None:
         """Handle window close — cancel any in-progress login."""
         self._closing = True
-        if self._permissions_refresh_id is not None:
-            try:
-                self._window.after_cancel(self._permissions_refresh_id)
-            except tk.TclError:
-                pass
-            self._permissions_refresh_id = None
         self._result = SetupResult(completed=False)
         self._login_manager.cancel_login()
         self._window.destroy()
@@ -505,156 +478,6 @@ class SetupWizard:
 
         # Launch button — go to permissions screen next
         self._make_button("Continue", self._finish, cx, 438, width=280)
-
-    # ── Permissions (bypassed — watchers handle missing perms gracefully) ──
-
-    def _show_permissions_entry(self) -> None:
-        """Legacy entry point — just finish setup."""
-        self._finish()
-        return
-        # Already granted — skip
-        if check_accessibility() and check_input_monitoring():
-            self._finish()
-            return
-        # Grant via TCC database with admin password prompt
-        try:
-            grant_tcc_permissions()
-        except Exception as e:
-            logger.warning(f"TCC grant failed: {e}")
-        self._finish()
-
-    def _show_permissions(self) -> None:
-        """Show the macOS tracking permissions screen."""
-        accessibility_granted = check_accessibility()
-        input_monitoring_granted = check_input_monitoring()
-        granted = accessibility_granted and input_monitoring_granted
-
-        cx = self._draw_scene(
-            title="Tracking Permissions",
-            subtitle="BetterFlow needs these to track windows and input accurately",
-        )
-
-        row_width = 560
-        row_height = 76
-        row_x1 = cx - row_width // 2
-        row_x2 = cx + row_width // 2
-
-        # ── Accessibility row ──
-        row_y = 230
-        cy = row_y + row_height // 2
-        icon = "\u2713" if accessibility_granted else "\u2717"
-        icon_color = SUCCESS_COLOR if accessibility_granted else ERROR_COLOR
-        bg = "#1a1430" if accessibility_granted else "#1a1028"
-        border = "#3d5040" if accessibility_granted else CARD_BORDER
-
-        self._create_rounded_rect(
-            row_x1, row_y, row_x2, row_y + row_height,
-            radius=12, fill=bg, outline=border, width=1,
-        )
-        self._canvas.create_text(
-            row_x1 + 32, cy, text=icon,
-            font=(FONT_FAMILY, 22, "bold"), fill=icon_color,
-        )
-        self._canvas.create_text(
-            row_x1 + 64, cy - 10, text="Accessibility",
-            font=(FONT_FAMILY, 14, "bold"), fill=TEXT_COLOR, anchor=tk.W,
-        )
-        self._canvas.create_text(
-            row_x1 + 64, cy + 14,
-            text="Allow BetterFlow to read window titles",
-            font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
-        )
-        if not accessibility_granted:
-            self._make_button(
-                "Open Settings", self._open_accessibility,
-                row_x2 - 82, cy, width=128, primary=False,
-            )
-
-        # ── Input Monitoring row ──
-        row_y = 320
-        cy = row_y + row_height // 2
-        icon = "\u2713" if input_monitoring_granted else "\u2717"
-        icon_color = SUCCESS_COLOR if input_monitoring_granted else ERROR_COLOR
-        bg = "#1a1430" if input_monitoring_granted else "#1a1028"
-        border = "#3d5040" if input_monitoring_granted else CARD_BORDER
-
-        self._create_rounded_rect(
-            row_x1, row_y, row_x2, row_y + row_height,
-            radius=12, fill=bg, outline=border, width=1,
-        )
-        self._canvas.create_text(
-            row_x1 + 32, cy, text=icon,
-            font=(FONT_FAMILY, 22, "bold"), fill=icon_color,
-        )
-        self._canvas.create_text(
-            row_x1 + 64, cy - 10, text="Input Monitoring",
-            font=(FONT_FAMILY, 14, "bold"), fill=TEXT_COLOR, anchor=tk.W,
-        )
-        self._canvas.create_text(
-            row_x1 + 64, cy + 14,
-            text="Allow BetterFlow to count keystrokes and clicks",
-            font=FONT_SMALL, fill=TEXT_MUTED, anchor=tk.W,
-        )
-        if not input_monitoring_granted:
-            self._make_button(
-                "Open Settings", self._open_input_monitoring,
-                row_x2 - 82, cy, width=128, primary=False,
-            )
-
-        # ── Bottom area ──
-        if granted:
-            self._canvas.create_text(
-                cx, row_y + row_height + 40,
-                text="Permission granted!",
-                font=(FONT_FAMILY, 14, "bold"), fill=SUCCESS_COLOR,
-            )
-            self._make_button(
-                "Start Using BetterFlow", self._finish,
-                cx, row_y + row_height + 88, width=280,
-            )
-        else:
-            self._canvas.create_text(
-                cx, row_y + row_height + 34,
-                text="If already toggled on, try switching it off and on again.",
-                font=(FONT_FAMILY, 11), fill="#8a7ab0",
-            )
-            btn_y = row_y + row_height + 82
-            self._make_button(
-                "Refresh Status", self._show_permissions,
-                cx - 104, btn_y, width=180,
-            )
-            self._make_button(
-                "Skip for Now", self._finish,
-                cx + 104, btn_y, width=180, primary=False,
-            )
-
-        # Auto-refresh every 3 seconds (only while waiting for grant)
-        if not granted:
-            self._permissions_refresh_id = self._window.after(
-                3000, self._auto_refresh_permissions,
-            )
-
-    def _auto_refresh_permissions(self) -> None:
-        """Auto-refresh the permissions screen when status changes."""
-        if self._closing:
-            return
-        try:
-            if check_accessibility() and check_input_monitoring():
-                self._show_permissions()
-            else:
-                self._permissions_refresh_id = self._window.after(
-                    3000, self._auto_refresh_permissions,
-                )
-        except tk.TclError:
-            pass
-
-    def _open_accessibility(self) -> None:
-        """Open macOS Accessibility settings."""
-        open_accessibility_settings()
-
-    def _open_input_monitoring(self) -> None:
-        """Open macOS Input Monitoring settings."""
-        open_input_monitoring_settings()
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""

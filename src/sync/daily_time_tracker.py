@@ -234,26 +234,38 @@ class DailyTimeTracker:
             )
 
     def _load_new_day(self, new_date: date) -> None:
-        """Load existing data for a new day into memory (no lock required).
+        """Load existing data for a new day and merge it into memory.
 
-        Updates _today_seconds under _lock after loading from SQLite.
+        Must hold _lock for the SQLite read so concurrent add_active_time
+        calls can't slip additions between the DB read and the in-memory
+        merge (previously a ``max()`` there silently discarded those).
+
+        The merge rule is ADD, not MAX: ``loaded`` is the baseline the DB
+        already persisted, and any ``_today_seconds`` accumulated between
+        rollover and this call is brand-new work that hasn't been persisted
+        yet. Taking the max would lose it.
         """
-        with self._cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT active_seconds FROM daily_active_time
-                WHERE date = ?
-                """,
-                (new_date.isoformat(),),
-            )
-            row = cursor.fetchone()
-            loaded = float(row["active_seconds"]) if row else 0.0
-
         with self._lock:
-            # Only update if we're still on the same date (no further rollover)
-            if self._today == new_date:
-                self._today_seconds = max(self._today_seconds, loaded)
-        logger.info(f"Day rollover to {new_date}, loaded {loaded:.1f}s")
+            if self._today != new_date:
+                return  # Another rollover raced ahead; nothing to do.
+            with self._cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT active_seconds FROM daily_active_time
+                    WHERE date = ?
+                    """,
+                    (new_date.isoformat(),),
+                )
+                row = cursor.fetchone()
+                loaded = float(row["active_seconds"]) if row else 0.0
+            pending = self._today_seconds
+            self._today_seconds = loaded + pending
+        logger.info(
+            "Day rollover to %s, loaded %.1fs, merged in-memory %.1fs",
+            new_date,
+            loaded,
+            pending,
+        )
 
     def _persist(self) -> None:
         """Save current state to SQLite.
@@ -274,8 +286,8 @@ class DailyTimeTracker:
             for conn in self._all_connections:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("DailyTimeTracker conn.close() failed: %s", e)
             self._all_connections.clear()
         if hasattr(self._local, "connection"):
             del self._local.connection
