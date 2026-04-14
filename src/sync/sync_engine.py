@@ -974,10 +974,17 @@ class SyncEngine:
             if event.status == "afk":
                 result_bucket_type = "break"
         elif bucket_type == BUCKET_TYPE_INPUT:
-            # Input events track keystrokes, clicks, scrolls for fraud detection
+            # Input events track keystrokes, clicks, scrolls for fraud detection.
+            # The MacOSInputWatcher tags each batch with the frontmost app so the
+            # server can attribute counts to the correct per-app aggregate.
             data["presses"] = event.presses
             data["clicks"] = event.clicks
             data["scrolls"] = event.scrolls
+            if event.app:
+                data["app"] = event.app
+            bundle = event.data.get("bundle")
+            if bundle:
+                data["bundle"] = bundle
 
         # Clamp future timestamps and reject negative durations
         now = datetime.now(timezone.utc)
