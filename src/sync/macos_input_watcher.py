@@ -91,7 +91,12 @@ class MacOSInputWatcher:
                 "Process does NOT have Accessibility permission — input tracking disabled"
             )
             return False
-        if not check_input_monitoring():
+        # Passing prompt=True calls CGRequestListenEventAccess, which shows
+        # Apple's native Input Monitoring dialog on first launch and registers
+        # the app in System Settings > Privacy & Security > Input Monitoring
+        # so the user can toggle it later. Without this, the app silently
+        # disables keypress tracking until the user finds the pane manually.
+        if not check_input_monitoring(prompt=True):
             logger.warning(
                 "Process does NOT have Input Monitoring permission — keypress tracking disabled"
             )
