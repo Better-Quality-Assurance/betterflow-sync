@@ -158,6 +158,25 @@ class MacOSInputWatcher:
             self._emit_thread = None
         logger.info("MacOSInputWatcher stopped")
 
+    def _current_frontmost_app(self) -> tuple[Optional[str], Optional[str]]:
+        """Return (localizedName, bundleIdentifier) of the frontmost app.
+
+        Called from the emitter thread only — NSWorkspace is not safe to
+        call from the CGEventTap callback, but read access from a regular
+        background thread is fine.
+        """
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if app is None:
+                return (None, None)
+            name = app.localizedName()
+            bundle = app.bundleIdentifier()
+            return (str(name) if name else None, str(bundle) if bundle else None)
+        except Exception as e:
+            logger.debug("frontmostApplication lookup failed: %s", e)
+            return (None, None)
+
     def _event_callback(self, proxy, event_type, event, refcon):
         """CGEventTap callback — increment counters. Never reads key values."""
         if event_type == _kCGEventTapDisabledByTimeout:
@@ -252,16 +271,29 @@ class MacOSInputWatcher:
             if presses == 0 and clicks == 0 and scrolls == 0:
                 continue
 
+            # Tag the batch with the currently focused app so the server can
+            # attribute these keystrokes to a real aggregate row rather than
+            # dumping them all into "Unknown". Close enough for fraud
+            # detection at a 10s window — if the user switched apps mid-batch
+            # we attribute everything to whichever app was frontmost at emit
+            # time, which is a small, acceptable approximation.
+            app_name, app_bundle = self._current_frontmost_app()
+
             try:
                 now = datetime.now(timezone.utc).isoformat()
+                data = {
+                    "presses": presses,
+                    "clicks": clicks,
+                    "scrolls": scrolls,
+                }
+                if app_name:
+                    data["app"] = app_name
+                if app_bundle:
+                    data["bundle"] = app_bundle
                 self._aw.post_events(self._bucket_id, [{
                     "timestamp": now,
                     "duration": self._emit_interval,
-                    "data": {
-                        "presses": presses,
-                        "clicks": clicks,
-                        "scrolls": scrolls,
-                    },
+                    "data": data,
                 }])
             except Exception as e:
                 # Leave the counters alone so the next tick re-sends them.

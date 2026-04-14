@@ -43,7 +43,31 @@ build: download-aw
 # Build for macOS
 build-mac: download-aw
 	pyinstaller build.spec --clean
+	@$(MAKE) sign-mac
 	@echo "Built: dist/BetterFlow.app"
+
+# Deep-sign the built .app with hardened runtime + entitlements.
+# Opt-in: set BF_CODESIGN_IDENTITY to the SHA1 or common name of your
+# signing identity (see `security find-identity -v -p codesigning`).
+# Stable signing keeps TCC grants (Input Monitoring, Accessibility)
+# across rebuilds — without it, every rebuild produces a new hash that
+# macOS treats as a fresh, unknown app.
+sign-mac:
+	@if [ -z "$$BF_CODESIGN_IDENTITY" ]; then \
+		echo "[sign-mac] BF_CODESIGN_IDENTITY not set — skipping codesign (unsigned build)"; \
+	elif [ ! -d "dist/BetterFlow.app" ]; then \
+		echo "[sign-mac] dist/BetterFlow.app not found — run build-mac first"; \
+		exit 1; \
+	else \
+		echo "[sign-mac] Signing dist/BetterFlow.app with $$BF_CODESIGN_IDENTITY"; \
+		codesign --deep --force --options runtime \
+			--entitlements resources/entitlements.mac.plist \
+			--sign "$$BF_CODESIGN_IDENTITY" \
+			--timestamp=none \
+			dist/BetterFlow.app; \
+		echo "[sign-mac] Verifying signature"; \
+		codesign --verify --deep --strict --verbose=2 dist/BetterFlow.app; \
+	fi
 
 # Build for Windows (run on Windows)
 build-windows: download-aw

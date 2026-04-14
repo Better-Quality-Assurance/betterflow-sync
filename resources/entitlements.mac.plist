@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Entitlements for BetterFlow codesign + hardened runtime.
+
+      PyInstaller bundles ship a native bootloader that loads an unsigned
+      Python interpreter, unsigned third-party dylibs, and writes DYLD_*
+      environment variables. Hardened Runtime blocks all of this by default,
+      so we grant the minimum exceptions needed for the bundle to launch.
+
+      We intentionally do NOT enable App Sandbox — BetterFlow reads AW data
+      over localhost, touches the keychain, and writes to Application Support,
+      which would all need manual entitlements under sandbox.
+    -->
+
+    <!-- PyInstaller loads a non-signed Python dylib and third-party libs. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- PyInstaller bootloader exports DYLD_LIBRARY_PATH so the frozen
+         interpreter finds bundled dylibs. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- Python allocates writable+executable pages for some C extensions. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Allow JIT pages for modules that use them (safer than
+         allow-unsigned-executable-memory alone on Apple Silicon). -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>
