@@ -146,6 +146,14 @@ class UpdateHandler:
                     send_notification("Update Failed", "Self-update failed. Try again later.")
 
         def on_pre_exit() -> None:
+            try:
+                self.coordinator.flush_idle_event()
+            except Exception:
+                pass
+            try:
+                self.coordinator.sync_engine.shutdown()
+            except Exception:
+                pass
             self.coordinator.stop()
 
         apply_update_async(

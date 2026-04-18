@@ -52,6 +52,7 @@ class SyncStats:
     gaps_filled: int = 0
     calls_detected: int = 0
     errors: list[str] = field(default_factory=list)
+    _should_heartbeat: bool = False
 
     @property
     def success(self) -> bool:
