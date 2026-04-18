@@ -5,6 +5,7 @@ import platform
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -159,6 +160,9 @@ class BetterFlowClient(BaseApiClient):
             AuthResult with api_token on success
         """
         url = f"{self.web_base_url}/api/v1/sync/auth/token"
+        parsed_url = urlparse(url)
+        if parsed_url.scheme != "https" and parsed_url.hostname not in ("localhost", "127.0.0.1"):
+            return AuthResult(success=False, error="Token exchange requires HTTPS")
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",

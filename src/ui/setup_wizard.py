@@ -330,7 +330,7 @@ class SetupWizard:
                 state = self._login_manager.login_via_browser()
             except Exception as exc:
                 logger.exception("Login thread raised unexpectedly")
-                state = LoginState(logged_in=False, error=str(exc))
+                state = LoginState(logged_in=False, error="An unexpected error occurred. Please try again.")
             if self._closing:
                 return
             try:
@@ -402,7 +402,8 @@ class SetupWizard:
             self._login_state = state
             self._show_success(state.user_email or "")
         else:
-            self._show_error(state.error or "Login failed")
+            safe_error = (state.error or "Login failed")[:200]
+        self._show_error(safe_error)
 
     def _show_error(self, error: str) -> None:
         """Show error state with retry."""
@@ -482,15 +483,16 @@ class SetupWizard:
     def _finish(self) -> None:
         """Complete and close the wizard only."""
         # Enable launch at login on first setup
+        auto_start_ok = False
         try:
             try:
                 from ..autostart import set_auto_start
             except ImportError:
                 from autostart import set_auto_start
-            set_auto_start(True)
+            auto_start_ok = set_auto_start(True)
         except Exception:
             pass  # Non-critical — user can enable manually
-        self._config.auto_start = True
+        self._config.auto_start = auto_start_ok
 
         self._result = SetupResult(
             completed=True,

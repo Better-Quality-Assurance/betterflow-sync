@@ -74,7 +74,8 @@ def apply_update(
     # Reject non-HTTPS download URLs to prevent MITM attacks
     parsed_url = urlparse(download_url)
     if parsed_url.scheme != "https":
-        _status(f"Refusing non-HTTPS download URL: {download_url}")
+        safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        _status(f"Refusing non-HTTPS download URL: {safe_url}")
         return False
 
     tmp_dir = None

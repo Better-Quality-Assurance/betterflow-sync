@@ -633,7 +633,10 @@ class Config:
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_call_duration from server, ignoring")
 
-        self.save()
+        try:
+            self.save()
+        except OSError as e:
+            logger.warning("Failed to persist server config to disk: %s", e)
 
 
 def setup_logging(debug: bool = False) -> None:

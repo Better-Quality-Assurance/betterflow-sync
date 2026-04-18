@@ -103,7 +103,7 @@ class LoginManager:
         except BetterFlowClientError as e:
             logger.warning(f"Auto-login failed (network): {e}")
             # Don't clear credentials on network error - might be temporary
-            return LoginState(logged_in=False, error=f"Cannot verify credentials: {e}")
+            return LoginState(logged_in=False, error="Network error - check your connection")
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.
