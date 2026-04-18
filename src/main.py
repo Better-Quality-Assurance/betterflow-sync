@@ -1127,6 +1127,9 @@ class BetterFlowApp:
             # between lock release and here, skip the second browser window.
             if self._shutdown_event.is_set() or self.coordinator.logged_in:
                 return
+            # Cancel any auth-error relogin that fired between lock release
+            # and here — prevents opening a second browser window.
+            self.login_manager.cancel_login()
             state = self.login_manager.login_via_browser()
             if self._shutdown_event.is_set():
                 return

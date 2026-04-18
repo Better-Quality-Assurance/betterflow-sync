@@ -1444,10 +1444,20 @@ class SyncEngine:
         return self._time_tracker.get_today_active_time()
 
     def shutdown(self) -> None:
-        """Shutdown the sync engine gracefully."""
+        """Shutdown the sync engine gracefully.
+
+        Resets per-session state so the engine can be reused after
+        logout/re-login without stale pause, config, or backoff state
+        carrying over from the previous session.
+        """
         with self._state_lock:
             need_end = self._session_active
             self._session_active = False
+            self._paused = False
+            self._private_mode = False
+            self._config_fetched = False
+        self._queue_consecutive_failures = 0
+        self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
         if need_end:
             for attempt in range(2):
                 try:
