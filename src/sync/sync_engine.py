@@ -471,14 +471,15 @@ class SyncEngine:
         if self.bf.is_reachable() and not self.queue.is_empty():
             self._process_queue(stats)
 
-        # Periodic heartbeat
+        # Check heartbeat counter — actual HTTP call is deferred to
+        # after sync() returns so _sync_lock is not held during the
+        # blocking network request.
         with self._state_lock:
             self._heartbeat_count += 1
             should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
             if should_heartbeat:
                 self._heartbeat_count = 0
-        if should_heartbeat:
-            self._send_heartbeat()
+        stats._should_heartbeat = should_heartbeat
 
         return stats
 

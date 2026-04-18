@@ -395,6 +395,7 @@ class SyncCoordinator:
         watchdog = threading.Timer(self._DO_SYNC_DEADLINE, _watchdog)
         watchdog.daemon = True
         watchdog.start()
+        stats = None
         try:
             if self.sync_engine.is_private:
                 self.tray.set_state(TrayState.PRIVATE)
@@ -486,6 +487,11 @@ class SyncCoordinator:
             watchdog_cancelled.set()
             watchdog.cancel()
             self._sync_lock.release()
+
+        # Heartbeat runs AFTER _sync_lock is released — no need to hold
+        # the lock during a blocking HTTP call that can take 30s on timeout.
+        if stats and getattr(stats, "_should_heartbeat", False):
+            self.sync_engine._send_heartbeat()
 
     def _fetch_hours_today(self) -> str:
         return self.hours.fetch_hours_today()

@@ -145,4 +145,12 @@ class UpdateHandler:
                 else:
                     send_notification("Update Failed", "Self-update failed. Try again later.")
 
-        apply_update_async(asset_url, on_progress=on_progress, on_complete=on_complete)
+        def on_pre_exit() -> None:
+            self.coordinator.stop()
+
+        apply_update_async(
+            asset_url,
+            on_progress=on_progress,
+            on_complete=on_complete,
+            on_pre_exit=on_pre_exit,
+        )
