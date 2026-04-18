@@ -114,10 +114,11 @@ class TestActivityAnalyzer:
         presses: int = 0,
         clicks: int = 0,
         scrolls: int = 0,
+        event_id: int = 1,
     ) -> AWEvent:
         """Create an input event for testing."""
         return AWEvent(
-            id=1,
+            id=event_id,
             timestamp=timestamp,
             duration=1.0,
             data={"presses": presses, "clicks": clicks, "scrolls": scrolls},
@@ -260,15 +261,21 @@ class TestActivityAnalyzer:
         assert self.analyzer.get_activity_state(self.now) == "idle-active"
 
     def test_old_events_pruned(self):
-        """Old events should be automatically pruned."""
-        # Add old event (20 minutes ago, should be pruned at 2x window = 10 min)
+        """Old events should be pruned when a newer event establishes the window."""
+        # Add an old event AND a recent one. Pruning is anchored to the
+        # latest event timestamp (not wall clock). With a 5-min window
+        # (2x = 10 min cutoff), an event 20 min before the latest is pruned.
         old_event = self._make_input_event(
             self.now - timedelta(minutes=20), presses=100
         )
-        self.analyzer.add_input_events([old_event])
+        recent_event = self._make_input_event(
+            self.now, presses=1, event_id=99
+        )
+        self.analyzer.add_input_events([old_event, recent_event])
 
-        # The old event should have been pruned
-        assert len(self.analyzer._input_events) == 0
+        # The old event should have been pruned, only recent remains
+        assert len(self.analyzer._input_events) == 1
+        assert self.analyzer._input_events[0].id == 99
 
     def test_multiple_input_events_summed(self):
         """Multiple input events in window should have counts summed."""

@@ -132,9 +132,9 @@ class CallDetector:
             return None
 
         if matched_name and matched_name != self._call_app:
-            # Switched to a different call app - end the current call,
-            # start a new one
-            ended = self._end_call()
+            # Switched to a different call app - end the current call
+            # at the switch timestamp, start a new one
+            ended = self._end_call(end_override=timestamp)
             self._start_call(matched_name, call_type, timestamp)
             return ended
 
@@ -169,14 +169,18 @@ class CallDetector:
         self._left_at = None
         logger.info(f"Call started: {name} ({call_type}) at {timestamp.isoformat()}")
 
-    def _end_call(self) -> Optional[CallEvent]:
-        """End the current call and return a CallEvent (or None if too short)."""
+    def _end_call(self, end_override: Optional[datetime] = None) -> Optional[CallEvent]:
+        """End the current call and return a CallEvent (or None if too short).
+
+        Args:
+            end_override: Use this timestamp as end time instead of inferring
+                from _left_at/_call_last_seen (e.g. when switching calls).
+        """
         if self._call_start is None:
             self._reset()
             return None
 
-        # End time is when the user last had the call app focused
-        end = self._left_at if self._left_at else self._call_last_seen
+        end = end_override or (self._left_at if self._left_at else self._call_last_seen)
         if end is None:
             end = self._call_start
         duration = (end - self._call_start).total_seconds()

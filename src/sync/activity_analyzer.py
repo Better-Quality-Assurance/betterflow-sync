@@ -411,11 +411,13 @@ class ActivityAnalyzer:
         if new_events:
             self._fraud_seq += 1
 
-        # Prune old events (older than 2x window to allow for lookback)
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            minutes=self._thresholds.window_minutes * 2
-        )
-        self._input_events = [e for e in self._input_events if e.timestamp >= cutoff]
+        # Prune old events anchored to the latest event timestamp (not wall
+        # clock) so historical replays from the offline queue aren't
+        # immediately discarded as "too old".
+        if self._input_events:
+            ref = max(e.timestamp for e in self._input_events)
+            cutoff = ref - timedelta(minutes=self._thresholds.window_minutes * 2)
+            self._input_events = [e for e in self._input_events if e.timestamp >= cutoff]
 
         # Sort by timestamp for consistent processing
         self._input_events.sort(key=lambda e: e.timestamp)
@@ -439,11 +441,11 @@ class ActivityAnalyzer:
         if new_events:
             self._fraud_seq += 1
 
-        # Prune old events (older than 2x window to allow for lookback)
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            minutes=self._thresholds.window_minutes * 2
-        )
-        self._window_events = [e for e in self._window_events if e.timestamp >= cutoff]
+        # Prune anchored to latest event timestamp (see add_input_events).
+        if self._window_events:
+            ref = max(e.timestamp for e in self._window_events)
+            cutoff = ref - timedelta(minutes=self._thresholds.window_minutes * 2)
+            self._window_events = [e for e in self._window_events if e.timestamp >= cutoff]
 
         # Sort by timestamp for consistent processing
         self._window_events.sort(key=lambda e: e.timestamp)

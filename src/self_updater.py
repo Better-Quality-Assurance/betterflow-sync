@@ -109,16 +109,22 @@ def apply_update(
         if is_dmg:
             _extract_from_dmg(dl_path, extract_dir)
         else:
-            # ZIP extraction with Zip Slip protection — extract member by
-            # member under validated paths (never use extractall after a
-            # separate validation pass: TOCTOU + case-insensitive FS risks).
+            # ZIP extraction with Zip Slip protection — validate the
+            # resolved path, then write to it explicitly (never let
+            # zf.extract re-derive the path from the raw member name,
+            # which could normalize differently on case-insensitive FS).
             extract_prefix = str(extract_dir.resolve()) + os.sep
             with zipfile.ZipFile(dl_path, "r") as zf:
                 for member in zf.namelist():
                     member_path = (extract_dir / member).resolve()
                     if not str(member_path).startswith(extract_prefix):
                         raise ValueError(f"Zip entry escapes target directory: {member}")
-                    zf.extract(member, extract_dir)
+                    if member.endswith("/"):
+                        member_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        member_path.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src, open(member_path, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
 
         # 3. Find the new .app or exe dir inside the extract
         if sys.platform == "darwin":
@@ -143,13 +149,17 @@ def apply_update(
             try:
                 # Move new -> install location
                 shutil.move(str(new_app), str(app_path))
-                # Preserve executable permissions
-                _fix_permissions(app_path)
             except Exception:
                 # Rollback on failure
                 if backup_path.exists() and not app_path.exists():
                     backup_path.rename(app_path)
                 raise
+            # Best-effort permission fix — app is already in place so
+            # don't rollback on a perms error (would leave no app at all).
+            try:
+                _fix_permissions(app_path)
+            except Exception as e:
+                logger.warning("Permission fix failed, update may not launch: %s", e)
 
             # Clean up backup
             shutil.rmtree(backup_path, ignore_errors=True)
@@ -357,7 +367,8 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
         else:
             stderr = result.stderr.strip()
             if "code object is not signed at all" in stderr:
-                logger.info("New app is unsigned")
+                logger.error("Rejecting update: new app is not signed")
+                return False
             else:
                 logger.error(f"codesign verification failed: {stderr}")
                 return False
