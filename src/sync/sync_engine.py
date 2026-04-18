@@ -544,13 +544,16 @@ class SyncEngine:
             if prev_duration is not None and abs(event.duration - prev_duration) < 0.5:
                 stats.events_filtered += 1
                 continue
-            # Check if this event was gap-filled on a prior cycle —
-            # AW returns original duration but we already sent the extended one
-            with self._cache_lock:
-                orig = self._gap_filled_originals.get((bucket_id, event.id))
-            if orig is not None and abs(event.duration - orig) < 0.5:
-                stats.events_filtered += 1
-                continue
+            # If we previously sent a gap-filled (extended) duration for this
+            # event and AW still returns a shorter duration, skip it — the
+            # server already has the longer, more accurate version. Only
+            # re-send when AW's duration catches up past what we sent.
+            if prev_duration is not None and event.duration < prev_duration - 0.5:
+                with self._cache_lock:
+                    is_gap_filled = self._gap_filled_originals.get((bucket_id, event.id)) is not None
+                if is_gap_filled:
+                    stats.events_filtered += 1
+                    continue
 
             if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
                 transformed_events = self._transform_window_event_with_timeout(
@@ -685,7 +688,19 @@ class SyncEngine:
         else:
             ranges = [(event_start, event_end)]
 
-        if self._has_input_data and not self._afk_watcher_available:
+        # Apply input timeout cap when input data is available and recent
+        # enough to be relevant. The AFK watcher has a lagging timeout
+        # (typically 5 min) during which it reports "not-afk" despite no
+        # actual input. The input cap trims those trailing minutes for more
+        # accurate time. But when input data is stale (e.g. input watcher
+        # crashed 30 min ago), AFK data alone is authoritative.
+        input_is_recent = (
+            self._has_input_data
+            and self._latest_input_at is not None
+            and (event_end - self._latest_input_at).total_seconds()
+            < self.config.aw.afk_timeout_minutes * 60 * 2
+        )
+        if input_is_recent:
             active_ranges = self._cap_ranges_to_input_timeout(ranges)
         else:
             active_ranges = ranges
@@ -1474,5 +1489,12 @@ class SyncEngine:
         with self._category_cache_lock:
             self._category_cache = None
             self._persisted_fallbacks.clear()
+        # Clear dedup caches so a re-login (possibly as a different user on
+        # a shared machine) doesn't silently skip events that were already
+        # sent in the previous session.
+        with self._cache_lock:
+            self._sent_cache = BoundedLRU(maxsize=5_000)
+            self._gap_filled_originals = BoundedLRU(maxsize=5_000)
+            self._time_cache = BoundedLRU(maxsize=5_000)
         # Close time tracker
         self._time_tracker.close()

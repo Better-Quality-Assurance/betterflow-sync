@@ -119,7 +119,7 @@ class SystemEventHandler:
         self.aw.reset_session()
         self.tray.set_state(TrayState.PAUSED, "Screen locked")
         self.reminder_manager.on_tracking_stopped()
-        if self.update_handler:
+        if self.update_handler and not self.coordinator.is_on_break:
             self.update_handler.try_auto_install()
 
     def on_screen_unlock(self) -> None:
@@ -168,7 +168,7 @@ class SystemEventHandler:
             if self.coordinator.paused_by_network:
                 with self._pause_state_lock:
                     user_paused = self._user_paused
-                if not user_paused:
+                if not user_paused and not self.coordinator.is_on_break:
                     self.sync_engine.resume()
                 self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
