@@ -1169,13 +1169,19 @@ class BetterFlowApp:
         os._exit(1)
 
     def _signal_handler(self, signum, frame) -> None:
-        """Handle shutdown signals (async-signal-safe).
+        """Handle shutdown signals.
 
-        Only set the shutdown event here. Avoid logging (logging lock may be
-        held) and avoid non-trivial work (e.g. tray.stop). The main loop
-        observes _shutdown_event and performs full cleanup.
+        Sets the shutdown event and stops the tray to break out of
+        run_blocking() immediately. Without the tray.stop() call, a
+        SIGINT during a 120s OAuth wait would hang until the browser
+        timeout expires. pystray's stop() on macOS posts to the Cocoa
+        run loop, making it safe to call here.
         """
         self._shutdown_event.set()
+        try:
+            self.tray.stop()
+        except Exception:
+            pass
 
     # -- Lifecycle --------------------------------------------------------
 

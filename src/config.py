@@ -46,9 +46,12 @@ def _load_dotenv() -> None:
     # Installed app runtime config location.
     candidates.append(Path(user_config_dir(APP_NAME, APP_AUTHOR)) / ".env")
 
-    # Prefer a .env in current working directory, then project root in source runs.
-    candidates.append(Path.cwd() / ".env")
-    candidates.append(Path(__file__).resolve().parents[1] / ".env")
+    # In development (non-frozen) builds, also check cwd and project root.
+    # Skipped in production PyInstaller bundles to prevent credential redirect
+    # via a planted .env file in an attacker-controlled working directory.
+    if not getattr(sys, "frozen", False):
+        candidates.append(Path.cwd() / ".env")
+        candidates.append(Path(__file__).resolve().parents[1] / ".env")
 
     seen: set[Path] = set()
     for path in candidates:

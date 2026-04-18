@@ -205,22 +205,26 @@ def _resources_dir() -> Path:
 
 # Cache the logo template to avoid re-reading from disk on every state change.
 _logo_template: Optional[Image.Image] = None
+_logo_template_lock = threading.Lock()
 
 
 def _get_logo_template() -> Optional[Image.Image]:
-    """Load and cache the B logo as an alpha mask."""
+    """Load and cache the B logo as an alpha mask (thread-safe)."""
     global _logo_template
     if _logo_template is not None:
         return _logo_template
-    logo_path = _resources_dir() / "logo.png"
-    if not logo_path.exists():
-        return None
-    try:
-        img = Image.open(logo_path).convert("RGBA")
-        _logo_template = img
-        return _logo_template
-    except Exception:
-        return None
+    with _logo_template_lock:
+        if _logo_template is not None:
+            return _logo_template
+        logo_path = _resources_dir() / "logo.png"
+        if not logo_path.exists():
+            return None
+        try:
+            img = Image.open(logo_path).convert("RGBA")
+            _logo_template = img
+            return _logo_template
+        except Exception:
+            return None
 
 
 def create_icon_image(color: str, size: int = 64) -> Image.Image:
@@ -826,7 +830,8 @@ class TrayIcon:
         """Handle quit menu click."""
         if self._on_quit:
             self._on_quit()
-        self.stop()
+        else:
+            self.stop()
 
     # -- Preference handlers -------------------------------------------------
 

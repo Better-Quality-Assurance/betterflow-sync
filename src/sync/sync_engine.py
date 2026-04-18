@@ -402,7 +402,7 @@ class SyncEngine:
                     # Store AFK events so _transform_event can check idle status
                     self._current_afk_events = afk_events
 
-                    filled = self._fill_window_gaps(raw_events, afk_events)
+                    filled = self._fill_window_gaps(raw_events, afk_events, bucket_id=bucket.id)
                     stats.gaps_filled += filled
 
                     # Feed raw events to call detector
@@ -546,7 +546,7 @@ class SyncEngine:
             # Check if this event was gap-filled on a prior cycle —
             # AW returns original duration but we already sent the extended one
             with self._cache_lock:
-                orig = self._gap_filled_originals.get(event.id)
+                orig = self._gap_filled_originals.get((bucket_id, event.id))
             if orig is not None and abs(event.duration - orig) < 0.5:
                 stats.events_filtered += 1
                 continue
@@ -828,6 +828,7 @@ class SyncEngine:
         window_events: list[AWEvent],
         afk_events: list[AWEvent],
         max_gap_seconds: float = 300.0,
+        bucket_id: str = "",
     ) -> int:
         """Extend window event durations to cover gaps confirmed by AFK data.
 
@@ -870,7 +871,7 @@ class SyncEngine:
             # dedup check sees original→original (unchanged) and skips.
             # The gap-filled event is already sent with extended duration.
             with self._cache_lock:
-                self._gap_filled_originals[current.id] = old_duration
+                self._gap_filled_originals[(bucket_id, current.id)] = old_duration
             filled += 1
 
         if filled:

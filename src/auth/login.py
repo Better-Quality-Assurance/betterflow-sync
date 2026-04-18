@@ -117,6 +117,11 @@ class LoginManager:
             LoginState with result
         """
         authorize_url = f"{self.bf.web_base_url}/sync/auth/authorize"
+        if not authorize_url.startswith("https://"):
+            return LoginState(
+                logged_in=False,
+                error="Refusing to start OAuth flow over non-HTTPS connection",
+            )
         logger.info(f"Using authorize URL: {authorize_url}")
         flow = BrowserAuthFlow(authorize_url)
         with self._flow_lock:
@@ -184,24 +189,31 @@ class LoginManager:
         """Log out and revoke device token.
 
         Returns:
-            True if successful
+            True if server-side revocation succeeded. Local credentials
+            are always cleared regardless — but False means the token
+            may still be valid server-side.
         """
-        # Revoke token on server
+        revoked = False
         try:
             self.bf.revoke()
+            revoked = True
         except Exception as e:
-            logger.warning(f"Failed to revoke token: {e}")
+            logger.warning(
+                "Failed to revoke token server-side — token may remain "
+                "valid until it expires. Revoke manually from the web "
+                "interface if needed. Error: %s", e,
+            )
 
-        # Clear local credentials
+        # Always clear local credentials even if revocation failed
         self.bf.clear_credentials()
         self.keychain.delete()
 
-        logger.info("Logged out")
+        logger.info("Logged out (server revoked: %s)", revoked)
 
         if self._on_logout_callback:
             self._on_logout_callback()
 
-        return True
+        return revoked
 
     def cancel_login(self) -> None:
         """Cancel any in-progress browser login flow."""

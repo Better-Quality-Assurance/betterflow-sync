@@ -51,11 +51,21 @@ class StoredCredentials:
             }
         )
 
+    _MAX_TOKEN_LEN = 512
+
     @classmethod
     def from_json(cls, data: str) -> "StoredCredentials":
         parsed = json.loads(data)
+        token = parsed["api_token"]
+        if (
+            not isinstance(token, str)
+            or len(token) > cls._MAX_TOKEN_LEN
+            or "\r" in token
+            or "\n" in token
+        ):
+            raise ValueError("api_token failed validation")
         return cls(
-            api_token=parsed["api_token"],
+            api_token=token,
             device_id=str(parsed["device_id"]),
             user_email=parsed["user_email"],
             user_name=parsed.get("user_name", ""),

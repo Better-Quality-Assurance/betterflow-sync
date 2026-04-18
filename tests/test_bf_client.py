@@ -424,7 +424,7 @@ class TestBetterFlowClient:
             callback=check_payload,
         )
 
-        self.client.exchange_code(code="code", device_name="dev")
+        self.client.exchange_code(code="code", device_name="dev", code_verifier="verifier")
 
     @responses.activate
     def test_exchange_code_invalid_code(self):
@@ -436,7 +436,7 @@ class TestBetterFlowClient:
             status=401,
         )
 
-        result = self.client.exchange_code(code="bad-code", device_name="device")
+        result = self.client.exchange_code(code="bad-code", device_name="device", code_verifier="verifier")
 
         assert result.success is False
         assert "Invalid" in result.error
@@ -450,7 +450,7 @@ class TestBetterFlowClient:
             body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
-        result = self.client.exchange_code(code="code", device_name="device")
+        result = self.client.exchange_code(code="code", device_name="device", code_verifier="verifier")
 
         assert result.success is False
         assert "connect" in result.error.lower()

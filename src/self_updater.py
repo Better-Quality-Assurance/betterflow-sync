@@ -49,6 +49,7 @@ def _get_app_bundle_path() -> Optional[Path]:
 def apply_update(
     download_url: str,
     on_progress: Optional[Callable[[str], None]] = None,
+    on_pre_exit: Optional[Callable[[], None]] = None,
 ) -> bool:
     """Download, extract, replace, and relaunch.
 
@@ -153,7 +154,13 @@ def apply_update(
             # Clean up backup
             shutil.rmtree(backup_path, ignore_errors=True)
 
-            # 5. Relaunch
+            # 5. Flush pending data + relaunch
+            if on_pre_exit:
+                _status("Flushing data...")
+                try:
+                    on_pre_exit()
+                except Exception as e:
+                    logger.warning("Pre-exit flush failed: %s", e)
             _status("Restarting...")
             subprocess.Popen(["open", str(app_path)])
             # Exit current process — os._exit works from any thread,
@@ -182,6 +189,11 @@ def apply_update(
             bat_content += f'rd /s /q "{tmp_dir}"\r\n'
             bat_content += 'del "%~f0"\r\n'
             bat_path.write_text(bat_content)
+            if on_pre_exit:
+                try:
+                    on_pre_exit()
+                except Exception as e:
+                    logger.warning("Pre-exit flush failed: %s", e)
             subprocess.Popen(
                 ["cmd", "/c", str(bat_path)],
                 creationflags=subprocess.CREATE_NO_WINDOW,
@@ -407,11 +419,12 @@ def apply_update_async(
     download_url: str,
     on_progress: Optional[Callable[[str], None]] = None,
     on_complete: Optional[Callable[[bool], None]] = None,
+    on_pre_exit: Optional[Callable[[], None]] = None,
 ) -> None:
     """Run apply_update in a background thread."""
 
     def _run():
-        result = apply_update(download_url, on_progress=on_progress)
+        result = apply_update(download_url, on_progress=on_progress, on_pre_exit=on_pre_exit)
         if on_complete:
             on_complete(result)
 

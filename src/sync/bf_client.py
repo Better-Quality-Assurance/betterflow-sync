@@ -142,7 +142,7 @@ class BetterFlowClient(BaseApiClient):
         self,
         code: str,
         device_name: str,
-        code_verifier: Optional[str] = None,
+        code_verifier: str,
         device_info: Optional[DeviceInfo] = None,
     ) -> AuthResult:
         """Exchange an authorization code for a Sanctum token.
@@ -150,7 +150,9 @@ class BetterFlowClient(BaseApiClient):
         Args:
             code: 64-char authorization code from browser flow
             device_name: Name for this device token
-            code_verifier: PKCE code verifier (required for PKCE flow)
+            code_verifier: PKCE code verifier (always required — desktop apps
+                are public OAuth clients so PKCE is the sole protection
+                against authorization code interception)
             device_info: Pre-collected device info (avoids redundant collect)
 
         Returns:
@@ -173,8 +175,7 @@ class BetterFlowClient(BaseApiClient):
             "hostname": device_info.hostname,
             "agent_version": AGENT_VERSION,
         }
-        if code_verifier:
-            payload["code_verifier"] = code_verifier
+        payload["code_verifier"] = code_verifier
 
         try:
             with self._session_lock:

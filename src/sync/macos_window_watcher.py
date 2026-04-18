@@ -161,9 +161,13 @@ class MacOSWindowWatcher:
         # When Accessibility is missing, title is always empty so the cache
         # key never changes — skip the cache entirely in that case to avoid
         # returning a stale URL for every Chrome poll.
-        if app_name in _URL_BROWSERS:
+        # Only query browser URL when we have a valid title (Accessibility
+        # granted). When title is empty (no permission), querying would spawn
+        # a subprocess every 2s poll cycle — thousands per work day for no
+        # useful result.
+        if app_name in _URL_BROWSERS and title:
             cache_key = (app_name, title)
-            if title and cache_key == self._browser_cache_key:
+            if cache_key == self._browser_cache_key:
                 url = self._browser_cache_url
                 incognito = self._browser_cache_incognito
             else:
