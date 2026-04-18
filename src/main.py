@@ -527,9 +527,13 @@ class BetterFlowApp:
         logger.info("BetterFlow starting...")
         logger.info(f"Using API URL: {self.config.api_url}")
 
-        # Clear stale notifications from previous session (crash/kill leaves them)
-        clear_notifications()
+        # Note: clear_notifications() is NOT called here or in background
+        # startup. NSUserNotificationCenter deadlocks when called before the
+        # Cocoa run loop is fully active (main thread) or from a non-main
+        # thread in PyInstaller bundles. Stale notifications from a crashed
+        # session are harmless and dismissed by macOS automatically.
 
+        logger.info("Initializing components...")
         # Initialize AW process manager
         self.aw_manager = AWManager(
             aw_port=self.config.aw.port,
@@ -547,6 +551,7 @@ class BetterFlowApp:
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
+        logger.info("Core clients initialized")
         if self.config.privacy.track_display_info:
             self.display_tracker = start_display_tracker()
         else:
@@ -566,6 +571,7 @@ class BetterFlowApp:
             self.input_watcher = MacOSInputWatcher(self.aw)
             self.aw_manager.disable_component("bf-window-tracker")
 
+        logger.info("Creating sync engine...")
         self.sync_engine = SyncEngine(
             aw=self.aw,
             bf=self.bf,
@@ -575,6 +581,7 @@ class BetterFlowApp:
             display_tracker=self.display_tracker,
         )
 
+        logger.info("Sync engine created")
         self.login_manager = LoginManager(self.bf, self.keychain)
 
         # Tray icon
