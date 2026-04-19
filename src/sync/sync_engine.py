@@ -52,6 +52,7 @@ class SyncStats:
     gaps_filled: int = 0
     calls_detected: int = 0
     errors: list[str] = field(default_factory=list)
+    queued_bucket_ids: set = field(default_factory=set)
     _should_heartbeat: bool = False
 
     @property
@@ -453,16 +454,24 @@ class SyncEngine:
             stats.calls_detected += len(call_events)
             all_events.extend(call_events)
 
-        # Send events, then commit checkpoints only on full success (N5).
-        # Conservative: only advance checkpoints when nothing was queued.
-        # Partial sends queue unsent events, but if those expire before
-        # retry succeeds, advancing the checkpoint would lose them.
+        # Send events, then advance checkpoints per-bucket. Only hold back
+        # checkpoints for buckets that had events queued (partial failure).
+        # Previously this was all-or-nothing: if ANY event was queued, NO
+        # checkpoint advanced, causing indefinite re-fetch of already-sent
+        # events that slowly filled the dedup LRU cache.
         if all_events:
             pre_queued = stats.events_queued
             self._send_events(all_events, stats)
             if stats.events_queued == pre_queued:
+                # Full success — advance all checkpoints
                 for bucket_id, ts, event_id in pending_checkpoints:
                     self.queue.set_checkpoint(bucket_id, ts, event_id)
+            else:
+                # Partial failure — advance only buckets whose events
+                # were all sent (none queued).
+                for bucket_id, ts, event_id in pending_checkpoints:
+                    if bucket_id not in stats.queued_bucket_ids:
+                        self.queue.set_checkpoint(bucket_id, ts, event_id)
         elif pending_checkpoints:
             # All events were dedup-filtered (already sent); safe to advance.
             for bucket_id, ts, event_id in pending_checkpoints:
@@ -580,8 +589,10 @@ class SyncEngine:
             and self._has_input_data
         ):
             last_event = events[-1]  # sorted oldest-first, use newest for assessment
+            total_active = sum(ev.get("duration", 0) for ev in transformed)
             fraud = self._activity_analyzer.get_fraud_assessment(
-                last_event.timestamp, app=last_event.app
+                last_event.timestamp, app=last_event.app,
+                active_seconds=total_active,
             )
             for ev in transformed:
                 if "activity_metrics" in ev:
@@ -715,10 +726,12 @@ class SyncEngine:
             return []
 
         transformed: list[dict] = []
+        total_active_duration = 0.0
         for idx, (segment_start, segment_end) in enumerate(active_ranges):
             duration = round((segment_end - segment_start).total_seconds(), 2)
             if duration <= 0:
                 continue
+            total_active_duration += duration
 
             segment_event = AWEvent(
                 id=event.id,
@@ -732,9 +745,24 @@ class SyncEngine:
                 bucket_type,
                 forced_activity_state=None if self._has_input_data else "active",
                 custom_event_id=f"{event.id}:{idx}",
+                skip_time_tracking=True,  # tracked per-event below
             )
             if transformed_event:
                 transformed.append(transformed_event)
+
+        # Track time at the EVENT level (not per-segment) to avoid
+        # double-counting or undercounting when segmentation changes
+        # across cycles (e.g. AFK splits differ between syncs).
+        if transformed and total_active_duration > 0:
+            event_date = event.timestamp.astimezone().date()
+            time_key = (bucket_id, event.id)
+            with self._cache_lock:
+                prev_counted = self._time_cache.get(time_key, 0.0)
+                delta = total_active_duration - prev_counted
+                if delta > 0:
+                    self._time_cache[time_key] = total_active_duration
+            if delta > 0:
+                self._time_tracker.add_active_time(delta, event_date)
 
         return transformed
 
@@ -903,6 +931,7 @@ class SyncEngine:
         bucket_type: str,
         forced_activity_state: Optional[str] = None,
         custom_event_id: Optional[str] = None,
+        skip_time_tracking: bool = False,
     ) -> Optional[dict]:
         """Transform an ActivityWatch event to BetterFlow format.
 
@@ -1088,7 +1117,11 @@ class SyncEngine:
             # Track counted time for any event that is not explicitly inactive.
             # This keeps live hours aligned with "time on the machine" while
             # still stopping the counter after prolonged no-input periods.
-            if activity_state is not None and activity_state != "inactive":
+            if (
+                not skip_time_tracking
+                and activity_state is not None
+                and activity_state != "inactive"
+            ):
                 event_date = event.timestamp.astimezone().date()
                 time_key = (bucket_id, result["id"])
                 time_delta = 0.0
@@ -1239,6 +1272,9 @@ class SyncEngine:
                         if failed:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
+                            stats.queued_bucket_ids.update(
+                                e.get("bucket_id", "") for e in failed
+                            )
                     else:
                         # N11: server returned non-success without accepted_ids
                         logger.warning(
@@ -1247,6 +1283,9 @@ class SyncEngine:
                         )
                         self.queue.enqueue(batch)
                         stats.events_queued += len(batch)
+                        stats.queued_bucket_ids.update(
+                            e.get("bucket_id", "") for e in batch
+                        )
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
@@ -1257,6 +1296,9 @@ class SyncEngine:
                 for remaining in batches[i:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
+                    stats.queued_bucket_ids.update(
+                        e.get("bucket_id", "") for e in remaining
+                    )
                 stats.errors.append(f"Authentication error: {e}")
                 raise
             except BetterFlowClientError:
@@ -1264,6 +1306,9 @@ class SyncEngine:
                 for remaining in batches[i:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
+                    stats.queued_bucket_ids.update(
+                        e.get("bucket_id", "") for e in remaining
+                    )
                 break
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain

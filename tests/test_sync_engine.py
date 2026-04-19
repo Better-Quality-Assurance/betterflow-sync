@@ -204,7 +204,9 @@ class TestSyncEngine:
         assert transformed[1]["id"] == "21:1"
         assert transformed[1]["duration"] == 30.0
         assert all(item["activity_state"] == "active" for item in transformed)
-        assert self.time_tracker.add_active_time.call_count == 2
+        # Time tracking is per-event (sum of segments = 60s), not per-segment
+        self.time_tracker.add_active_time.assert_called_once()
+        assert self.time_tracker.add_active_time.call_args[0][0] == 60.0
 
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""

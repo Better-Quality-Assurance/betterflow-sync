@@ -473,7 +473,12 @@ class ActivityAnalyzer:
         """
         return self._compute_metrics(timestamp)
 
-    def get_fraud_assessment(self, timestamp: datetime, app: Optional[str] = None) -> FraudAssessment:
+    def get_fraud_assessment(
+        self,
+        timestamp: datetime,
+        app: Optional[str] = None,
+        active_seconds: float = 0.0,
+    ) -> FraudAssessment:
         """Get fraud assessment incorporating session-level signals.
 
         Records the current window metrics into the fraud detector (if not
@@ -482,6 +487,9 @@ class ActivityAnalyzer:
         Args:
             timestamp: The timestamp to assess.
             app: Optional app name for app diversity tracking.
+            active_seconds: Actual total active seconds from this sync
+                batch's transformed events (used for fraud detector's
+                app diversity threshold instead of a fixed window size).
 
         Returns:
             FraudAssessment with score, signals, and extra metrics.
@@ -502,7 +510,8 @@ class ActivityAnalyzer:
             self._fraud_detector.record_window_metrics(metrics, app=app)
             # Track active time for app diversity checks (inside guard to avoid double-counting)
             if metrics.is_engaged(self._thresholds):
-                self._fraud_detector.add_active_time(self._thresholds.window_minutes * 60)
+                actual = active_seconds if active_seconds > 0 else self._thresholds.window_minutes * 60
+                self._fraud_detector.add_active_time(actual)
             self._last_fraud_seq = self._fraud_seq
 
         return self._fraud_detector.assess()
