@@ -33,6 +33,7 @@ venv/
 ENV/
 env/
 .venv/
+.venv-*/
 
 # IDE
 .idea/
@@ -70,6 +71,21 @@ src/_build_info.py
 
 # Plans (local only)
 plans.md
+docs/plans/
+
+# Working notes (local only)
+AUDIT-FIX-PLAN.md
+TRASH-FILES.md
+TRASH/
+
+# Claude local config
+.claude/
+
+# PyInstaller spec is regenerated; only the .bak was ignored before
+*.spec
+
+# pip install detritus when shell mis-parses '>='
+=*
 
 # Keep resources placeholder
 !resources/.gitkeep
