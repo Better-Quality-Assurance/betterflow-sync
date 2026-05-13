@@ -200,13 +200,6 @@ class SyncCoordinator:
                 id="queue_expire_job",
                 replace_existing=True,
             )
-            # Refresh app categories every 6 hours
-            self.scheduler.add_job(
-                self.fetch_categories,
-                trigger=IntervalTrigger(hours=6),
-                id="category_refresh_job",
-                replace_existing=True,
-            )
             # Refresh weekly/monthly trends every 30 minutes
             self.scheduler.add_job(
                 self._fetch_trends,
@@ -711,7 +704,6 @@ class BetterFlowApp:
             logger.exception("Failed to fetch server configuration during startup")
 
         self.coordinator.fetch_projects()
-        self.coordinator.fetch_categories()
         self._check_stale_session()
         self.coordinator.start()
         self._ensure_update_checks_started()

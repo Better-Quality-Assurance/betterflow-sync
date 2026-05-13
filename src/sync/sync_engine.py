@@ -248,9 +248,9 @@ class SyncEngine:
             self._send_private_time_event(private_start_snap)
         if need_end_session:
             try:
-                self.bf.end_session("private_time")
+                self.bf.end_session("user_logout")
             except BetterFlowClientError as e:
-                logger.warning("end_session(private_time) failed: %s", e)
+                logger.warning("end_session(user_logout) failed: %s", e)
 
     @property
     def is_private(self) -> bool:
