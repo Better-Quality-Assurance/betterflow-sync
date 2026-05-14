@@ -276,17 +276,6 @@ class SyncCoordinator:
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 
-    def fetch_categories(self) -> None:
-        """Fetch app-to-category mappings from server and sync to local DB."""
-        try:
-            response = self.bf.get_categories()
-            mappings = response.get("categories", {})
-            self.queue.sync_categories(mappings)
-            self.sync_engine.invalidate_category_cache()
-            logger.info(f"Synced {len(mappings)} app categories")
-        except Exception as e:
-            logger.warning(f"Failed to fetch categories: {e}")
-
     # -- internal ---------------------------------------------------------
 
     @property

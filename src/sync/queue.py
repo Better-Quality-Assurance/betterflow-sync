@@ -537,33 +537,6 @@ class OfflineQueue:
                 (app_name, category, source, now),
             )
 
-    def sync_categories(self, mappings: dict[str, str]) -> None:
-        """Bulk replace server-sourced categories, preserving user overrides.
-
-        Args:
-            mappings: Dict mapping app_name -> category from server
-        """
-        if not mappings:
-            # Empty server response means "no opinion" - leave existing entries.
-            return
-        now = datetime.now(timezone.utc).isoformat()
-        with self._cursor() as cursor:
-            # Clear server and fallback entries; user overrides survive because
-            # they have source='user' and the DELETE only targets the other two.
-            cursor.execute(
-                "DELETE FROM app_categories WHERE source IN ('server', 'fallback')"
-            )
-            # Insert new server categories.  Any remaining conflict is a 'user'
-            # row, which we preserve via DO NOTHING.
-            cursor.executemany(
-                """
-                INSERT INTO app_categories (app_name, category, source, updated_at)
-                VALUES (?, ?, 'server', ?)
-                ON CONFLICT(app_name) DO NOTHING
-                """,
-                [(app, cat, now) for app, cat in mappings.items()],
-            )
-
     def close(self) -> None:
         """Permanently close all tracked database connections.
 

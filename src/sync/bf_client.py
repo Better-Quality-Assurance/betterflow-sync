@@ -353,14 +353,6 @@ class BetterFlowClient(BaseApiClient):
         """Get list of projects for app mapping."""
         return self._request("GET", "projects")
 
-    def get_categories(self) -> dict:
-        """Get app-to-category mappings from server.
-
-        Returns:
-            Dict with "categories" key mapping app names to categories.
-        """
-        return self._request("GET", "categories")
-
     def update_project_mapping(self, app_name: str, project_id: int) -> dict:
         """Update app to project mapping.
 
