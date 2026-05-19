@@ -1,7 +1,9 @@
 """Platform-specific auto-start (login item) management."""
 
 import logging
+import os
 import platform
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,6 +45,21 @@ def get_auto_start() -> bool:
         return False
 
 
+def ensure_synced() -> None:
+    """Re-bootstrap auto-start at startup if config says it should be on
+    but the OS-level state has drifted (plist missing, agent not loaded,
+    or plist path stale after a reinstall). No-op in dev mode."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        if get_auto_start():
+            return  # already loaded with launchd
+        if set_auto_start(True):
+            logger.info("Auto-start re-synced at startup")
+    except Exception as e:
+        logger.warning(f"Auto-start sync failed (non-fatal): {e}")
+
+
 # -- macOS: LaunchAgent plist --------------------------------------------------
 
 def _plist_path() -> Path:
@@ -63,12 +80,43 @@ def _app_launch_args() -> list[str]:
     return [sys.executable, "-m", "src.main"]
 
 
+def _launchctl_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _launchctl(args: list[str]) -> tuple[int, str]:
+    """Run launchctl and return (returncode, combined-output). Never raises."""
+    try:
+        proc = subprocess.run(
+            ["launchctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+    except Exception as e:
+        return -1, str(e)
+
+
 def _set_macos(enabled: bool) -> bool:
     import plistlib
 
     plist_file = _plist_path()
+    target = f"{_launchctl_domain()}/{LAUNCHAGENT_LABEL}"
+
+    if enabled and not getattr(sys, "frozen", False):
+        # In dev mode `sys.executable` is the user's python and the plist
+        # would point at `python -m src.main` from the wrong cwd. Refuse to
+        # write garbage that would break the user's next reboot.
+        logger.warning("Auto-start not supported in dev mode on macOS")
+        return False
 
     if not enabled:
+        # Unload first, then remove the file. bootout returns nonzero if the
+        # agent isn't loaded; that's fine.
+        rc, out = _launchctl(["bootout", target])
+        if rc != 0 and out:
+            logger.debug(f"launchctl bootout returned {rc}: {out}")
         if plist_file.exists():
             plist_file.unlink()
             logger.info(f"Removed LaunchAgent plist: {plist_file}")
@@ -85,13 +133,28 @@ def _set_macos(enabled: bool) -> bool:
     plist_file.parent.mkdir(parents=True, exist_ok=True)
     with open(plist_file, "wb") as f:
         plistlib.dump(plist_data, f)
-
     logger.info(f"Wrote LaunchAgent plist: {plist_file}")
+
+    # Bootstrap so the agent is active for the current session too, not just
+    # after the next login. If already loaded, bootout first so the new plist
+    # takes effect.
+    _launchctl(["bootout", target])
+    rc, out = _launchctl(["bootstrap", _launchctl_domain(), str(plist_file)])
+    if rc == 0:
+        logger.info(f"LaunchAgent loaded: {target}")
+    else:
+        # Not fatal: macOS will still pick the plist up on next login because
+        # RunAtLoad=true. Log so the user knows the immediate load failed.
+        logger.warning(f"launchctl bootstrap returned {rc}: {out}")
     return True
 
 
 def _get_macos() -> bool:
-    return _plist_path().exists()
+    if not _plist_path().exists():
+        return False
+    # Confirm it's actually loaded with launchd, not just present on disk.
+    rc, _ = _launchctl(["print", f"{_launchctl_domain()}/{LAUNCHAGENT_LABEL}"])
+    return rc == 0
 
 
 # -- Windows: Registry Run key ------------------------------------------------

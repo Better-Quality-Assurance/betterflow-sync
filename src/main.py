@@ -746,6 +746,20 @@ class BetterFlowApp:
         if hasattr(signal, "SIGPIPE"):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+        # Self-heal auto-start: if config says it should be on but the OS-level
+        # LaunchAgent isn't actually loaded (drift from a prior install,
+        # manual launchctl bootout, or migration to a new bundle path),
+        # re-bootstrap it. No-op in dev mode.
+        if self.config.auto_start:
+            try:
+                try:
+                    from .autostart import ensure_synced as ensure_autostart_synced
+                except ImportError:
+                    from autostart import ensure_synced as ensure_autostart_synced
+                ensure_autostart_synced()
+            except Exception as e:
+                logger.warning("Auto-start sync failed (non-fatal): %s", e)
+
         # First-run setup wizard
         wizard_login_state = None
         if not self.config.setup_complete:
@@ -965,21 +979,31 @@ class BetterFlowApp:
         self.coordinator.trigger_sync()
 
     def _on_system_sleep(self) -> None:
+        if self._shutdown_event.is_set():
+            return
         self.sys_events.on_system_sleep()
 
     def _on_system_wake(self) -> None:
+        if self._shutdown_event.is_set():
+            return
         self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
         self.sys_events.on_system_shutdown()
 
     def _on_screen_lock(self) -> None:
+        if self._shutdown_event.is_set():
+            return
         self.sys_events.on_screen_lock()
 
     def _on_screen_unlock(self) -> None:
+        if self._shutdown_event.is_set():
+            return
         self.sys_events.on_screen_unlock()
 
     def _on_network_change(self, is_online: bool) -> None:
+        if self._shutdown_event.is_set():
+            return
         self.sys_events.on_network_change(is_online)
 
     def _on_export_logs(self) -> None:
@@ -1188,6 +1212,9 @@ class BetterFlowApp:
             if self._shutdown_done:
                 return
             self._shutdown_done = True
+        # Signal late system-event callbacks (network/sleep/lock) to no-op
+        # before they touch torn-down resources like the offline queue.
+        self._shutdown_event.set()
         logger.info("Shutting down...")
 
         # Flush idle event before stopping (otherwise idle period is lost)
