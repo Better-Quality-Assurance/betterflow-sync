@@ -1,6 +1,6 @@
 # BetterFlow - Build Makefile
 
-.PHONY: install install-dev test lint format clean build build-mac build-windows run download-aw clean-aw
+.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows run download-aw clean-aw
 
 # Install production dependencies
 install:
@@ -45,6 +45,12 @@ build-mac: download-aw
 	pyinstaller build.spec --clean
 	@$(MAKE) sign-mac
 	@echo "Built: dist/BetterFlow.app"
+
+# Install dist/BetterFlow.app into /Applications, terminating any running
+# instance first and waiting for its shutdown to complete before replacing
+# the bundle. See scripts/install-mac.sh for the kill-grace logic.
+install-mac:
+	./scripts/install-mac.sh
 
 # Deep-sign the built .app with hardened runtime + entitlements.
 # Opt-in: set BF_CODESIGN_IDENTITY to the SHA1 or common name of your
