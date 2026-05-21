@@ -47,6 +47,11 @@ _TERMINAL_BUNDLE_IDS: dict[str, str] = {
 class MacOSWindowWatcher:
     """Daemon thread that polls the active window via PyObjC and posts heartbeats to AW."""
 
+    # How often _run() re-checks AXIsProcessTrusted() so we log when
+    # Accessibility goes from missing → granted (or vice versa) without
+    # the user having to restart the app.
+    _ACCESSIBILITY_RECHECK_INTERVAL_S = 30.0
+
     def __init__(self, aw_client, poll_interval: float = 2.0):
         self._aw = aw_client
         self._poll_interval = poll_interval
@@ -54,6 +59,10 @@ class MacOSWindowWatcher:
         self._thread: Optional[threading.Thread] = None
         self._hostname = platform.node()
         self._bucket_id = f"aw-watcher-window_{self._hostname}"
+        # Last known Accessibility-permission state; lets the poll loop
+        # emit a one-shot log on each transition.
+        self._last_accessibility: Optional[bool] = None
+        self._last_accessibility_check_ts: float = 0.0
         # Cache terminal tab title to avoid spawning osascript every poll.
         # _terminal_cache_key is (app_name, ax_title); value is the tab title or None.
         self._terminal_cache_key: Optional[tuple[str, str]] = None
@@ -262,6 +271,7 @@ class MacOSWindowWatcher:
 
         while not self._stop_event.wait(self._poll_interval):
             try:
+                self._maybe_log_accessibility_transition()
                 # Wrap each iteration in an autorelease pool so that
                 # ObjC objects created by NSWorkspace / Accessibility
                 # APIs are freed at the end of each poll cycle.
@@ -273,6 +283,33 @@ class MacOSWindowWatcher:
                     self._poll_once()
             except Exception as e:
                 logger.warning(f"Window watcher poll error: {e}")
+
+    def _maybe_log_accessibility_transition(self) -> None:
+        """Re-check AXIsProcessTrusted() occasionally and log when the
+        grant flips. Title fetches already work transparently once the
+        permission appears — this just makes the change visible in logs."""
+        import time
+        now = time.monotonic()
+        if now - self._last_accessibility_check_ts < self._ACCESSIBILITY_RECHECK_INTERVAL_S:
+            return
+        self._last_accessibility_check_ts = now
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            trusted = bool(AXIsProcessTrusted())
+        except Exception:
+            return
+        if self._last_accessibility is None:
+            self._last_accessibility = trusted
+            return
+        if trusted and not self._last_accessibility:
+            logger.info(
+                "Accessibility permission now granted — window titles will be tracked"
+            )
+        elif not trusted and self._last_accessibility:
+            logger.warning(
+                "Accessibility permission revoked — window titles will be empty"
+            )
+        self._last_accessibility = trusted
 
     def _poll_once(self) -> None:
         """Single poll iteration: get active window, post heartbeat."""

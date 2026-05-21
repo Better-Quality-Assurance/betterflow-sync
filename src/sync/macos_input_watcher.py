@@ -40,6 +40,12 @@ _EVENT_MASK = (
 class MacOSInputWatcher:
     """Daemon threads that count input events via CGEventTap and post to AW."""
 
+    # How often the permission-retry thread re-checks Accessibility +
+    # Input Monitoring after start() failed because of a missing grant.
+    # Keep it modest so users see input tracking come online within ~30s
+    # of toggling the switch in System Settings, without spamming logs.
+    _PERMISSION_RETRY_INTERVAL_S = 30.0
+
     def __init__(self, aw_client, emit_interval: float = 10.0):
         self._aw = aw_client
         self._emit_interval = emit_interval
@@ -59,6 +65,14 @@ class MacOSInputWatcher:
         self._run_loop = None
         self._tap_ref = None
         self._loop_ready = threading.Event()
+
+        # Permission self-heal: when start() fails because Accessibility
+        # or Input Monitoring isn't granted yet, this thread polls every
+        # _PERMISSION_RETRY_INTERVAL_S and calls start() again once both
+        # are present. Avoids needing the user to restart the app after
+        # toggling permissions in System Settings.
+        self._permission_retry_thread: Optional[threading.Thread] = None
+        self._permission_retry_stop = threading.Event()
 
     @property
     def is_running(self) -> bool:
@@ -90,6 +104,7 @@ class MacOSInputWatcher:
             logger.warning(
                 "Process does NOT have Accessibility permission — input tracking disabled"
             )
+            self._ensure_permission_retry()
             return False
         # Passing prompt=True calls CGRequestListenEventAccess, which shows
         # Apple's native Input Monitoring dialog on first launch and registers
@@ -100,6 +115,7 @@ class MacOSInputWatcher:
             logger.warning(
                 "Process does NOT have Input Monitoring permission — keypress tracking disabled"
             )
+            self._ensure_permission_retry()
             return False
         try:
             self._aw.create_bucket(self._bucket_id, "aw-watcher-input", self._hostname)
@@ -130,8 +146,52 @@ class MacOSInputWatcher:
         )
         return True
 
+    def _ensure_permission_retry(self) -> None:
+        """Spawn (or keep alive) a background thread that retries start()
+        every _PERMISSION_RETRY_INTERVAL_S until both Accessibility and
+        Input Monitoring are granted, then exits."""
+        if self._permission_retry_thread and self._permission_retry_thread.is_alive():
+            return
+        self._permission_retry_stop.clear()
+        self._permission_retry_thread = threading.Thread(
+            target=self._permission_retry_loop,
+            daemon=True,
+            name="macos-input-permission-retry",
+        )
+        self._permission_retry_thread.start()
+        logger.info(
+            "Input watcher will recheck permissions every "
+            f"{int(self._PERMISSION_RETRY_INTERVAL_S)}s until granted"
+        )
+
+    def _permission_retry_loop(self) -> None:
+        while not self._permission_retry_stop.wait(self._PERMISSION_RETRY_INTERVAL_S):
+            if self.is_running:
+                # Another start() call already brought us online.
+                return
+            # prompt=False so we don't keep showing dialogs on every retry;
+            # the first start() already registered the app in System Settings.
+            if check_accessibility() and check_input_monitoring(prompt=False):
+                logger.info(
+                    "Input watcher permissions now granted — starting capture"
+                )
+                if self.start():
+                    return
+                # start() failed for some other reason; keep retrying.
+
     def stop(self) -> None:
         """Signal threads to stop and clean up."""
+        # Always stop the permission-retry watchdog, even if no capture
+        # threads are running yet.
+        self._permission_retry_stop.set()
+        if (
+            self._permission_retry_thread
+            and self._permission_retry_thread.is_alive()
+            and self._permission_retry_thread is not threading.current_thread()
+        ):
+            self._permission_retry_thread.join(timeout=2.0)
+        self._permission_retry_thread = None
+
         if not self.is_running:
             return
 
