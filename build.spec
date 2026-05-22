@@ -99,6 +99,7 @@ hiddenimports = [
     "AppKit",
     "Foundation",
     "SystemConfiguration",
+    "ApplicationServices",  # AX API for MacOSWindowWatcher window titles + AXIsProcessTrusted
     "_build_info",  # Generated at build time by the spec preamble
 ]
 
