@@ -1,5 +1,10 @@
 """System tray icon and menu."""
 
+# Annotations are lazy (PEP 563) so the module imports cleanly on headless hosts
+# where pystray is unavailable (pystray=None) — type hints like `-> pystray.Menu`
+# must not be evaluated at definition time.
+from __future__ import annotations
+
 import logging
 import math
 import os
