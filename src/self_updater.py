@@ -1,6 +1,7 @@
-"""Self-update: download a new release, replace the running .app, and relaunch.
+"""Self-update: download a new release, replace the running app, and relaunch.
 
-Supports both ZIP and DMG formats (macOS uses DMG, Windows uses ZIP).
+Supports three formats: macOS uses DMG, Windows uses ZIP, Linux uses a single
+.AppImage file replaced in place.
 """
 
 import logging
@@ -23,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 def _get_app_bundle_path() -> Optional[Path]:
-    """Return the path to the running .app bundle (macOS) or .exe dir (Windows).
+    """Return the path to the running app: .app bundle (macOS), .exe dir
+    (Windows), or the .AppImage file (Linux).
 
     Works for both PyInstaller bundles and dev mode.
     """
@@ -41,6 +43,14 @@ def _get_app_bundle_path() -> Optional[Path]:
         # PyInstaller: dist/BetterFlow/BetterFlow.exe - the folder is the app
         if getattr(sys, "frozen", False):
             return Path(sys._MEIPASS).parent if hasattr(sys, "_MEIPASS") else exe.parent
+        return None
+
+    elif sys.platform.startswith("linux"):
+        # AppImage sets $APPIMAGE to the real path of the .AppImage file
+        # (sys.executable points into the read-only squashfs mount instead).
+        appimage = os.environ.get("APPIMAGE")
+        if appimage:
+            return Path(appimage).resolve()
         return None
 
     return None
@@ -89,7 +99,13 @@ def apply_update(
         # Parse URL path to detect format (handles query params like ?token=abc)
         url_path = urlparse(download_url).path.lower()
         is_dmg = url_path.endswith(".dmg")
-        dl_filename = "update.dmg" if is_dmg else "update.zip"
+        is_appimage = url_path.endswith(".appimage")
+        if is_appimage:
+            dl_filename = "update.AppImage"
+        elif is_dmg:
+            dl_filename = "update.dmg"
+        else:
+            dl_filename = "update.zip"
         dl_path = tmp_dir / dl_filename
 
         total = int(resp.headers.get("content-length", 0))
@@ -101,6 +117,11 @@ def apply_update(
                 if total > 0:
                     pct = int(downloaded / total * 100)
                     _status(f"Downloading... {pct}%")
+
+        # Linux: the downloaded AppImage *is* the new app — replace in place,
+        # no extraction or .app/.exe discovery needed.
+        if sys.platform.startswith("linux"):
+            return _install_appimage(dl_path, app_path, _status, on_pre_exit)
 
         # 2. Extract
         _status("Extracting...")
@@ -221,6 +242,62 @@ def apply_update(
         # Clean up temp dir (except on Windows where bat script needs it)
         if tmp_dir and sys.platform != "win32":
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _install_appimage(
+    new_appimage: Path,
+    app_path: Path,
+    status: Callable[[str], None],
+    on_pre_exit: Optional[Callable[[], None]],
+) -> bool:
+    """Replace the running .AppImage in place and relaunch (Linux).
+
+    A running AppImage can be safely renamed/replaced: the kernel keeps the
+    executing inode alive (and the FUSE mount with it) until this process
+    exits, so we move the old file aside, drop the new one in, and exec it.
+    """
+    # Sanity check: AppImages are ELF binaries (magic \x7fELF).
+    try:
+        with open(new_appimage, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                status("Downloaded file is not a valid AppImage - update aborted")
+                return False
+    except OSError as e:
+        status(f"Could not read downloaded update: {e}")
+        return False
+
+    status("Installing...")
+    new_appimage.chmod(0o755)
+
+    # Use an explicit ".old" suffix on the full name (with_suffix would strip
+    # the ".AppImage" extension).
+    backup_path = Path(str(app_path) + ".old")
+    if backup_path.exists():
+        backup_path.unlink()
+
+    app_path.rename(backup_path)
+    try:
+        shutil.move(str(new_appimage), str(app_path))
+        app_path.chmod(0o755)
+    except Exception:
+        # Rollback so the user is never left without a runnable app.
+        if backup_path.exists() and not app_path.exists():
+            backup_path.rename(app_path)
+        raise
+
+    backup_path.unlink(missing_ok=True)
+
+    if on_pre_exit:
+        status("Flushing data...")
+        try:
+            on_pre_exit()
+        except Exception as e:
+            logger.warning("Pre-exit flush failed: %s", e)
+
+    status("Restarting...")
+    subprocess.Popen([str(app_path)])
+    # os._exit works from any thread, unlike sys.exit.
+    os._exit(0)
 
 
 def _find_app_in(directory: Path) -> Optional[Path]:

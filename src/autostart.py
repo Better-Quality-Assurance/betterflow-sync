@@ -6,6 +6,7 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ def set_auto_start(enabled: bool) -> bool:
             return _set_macos(enabled)
         elif system == "Windows":
             return _set_windows(enabled)
+        elif system == "Linux":
+            return _set_linux(enabled)
         else:
             logger.warning(f"Auto-start not supported on {system}")
             return False
@@ -39,6 +42,8 @@ def get_auto_start() -> bool:
             return _get_macos()
         elif system == "Windows":
             return _get_windows()
+        elif system == "Linux":
+            return _get_linux()
         else:
             return False
     except Exception:
@@ -203,3 +208,68 @@ def _get_windows() -> bool:
             winreg.CloseKey(key)
     except OSError:
         return False
+
+
+# -- Linux: XDG autostart .desktop entry --------------------------------------
+
+
+def _desktop_entry_path() -> Path:
+    """Path to the freedesktop autostart entry (honors XDG_CONFIG_HOME)."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config_home) / "autostart" / f"{LAUNCHAGENT_LABEL}.desktop"
+
+
+def _linux_exec_command() -> Optional[str]:
+    """Determine the command to relaunch the app at login.
+
+    Running as an AppImage, $APPIMAGE is the real .AppImage path. Returns None
+    in dev mode (where there's nothing stable to point launch at)."""
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        return appimage
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return None
+
+
+def _set_linux(enabled: bool) -> bool:
+    entry = _desktop_entry_path()
+
+    if not enabled:
+        if entry.exists():
+            entry.unlink()
+            logger.info(f"Removed autostart desktop entry: {entry}")
+        return True
+
+    if not getattr(sys, "frozen", False):
+        # In dev mode there is no stable executable to point Exec= at.
+        logger.warning("Auto-start not supported in dev mode on Linux")
+        return False
+
+    exec_cmd = _linux_exec_command()
+    if not exec_cmd:
+        logger.warning("Cannot determine Linux executable path for auto-start")
+        return False
+
+    # The desktop-entry spec requires reserved characters (incl. spaces) to be
+    # double-quoted in the Exec field.
+    exec_field = f'"{exec_cmd}"' if " " in exec_cmd else exec_cmd
+
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=BetterFlow\n"
+        f"Exec={exec_field}\n"
+        "Icon=betterflow\n"
+        "Comment=Sync ActivityWatch data to BetterFlow\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    entry.write_text(content, encoding="utf-8")
+    logger.info(f"Wrote autostart desktop entry: {entry}")
+    return True
+
+
+def _get_linux() -> bool:
+    return _desktop_entry_path().exists()

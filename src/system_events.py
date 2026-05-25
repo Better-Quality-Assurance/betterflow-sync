@@ -3,6 +3,7 @@
 Platform-specific implementations:
 - macOS: pyobjc NSWorkspace notifications + SCNetworkReachability
 - Windows: ctypes hidden window message pump
+- Linux: systemd-logind PrepareForSleep D-Bus signal (via jeepney)
 - Fallback: socket-based network poller
 """
 
@@ -54,6 +55,8 @@ def start_system_event_listener(
                 _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
         elif _system == "Windows":
             _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
+        elif _system == "Linux":
+            _start_linux_power_listener(on_sleep, on_wake)
         return
 
     if _system == "Darwin":
@@ -63,6 +66,9 @@ def start_system_event_listener(
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
     elif _system == "Windows":
         _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
+        _start_network_poller(on_network_change, host=host, port=reachability_port)
+    elif _system == "Linux":
+        _start_linux_power_listener(on_sleep, on_wake)
         _start_network_poller(on_network_change, host=host, port=reachability_port)
     else:
         logger.warning(f"System events not supported on {_system}")
@@ -419,6 +425,77 @@ def _start_windows_listener(
             user32.DispatchMessageW(ctypes.byref(msg))
 
     thread = threading.Thread(target=run_message_pump, name="system-power-listener", daemon=True)
+    thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Linux: systemd-logind PrepareForSleep signal (via jeepney)
+# ---------------------------------------------------------------------------
+
+def _start_linux_power_listener(
+    on_sleep: Callable,
+    on_wake: Callable,
+) -> None:
+    """Listen for suspend/resume via systemd-logind's PrepareForSleep signal.
+
+    logind emits ``PrepareForSleep(True)`` just before the system suspends and
+    ``PrepareForSleep(False)`` after it resumes. Shutdown is intentionally not
+    handled here — the process receives SIGTERM on logout/shutdown, which is
+    wired up separately. Uses jeepney (pure-Python D-Bus, no native deps).
+    """
+    try:
+        from jeepney import MatchRule
+        from jeepney.bus_messages import message_bus
+        from jeepney.io.blocking import open_dbus_connection
+    except ImportError:
+        logger.warning("jeepney not available — sleep/wake detection disabled on Linux")
+        return
+
+    def run_loop():
+        try:
+            conn = open_dbus_connection(bus="SYSTEM")
+        except Exception as e:
+            logger.warning("Could not connect to system D-Bus (%s) — sleep/wake disabled", e)
+            return
+
+        rule = MatchRule(
+            type="signal",
+            sender="org.freedesktop.login1",
+            interface="org.freedesktop.login1.Manager",
+            member="PrepareForSleep",
+            path="/org/freedesktop/login1",
+        )
+        try:
+            conn.send_and_get_reply(message_bus.AddMatch(rule))
+        except Exception as e:
+            logger.warning("Failed to register logind match rule: %s", e)
+            conn.close()
+            return
+
+        logger.debug("Linux logind sleep/wake listener started")
+        try:
+            with conn.filter(rule) as queue:
+                while not _stop_event.is_set():
+                    try:
+                        msg = conn.recv_until_filtered(queue, timeout=1.0)
+                    except TimeoutError:
+                        continue
+                    try:
+                        going_to_sleep = bool(msg.body[0])
+                    except (IndexError, TypeError):
+                        continue
+                    if going_to_sleep:
+                        logger.info("System sleep detected (logind) — pausing")
+                        _safe_call(on_sleep)
+                    else:
+                        logger.info("System wake detected (logind) — resuming")
+                        _safe_call(on_wake)
+        except Exception:
+            logger.exception("Linux sleep/wake listener stopped unexpectedly")
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=run_loop, name="system-power-listener", daemon=True)
     thread.start()
 
 

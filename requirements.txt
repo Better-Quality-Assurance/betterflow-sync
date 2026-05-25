@@ -8,6 +8,15 @@ Pillow>=10.0
 pyobjc-framework-SystemConfiguration>=10.0; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
 
+# Linux-only dependencies
+# PyGObject -> AppIndicator tray backend; python-xlib -> XOrg fallback backend;
+# jeepney -> systemd-logind sleep/wake D-Bus signals; SecretStorage -> keyring
+# Secret Service backend (also pulled in transitively by keyring on Linux).
+PyGObject>=3.42; sys_platform == "linux"
+python-xlib>=0.33; sys_platform == "linux"
+jeepney>=0.8; sys_platform == "linux"
+SecretStorage>=3.3; sys_platform == "linux"
+
 # Development dependencies (install with: pip install -r requirements-dev.txt)
 # pytest>=7.0
 # pytest-mock>=3.0

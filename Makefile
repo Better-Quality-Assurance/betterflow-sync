@@ -1,6 +1,6 @@
 # BetterFlow - Build Makefile
 
-.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows run download-aw clean-aw
+.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows build-linux appimage run download-aw clean-aw
 
 # Install production dependencies
 install:
@@ -79,6 +79,16 @@ sign-mac:
 build-windows: download-aw
 	pyinstaller build.spec --clean
 	@echo "Built: dist/BetterFlow.exe"
+
+# Build for Linux (run on Linux) — produces dist/BetterFlow/ one-dir bundle
+build-linux: download-aw
+	pyinstaller build.spec --clean
+	@echo "Built: dist/BetterFlow/"
+
+# Package the Linux build as a single portable AppImage
+appimage: build-linux
+	./scripts/build-appimage.sh
+	@echo "Built: dist/BetterFlow-linux-x86_64.AppImage"
 
 # Run the application (development)
 run:

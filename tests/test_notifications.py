@@ -73,9 +73,10 @@ class TestSendNotification:
         args = mock_run.call_args
         assert args[0][0][0] == "powershell"
 
-    @patch("src.notifications.platform.system", return_value="Linux")
+    @patch("src.notifications.platform.system", return_value="FreeBSD")
     @patch("src.notifications.subprocess.run")
     def test_unsupported_platform_no_error(self, mock_run, _mock_sys):
+        # macOS/Windows/Linux are all supported; anything else is a silent no-op.
         send_notification("Title", "Body")
         mock_run.assert_not_called()
 

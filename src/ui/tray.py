@@ -156,12 +156,42 @@ class TrayModel:
         self.needs_permissions: bool = False
 
 
+# On Linux, pystray binds its backend at import time. Choose it explicitly:
+# AppIndicator (gives a proper status-menu) when the GTK/AppIndicator GObject
+# bindings are present, otherwise the pure-Xlib XOrg backend. Respect an
+# operator-provided PYSTRAY_BACKEND if already set.
+if sys.platform.startswith("linux") and not os.environ.get("PYSTRAY_BACKEND"):
+    try:
+        import gi  # noqa: F401
+
+        gi.require_version("Gtk", "3.0")
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+        except ValueError:
+            gi.require_version("AppIndicator3", "0.1")
+        os.environ["PYSTRAY_BACKEND"] = "appindicator"
+    except (ImportError, ValueError):
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+
 try:
     import pystray
     from pystray import MenuItem as Item
 except ImportError:
-    pystray = None
-    Item = None
+    # On Linux the chosen backend may fail to import even when its bindings
+    # looked present; retry once with the pure-Xlib XOrg backend before giving
+    # up. A failed `import pystray` is dropped from sys.modules, so re-importing
+    # re-runs pystray's backend selection against the new env var.
+    if sys.platform.startswith("linux") and os.environ.get("PYSTRAY_BACKEND") != "xorg":
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+        try:
+            import pystray
+            from pystray import MenuItem as Item
+        except ImportError:
+            pystray = None
+            Item = None
+    else:
+        pystray = None
+        Item = None
 
 logger = logging.getLogger(__name__)
 
