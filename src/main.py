@@ -746,6 +746,11 @@ class BetterFlowApp:
         if hasattr(signal, "SIGPIPE"):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+        # Apply an update staged in a previous session before anything else —
+        # a fast local replace + relaunch into the new version. No-op if nothing
+        # newer is staged. Relaunches (os._exit) on success.
+        self._apply_staged_update_on_launch()
+
         # Self-heal auto-start: if config says it should be on but the OS-level
         # LaunchAgent isn't actually loaded (drift from a prior install,
         # manual launchctl bootout, or migration to a new bundle path),
@@ -807,6 +812,23 @@ class BetterFlowApp:
 
     def _try_auto_install(self) -> None:
         self.update_handler.try_auto_install()
+
+    def _apply_staged_update_on_launch(self) -> None:
+        """Apply a previously staged update (newer than current) before the UI
+        and services start, then relaunch into it. No-op otherwise.
+
+        Loop-safety lives in self_updater.get_staged_update (only strictly-newer
+        staged builds are applied, and staging is cleared before applying)."""
+        if not self.config.check_updates:
+            return
+        try:
+            try:
+                from .self_updater import apply_staged_update
+            except ImportError:
+                from self_updater import apply_staged_update
+            apply_staged_update(_VERSION)
+        except Exception:
+            logger.exception("Staged update apply on launch failed (continuing startup)")
 
     def _on_install_update(self, asset_url: str) -> None:
         self.update_handler.on_install_update(asset_url)
