@@ -2,8 +2,18 @@
 
 Supports three formats: macOS uses DMG, Windows uses ZIP, Linux uses a single
 .AppImage file replaced in place.
+
+Two delivery paths:
+- apply_update(url): download then apply immediately (manual "Install & Restart"
+  and catch-on-launch).
+- stage_update(url, version) + apply_staged_update(): download in the background
+  during a session, then apply the staged artifact on next launch / idle.
+  Staging is loop-safe — a staged build is only applied when STRICTLY newer than
+  the running version, and staging is always cleared before applying so a failed
+  or no-op apply can never re-trigger.
 """
 
+import json
 import logging
 import os
 import re
@@ -14,11 +24,19 @@ import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import requests
+
+try:
+    from .config import Config
+    from .update_checker import _version_tuple
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from config import Config
+    from update_checker import _version_tuple
 
 logger = logging.getLogger(__name__)
 
@@ -56,19 +74,89 @@ def _get_app_bundle_path() -> Optional[Path]:
     return None
 
 
+def _artifact_filename_from_url(download_url: str) -> str:
+    """Derive a safe local filename (keeping the real extension) from the URL.
+
+    The extension drives format detection in _apply_local_artifact, so we keep
+    the asset's real name (e.g. BetterFlow-macOS-arm64.dmg) but strip any path
+    components to prevent traversal.
+    """
+    name = os.path.basename(urlparse(download_url).path).replace("\\", "").strip()
+    return name or "update.bin"
+
+
+def _download_to_file(
+    download_url: str,
+    dest: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Stream a download to ``dest``, reporting percent progress."""
+    resp = requests.get(download_url, stream=True, timeout=120)
+    resp.raise_for_status()
+    total = int(resp.headers.get("content-length", 0))
+    downloaded = 0
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=256 * 1024):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if total > 0 and on_progress:
+                on_progress(f"Downloading... {int(downloaded / total * 100)}%")
+
+
 def apply_update(
     download_url: str,
     on_progress: Optional[Callable[[str], None]] = None,
     on_pre_exit: Optional[Callable[[], None]] = None,
 ) -> bool:
-    """Download, extract, replace, and relaunch.
+    """Download a release artifact, then replace the running app and relaunch.
 
     Args:
-        download_url: Direct URL to the platform asset (DMG on macOS, ZIP on Windows).
+        download_url: Direct HTTPS URL to the platform asset (DMG / ZIP / AppImage).
         on_progress: Optional callback(status_message) for UI feedback.
 
     Returns:
-        True if update was applied (app will relaunch), False on failure.
+        True if the update was applied (app will relaunch), False on failure.
+    """
+
+    def _status(msg: str) -> None:
+        logger.info(f"Self-update: {msg}")
+        if on_progress:
+            on_progress(msg)
+
+    # Reject non-HTTPS download URLs to prevent MITM attacks
+    parsed_url = urlparse(download_url)
+    if parsed_url.scheme != "https":
+        safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        _status(f"Refusing non-HTTPS download URL: {safe_url}")
+        return False
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-update-"))
+    try:
+        _status("Downloading update...")
+        dl_path = tmp_dir / _artifact_filename_from_url(download_url)
+        _download_to_file(download_url, dl_path, on_progress)
+        return _apply_local_artifact(dl_path, on_progress, on_pre_exit)
+    except Exception as e:
+        _status(f"Update failed: {e}")
+        logger.exception("Self-update failed")
+        return False
+    finally:
+        # On Windows the bat script (spawned inside _apply_local_artifact) needs
+        # its own temp dir; this download dir is separate and safe to remove.
+        if sys.platform != "win32":
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _apply_local_artifact(
+    artifact_path: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+    on_pre_exit: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Replace the running app from an already-downloaded artifact and relaunch.
+
+    Format is detected from the artifact's extension (.dmg / .AppImage / .zip).
+    On success the process relaunches and never returns; on any failure it
+    returns False so the caller can continue running the current version.
     """
 
     def _status(msg: str) -> None:
@@ -81,62 +169,28 @@ def apply_update(
         _status("Cannot determine app location - update aborted")
         return False
 
-    # Reject non-HTTPS download URLs to prevent MITM attacks
-    parsed_url = urlparse(download_url)
-    if parsed_url.scheme != "https":
-        safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        _status(f"Refusing non-HTTPS download URL: {safe_url}")
-        return False
+    is_dmg = artifact_path.name.lower().endswith(".dmg")
 
-    tmp_dir = None
+    # Linux: the AppImage *is* the new app — replace in place, no extraction.
+    if sys.platform.startswith("linux"):
+        return _install_appimage(artifact_path, app_path, _status, on_pre_exit)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-apply-"))
     try:
-        # 1. Download
-        _status("Downloading update...")
-        resp = requests.get(download_url, stream=True, timeout=120)
-        resp.raise_for_status()
-
-        tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-update-"))
-        # Parse URL path to detect format (handles query params like ?token=abc)
-        url_path = urlparse(download_url).path.lower()
-        is_dmg = url_path.endswith(".dmg")
-        is_appimage = url_path.endswith(".appimage")
-        if is_appimage:
-            dl_filename = "update.AppImage"
-        elif is_dmg:
-            dl_filename = "update.dmg"
-        else:
-            dl_filename = "update.zip"
-        dl_path = tmp_dir / dl_filename
-
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        with open(dl_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=256 * 1024):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = int(downloaded / total * 100)
-                    _status(f"Downloading... {pct}%")
-
-        # Linux: the downloaded AppImage *is* the new app — replace in place,
-        # no extraction or .app/.exe discovery needed.
-        if sys.platform.startswith("linux"):
-            return _install_appimage(dl_path, app_path, _status, on_pre_exit)
-
-        # 2. Extract
+        # 1. Extract
         _status("Extracting...")
         extract_dir = tmp_dir / "extracted"
         extract_dir.mkdir()
 
         if is_dmg:
-            _extract_from_dmg(dl_path, extract_dir)
+            _extract_from_dmg(artifact_path, extract_dir)
         else:
             # ZIP extraction with Zip Slip protection — validate the
             # resolved path, then write to it explicitly (never let
             # zf.extract re-derive the path from the raw member name,
             # which could normalize differently on case-insensitive FS).
             extract_prefix = str(extract_dir.resolve()) + os.sep
-            with zipfile.ZipFile(dl_path, "r") as zf:
+            with zipfile.ZipFile(artifact_path, "r") as zf:
                 for member in zf.namelist():
                     member_path = (extract_dir / member).resolve()
                     if not str(member_path).startswith(extract_prefix):
@@ -148,28 +202,26 @@ def apply_update(
                         with zf.open(member) as src, open(member_path, "wb") as dst:
                             shutil.copyfileobj(src, dst)
 
-        # 3. Find the new .app or exe dir inside the extract
+        # 2. Find the new .app or exe dir inside the extract
         if sys.platform == "darwin":
             new_app = _find_app_in(extract_dir)
             if new_app is None:
                 _status("No .app found in update archive - aborted")
                 return False
 
-            # 3b. Verify code signature and downgrade protection
+            # 2b. Verify code signature and downgrade protection
             if not _verify_codesign(new_app, current_app_path=app_path):
                 _status("Code signature verification failed - update aborted")
                 return False
 
-            # 4. Replace: move old to trash, move new in place
+            # 3. Replace: move old aside, move new in place
             backup_path = app_path.parent / f"{app_path.stem}.old.app"
             if backup_path.exists():
                 shutil.rmtree(backup_path)
 
             _status("Installing...")
-            # Rename current -> backup
             app_path.rename(backup_path)
             try:
-                # Move new -> install location
                 shutil.move(str(new_app), str(app_path))
             except Exception:
                 # Rollback on failure
@@ -183,10 +235,9 @@ def apply_update(
             except Exception as e:
                 logger.warning("Permission fix failed, update may not launch: %s", e)
 
-            # Clean up backup
             shutil.rmtree(backup_path, ignore_errors=True)
 
-            # 5. Flush pending data + relaunch
+            # 4. Flush pending data + relaunch
             if on_pre_exit:
                 _status("Flushing data...")
                 try:
@@ -195,13 +246,13 @@ def apply_update(
                     logger.warning("Pre-exit flush failed: %s", e)
             _status("Restarting...")
             subprocess.Popen(["open", str(app_path)])
-            # Exit current process — os._exit works from any thread,
-            # unlike sys.exit which only raises SystemExit in the calling thread.
+            # os._exit works from any thread, unlike sys.exit which only raises
+            # SystemExit in the calling thread.
             os._exit(0)
 
         elif sys.platform == "win32":
-            # Windows: extract contains BetterFlow.exe + supporting files
-            # Use a bat script to replace after this process exits
+            # Windows: extract contains BetterFlow.exe + supporting files.
+            # Use a bat script to replace after this process exits.
             new_files = list(extract_dir.iterdir())
             if not new_files:
                 _status("Empty update archive - aborted")
@@ -236,11 +287,11 @@ def apply_update(
 
     except Exception as e:
         _status(f"Update failed: {e}")
-        logger.exception("Self-update failed")
+        logger.exception("Self-update apply failed")
         return False
     finally:
-        # Clean up temp dir (except on Windows where bat script needs it)
-        if tmp_dir and sys.platform != "win32":
+        # Clean up temp dir (except on Windows where the bat script needs it)
+        if sys.platform != "win32":
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -519,3 +570,139 @@ def apply_update_async(
 
     thread = threading.Thread(target=_run, name="self-updater", daemon=True)
     thread.start()
+
+
+# ---------------------------------------------------------------------------
+# Staged updates: download in the background, apply on next launch / idle.
+# ---------------------------------------------------------------------------
+
+def _staging_dir() -> Path:
+    return Config.get_data_dir() / "staged_update"
+
+
+def _staging_meta_path() -> Path:
+    return _staging_dir() / "staged.json"
+
+
+def clear_staged_update() -> None:
+    """Remove any staged artifact + metadata. Safe to call anytime."""
+    shutil.rmtree(_staging_dir(), ignore_errors=True)
+
+
+def stage_update(
+    download_url: str,
+    version: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Download a release artifact into the staging area (does NOT apply it).
+
+    Returns True if the artifact was downloaded and recorded.
+    """
+    parsed_url = urlparse(download_url)
+    if parsed_url.scheme != "https":
+        logger.warning("Refusing to stage non-HTTPS update URL")
+        return False
+
+    clear_staged_update()
+    staging = _staging_dir()
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+        filename = _artifact_filename_from_url(download_url)
+        dest = staging / filename
+        logger.info("Staging update %s -> %s", version, dest)
+        _download_to_file(download_url, dest, on_progress)
+        _staging_meta_path().write_text(json.dumps({
+            "version": str(version),
+            "artifact": filename,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }))
+        return True
+    except Exception as e:
+        logger.warning("Failed to stage update: %s", e)
+        clear_staged_update()
+        return False
+
+
+def stage_update_async(
+    download_url: str,
+    version: str,
+    on_complete: Optional[Callable[[bool], None]] = None,
+) -> None:
+    """Run stage_update on a background thread."""
+
+    def _run():
+        ok = stage_update(download_url, version)
+        if on_complete:
+            on_complete(ok)
+
+    threading.Thread(target=_run, name="update-stager", daemon=True).start()
+
+
+def get_staged_update(current_version: str) -> Optional[Path]:
+    """Return the staged artifact path iff it is STRICTLY newer than current.
+
+    Clears stale/invalid staging (older/equal version, missing file, bad
+    metadata, suspicious filename) so it can never be applied. This is the core
+    loop guard: a staged build equal to the running version is discarded, so an
+    apply→relaunch→apply cycle is impossible.
+    """
+    meta_path = _staging_meta_path()
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+        staged_version = str(meta.get("version", ""))
+        artifact = str(meta.get("artifact", ""))
+    except Exception:
+        clear_staged_update()
+        return None
+
+    # Only strictly-newer versions may be applied.
+    try:
+        if _version_tuple(staged_version) <= _version_tuple(current_version):
+            clear_staged_update()
+            return None
+    except Exception:
+        clear_staged_update()
+        return None
+
+    # Artifact must be a plain filename living directly in the staging dir.
+    if not artifact or "/" in artifact or "\\" in artifact or artifact in (".", ".."):
+        clear_staged_update()
+        return None
+    artifact_path = _staging_dir() / artifact
+    if not artifact_path.is_file():
+        clear_staged_update()
+        return None
+    return artifact_path
+
+
+def apply_staged_update(
+    current_version: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+    on_pre_exit: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Apply a previously staged update if one newer than current exists.
+
+    Loop-safe: the artifact is moved out and staging is cleared BEFORE applying,
+    so a failed or no-op apply never re-triggers on the next launch. On success
+    the process relaunches (never returns). Returns False if there was nothing to
+    apply or the apply failed (the caller should continue normal startup).
+    """
+    staged = get_staged_update(current_version)
+    if staged is None:
+        return False
+
+    # Move the artifact out of staging, then wipe staging up-front.
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-staged-"))
+        artifact = tmp_dir / staged.name
+        shutil.move(str(staged), str(artifact))
+    except Exception as e:
+        logger.warning("Could not move staged artifact: %s", e)
+        clear_staged_update()
+        return False
+    clear_staged_update()
+
+    logger.info("Applying staged update from %s", artifact)
+    return _apply_local_artifact(artifact, on_progress, on_pre_exit)
