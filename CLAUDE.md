@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-BetterFlow is a Python desktop app that syncs ActivityWatch data to BetterFlow for automatic time tracking. It runs as a system tray application on macOS and Windows, polling ActivityWatch locally and sending events to the BetterFlow API.
+BetterFlow is a Python desktop app that syncs ActivityWatch data to BetterFlow for automatic time tracking. It runs as a system tray application on macOS, Windows, and Linux (X11), polling ActivityWatch locally and sending events to the BetterFlow API.
 
 ## Commands
 
@@ -23,9 +23,18 @@ make build            # Build for current platform (requires pyinstaller)
 make build-mac        # Build macOS .app bundle
 make dmg              # Build macOS DMG installer (requires create-dmg)
 
+# Linux build (run on Linux; needs gobject-introspection + libnotify-bin)
+make build-linux      # Build dist/BetterFlow/ one-dir bundle
+make appimage         # Package as dist/BetterFlow-linux-x86_64.AppImage
+
 # Windows build (run on Windows)
 powershell -ExecutionPolicy Bypass -File build-windows.ps1
 ```
+
+The Linux build mirrors the Windows path: it runs the external bundled
+ActivityWatch trackers (server + window + idle) as subprocesses with no
+in-process watchers and no permissions model. The in-app updater replaces the
+running `.AppImage` in place via the `$APPIMAGE` env var.
 
 ## Architecture
 

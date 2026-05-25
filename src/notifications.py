@@ -90,6 +90,8 @@ def send_notification(title: str, message: str, sound: bool = True) -> None:
             _send_macos_osascript(title, message, sound)
         elif system == "Windows":
             _send_windows(title, message)
+        elif system == "Linux":
+            _send_linux(title, message)
         else:
             logger.debug("Notifications not supported on %s", system)
     except Exception as e:
@@ -274,4 +276,38 @@ def _clear_windows() -> None:
             "_clear_windows failed (rc=%s): %s",
             result.returncode,
             result.stderr.decode(errors="replace").strip(),
+        )
+
+
+# --------------------------------------------------------------------------
+# Linux — notify-send (libnotify)
+# --------------------------------------------------------------------------
+
+
+def _send_linux(title: str, message: str) -> None:
+    """Send a desktop notification via notify-send (libnotify).
+
+    Arguments are passed as an argv list (no shell), so notify-send handles
+    quoting; we still strip control chars and cap length defensively. If
+    notify-send is not installed we log at debug and return rather than raise.
+    """
+    safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)[:200]
+    safe_message = re.sub(r'[\x00-\x1f\x7f]', '', message)[:500]
+
+    args = ["notify-send", "--app-name=BetterFlow"]
+    icon_path = _resolve_icon_path()
+    if icon_path is not None:
+        args.append(f"--icon={icon_path}")
+    args.extend([safe_title, safe_message])
+
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=5)
+    except FileNotFoundError:
+        logger.debug("notify-send not found — desktop notification skipped")
+        return
+    if result.returncode != 0:
+        logger.warning(
+            "notify-send failed (exit %s): %s",
+            result.returncode,
+            result.stderr.decode(errors="replace")[:200],
         )

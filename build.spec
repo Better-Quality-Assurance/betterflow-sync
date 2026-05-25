@@ -29,6 +29,7 @@ _build_info.write_text(
 # Determine platform
 is_mac = platform.system() == "Darwin"
 is_windows = platform.system() == "Windows"
+is_linux = platform.system() == "Linux"
 
 # Paths
 root_dir = Path(SPECPATH)
@@ -41,7 +42,12 @@ datas = [
 ]
 
 # Tracker binaries (included as binaries to preserve execute permissions)
-aw_platform = "darwin" if is_mac else "windows"
+if is_mac:
+    aw_platform = "darwin"
+elif is_windows:
+    aw_platform = "windows"
+else:
+    aw_platform = "linux"
 aw_dir = resources_dir / "trackers" / aw_platform
 aw_binaries = []
 if aw_dir.exists():
@@ -56,10 +62,43 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 tcl_tk_datas = collect_data_files("tkinter")
 tcl_tk_binaries = collect_dynamic_libs("_tkinter")
 
+# Platform-specific hidden imports (tray backend, keyring backend, native libs).
+if is_mac:
+    platform_hiddenimports = [
+        "pystray._darwin",
+        "keyring.backends.macOS",
+        # macOS frameworks for in-process watchers (CGEventTap, AX API, etc.)
+        "Quartz",
+        "CoreFoundation",
+        "AppKit",
+        "Foundation",
+        "SystemConfiguration",
+        "ApplicationServices",
+    ]
+elif is_windows:
+    platform_hiddenimports = [
+        "pystray._win32",
+        "keyring.backends.Windows",
+    ]
+else:  # Linux
+    platform_hiddenimports = [
+        "pystray._appindicator",
+        "pystray._xorg",
+        "gi",
+        "gi.repository.Gtk",
+        "gi.repository.AyatanaAppIndicator3",
+        "Xlib",
+        "Xlib.support.unix_connect",
+        "keyring.backends.SecretService",
+        "secretstorage",
+        "jeepney",
+        "jeepney.io.blocking",
+        "jeepney.bus_messages",
+    ]
+
 # Hidden imports for pystray, keyring backends, and our modules
 hiddenimports = [
-    "pystray._darwin" if is_mac else "pystray._win32",
-    "keyring.backends.macOS" if is_mac else "keyring.backends.Windows",
+    *platform_hiddenimports,
     "tkinter",
     "_tkinter",
     "PIL._tkinter_finder",
@@ -93,13 +132,6 @@ hiddenimports = [
     "auth.browser_auth",
     "sync.macos_window_watcher",
     "sync.macos_input_watcher",
-    # macOS frameworks for in-process watchers (CGEventTap, etc.)
-    "Quartz",
-    "CoreFoundation",
-    "AppKit",
-    "Foundation",
-    "SystemConfiguration",
-    "ApplicationServices",  # AX API for MacOSWindowWatcher window titles + AXIsProcessTrusted
     "_build_info",  # Generated at build time by the spec preamble
 ]
 
@@ -192,4 +224,32 @@ elif is_windows:
         argv_emulation=False,
         target_arch=TARGET_ARCH,
         icon=str(resources_dir / "icon.ico") if (resources_dir / "icon.ico").exists() else None,
+    )
+
+elif is_linux:
+    # One-dir build; scripts/build-appimage.sh wraps dist/BetterFlow into an
+    # AppDir and packages it as a single .AppImage.
+    exe = EXE(
+        pyz,
+        a.scripts,
+        exclude_binaries=True,
+        name="BetterFlow",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=TARGET_ARCH,
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        name="BetterFlow",
     )

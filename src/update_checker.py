@@ -47,6 +47,7 @@ def _matches_channel(release: dict, channel: str) -> bool:
 _ASSET_PATTERNS = {
     "Darwin": "BetterFlow-macOS",
     "Windows": "BetterFlow-Windows",
+    "Linux": "BetterFlow-linux",
 }
 
 
@@ -59,6 +60,7 @@ def _find_platform_asset(
 
     On macOS: prefers architecture-specific DMG (arm64/x86_64), falls back to ZIP.
     On Windows: matches ZIP assets.
+    On Linux: matches the .AppImage asset.
 
     Args:
         release: GitHub release dict with "assets" list.
@@ -72,6 +74,14 @@ def _find_platform_asset(
         return None
 
     assets = release.get("assets", [])
+    if system == "Linux":
+        for asset in assets:
+            name = asset.get("name", "")
+            url = asset.get("browser_download_url")
+            if pattern in name and name.endswith(".AppImage") and url:
+                return url
+        return None
+
     if system == "Darwin":
         # Prefer arch-specific DMG
         for asset in assets:

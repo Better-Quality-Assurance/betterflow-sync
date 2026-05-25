@@ -19,7 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from platformdirs import user_data_dir
+
 logger = logging.getLogger(__name__)
+
+# Identity used for platformdirs paths on Linux (matches src/config.py).
+APP_NAME = "BetterFlow"
+APP_AUTHOR = "BetterQA"
 
 # Binaries to manage (start order matters: server first, then watchers)
 # These are renamed from aw-* originals for white-labeling
@@ -34,6 +40,7 @@ RELEASE_BASE = (
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
     "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
+    "linux": f"activitywatch-{AW_VERSION}-linux-x86_64.zip",
 }
 
 # Mapping from original AW names to our branded names (used during download/extract)
@@ -49,27 +56,38 @@ STALE_THRESHOLD = 120  # seconds with no new events before force-restarting watc
 
 
 def _get_platform_key() -> str:
-    return "darwin" if platform.system() == "Darwin" else "windows"
+    system = platform.system()
+    if system == "Darwin":
+        return "darwin"
+    if system == "Windows":
+        return "windows"
+    return "linux"
+
+
+def _app_support_base() -> str:
+    """Base application-support directory shared by trackers and the DB.
+
+    Kept identical to the historical macOS/Windows locations so existing
+    installs are not orphaned; Linux uses the XDG data dir (matching
+    src/config.py's platformdirs usage).
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/BetterFlow")
+    if system == "Windows":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "BetterQA", "BetterFlow")
+    return user_data_dir(APP_NAME, APP_AUTHOR)
 
 
 def _get_install_dir() -> str:
     """Get persistent directory for tracker binaries (survives app updates)."""
-    if platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/BetterFlow")
-    else:
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        base = os.path.join(base, "BetterQA", "BetterFlow")
-    return os.path.join(base, "trackers", _get_platform_key())
+    return os.path.join(_app_support_base(), "trackers", _get_platform_key())
 
 
 def _get_db_dir() -> str:
     """Get sqlite file path for tracker database storage."""
-    if platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support/BetterFlow")
-    else:
-        base = os.environ.get("APPDATA", os.path.expanduser("~"))
-        base = os.path.join(base, "BetterQA", "BetterFlow")
-    return os.path.join(base, "data", "aw-db.sqlite")
+    return os.path.join(_app_support_base(), "data", "aw-db.sqlite")
 
 
 def _binaries_present(directory: str) -> bool:
@@ -186,8 +204,9 @@ def _download_aw_binaries(install_dir: str) -> bool:
             logger.error("Tracker extraction incomplete after install")
             return False
 
-        # macOS: fix permissions + strip quarantine
-        if plat == "darwin":
+        # POSIX: make launchers executable. macOS additionally strips the
+        # quarantine xattr (no such concept on Linux).
+        if plat in ("darwin", "linux"):
             for root, _, files in os.walk(install_dir):
                 for file_name in files:
                     path = os.path.join(root, file_name)
@@ -196,10 +215,11 @@ def _download_aw_binaries(install_dir: str) -> bool:
                         os.chmod(
                             path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
                         )
-                    subprocess.run(
-                        ["xattr", "-d", "com.apple.quarantine", path],
-                        capture_output=True,
-                    )
+                    if plat == "darwin":
+                        subprocess.run(
+                            ["xattr", "-d", "com.apple.quarantine", path],
+                            capture_output=True,
+                        )
 
         logger.info("Tracker binaries installed successfully")
         return True
@@ -455,9 +475,10 @@ class AWManager:
             # Platform-specific: prevent dock icon on macOS
             if platform.system() == "Darwin":
                 env["LSBackgroundOnly"] = "1"
-                # Watchers with bundled runtime expect execution from their own dir.
-                if name in BF_WATCHERS:
-                    kwargs["cwd"] = os.path.dirname(binary_path)
+            # Watchers ship as bundled runtimes (macOS/Linux) and expect to be
+            # launched from their own directory so they can find their payload.
+            if platform.system() in ("Darwin", "Linux") and name in BF_WATCHERS:
+                kwargs["cwd"] = os.path.dirname(binary_path)
 
             # Platform-specific: prevent console window on Windows
             if platform.system() == "Windows":
@@ -620,11 +641,13 @@ class AWManager:
                             if os.path.basename(p).startswith("bf-"):
                                 st = os.stat(p)
                                 os.chmod(p, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-                            # Strip quarantine
-                            subprocess.run(
-                                ["xattr", "-d", "com.apple.quarantine", p],
-                                capture_output=True,
-                            )
+                            # Strip quarantine (macOS only; `xattr` does not exist
+                            # on Linux and would raise FileNotFoundError here).
+                            if platform.system() == "Darwin":
+                                subprocess.run(
+                                    ["xattr", "-d", "com.apple.quarantine", p],
+                                    capture_output=True,
+                                )
             logger.info(f"Installed tracker binaries to {install_dir}")
             return _binaries_present(install_dir)
         except Exception as e:

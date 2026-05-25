@@ -29,6 +29,7 @@ RELEASE_BASE = (
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
     "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
+    "linux": f"activitywatch-{AW_VERSION}-linux-x86_64.zip",
 }
 
 # Output directory relative to project root
@@ -43,6 +44,8 @@ def get_platform() -> str:
         return "darwin"
     elif system == "Windows":
         return "windows"
+    elif system == "Linux":
+        return "linux"
     else:
         print(f"Unsupported platform: {system}")
         sys.exit(1)
@@ -143,8 +146,8 @@ def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
 
 
 def fix_permissions(output_dir: str, plat: str) -> None:
-    """Make binaries executable on macOS and strip quarantine xattr."""
-    if plat != "darwin":
+    """Make launchers executable on POSIX; strip quarantine xattr on macOS."""
+    if plat not in ("darwin", "linux"):
         return
 
     for root, _, files in os.walk(output_dir):
@@ -154,10 +157,11 @@ def fix_permissions(output_dir: str, plat: str) -> None:
                 st = os.stat(path)
                 os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
                 print(f"  Fixed permissions: {path}")
-            subprocess.run(
-                ["xattr", "-d", "com.apple.quarantine", path],
-                capture_output=True,
-            )
+            if plat == "darwin":
+                subprocess.run(
+                    ["xattr", "-d", "com.apple.quarantine", path],
+                    capture_output=True,
+                )
 
 
 def main() -> None:

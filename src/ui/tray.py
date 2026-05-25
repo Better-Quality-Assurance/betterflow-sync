@@ -1,5 +1,10 @@
 """System tray icon and menu."""
 
+# Annotations are lazy (PEP 563) so the module imports cleanly on headless hosts
+# where pystray is unavailable (pystray=None) — type hints like `-> pystray.Menu`
+# must not be evaluated at definition time.
+from __future__ import annotations
+
 import logging
 import math
 import os
@@ -156,12 +161,44 @@ class TrayModel:
         self.needs_permissions: bool = False
 
 
+# On Linux, pystray binds its backend at import time. Choose it explicitly:
+# AppIndicator (gives a proper status-menu) when the GTK/AppIndicator GObject
+# bindings are present, otherwise the pure-Xlib XOrg backend. Respect an
+# operator-provided PYSTRAY_BACKEND if already set.
+if sys.platform.startswith("linux") and not os.environ.get("PYSTRAY_BACKEND"):
+    try:
+        import gi  # noqa: F401
+
+        gi.require_version("Gtk", "3.0")
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+        except ValueError:
+            gi.require_version("AppIndicator3", "0.1")
+        os.environ["PYSTRAY_BACKEND"] = "appindicator"
+    except (ImportError, ValueError):
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+
 try:
     import pystray
     from pystray import MenuItem as Item
-except ImportError:
+except Exception:
+    # A backend can fail to bind for reasons beyond ImportError — on a headless
+    # box GTK fails to initialise (AppIndicator) or Xlib finds no display
+    # (XOrg). Any failure here just means "no usable tray backend"; the app
+    # already treats pystray=None as run-without-tray (e.g. headless servers,
+    # CI). Try the pure-Xlib XOrg backend once — a failed import is dropped from
+    # sys.modules, so re-importing re-runs pystray's backend selection — then
+    # degrade gracefully.
     pystray = None
     Item = None
+    if sys.platform.startswith("linux") and os.environ.get("PYSTRAY_BACKEND") != "xorg":
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+        try:
+            import pystray
+            from pystray import MenuItem as Item
+        except Exception:
+            pystray = None
+            Item = None
 
 logger = logging.getLogger(__name__)
 
