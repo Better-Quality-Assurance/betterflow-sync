@@ -68,8 +68,13 @@ class DailyTimeTracker:
             except (sqlite3.ProgrammingError, sqlite3.OperationalError):
                 del self._local.connection
         if not hasattr(self._local, "connection"):
-            conn = sqlite3.connect(str(self._db_path))
+            conn = sqlite3.connect(str(self._db_path), timeout=30.0)
             conn.row_factory = sqlite3.Row
+            # WAL + a generous busy timeout so concurrent writers from multiple
+            # threads serialize gracefully instead of raising "database is
+            # locked" (observed on Windows under contention). Mirrors OfflineQueue.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
             with self._conn_lock:
                 if self._closed:
                     conn.close()
