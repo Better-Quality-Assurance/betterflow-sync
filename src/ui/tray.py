@@ -176,22 +176,24 @@ if sys.platform.startswith("linux") and not os.environ.get("PYSTRAY_BACKEND"):
 try:
     import pystray
     from pystray import MenuItem as Item
-except ImportError:
-    # On Linux the chosen backend may fail to import even when its bindings
-    # looked present; retry once with the pure-Xlib XOrg backend before giving
-    # up. A failed `import pystray` is dropped from sys.modules, so re-importing
-    # re-runs pystray's backend selection against the new env var.
+except Exception:
+    # A backend can fail to bind for reasons beyond ImportError — on a headless
+    # box GTK fails to initialise (AppIndicator) or Xlib finds no display
+    # (XOrg). Any failure here just means "no usable tray backend"; the app
+    # already treats pystray=None as run-without-tray (e.g. headless servers,
+    # CI). Try the pure-Xlib XOrg backend once — a failed import is dropped from
+    # sys.modules, so re-importing re-runs pystray's backend selection — then
+    # degrade gracefully.
+    pystray = None
+    Item = None
     if sys.platform.startswith("linux") and os.environ.get("PYSTRAY_BACKEND") != "xorg":
         os.environ["PYSTRAY_BACKEND"] = "xorg"
         try:
             import pystray
             from pystray import MenuItem as Item
-        except ImportError:
+        except Exception:
             pystray = None
             Item = None
-    else:
-        pystray = None
-        Item = None
 
 logger = logging.getLogger(__name__)
 
