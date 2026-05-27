@@ -159,6 +159,9 @@ class TrayModel:
 
         # Permissions
         self.needs_permissions: bool = False
+        # macOS Input Monitoring (keystroke/click capture). True until a check
+        # proves otherwise so non-macOS platforms never show the warning.
+        self.input_monitoring_ok: bool = True
 
 
 # On Linux, pystray binds its backend at import time. Choose it explicitly:
@@ -488,6 +491,8 @@ class TrayIcon:
                 "private_interval_minutes": self.model.private_interval_minutes,
                 "auto_categorize": self.model.auto_categorize,
                 "track_display_info": self.model.track_display_info,
+                "needs_permissions": self.model.needs_permissions,
+                "input_monitoring_ok": self.model.input_monitoring_ok,
             }
 
     def _create_menu(self) -> pystray.Menu:
@@ -499,6 +504,16 @@ class TrayIcon:
         s = self._snapshot_model()
         items = []
         logged_in = s["user_email"] is not None
+
+        # ── Permission warning (macOS Input Monitoring) ─────
+        # Surfaced at the very top so a disabled keystroke/click capture — which
+        # makes the day look like a jiggler server-side — is impossible to miss.
+        if not s["input_monitoring_ok"]:
+            items.append(Item(
+                "⚠️  Input tracking off — Fix Permissions",
+                self._handle_fix_permissions,
+            ))
+            items.append(Item("─" * 20, None, enabled=False))
 
         # ── User identity & status ──────────────────────────
         if s["user_email"]:
@@ -701,6 +716,8 @@ class TrayIcon:
             return "Paused"
         elif state == TrayState.WAITING_AUTH:
             return "Waiting for login..."
+        elif state == TrayState.NEEDS_PERMISSIONS:
+            return "Permissions needed"
         else:
             return "Starting..."
 
@@ -740,6 +757,29 @@ class TrayIcon:
         return state not in (TrayState.QUEUED, TrayState.QUEUE_WARNING, TrayState.ERROR)
 
     # -- Menu action handlers ------------------------------------------------
+
+    def _handle_fix_permissions(self, icon, item) -> None:
+        """Register the app for Input Monitoring and open its System Settings pane.
+
+        input_monitoring_active(prompt=True) calls IOHIDRequestAccess, which
+        lists BetterFlow under Input Monitoring so there's a toggle to flip; the
+        60s permission re-check clears the warning once the user enables it.
+        """
+        try:
+            from .permissions import (
+                input_monitoring_active,
+                open_input_monitoring_settings,
+            )
+        except ImportError:
+            from permissions import (  # type: ignore[no-redef]
+                input_monitoring_active,
+                open_input_monitoring_settings,
+            )
+        try:
+            input_monitoring_active(prompt=True)
+            open_input_monitoring_settings()
+        except Exception as e:
+            logger.warning("Failed to open Input Monitoring settings: %s", e)
 
     def _handle_login(self, icon, item) -> None:
         """Handle login menu click."""

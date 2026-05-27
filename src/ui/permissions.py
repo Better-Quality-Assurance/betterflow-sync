@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 _IS_MACOS = platform.system() == "Darwin"
 
+# One-shot guard so input_monitoring_active() logs its macOS diagnostics once
+# per process instead of on every poll.
+_IM_DIAG_LOGGED = False
+
 # Whitelist of TCC services we will ever insert into TCC.db. Guards
 # grant_tcc_permissions() against accidental SQL injection if callers ever
 # route user input into the services list.
@@ -112,6 +116,136 @@ def check_input_monitoring(prompt: bool = False) -> bool:
         logger.debug(f"Input Monitoring check failed: {e}")
 
     return False
+
+
+def _probe_listen_event_tap() -> bool:
+    """Create a throwaway listen-only CGEventTap.
+
+    Doing so is the canonical way to (1) make the app appear in System Settings
+    > Privacy & Security > Input Monitoring — without this the app is never
+    listed and the user has no toggle to flip — and (2) authoritatively detect
+    the grant: CGEventTapCreate only returns a tap when access is granted.
+
+    Returns True if the tap was created (access granted), else False.
+    """
+    try:
+        from Quartz import (
+            CGEventTapCreate,
+            kCGEventTapOptionListenOnly,
+            kCGHeadInsertEventTap,
+            kCGSessionEventTap,
+        )
+    except Exception as e:
+        logger.debug("Quartz event-tap import failed: %s", e)
+        return False
+
+    def _noop(proxy, event_type, event, refcon):
+        return event
+
+    tap = None
+    try:
+        # kCGEventKeyDown == 10. A minimal mask is enough to trigger the grant
+        # check and register the app in the Input Monitoring list.
+        tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            (1 << 10),
+            _noop,
+            None,
+        )
+        return tap is not None
+    except Exception as e:
+        logger.debug("CGEventTapCreate probe failed: %s", e)
+        return False
+    finally:
+        # We never run this tap — tear it down so it doesn't leak.
+        if tap is not None:
+            try:
+                from CoreFoundation import CFMachPortInvalidate, CFRelease
+
+                CFMachPortInvalidate(tap)
+                CFRelease(tap)
+            except Exception as e:
+                logger.debug("event-tap probe cleanup failed: %s", e)
+
+
+# IOKit HID request types / access states (from <IOKit/hidsystem/IOHIDLib.h>).
+_kIOHIDRequestTypeListenEvent = 1
+_kIOHIDAccessTypeGranted = 0
+_IOKIT_FRAMEWORK = "/System/Library/Frameworks/IOKit.framework/IOKit"
+
+
+def _iokit_hid():
+    """Load IOKit and bind the HID access functions, or return None.
+
+    These (IOHIDCheckAccess / IOHIDRequestAccess) are the canonical
+    Input Monitoring APIs — calling IOHIDRequestAccess is what actually lists
+    the app under System Settings > Privacy & Security > Input Monitoring.
+    pyobjc doesn't expose them, so we bind them through ctypes.
+    """
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL(_IOKIT_FRAMEWORK)
+        lib.IOHIDCheckAccess.restype = ctypes.c_int
+        lib.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
+        lib.IOHIDRequestAccess.restype = ctypes.c_bool
+        lib.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
+        return lib
+    except Exception as e:
+        logger.debug("IOKit HID bind failed: %s", e)
+        return None
+
+
+def input_monitoring_active(prompt: bool = False) -> bool:
+    """Authoritative Input Monitoring check that also registers the app.
+
+    Primary path is IOKit HID: IOHIDCheckAccess reports the true grant state,
+    and IOHIDRequestAccess (when prompt=True) registers the app in System
+    Settings > Input Monitoring and shows the system prompt — this is the call
+    that makes BetterFlow appear in the list so the user can toggle it. Falls
+    back to a listen-only event-tap probe if IOKit can't be bound.
+
+    Args:
+        prompt: When True, request access (registers the app + shows prompt).
+
+    Returns True on non-macOS platforms.
+    """
+    if not _IS_MACOS:
+        return True
+
+    access = None
+    requested = None
+    granted = False
+    lib = _iokit_hid()
+    if lib is not None:
+        try:
+            access = int(lib.IOHIDCheckAccess(_kIOHIDRequestTypeListenEvent))
+            if access != _kIOHIDAccessTypeGranted and prompt:
+                requested = bool(lib.IOHIDRequestAccess(_kIOHIDRequestTypeListenEvent))
+                access = int(lib.IOHIDCheckAccess(_kIOHIDRequestTypeListenEvent))
+            granted = access == _kIOHIDAccessTypeGranted
+        except Exception as e:
+            logger.debug("IOKit HID access check failed: %s", e)
+            lib = None
+
+    if lib is None:
+        # Fallback: listen-only event-tap probe (also registers, less reliably).
+        granted = _probe_listen_event_tap()
+
+    # One-shot INFO diagnostic so the grant state + registration result are
+    # visible in the log. Logged once per process to avoid spamming the poll.
+    global _IM_DIAG_LOGGED
+    if not _IM_DIAG_LOGGED:
+        _IM_DIAG_LOGGED = True
+        logger.info(
+            "Input Monitoring diagnostics: hid_access=%s requested=%s granted=%s "
+            "(0=granted,1=denied,2=unknown)",
+            access, requested, granted,
+        )
+
+    return granted
 
 
 def open_accessibility_settings() -> None:
