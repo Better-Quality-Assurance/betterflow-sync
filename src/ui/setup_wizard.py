@@ -80,7 +80,7 @@ class SetupResult:
 class SetupWizard:
     """First-run setup wizard window."""
 
-    def __init__(self, config: Config, login_manager: LoginManager):
+    def __init__(self, config: Config, login_manager: Optional[LoginManager] = None):
         self._config = config
         self._login_manager = login_manager
         self._result = SetupResult()
@@ -91,11 +91,15 @@ class SetupWizard:
         self._spinner_angle: int = 0
         self._button_id = itertools.count(1)
         self._perm_prompted: bool = False
+        # Permission-gate mode: when True, the window shows only the permission
+        # screen and reports its outcome via _gate_result instead of SetupResult.
+        self._gate_only: bool = False
+        self._gate_result: str = "quit"
 
-    def show(self) -> SetupResult:
-        """Show the wizard and return result when closed."""
+    def _build_window(self, title: str = "BetterFlow") -> None:
+        """Create the Tk window + canvas, centered, with the close handler."""
         self._window = tk.Tk()
-        self._window.title("BetterFlow")
+        self._window.title(title)
         self._window.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self._window.resizable(False, False)
         self._window.configure(bg=BG_COLOR)
@@ -130,10 +134,26 @@ class SetupWizard:
         )
         self._canvas.pack(fill=tk.BOTH, expand=True)
 
+    def show(self) -> SetupResult:
+        """Show the wizard and return result when closed."""
+        self._build_window()
         self._show_welcome()
-
         self._window.mainloop()
         return self._result
+
+    def run_permission_gate(self) -> str:
+        """Show only the permission gate; block until resolved.
+
+        Returns 'granted' (both permissions present), 'restart' (the user asked
+        to relaunch so a new grant takes effect) or 'quit' (window closed).
+        """
+        self._gate_only = True
+        self._gate_result = "quit"
+        self._build_window(title="BetterFlow — Permissions")
+        self._request_permissions_once()
+        self._render_permissions()
+        self._window.mainloop()
+        return self._gate_result
 
     def _clear(self) -> None:
         """Clear all canvas items and widgets."""
@@ -152,8 +172,13 @@ class SetupWizard:
     def _on_close(self) -> None:
         """Handle window close — cancel any in-progress login."""
         self._closing = True
-        self._result = SetupResult(completed=False)
-        self._login_manager.cancel_login()
+        if self._gate_only:
+            # Closing the gate means permissions were not approved.
+            self._gate_result = "quit"
+        else:
+            self._result = SetupResult(completed=False)
+            if self._login_manager is not None:
+                self._login_manager.cancel_login()
         self._window.destroy()
 
     def _make_button(self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True) -> str:
@@ -478,27 +503,12 @@ class SetupWizard:
             justify=tk.CENTER,
         )
 
-        # macOS requires explicit Accessibility + Input Monitoring grants
-        # before tracking works — gate setup on them. Other platforms have no
-        # such permissions, so finish directly.
-        next_step = self._show_permissions if platform.system() == "Darwin" else self._finish
-        self._make_button("Continue", next_step, cx, 438, width=280)
+        # Login is done. macOS tracking permissions are enforced separately by
+        # the always-on permission gate (see SetupWizard.run_permission_gate),
+        # which runs after this wizard and on every subsequent launch.
+        self._make_button("Continue", self._finish, cx, 438, width=280)
 
-    # ── Permissions Screen (macOS) ───────────────────────────────────
-
-    def _show_permissions(self) -> None:
-        """Gate completion on macOS tracking permissions.
-
-        Prompts for Accessibility + Input Monitoring (registering the app in
-        System Settings), then polls live status. 'Continue' only becomes
-        available once both are granted; closing the window without granting
-        leaves setup incomplete, so the app will not run until approved.
-        """
-        if platform.system() != "Darwin":
-            self._finish()
-            return
-        self._request_permissions_once()
-        self._render_permissions()
+    # ── Permissions Gate (macOS) ─────────────────────────────────────
 
     def _request_permissions_once(self) -> None:
         """Fire the native prompts a single time on first entry.
@@ -563,24 +573,44 @@ class SetupWizard:
                 text="All set — you're ready to go.",
                 font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
             )
-            self._make_button("Continue", self._finish, cx, 438, width=280)
+            self._make_button(
+                "Continue", lambda: self._finish_gate("granted"), cx, 438, width=280
+            )
             return
 
+        # macOS only reveals a newly-granted Input Monitoring permission to a
+        # freshly-launched process, so the user must restart after enabling it —
+        # we can't detect it live. Make Restart the primary action.
         self._canvas.create_text(
-            cx, 360,
+            cx, 356,
             text=("In System Settings, turn BetterFlow ON under both\n"
-                  "“Accessibility” and “Input Monitoring”. Both are required."),
+                  "“Accessibility” and “Input Monitoring”, then Restart."),
             font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
         )
         self._make_button(
             "Open System Settings", self._open_permission_settings,
-            cx - 132, 438, width=236, primary=True,
+            cx - 132, 440, width=236, primary=False,
         )
-        self._draw_disabled_button(cx + 132, 438, "Waiting…", width=196)
+        self._make_button(
+            "Restart", lambda: self._finish_gate("restart"),
+            cx + 132, 440, width=196, primary=True,
+        )
 
-        # Poll until granted. _draw_scene -> _clear cancels this id before the
-        # next redraw, so there's no overlapping callback leak.
+        # Keep polling so the Accessibility badge updates live (Input Monitoring
+        # won't flip until restart). _draw_scene -> _clear cancels this id before
+        # the next redraw, so there's no overlapping callback leak.
         self._spinner_after_id = self._window.after(1500, self._render_permissions)
+
+    def _finish_gate(self, result: str) -> None:
+        """Resolve the permission gate with the given outcome and close it."""
+        self._gate_result = result
+        if self._spinner_after_id is not None:
+            try:
+                self._window.after_cancel(self._spinner_after_id)
+            except tk.TclError as e:
+                logger.debug("after_cancel on gate poll failed: %s", e)
+            self._spinner_after_id = None
+        self._window.destroy()
 
     def _perm_row(self, cx: int, y: int, label: str, ok: bool, hint: str) -> None:
         """Draw one permission status row with a ✓/✗ badge."""
@@ -668,3 +698,12 @@ def show_setup_wizard(config: Config, login_manager: LoginManager) -> SetupResul
     """
     wizard = SetupWizard(config, login_manager)
     return wizard.show()
+
+
+def run_permission_gate(config: Config) -> str:
+    """Show the macOS permission gate, blocking until it is resolved.
+
+    Returns 'granted' (both permissions present), 'restart' (relaunch so a new
+    grant takes effect) or 'quit' (the user closed the window without granting).
+    """
+    return SetupWizard(config).run_permission_gate()

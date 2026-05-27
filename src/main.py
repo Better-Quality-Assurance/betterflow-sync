@@ -3,6 +3,7 @@
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -865,6 +866,18 @@ class BetterFlowApp:
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
 
+        # macOS tracking permissions are a hard precondition. Unlike the
+        # first-run wizard, this gate runs on EVERY launch and keeps showing
+        # until both Accessibility and Input Monitoring are granted — if the
+        # user revoked them, or a new build's signature dropped them, they get
+        # the gate again rather than silently-degraded tracking.
+        #
+        # macOS only exposes a freshly-granted Input Monitoring permission to a
+        # newly-launched process, so the gate relaunches the app to re-check
+        # rather than polling in place (which can never see the new grant).
+        if not self._ensure_macos_permissions():
+            return
+
         self._set_startup_status("Starting...")
         self._startup_thread = threading.Thread(
             target=self._background_startup,
@@ -879,6 +892,61 @@ class BetterFlowApp:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _ensure_macos_permissions(self) -> bool:
+        """Block on the permission gate until tracking permissions are granted.
+
+        Returns True to continue startup, False if the app should exit. On
+        non-macOS platforms this is always True (no such permissions).
+
+        Shows the gate window when Accessibility or Input Monitoring is missing.
+        The gate returns 'granted' (proceed), 'restart' (relaunch so a new
+        grant takes effect, then re-check) or 'quit' (user closed it — the app
+        must not run without approval).
+        """
+        if sys.platform != "darwin":
+            return True
+        try:
+            from .ui.permissions import check_accessibility, check_input_monitoring
+            from .ui.setup_wizard import run_permission_gate
+        except ImportError:
+            from ui.permissions import check_accessibility, check_input_monitoring  # type: ignore[no-redef]
+            from ui.setup_wizard import run_permission_gate  # type: ignore[no-redef]
+
+        if check_accessibility() and check_input_monitoring():
+            return True
+
+        result = run_permission_gate(self.config)
+        if result == "granted":
+            return True
+        if result == "restart":
+            logger.info("Relaunching to apply newly granted permissions")
+            self._relaunch()
+            return False
+        logger.info("Tracking permissions not granted — exiting")
+        return False
+
+    def _relaunch(self) -> None:
+        """Relaunch the app so a freshly granted macOS permission is picked up.
+
+        Never returns — the process exits after spawning its replacement.
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                # .../BetterFlow.app/Contents/MacOS/BetterFlow -> the .app bundle
+                exe = Path(sys.executable)
+                bundle = exe.parents[2] if len(exe.parents) >= 3 else None
+                if bundle is not None and bundle.suffix == ".app":
+                    subprocess.Popen(["open", str(bundle)])
+                else:
+                    subprocess.Popen([str(exe)])
+            else:
+                # Dev mode: re-exec the same interpreter + args.
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+                return
+        except Exception:
+            logger.exception("Relaunch failed")
+        os._exit(0)
 
     # -- Event handlers ---------------------------------------------------
 
