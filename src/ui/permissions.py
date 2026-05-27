@@ -114,6 +114,93 @@ def check_input_monitoring(prompt: bool = False) -> bool:
     return False
 
 
+def _probe_listen_event_tap() -> bool:
+    """Create a throwaway listen-only CGEventTap.
+
+    Doing so is the canonical way to (1) make the app appear in System Settings
+    > Privacy & Security > Input Monitoring — without this the app is never
+    listed and the user has no toggle to flip — and (2) authoritatively detect
+    the grant: CGEventTapCreate only returns a tap when access is granted.
+
+    Returns True if the tap was created (access granted), else False.
+    """
+    try:
+        from Quartz import (
+            CGEventTapCreate,
+            kCGEventTapOptionListenOnly,
+            kCGHeadInsertEventTap,
+            kCGSessionEventTap,
+        )
+    except Exception as e:
+        logger.debug("Quartz event-tap import failed: %s", e)
+        return False
+
+    def _noop(proxy, event_type, event, refcon):
+        return event
+
+    tap = None
+    try:
+        # kCGEventKeyDown == 10. A minimal mask is enough to trigger the grant
+        # check and register the app in the Input Monitoring list.
+        tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            (1 << 10),
+            _noop,
+            None,
+        )
+        return tap is not None
+    except Exception as e:
+        logger.debug("CGEventTapCreate probe failed: %s", e)
+        return False
+    finally:
+        # We never run this tap — tear it down so it doesn't leak.
+        if tap is not None:
+            try:
+                from CoreFoundation import CFMachPortInvalidate, CFRelease
+
+                CFMachPortInvalidate(tap)
+                CFRelease(tap)
+            except Exception as e:
+                logger.debug("event-tap probe cleanup failed: %s", e)
+
+
+def input_monitoring_active(prompt: bool = False) -> bool:
+    """Authoritative Input Monitoring check that also registers the app.
+
+    Fast path: CGPreflightListenEventAccess. If that reports False (it returns
+    false negatives for some signatures and never lists the app), fall back to
+    actually creating a listen-only event tap, which both registers the app in
+    System Settings and tells us the true grant state.
+
+    Args:
+        prompt: When True, surface the native dialog the first time.
+
+    Returns True on non-macOS platforms.
+    """
+    if not _IS_MACOS:
+        return True
+
+    try:
+        from Quartz import CGPreflightListenEventAccess
+
+        if CGPreflightListenEventAccess():
+            return True
+    except Exception as e:
+        logger.debug("CGPreflightListenEventAccess failed: %s", e)
+
+    if prompt:
+        try:
+            from Quartz import CGRequestListenEventAccess
+
+            CGRequestListenEventAccess()
+        except Exception as e:
+            logger.debug("CGRequestListenEventAccess failed: %s", e)
+
+    return _probe_listen_event_tap()
+
+
 def prompt_accessibility() -> bool:
     """Show the native Accessibility prompt and register the app in the list.
 

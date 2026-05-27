@@ -31,6 +31,7 @@ try:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
+        input_monitoring_active,
     )
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
@@ -53,6 +54,7 @@ except ImportError:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
+        input_monitoring_active,
     )
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
@@ -305,28 +307,19 @@ class SyncCoordinator:
     _PERM_REWARN_INTERVAL = timedelta(hours=4)
 
     def _check_permissions(self) -> None:
-        """Check macOS tracking permissions and surface a visible warning.
+        """Surface a visible warning when Input Monitoring is off.
 
-        Two grants matter on macOS:
-        - Accessibility: window titles (app names still work without it).
-        - Input Monitoring: keystroke/click capture. Without it we collect
-          active time but zero input, which the server reads as a jiggler and
-          flags the day as suspicious — so this is a hard, user-visible error
-          rather than a silent degradation.
+        Input Monitoring is the only tracking permission BetterFlow requires —
+        without it we collect active time but zero keystrokes/clicks, which the
+        server reads as a jiggler and flags the day as suspicious. App names and
+        durations come from NSWorkspace and don't need Accessibility.
 
-        No-op on non-macOS, where both checks return True.
+        No-op on non-macOS, where the check returns True.
         """
         try:
-            has_accessibility = check_accessibility()
-            has_input = check_input_monitoring()
-            granted = has_accessibility and has_input
-
-            if not has_input:
-                status = "Input tracking OFF — Fix Permissions"
-            elif not has_accessibility:
-                status = "Limited tracking — Fix Permissions"
-            else:
-                status = None
+            has_input = input_monitoring_active()
+            granted = has_input
+            status = None if has_input else "Input tracking OFF — Fix Permissions"
 
             high_priority = (
                 TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
@@ -866,11 +859,11 @@ class BetterFlowApp:
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
 
-        # macOS tracking permissions are a hard precondition. Unlike the
-        # first-run wizard, this gate runs on EVERY launch and keeps showing
-        # until both Accessibility and Input Monitoring are granted — if the
-        # user revoked them, or a new build's signature dropped them, they get
-        # the gate again rather than silently-degraded tracking.
+        # macOS Input Monitoring is a hard precondition. Unlike the first-run
+        # wizard, this gate runs on EVERY launch and keeps showing until the
+        # grant is present — if the user revoked it, or a new build's signature
+        # dropped it, they get the gate again rather than silently-degraded
+        # tracking (active time with no input, which the server flags).
         #
         # macOS only exposes a freshly-granted Input Monitoring permission to a
         # newly-launched process, so the gate relaunches the app to re-check
@@ -894,26 +887,26 @@ class BetterFlowApp:
             self._shutdown()
 
     def _ensure_macos_permissions(self) -> bool:
-        """Block on the permission gate until tracking permissions are granted.
+        """Block on the permission gate until Input Monitoring is granted.
 
         Returns True to continue startup, False if the app should exit. On
-        non-macOS platforms this is always True (no such permissions).
+        non-macOS platforms this is always True (no such permission).
 
-        Shows the gate window when Accessibility or Input Monitoring is missing.
-        The gate returns 'granted' (proceed), 'restart' (relaunch so a new
-        grant takes effect, then re-check) or 'quit' (user closed it — the app
-        must not run without approval).
+        Input Monitoring is the single required grant. The gate returns
+        'granted' (proceed), 'restart' (relaunch so a freshly-toggled grant
+        takes effect, then re-check) or 'quit' (user closed it — the app must
+        not run without approval).
         """
         if sys.platform != "darwin":
             return True
         try:
-            from .ui.permissions import check_accessibility, check_input_monitoring
+            from .ui.permissions import input_monitoring_active
             from .ui.setup_wizard import run_permission_gate
         except ImportError:
-            from ui.permissions import check_accessibility, check_input_monitoring  # type: ignore[no-redef]
+            from ui.permissions import input_monitoring_active  # type: ignore[no-redef]
             from ui.setup_wizard import run_permission_gate  # type: ignore[no-redef]
 
-        if check_accessibility() and check_input_monitoring():
+        if input_monitoring_active():
             return True
 
         result = run_permission_gate(self.config)

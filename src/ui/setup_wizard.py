@@ -511,70 +511,62 @@ class SetupWizard:
     # ── Permissions Gate (macOS) ─────────────────────────────────────
 
     def _request_permissions_once(self) -> None:
-        """Fire the native prompts a single time on first entry.
+        """Register the app and show the native prompt once on first entry.
 
-        Only prompts for permissions that are actually missing — prompting for
-        an already-granted one pops a needless dialog and, for Accessibility,
-        opens the wrong System Settings pane (which made users think they'd
-        granted Input Monitoring when they hadn't).
+        input_monitoring_active(prompt=True) creates a listen-only event tap,
+        which is what makes BetterFlow appear in System Settings > Input
+        Monitoring — without it the app is never listed and there's no toggle
+        to flip.
         """
         if getattr(self, "_perm_prompted", False):
             return
         self._perm_prompted = True
         try:
-            from ..ui.permissions import (
-                check_accessibility,
-                check_input_monitoring,
-                prompt_accessibility,
-            )
+            from ..ui.permissions import input_monitoring_active
         except ImportError:
-            from ui.permissions import (
-                check_accessibility,
-                check_input_monitoring,
-                prompt_accessibility,
-            )
+            from ui.permissions import input_monitoring_active
         try:
-            if not check_accessibility():
-                prompt_accessibility()
-            if not check_input_monitoring():
-                check_input_monitoring(prompt=True)
+            input_monitoring_active(prompt=True)
         except Exception:
-            logger.exception("Permission prompt failed during setup")
+            logger.exception("Input Monitoring prompt failed during setup")
 
     def _render_permissions(self) -> None:
-        """Draw the permissions scene and re-poll until both are granted."""
+        """Draw the single-permission gate and re-poll until granted.
+
+        Only Input Monitoring is required — app names and durations come from
+        NSWorkspace without Accessibility, so we don't make the user grant two
+        permissions. The check also registers the app in the Input Monitoring
+        list so there's a toggle to flip.
+        """
         if self._closing or not self._canvas.winfo_exists():
             return
         try:
-            from ..ui.permissions import check_accessibility, check_input_monitoring
+            from ..ui.permissions import input_monitoring_active
         except ImportError:
-            from ui.permissions import check_accessibility, check_input_monitoring
+            from ui.permissions import input_monitoring_active
 
-        has_accessibility = check_accessibility()
-        has_input = check_input_monitoring()
+        has_input = input_monitoring_active()
 
         cx = self._draw_scene(
-            title="Grant Permissions",
-            subtitle="Required so BetterFlow can track and protect your hours",
+            title="Grant Permission",
+            subtitle="One permission lets BetterFlow protect your hours",
         )
 
-        self._perm_row(cx, 236, "Accessibility", has_accessibility, "App & window names")
-        # Friendly label — the literal macOS pane is called "Input Monitoring",
-        # which reads as surveillance and scares users off. We name it for what
-        # it does and point to the system pane in the instruction line below.
+        # Friendly label — the literal macOS pane is "Input Monitoring", which
+        # reads as surveillance; the instruction line names the pane for findability.
         self._perm_row(
-            cx, 296, "Keyboard & Click Activity", has_input,
+            cx, 258, "Keyboard & Click Activity", has_input,
             "Counts keystrokes & clicks (no content) — prevents false fraud flags",
         )
 
-        if has_accessibility and has_input:
+        if has_input:
             self._canvas.create_text(
-                cx, 364,
+                cx, 332,
                 text="All set — you're ready to go.",
                 font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
             )
             self._make_button(
-                "Continue", lambda: self._finish_gate("granted"), cx, 438, width=280
+                "Continue", lambda: self._finish_gate("granted"), cx, 430, width=280
             )
             return
 
@@ -582,23 +574,22 @@ class SetupWizard:
         # freshly-launched process, so the user must restart after enabling it —
         # we can't detect it live. Make Restart the primary action.
         self._canvas.create_text(
-            cx, 356,
-            text=("In System Settings, turn BetterFlow ON under both\n"
-                  "“Accessibility” and “Input Monitoring”, then Restart."),
+            cx, 330,
+            text=("In System Settings, turn BetterFlow ON under\n"
+                  "“Input Monitoring”, then click Restart."),
             font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
         )
         self._make_button(
             "Open System Settings", self._open_permission_settings,
-            cx - 132, 440, width=236, primary=False,
+            cx - 132, 430, width=236, primary=False,
         )
         self._make_button(
             "Restart", lambda: self._finish_gate("restart"),
-            cx + 132, 440, width=196, primary=True,
+            cx + 132, 430, width=196, primary=True,
         )
 
-        # Keep polling so the Accessibility badge updates live (Input Monitoring
-        # won't flip until restart). _draw_scene -> _clear cancels this id before
-        # the next redraw, so there's no overlapping callback leak.
+        # Poll so the badge refreshes. _draw_scene -> _clear cancels this id
+        # before the next redraw, so there's no overlapping callback leak.
         self._spinner_after_id = self._window.after(1500, self._render_permissions)
 
     def _finish_gate(self, result: str) -> None:
@@ -640,29 +631,22 @@ class SetupWizard:
         self._canvas.create_text(x, y, text=text, font=FONT_BUTTON, fill="#6f6390")
 
     def _open_permission_settings(self) -> None:
-        """Open the System Settings pane for whichever grant is still missing."""
+        """Register the app (so it's listed) and open the Input Monitoring pane."""
         try:
             from ..ui.permissions import (
-                check_accessibility,
-                check_input_monitoring,
-                open_accessibility_settings,
+                input_monitoring_active,
                 open_input_monitoring_settings,
             )
         except ImportError:
             from ui.permissions import (
-                check_accessibility,
-                check_input_monitoring,
-                open_accessibility_settings,
+                input_monitoring_active,
                 open_input_monitoring_settings,
             )
         try:
-            if not check_input_monitoring():
-                check_input_monitoring(prompt=True)
-                open_input_monitoring_settings()
-            elif not check_accessibility():
-                open_accessibility_settings()
+            input_monitoring_active(prompt=True)
+            open_input_monitoring_settings()
         except Exception:
-            logger.exception("Failed to open permission settings during setup")
+            logger.exception("Failed to open Input Monitoring settings during setup")
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
