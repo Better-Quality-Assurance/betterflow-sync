@@ -1,5 +1,6 @@
 """Download ActivityWatch binaries from GitHub releases and rename for white-labeling."""
 
+import hashlib
 import os
 import platform
 import shutil
@@ -11,6 +12,21 @@ import urllib.request
 import zipfile
 
 AW_VERSION = "v0.13.2"
+
+# Expected SHA-256 of each release asset, pinned per AW version. These are the
+# canonical GitHub release artifacts for AW_VERSION (immutable once published).
+# A download whose hash does not match one of these is rejected — this is the
+# supply-chain integrity check for the bundled tracker binaries.
+#
+# To bump AW_VERSION: download the three zips from the release, run
+# `shasum -a 256 <file>` on each, and replace the digests below.
+EXPECTED_SHA256 = {
+    "v0.13.2": {
+        "activitywatch-v0.13.2-macos-x86_64.zip": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",
+        "activitywatch-v0.13.2-windows-x86_64.zip": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
+        "activitywatch-v0.13.2-linux-x86_64.zip": "8f62b10babf8a8f108cbdf7267c02fbc1ce2a970fa9535f230b3416b803e3360",
+    },
+}
 
 # Original AW binary names (what's in the zip) -> branded names
 AW_TO_BF_NAMES = {
@@ -83,18 +99,60 @@ def resolve_binary_path(output_dir: str, name: str, plat: str) -> str | None:
     return None
 
 
+def _sha256_file(path: str) -> str:
+    """Compute the SHA-256 hex digest of a file, streaming to bound memory."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def expected_digest(asset: str) -> str:
+    """Look up the pinned SHA-256 for an asset, or abort if none is recorded."""
+    version_map = EXPECTED_SHA256.get(AW_VERSION)
+    if not version_map or asset not in version_map:
+        print(
+            f"ERROR: No pinned SHA-256 for {asset} (version {AW_VERSION}). "
+            "Refusing to download an unverified binary. Update EXPECTED_SHA256."
+        )
+        sys.exit(1)
+    return version_map[asset].lower()
+
+
 def download_release(plat: str) -> str:
-    """Download release zip to a temp file. Returns path to zip."""
+    """Download release zip to a temp file and verify its SHA-256. Returns path to zip."""
     asset = RELEASE_ASSETS[plat]
+    expected = expected_digest(asset)
     url = f"{RELEASE_BASE}/{asset}"
     print(f"Downloading {url} ...")
 
-    tmp = tempfile.mktemp(suffix=".zip")
-    urllib.request.urlretrieve(url, tmp)
+    # mkstemp() atomically creates the file with O_EXCL (no mktemp race / symlink
+    # attack window). We own the fd; close it before urlretrieve writes the path.
+    fd, tmp = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(url, tmp)
 
-    size_mb = os.path.getsize(tmp) / (1024 * 1024)
-    print(f"Downloaded {size_mb:.1f} MB")
-    return tmp
+        actual = _sha256_file(tmp)
+        if actual != expected:
+            print(
+                "ERROR: SHA-256 mismatch — refusing to use this download.\n"
+                f"  asset:    {asset}\n"
+                f"  expected: {expected}\n"
+                f"  actual:   {actual}"
+            )
+            sys.exit(1)
+
+        size_mb = os.path.getsize(tmp) / (1024 * 1024)
+        print(f"Downloaded {size_mb:.1f} MB — SHA-256 verified")
+        return tmp
+    except BaseException:
+        # On any failure (verification, download, interrupt) don't leave the
+        # temp file behind.
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
