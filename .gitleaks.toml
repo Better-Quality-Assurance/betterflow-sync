@@ -1,0 +1,55 @@
+# gitleaks configuration
+#
+# Extends the bundled default ruleset (https://github.com/gitleaks/gitleaks)
+# so we get the full catalogue of secret detectors, then layers on an
+# allowlist for known example/placeholder values committed in this repo
+# (e.g. .env.example files) so the scan does not false-positive on them.
+#
+# Run locally:   gitleaks detect --config .gitleaks.toml
+# Pre-commit:    gitleaks protect --staged --config .gitleaks.toml
+
+# Inherit every rule from the gitleaks default config.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Global allowlist for known example / placeholder / public values"
+
+# Files that are intentionally committed templates, fixtures, lockfiles, or
+# vendored deps. Example env files document the *shape* of secrets, never real ones.
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.env\.sample$''',
+  '''(^|/)\.env\.template$''',
+  '''(^|/)\.env\.dist$''',
+  '''(^|/)\.env\.testing$''',
+  '''(^|/)\.env\.local\.example$''',
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|composer\.lock|deno\.lock|Cargo\.lock)$''',
+  '''(^|/)node_modules/''',
+  '''(^|/)vendor/''',
+  '''(^|/)(__fixtures__|fixtures|testdata|__mocks__)/''',
+]
+
+# Common placeholder tokens used in example config and docs. These are not real
+# secrets; allowlisting the literal patterns keeps the scan signal high.
+regexes = [
+  '''your[_-][a-z0-9]+[_-](here|key|secret|token|password|id)''',
+  '''your[_-](anon|api|secret|jwt|encryption|access|client)[_-]?key''',
+  '''(?i)\b(change[_-]?me|replace[_-]?me|example|placeholder|dummy|xxxxx+|<[^>]+>)\b''',
+  '''(?i)your[_-]project[_-]ref''',
+  '''(?i)minimum[_-]32[_-]characters''',
+  # Public Supabase anon keys are JWTs with role:"anon" and are safe to expose
+  # (browser-side, gated by RLS). They are not service-role keys.
+  '''eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]*?(anon|role.{0,10}anon)[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+''',
+]
+
+# Generic placeholder strings sometimes flagged by stopword/high-entropy rules.
+stopwords = [
+  "your-anon-key-here",
+  "your-project-ref",
+  "change_me",
+  "changeme",
+  "placeholder",
+  "example",
+]

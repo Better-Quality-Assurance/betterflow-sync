@@ -1,0 +1,31 @@
+name: gitleaks
+
+# Secret-scanning gate. Fails the build if any committed secret is detected.
+# Scans the full git history on push and pull_request (fetch-depth: 0).
+# Config and allowlist live in .gitleaks.toml at the repo root.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: scan for committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use the repo-local config (default ruleset + our allowlist).
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Scan the entire commit history, not just the diff.
+          GITLEAKS_ENABLE_COMMENTS: "false"
