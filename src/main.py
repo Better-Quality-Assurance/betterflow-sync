@@ -144,6 +144,16 @@ class SyncCoordinator:
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
 
+        # macOS permission-warning throttle. Input Monitoring can be revoked
+        # silently (e.g. a new build changes the code signature and macOS drops
+        # the TCC grant), which leaves us collecting window time but no
+        # keystrokes/clicks — server-side that looks like a jiggler and flags
+        # the day as suspicious. We surface a notification, throttled to one per
+        # state-change plus a periodic re-warn so it can't spam the user.
+        self._perm_lock = threading.Lock()
+        self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
+        self._last_perm_warn_at: Optional[datetime] = None
+
     @property
     def logged_in(self) -> bool:
         with self._state_lock:
@@ -225,9 +235,16 @@ class SyncCoordinator:
             id="startup_trends",
             replace_existing=True,
         )
-        # Permissions check removed — macOS AXIsProcessTrusted() is unreliable
-        # after rebuilds (returns False even when toggle is ON in System Settings).
-        # Watchers handle missing permissions gracefully on their own.
+        # Surface a missing-permission warning soon after launch. Delayed a few
+        # seconds so the in-process watchers have attempted their own start and
+        # any TCC grant has settled. The 60s tick re-checks thereafter, so the
+        # warning clears automatically once the user toggles the permission on.
+        self.scheduler.add_job(
+            self._check_permissions,
+            trigger=DateTrigger(run_date=now + timedelta(seconds=8)),
+            id="startup_permissions",
+            replace_existing=True,
+        )
 
     def stop(self) -> None:
         """Shut down the scheduler if running."""
@@ -283,11 +300,33 @@ class SyncCoordinator:
         """Check if a sync is currently running (non-blocking)."""
         return self._sync_lock.locked()
 
+    # Re-warn about disabled input tracking at most this often while it stays off.
+    _PERM_REWARN_INTERVAL = timedelta(hours=4)
+
     def _check_permissions(self) -> None:
-        """Check macOS tracking permissions and update tray state."""
+        """Check macOS tracking permissions and surface a visible warning.
+
+        Two grants matter on macOS:
+        - Accessibility: window titles (app names still work without it).
+        - Input Monitoring: keystroke/click capture. Without it we collect
+          active time but zero input, which the server reads as a jiggler and
+          flags the day as suspicious — so this is a hard, user-visible error
+          rather than a silent degradation.
+
+        No-op on non-macOS, where both checks return True.
+        """
         try:
             has_accessibility = check_accessibility()
-            granted = has_accessibility
+            has_input = check_input_monitoring()
+            granted = has_accessibility and has_input
+
+            if not has_input:
+                status = "Input tracking OFF — Fix Permissions"
+            elif not has_accessibility:
+                status = "Limited tracking — Fix Permissions"
+            else:
+                status = None
+
             high_priority = (
                 TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
                 TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
@@ -295,14 +334,14 @@ class SyncCoordinator:
             )
             with self.tray.model.lock:
                 previous_needs_permissions = self.tray.model.needs_permissions
-                previous_hours_today = self.tray.model.hours_today
+                previous_input_ok = self.tray.model.input_monitoring_ok
                 self.tray.model.needs_permissions = not granted
+                self.tray.model.input_monitoring_ok = has_input
                 current_state = self.tray.model.state
                 if not granted:
-                    self.tray.model.hours_today = "---"
                     if current_state not in high_priority:
                         self.tray.model.state = TrayState.NEEDS_PERMISSIONS
-                        self.tray.model.status_text = "Limited Tracking"
+                        self.tray.model.status_text = status
                         should_update_icon = True
                     else:
                         should_update_icon = False
@@ -314,18 +353,50 @@ class SyncCoordinator:
                         should_update_icon = False
                 should_update_menu = (
                     previous_needs_permissions != self.tray.model.needs_permissions
-                    or previous_hours_today != self.tray.model.hours_today
+                    or previous_input_ok != self.tray.model.input_monitoring_ok
                 )
             if should_update_icon:
                 self.tray._update_icon()
             if should_update_icon or should_update_menu:
                 self.tray._update_menu()
-            if not granted:
-                logger.debug("macOS Accessibility permission missing")
-            elif should_update_icon:
+
+            self._maybe_warn_input_tracking(has_input)
+
+            if granted and should_update_icon:
                 logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
-            logger.debug(f"Permissions check failed: {e}")
+            logger.warning("Permissions check failed: %s", e)
+
+    def _maybe_warn_input_tracking(self, has_input: bool) -> None:
+        """Notify the user when keystroke/click capture is disabled.
+
+        Throttled to one notification per OFF transition, then re-warned every
+        _PERM_REWARN_INTERVAL while it remains off so a long session can't hide
+        the problem.
+        """
+        now = datetime.now(timezone.utc)
+        with self._perm_lock:
+            self._input_tracking_ok = has_input
+            if has_input:
+                self._last_perm_warn_at = None
+                return
+            recently_warned = (
+                self._last_perm_warn_at is not None
+                and (now - self._last_perm_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_perm_warn_at = now
+
+        logger.warning(
+            "Input Monitoring permission missing — keystroke/click capture disabled"
+        )
+        send_notification(
+            "Input tracking is off",
+            "BetterFlow can't record keystrokes or clicks, so your hours may be "
+            "flagged as suspicious. Click the BetterFlow menu bar icon → "
+            "Fix Permissions to turn on Input Monitoring.",
+        )
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
@@ -337,6 +408,7 @@ class SyncCoordinator:
         self.tray.tick_clock()
         self._check_idle_status()
         self._refresh_hours_today()
+        self._check_permissions()
         if self.reminder_manager:
             self.reminder_manager.check()
 

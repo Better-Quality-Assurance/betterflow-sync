@@ -114,6 +114,33 @@ def check_input_monitoring(prompt: bool = False) -> bool:
     return False
 
 
+def prompt_accessibility() -> bool:
+    """Show the native Accessibility prompt and register the app in the list.
+
+    AXIsProcessTrustedWithOptions({prompt: True}) both reports the current
+    trust state and, when untrusted, surfaces Apple's dialog and adds the app
+    to System Settings > Privacy & Security > Accessibility so the user can
+    toggle it. Falls back to the plain check on any binding error.
+
+    Returns True on non-macOS platforms.
+    """
+    if not _IS_MACOS:
+        return True
+
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
+
+        return bool(
+            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        )
+    except Exception as e:
+        logger.debug("Accessibility prompt failed, falling back to check: %s", e)
+        return check_accessibility()
+
+
 def open_accessibility_settings() -> None:
     """Open System Settings to Accessibility pane."""
     if not _IS_MACOS:

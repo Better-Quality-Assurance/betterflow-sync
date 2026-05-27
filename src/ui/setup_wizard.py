@@ -90,6 +90,7 @@ class SetupWizard:
         self._spinner_after_id: Optional[str] = None
         self._spinner_angle: int = 0
         self._button_id = itertools.count(1)
+        self._perm_prompted: bool = False
 
     def show(self) -> SetupResult:
         """Show the wizard and return result when closed."""
@@ -403,7 +404,7 @@ class SetupWizard:
             self._show_success(state.user_email or "")
         else:
             safe_error = (state.error or "Login failed")[:200]
-        self._show_error(safe_error)
+            self._show_error(safe_error)
 
     def _show_error(self, error: str) -> None:
         """Show error state with retry."""
@@ -477,8 +478,142 @@ class SetupWizard:
             justify=tk.CENTER,
         )
 
-        # Launch button — go to permissions screen next
-        self._make_button("Continue", self._finish, cx, 438, width=280)
+        # macOS requires explicit Accessibility + Input Monitoring grants
+        # before tracking works — gate setup on them. Other platforms have no
+        # such permissions, so finish directly.
+        next_step = self._show_permissions if platform.system() == "Darwin" else self._finish
+        self._make_button("Continue", next_step, cx, 438, width=280)
+
+    # ── Permissions Screen (macOS) ───────────────────────────────────
+
+    def _show_permissions(self) -> None:
+        """Gate completion on macOS tracking permissions.
+
+        Prompts for Accessibility + Input Monitoring (registering the app in
+        System Settings), then polls live status. 'Continue' only becomes
+        available once both are granted; closing the window without granting
+        leaves setup incomplete, so the app will not run until approved.
+        """
+        if platform.system() != "Darwin":
+            self._finish()
+            return
+        self._request_permissions_once()
+        self._render_permissions()
+
+    def _request_permissions_once(self) -> None:
+        """Fire the native prompts a single time on first entry."""
+        if getattr(self, "_perm_prompted", False):
+            return
+        self._perm_prompted = True
+        try:
+            from ..ui.permissions import check_input_monitoring, prompt_accessibility
+        except ImportError:
+            from ui.permissions import check_input_monitoring, prompt_accessibility
+        try:
+            prompt_accessibility()
+            check_input_monitoring(prompt=True)
+        except Exception:
+            logger.exception("Permission prompt failed during setup")
+
+    def _render_permissions(self) -> None:
+        """Draw the permissions scene and re-poll until both are granted."""
+        if self._closing or not self._canvas.winfo_exists():
+            return
+        try:
+            from ..ui.permissions import check_accessibility, check_input_monitoring
+        except ImportError:
+            from ui.permissions import check_accessibility, check_input_monitoring
+
+        has_accessibility = check_accessibility()
+        has_input = check_input_monitoring()
+
+        cx = self._draw_scene(
+            title="Grant Permissions",
+            subtitle="Required so BetterFlow can track and protect your hours",
+        )
+
+        self._perm_row(cx, 236, "Accessibility", has_accessibility, "App & window names")
+        self._perm_row(
+            cx, 296, "Input Monitoring", has_input,
+            "Keystrokes & clicks — prevents false fraud flags",
+        )
+
+        if has_accessibility and has_input:
+            self._canvas.create_text(
+                cx, 364,
+                text="All set — you're ready to go.",
+                font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
+            )
+            self._make_button("Continue", self._finish, cx, 438, width=280)
+            return
+
+        self._canvas.create_text(
+            cx, 360,
+            text=("Turn BetterFlow ON in System Settings.\n"
+                  "Both permissions are required to continue."),
+            font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
+        )
+        self._make_button(
+            "Open System Settings", self._open_permission_settings,
+            cx - 132, 438, width=236, primary=True,
+        )
+        self._draw_disabled_button(cx + 132, 438, "Waiting…", width=196)
+
+        # Poll until granted. _draw_scene -> _clear cancels this id before the
+        # next redraw, so there's no overlapping callback leak.
+        self._spinner_after_id = self._window.after(1500, self._render_permissions)
+
+    def _perm_row(self, cx: int, y: int, label: str, ok: bool, hint: str) -> None:
+        """Draw one permission status row with a ✓/✗ badge."""
+        color = SUCCESS_COLOR if ok else ERROR_COLOR
+        symbol = "✓" if ok else "✗"
+        left = cx - 210
+        self._canvas.create_oval(left, y - 14, left + 28, y + 14, fill=color, outline="")
+        self._canvas.create_text(
+            left + 14, y, text=symbol, font=(FONT_FAMILY, 15, "bold"), fill=BTN_TEXT
+        )
+        self._canvas.create_text(
+            left + 46, y - 9, text=label, font=(FONT_FAMILY, 13, "bold"),
+            fill=TEXT_COLOR, anchor="w",
+        )
+        self._canvas.create_text(
+            left + 46, y + 11, text=hint, font=FONT_SMALL, fill=TEXT_MUTED, anchor="w",
+        )
+
+    def _draw_disabled_button(self, x: int, y: int, text: str, width: int = 200) -> None:
+        """Draw a non-interactive, greyed-out button placeholder."""
+        x1, y1 = x - (width // 2), y - (BTN_HEIGHT // 2)
+        x2, y2 = x + (width // 2), y + (BTN_HEIGHT // 2)
+        self._create_rounded_rect(
+            x1, y1, x2, y2, radius=BTN_BORDER_RADIUS,
+            fill="#2a2342", outline="#3d2d6b", width=1,
+        )
+        self._canvas.create_text(x, y, text=text, font=FONT_BUTTON, fill="#6f6390")
+
+    def _open_permission_settings(self) -> None:
+        """Open the System Settings pane for whichever grant is still missing."""
+        try:
+            from ..ui.permissions import (
+                check_accessibility,
+                check_input_monitoring,
+                open_accessibility_settings,
+                open_input_monitoring_settings,
+            )
+        except ImportError:
+            from ui.permissions import (
+                check_accessibility,
+                check_input_monitoring,
+                open_accessibility_settings,
+                open_input_monitoring_settings,
+            )
+        try:
+            if not check_input_monitoring():
+                check_input_monitoring(prompt=True)
+                open_input_monitoring_settings()
+            elif not check_accessibility():
+                open_accessibility_settings()
+        except Exception:
+            logger.exception("Failed to open permission settings during setup")
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
