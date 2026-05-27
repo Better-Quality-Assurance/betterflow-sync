@@ -80,7 +80,7 @@ class SetupResult:
 class SetupWizard:
     """First-run setup wizard window."""
 
-    def __init__(self, config: Config, login_manager: LoginManager):
+    def __init__(self, config: Config, login_manager: Optional[LoginManager] = None):
         self._config = config
         self._login_manager = login_manager
         self._result = SetupResult()
@@ -90,11 +90,16 @@ class SetupWizard:
         self._spinner_after_id: Optional[str] = None
         self._spinner_angle: int = 0
         self._button_id = itertools.count(1)
+        self._perm_prompted: bool = False
+        # Permission-gate mode: when True, the window shows only the permission
+        # screen and reports its outcome via _gate_result instead of SetupResult.
+        self._gate_only: bool = False
+        self._gate_result: str = "quit"
 
-    def show(self) -> SetupResult:
-        """Show the wizard and return result when closed."""
+    def _build_window(self, title: str = "BetterFlow") -> None:
+        """Create the Tk window + canvas, centered, with the close handler."""
         self._window = tk.Tk()
-        self._window.title("BetterFlow")
+        self._window.title(title)
         self._window.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
         self._window.resizable(False, False)
         self._window.configure(bg=BG_COLOR)
@@ -129,10 +134,26 @@ class SetupWizard:
         )
         self._canvas.pack(fill=tk.BOTH, expand=True)
 
+    def show(self) -> SetupResult:
+        """Show the wizard and return result when closed."""
+        self._build_window()
         self._show_welcome()
-
         self._window.mainloop()
         return self._result
+
+    def run_permission_gate(self) -> str:
+        """Show only the permission gate; block until resolved.
+
+        Returns 'granted' (both permissions present), 'restart' (the user asked
+        to relaunch so a new grant takes effect) or 'quit' (window closed).
+        """
+        self._gate_only = True
+        self._gate_result = "quit"
+        self._build_window(title="BetterFlow — Permissions")
+        self._request_permissions_once()
+        self._render_permissions()
+        self._window.mainloop()
+        return self._gate_result
 
     def _clear(self) -> None:
         """Clear all canvas items and widgets."""
@@ -151,8 +172,13 @@ class SetupWizard:
     def _on_close(self) -> None:
         """Handle window close — cancel any in-progress login."""
         self._closing = True
-        self._result = SetupResult(completed=False)
-        self._login_manager.cancel_login()
+        if self._gate_only:
+            # Closing the gate means permissions were not approved.
+            self._gate_result = "quit"
+        else:
+            self._result = SetupResult(completed=False)
+            if self._login_manager is not None:
+                self._login_manager.cancel_login()
         self._window.destroy()
 
     def _make_button(self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True) -> str:
@@ -403,7 +429,7 @@ class SetupWizard:
             self._show_success(state.user_email or "")
         else:
             safe_error = (state.error or "Login failed")[:200]
-        self._show_error(safe_error)
+            self._show_error(safe_error)
 
     def _show_error(self, error: str) -> None:
         """Show error state with retry."""
@@ -477,8 +503,177 @@ class SetupWizard:
             justify=tk.CENTER,
         )
 
-        # Launch button — go to permissions screen next
+        # Login is done. macOS tracking permissions are enforced separately by
+        # the always-on permission gate (see SetupWizard.run_permission_gate),
+        # which runs after this wizard and on every subsequent launch.
         self._make_button("Continue", self._finish, cx, 438, width=280)
+
+    # ── Permissions Gate (macOS) ─────────────────────────────────────
+
+    def _request_permissions_once(self) -> None:
+        """Register the app and show the native prompt once on first entry.
+
+        input_monitoring_active(prompt=True) creates a listen-only event tap,
+        which is what makes BetterFlow appear in System Settings > Input
+        Monitoring — without it the app is never listed and there's no toggle
+        to flip.
+        """
+        if getattr(self, "_perm_prompted", False):
+            return
+        self._perm_prompted = True
+        try:
+            from ..ui.permissions import input_monitoring_active
+        except ImportError:
+            from ui.permissions import input_monitoring_active
+        try:
+            input_monitoring_active(prompt=True)
+        except Exception:
+            logger.exception("Input Monitoring prompt failed during setup")
+
+    def _render_permissions(self) -> None:
+        """Draw the single-permission gate and re-poll until granted.
+
+        Only Input Monitoring is required — app names and durations come from
+        NSWorkspace without Accessibility, so we don't make the user grant two
+        permissions. The check also registers the app in the Input Monitoring
+        list so there's a toggle to flip.
+        """
+        if self._closing or not self._canvas.winfo_exists():
+            return
+        try:
+            from ..ui.permissions import input_monitoring_active
+        except ImportError:
+            from ui.permissions import input_monitoring_active
+
+        has_input = input_monitoring_active()
+
+        cx = self._draw_scene(
+            title="Grant Permission",
+            subtitle="One permission lets BetterFlow protect your hours",
+        )
+
+        # Friendly label — the literal macOS pane is "Input Monitoring", which
+        # reads as surveillance; the instruction line names the pane for findability.
+        self._perm_row(
+            cx, 258, "Keyboard & Click Activity", has_input,
+            "Counts keystrokes & clicks (no content) — prevents false fraud flags",
+        )
+
+        if has_input:
+            self._canvas.create_text(
+                cx, 332,
+                text="All set — you're ready to go.",
+                font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
+            )
+            self._make_button(
+                "Continue", lambda: self._finish_gate("granted"), cx, 430, width=280
+            )
+            return
+
+        self._canvas.create_text(
+            cx, 322,
+            text=("In System Settings, turn BetterFlow ON under “Input Monitoring”.\n"
+                  "If it isn't listed, click ＋ and add /Applications/BetterFlow.app.\n"
+                  "Then click Refresh."),
+            font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
+        )
+        self._make_button(
+            "Open System Settings", self._open_permission_settings,
+            cx - 132, 424, width=236, primary=False,
+        )
+        # Refresh re-checks in place (re-creates the event tap, which reads the
+        # current grant) — no relaunch needed when macOS reports it live.
+        self._make_button(
+            "Refresh", self._render_permissions,
+            cx + 132, 424, width=196, primary=True,
+        )
+        # Fallback: macOS sometimes caches the denial until the process restarts.
+        # If a refresh can't see a grant the user just enabled, this forces it.
+        self._make_text_link(
+            "Still not detected after enabling? Restart",
+            lambda: self._finish_gate("restart"), cx, 468,
+        )
+
+        # Auto-poll so the badge flips on its own the moment the grant lands.
+        # _draw_scene -> _clear cancels this id before the next redraw, so there's
+        # no overlapping callback leak.
+        self._spinner_after_id = self._window.after(1500, self._render_permissions)
+
+    def _make_text_link(self, text: str, command, x: int, y: int) -> str:
+        """Draw a small clickable text link for low-emphasis fallback actions."""
+        tag = f"link_{next(self._button_id)}"
+        item = self._canvas.create_text(
+            x, y, text=text, font=FONT_SMALL, fill="#9a87c4", tags=(tag,)
+        )
+
+        def on_enter(_e):
+            self._canvas.itemconfigure(item, fill=TEXT_COLOR)
+            self._canvas.configure(cursor="hand2")
+
+        def on_leave(_e):
+            self._canvas.itemconfigure(item, fill="#9a87c4")
+            self._canvas.configure(cursor="")
+
+        self._canvas.tag_bind(tag, "<Enter>", on_enter)
+        self._canvas.tag_bind(tag, "<Leave>", on_leave)
+        self._canvas.tag_bind(tag, "<Button-1>", lambda _e: self._window.after(1, command))
+        return tag
+
+    def _finish_gate(self, result: str) -> None:
+        """Resolve the permission gate with the given outcome and close it."""
+        self._gate_result = result
+        if self._spinner_after_id is not None:
+            try:
+                self._window.after_cancel(self._spinner_after_id)
+            except tk.TclError as e:
+                logger.debug("after_cancel on gate poll failed: %s", e)
+            self._spinner_after_id = None
+        self._window.destroy()
+
+    def _perm_row(self, cx: int, y: int, label: str, ok: bool, hint: str) -> None:
+        """Draw one permission status row with a ✓/✗ badge."""
+        color = SUCCESS_COLOR if ok else ERROR_COLOR
+        symbol = "✓" if ok else "✗"
+        left = cx - 210
+        self._canvas.create_oval(left, y - 14, left + 28, y + 14, fill=color, outline="")
+        self._canvas.create_text(
+            left + 14, y, text=symbol, font=(FONT_FAMILY, 15, "bold"), fill=BTN_TEXT
+        )
+        self._canvas.create_text(
+            left + 46, y - 9, text=label, font=(FONT_FAMILY, 13, "bold"),
+            fill=TEXT_COLOR, anchor="w",
+        )
+        self._canvas.create_text(
+            left + 46, y + 11, text=hint, font=FONT_SMALL, fill=TEXT_MUTED, anchor="w",
+        )
+
+    def _draw_disabled_button(self, x: int, y: int, text: str, width: int = 200) -> None:
+        """Draw a non-interactive, greyed-out button placeholder."""
+        x1, y1 = x - (width // 2), y - (BTN_HEIGHT // 2)
+        x2, y2 = x + (width // 2), y + (BTN_HEIGHT // 2)
+        self._create_rounded_rect(
+            x1, y1, x2, y2, radius=BTN_BORDER_RADIUS,
+            fill="#2a2342", outline="#3d2d6b", width=1,
+        )
+        self._canvas.create_text(x, y, text=text, font=FONT_BUTTON, fill="#6f6390")
+
+    def _open_permission_settings(self) -> None:
+        """Register the app (so it's listed) and open the Input Monitoring pane."""
+        try:
+            from ..ui.permissions import (
+                input_monitoring_active,
+                open_input_monitoring_settings,
+            )
+        except ImportError:
+            from ui.permissions import (
+                input_monitoring_active,
+                open_input_monitoring_settings,
+            )
+        try:
+            input_monitoring_active(prompt=True)
+            open_input_monitoring_settings()
+        except Exception:
+            logger.exception("Failed to open Input Monitoring settings during setup")
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""
@@ -514,3 +709,12 @@ def show_setup_wizard(config: Config, login_manager: LoginManager) -> SetupResul
     """
     wizard = SetupWizard(config, login_manager)
     return wizard.show()
+
+
+def run_permission_gate(config: Config) -> str:
+    """Show the macOS permission gate, blocking until it is resolved.
+
+    Returns 'granted' (both permissions present), 'restart' (relaunch so a new
+    grant takes effect) or 'quit' (the user closed the window without granting).
+    """
+    return SetupWizard(config).run_permission_gate()

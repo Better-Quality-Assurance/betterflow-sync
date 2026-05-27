@@ -3,6 +3,7 @@
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ try:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
+        input_monitoring_active,
     )
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
@@ -52,6 +54,7 @@ except ImportError:
         check_accessibility,
         check_input_monitoring,
         grant_tcc_permissions,
+        input_monitoring_active,
     )
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
@@ -144,6 +147,16 @@ class SyncCoordinator:
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
 
+        # macOS permission-warning throttle. Input Monitoring can be revoked
+        # silently (e.g. a new build changes the code signature and macOS drops
+        # the TCC grant), which leaves us collecting window time but no
+        # keystrokes/clicks — server-side that looks like a jiggler and flags
+        # the day as suspicious. We surface a notification, throttled to one per
+        # state-change plus a periodic re-warn so it can't spam the user.
+        self._perm_lock = threading.Lock()
+        self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
+        self._last_perm_warn_at: Optional[datetime] = None
+
     @property
     def logged_in(self) -> bool:
         with self._state_lock:
@@ -225,9 +238,16 @@ class SyncCoordinator:
             id="startup_trends",
             replace_existing=True,
         )
-        # Permissions check removed — macOS AXIsProcessTrusted() is unreliable
-        # after rebuilds (returns False even when toggle is ON in System Settings).
-        # Watchers handle missing permissions gracefully on their own.
+        # Surface a missing-permission warning soon after launch. Delayed a few
+        # seconds so the in-process watchers have attempted their own start and
+        # any TCC grant has settled. The 60s tick re-checks thereafter, so the
+        # warning clears automatically once the user toggles the permission on.
+        self.scheduler.add_job(
+            self._check_permissions,
+            trigger=DateTrigger(run_date=now + timedelta(seconds=8)),
+            id="startup_permissions",
+            replace_existing=True,
+        )
 
     def stop(self) -> None:
         """Shut down the scheduler if running."""
@@ -283,11 +303,24 @@ class SyncCoordinator:
         """Check if a sync is currently running (non-blocking)."""
         return self._sync_lock.locked()
 
+    # Re-warn about disabled input tracking at most this often while it stays off.
+    _PERM_REWARN_INTERVAL = timedelta(hours=4)
+
     def _check_permissions(self) -> None:
-        """Check macOS tracking permissions and update tray state."""
+        """Surface a visible warning when Input Monitoring is off.
+
+        Input Monitoring is the only tracking permission BetterFlow requires —
+        without it we collect active time but zero keystrokes/clicks, which the
+        server reads as a jiggler and flags the day as suspicious. App names and
+        durations come from NSWorkspace and don't need Accessibility.
+
+        No-op on non-macOS, where the check returns True.
+        """
         try:
-            has_accessibility = check_accessibility()
-            granted = has_accessibility
+            has_input = input_monitoring_active()
+            granted = has_input
+            status = None if has_input else "Input tracking OFF — Fix Permissions"
+
             high_priority = (
                 TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
                 TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
@@ -295,14 +328,14 @@ class SyncCoordinator:
             )
             with self.tray.model.lock:
                 previous_needs_permissions = self.tray.model.needs_permissions
-                previous_hours_today = self.tray.model.hours_today
+                previous_input_ok = self.tray.model.input_monitoring_ok
                 self.tray.model.needs_permissions = not granted
+                self.tray.model.input_monitoring_ok = has_input
                 current_state = self.tray.model.state
                 if not granted:
-                    self.tray.model.hours_today = "---"
                     if current_state not in high_priority:
                         self.tray.model.state = TrayState.NEEDS_PERMISSIONS
-                        self.tray.model.status_text = "Limited Tracking"
+                        self.tray.model.status_text = status
                         should_update_icon = True
                     else:
                         should_update_icon = False
@@ -314,18 +347,50 @@ class SyncCoordinator:
                         should_update_icon = False
                 should_update_menu = (
                     previous_needs_permissions != self.tray.model.needs_permissions
-                    or previous_hours_today != self.tray.model.hours_today
+                    or previous_input_ok != self.tray.model.input_monitoring_ok
                 )
             if should_update_icon:
                 self.tray._update_icon()
             if should_update_icon or should_update_menu:
                 self.tray._update_menu()
-            if not granted:
-                logger.debug("macOS Accessibility permission missing")
-            elif should_update_icon:
+
+            self._maybe_warn_input_tracking(has_input)
+
+            if granted and should_update_icon:
                 logger.info("macOS permissions granted — clearing warning")
         except Exception as e:
-            logger.debug(f"Permissions check failed: {e}")
+            logger.warning("Permissions check failed: %s", e)
+
+    def _maybe_warn_input_tracking(self, has_input: bool) -> None:
+        """Notify the user when keystroke/click capture is disabled.
+
+        Throttled to one notification per OFF transition, then re-warned every
+        _PERM_REWARN_INTERVAL while it remains off so a long session can't hide
+        the problem.
+        """
+        now = datetime.now(timezone.utc)
+        with self._perm_lock:
+            self._input_tracking_ok = has_input
+            if has_input:
+                self._last_perm_warn_at = None
+                return
+            recently_warned = (
+                self._last_perm_warn_at is not None
+                and (now - self._last_perm_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_perm_warn_at = now
+
+        logger.warning(
+            "Input Monitoring permission missing — keystroke/click capture disabled"
+        )
+        send_notification(
+            "Input tracking is off",
+            "BetterFlow can't record keystrokes or clicks, so your hours may be "
+            "flagged as suspicious. Click the BetterFlow menu bar icon → "
+            "Fix Permissions to turn on Input Monitoring.",
+        )
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
@@ -337,6 +402,7 @@ class SyncCoordinator:
         self.tray.tick_clock()
         self._check_idle_status()
         self._refresh_hours_today()
+        self._check_permissions()
         if self.reminder_manager:
             self.reminder_manager.check()
 
@@ -793,6 +859,18 @@ class BetterFlowApp:
             if result.logged_in and result.login_state:
                 wizard_login_state = result.login_state
 
+        # macOS Input Monitoring is a hard precondition. Unlike the first-run
+        # wizard, this gate runs on EVERY launch and keeps showing until the
+        # grant is present — if the user revoked it, or a new build's signature
+        # dropped it, they get the gate again rather than silently-degraded
+        # tracking (active time with no input, which the server flags).
+        #
+        # macOS only exposes a freshly-granted Input Monitoring permission to a
+        # newly-launched process, so the gate relaunches the app to re-check
+        # rather than polling in place (which can never see the new grant).
+        if not self._ensure_macos_permissions():
+            return
+
         self._set_startup_status("Starting...")
         self._startup_thread = threading.Thread(
             target=self._background_startup,
@@ -807,6 +885,64 @@ class BetterFlowApp:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _ensure_macos_permissions(self) -> bool:
+        """Block on the permission gate until Input Monitoring is granted.
+
+        Returns True to continue startup, False if the app should exit. On
+        non-macOS platforms this is always True (no such permission).
+
+        Input Monitoring is the single required grant. The gate returns
+        'granted' (proceed), 'restart' (relaunch so a freshly-toggled grant
+        takes effect, then re-check) or 'quit' (user closed it — the app must
+        not run without approval).
+        """
+        if sys.platform != "darwin":
+            return True
+        try:
+            from .ui.permissions import input_monitoring_active
+            from .ui.setup_wizard import run_permission_gate
+        except ImportError:
+            from ui.permissions import input_monitoring_active  # type: ignore[no-redef]
+            from ui.setup_wizard import run_permission_gate  # type: ignore[no-redef]
+
+        # prompt=True calls IOHIDRequestAccess, which registers BetterFlow in
+        # System Settings > Input Monitoring (so there's a toggle) and surfaces
+        # the system prompt — done on every launch until granted.
+        if input_monitoring_active(prompt=True):
+            return True
+
+        result = run_permission_gate(self.config)
+        if result == "granted":
+            return True
+        if result == "restart":
+            logger.info("Relaunching to apply newly granted permissions")
+            self._relaunch()
+            return False
+        logger.info("Tracking permissions not granted — exiting")
+        return False
+
+    def _relaunch(self) -> None:
+        """Relaunch the app so a freshly granted macOS permission is picked up.
+
+        Never returns — the process exits after spawning its replacement.
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                # .../BetterFlow.app/Contents/MacOS/BetterFlow -> the .app bundle
+                exe = Path(sys.executable)
+                bundle = exe.parents[2] if len(exe.parents) >= 3 else None
+                if bundle is not None and bundle.suffix == ".app":
+                    subprocess.Popen(["open", str(bundle)])
+                else:
+                    subprocess.Popen([str(exe)])
+            else:
+                # Dev mode: re-exec the same interpreter + args.
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+                return
+        except Exception:
+            logger.exception("Relaunch failed")
+        os._exit(0)
 
     # -- Event handlers ---------------------------------------------------
 
