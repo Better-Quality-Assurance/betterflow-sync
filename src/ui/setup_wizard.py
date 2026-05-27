@@ -501,17 +501,33 @@ class SetupWizard:
         self._render_permissions()
 
     def _request_permissions_once(self) -> None:
-        """Fire the native prompts a single time on first entry."""
+        """Fire the native prompts a single time on first entry.
+
+        Only prompts for permissions that are actually missing — prompting for
+        an already-granted one pops a needless dialog and, for Accessibility,
+        opens the wrong System Settings pane (which made users think they'd
+        granted Input Monitoring when they hadn't).
+        """
         if getattr(self, "_perm_prompted", False):
             return
         self._perm_prompted = True
         try:
-            from ..ui.permissions import check_input_monitoring, prompt_accessibility
+            from ..ui.permissions import (
+                check_accessibility,
+                check_input_monitoring,
+                prompt_accessibility,
+            )
         except ImportError:
-            from ui.permissions import check_input_monitoring, prompt_accessibility
+            from ui.permissions import (
+                check_accessibility,
+                check_input_monitoring,
+                prompt_accessibility,
+            )
         try:
-            prompt_accessibility()
-            check_input_monitoring(prompt=True)
+            if not check_accessibility():
+                prompt_accessibility()
+            if not check_input_monitoring():
+                check_input_monitoring(prompt=True)
         except Exception:
             logger.exception("Permission prompt failed during setup")
 
@@ -533,9 +549,12 @@ class SetupWizard:
         )
 
         self._perm_row(cx, 236, "Accessibility", has_accessibility, "App & window names")
+        # Friendly label — the literal macOS pane is called "Input Monitoring",
+        # which reads as surveillance and scares users off. We name it for what
+        # it does and point to the system pane in the instruction line below.
         self._perm_row(
-            cx, 296, "Input Monitoring", has_input,
-            "Keystrokes & clicks — prevents false fraud flags",
+            cx, 296, "Keyboard & Click Activity", has_input,
+            "Counts keystrokes & clicks (no content) — prevents false fraud flags",
         )
 
         if has_accessibility and has_input:
@@ -549,8 +568,8 @@ class SetupWizard:
 
         self._canvas.create_text(
             cx, 360,
-            text=("Turn BetterFlow ON in System Settings.\n"
-                  "Both permissions are required to continue."),
+            text=("In System Settings, turn BetterFlow ON under both\n"
+                  "“Accessibility” and “Input Monitoring”. Both are required."),
             font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
         )
         self._make_button(
