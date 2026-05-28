@@ -1,16 +1,45 @@
-"""Sync engine - orchestrates data flow from ActivityWatch to BetterFlow."""
+"""Sync engine - orchestrates data flow from ActivityWatch to BetterFlow.
+
+Responsibilities handled by this module
+----------------------------------------
+* **Orchestration** (``SyncEngine.sync``) — the main sync loop that calls all
+  other subsystems in order.
+* **State management** — pause/resume, private mode, session tracking,
+  dedup caches, category cache; all protected by ``_state_lock`` /
+  ``_cache_lock``.
+* **Source fetching** — ``_fetch_bucket_events``, ``_sync_bucket``,
+  ``_get_afk_events_for_range``.
+* **Transformation** — ``_transform_event``, ``_transform_window_event_with_timeout``,
+  ``_fill_window_gaps``, ``_transform_and_checkpoint``.  Pure helpers have been
+  extracted to ``sync.transform`` (stateless functions) so they can be tested
+  and reasoned about in isolation.
+* **Persistence / send** — ``_send_events``, ``_process_queue``,
+  ``_apply_queue_backoff``, ``send_break_event``, ``send_idle_event``,
+  ``_send_heartbeat``.
+
+Imported data models (``SyncStats``, ``BoundedLRU``, length constants) live in
+``sync.models`` to keep this file focused on behaviour.
+
+Stateless pure helpers (``extract_domain``, ``infer_page_category``,
+``overlap_range``, ``is_active_during``, ``status_at``, ``version_below``)
+live in ``sync.transform``.
+"""
+
+# ---------------------------------------------------------------------------
+# Standard-library imports
+# ---------------------------------------------------------------------------
 
 import logging
 import math
-import re
 import socket
 import threading
 import time
-from collections import OrderedDict
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
-from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Version detection (try package-mode path first, then PyInstaller flat path)
+# ---------------------------------------------------------------------------
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -20,96 +49,98 @@ except ImportError:
     except ImportError:
         AGENT_VERSION = "0.0.0"
 
+# ---------------------------------------------------------------------------
+# Local imports (try relative first, fall back for PyInstaller bundle)
+# ---------------------------------------------------------------------------
+
 try:
     from ..config import Config
-    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
-    from .bf_client import BetterFlowClientError, BetterFlowAuthError
+    from .aw_client import (
+        AWClientError,
+        AWEvent,
+        BUCKET_TYPE_AFK,
+        BUCKET_TYPE_AFK_ALT,
+        BUCKET_TYPE_CALL,
+        BUCKET_TYPE_INPUT,
+        BUCKET_TYPE_WEB,
+        BUCKET_TYPE_WINDOW,
+        BUCKET_TYPE_WINDOW_ALT,
+    )
+    from .bf_client import BetterFlowAuthError, BetterFlowClientError
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
+    # Data models
+    from .models import BoundedLRU, SyncStats, MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH
+    # Pure transformation helpers
+    from .transform import (
+        extract_domain as _extract_domain_fn,
+        infer_page_category as _infer_page_category_fn,
+        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
+        overlap_range as _overlap_range_fn,
+        is_active_during as _is_active_during_fn,
+        status_at as _status_at_fn,
+        version_below as _version_below_fn,
+    )
 except ImportError:
-    from config import Config
-    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
-    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
-    from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
-    from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
-    from sync.daily_time_tracker import DailyTimeTracker
-    from sync.call_detector import CallDetector, CallEvent
+    from config import Config  # type: ignore[no-redef]
+    from sync.aw_client import (  # type: ignore[no-redef]
+        AWClientError,
+        AWEvent,
+        BUCKET_TYPE_AFK,
+        BUCKET_TYPE_AFK_ALT,
+        BUCKET_TYPE_CALL,
+        BUCKET_TYPE_INPUT,
+        BUCKET_TYPE_WEB,
+        BUCKET_TYPE_WINDOW,
+        BUCKET_TYPE_WINDOW_ALT,
+    )
+    from sync.bf_client import BetterFlowAuthError, BetterFlowClientError  # type: ignore[no-redef]
+    from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol  # type: ignore[no-redef]
+    from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds  # type: ignore[no-redef]
+    from sync.daily_time_tracker import DailyTimeTracker  # type: ignore[no-redef]
+    from sync.call_detector import CallDetector, CallEvent  # type: ignore[no-redef]
+    from sync.models import BoundedLRU, SyncStats, MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH  # type: ignore[no-redef]
+    from sync.transform import (  # type: ignore[no-redef]
+        extract_domain as _extract_domain_fn,
+        infer_page_category as _infer_page_category_fn,
+        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
+        overlap_range as _overlap_range_fn,
+        is_active_during as _is_active_during_fn,
+        status_at as _status_at_fn,
+        version_below as _version_below_fn,
+    )
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SyncStats:
-    """Statistics from a sync cycle."""
-
-    events_fetched: int = 0
-    events_filtered: int = 0
-    events_sent: int = 0
-    events_queued: int = 0
-    buckets_synced: int = 0
-    gaps_filled: int = 0
-    calls_detected: int = 0
-    errors: list[str] = field(default_factory=list)
-    queued_bucket_ids: set = field(default_factory=set)
-    _should_heartbeat: bool = False
-
-    @property
-    def success(self) -> bool:
-        return len(self.errors) == 0
-
-
-MAX_APP_LENGTH = 256
-MAX_TITLE_LENGTH = 1024
-MAX_URL_LENGTH = 2048
-
-
-class BoundedLRU:
-    """Ordered dict with hard-capped size.
-
-    Writes move the key to the end (most-recent). When the size exceeds
-    ``maxsize`` the oldest entry is evicted. This replaces three nearly
-    identical hand-rolled caches (_sent_cache, _gap_filled_originals,
-    _time_cache) that each duplicated the same eviction logic.
-
-    Not thread-safe on its own — callers must wrap operations in a lock
-    when shared across threads, exactly as the original caches did.
-
-    Does NOT inherit from dict — callers must use the explicit API below.
-    """
-
-    def __init__(self, maxsize: int) -> None:
-        if maxsize <= 0:
-            raise ValueError("maxsize must be positive")
-        self._maxsize = maxsize
-        self._od: OrderedDict = OrderedDict()
-
-    def get(self, key, default=None):
-        if key in self._od:
-            self._od.move_to_end(key)
-            return self._od[key]
-        return default
-
-    def __contains__(self, key) -> bool:
-        return key in self._od
-
-    def __getitem__(self, key):
-        self._od.move_to_end(key)
-        return self._od[key]
-
-    def __setitem__(self, key, value) -> None:
-        self._od[key] = value
-        self._od.move_to_end(key)
-        if len(self._od) > self._maxsize:
-            self._od.popitem(last=False)
-
-    def __len__(self) -> int:
-        return len(self._od)
-
+# ===========================================================================
+# SyncEngine
+# ===========================================================================
 
 class SyncEngine:
-    """Core sync engine that orchestrates AW -> BetterFlow data flow."""
+    """Core sync engine that orchestrates AW -> BetterFlow data flow.
+
+    Internal structure
+    ------------------
+    The class is organised into five logical sections that map to the five
+    responsibilities listed in the module docstring.  Sections are marked
+    with banners so the reader can navigate without an IDE:
+
+      § 1  Construction & setup
+      § 2  State management  (pause, private mode, project, category cache)
+      § 3  Configuration fetching
+      § 4  Orchestration  (sync loop)
+      § 5  Source fetching
+      § 6  Transformation
+      § 7  Persistence / send
+      § 8  Status & lifecycle
+    """
+
+    # -----------------------------------------------------------------------
+    # § 1  Construction & setup
+    # -----------------------------------------------------------------------
 
     def __init__(
         self,
@@ -201,6 +232,10 @@ class SyncEngine:
             window_minutes=eng.window_minutes,
         )
 
+    # -----------------------------------------------------------------------
+    # § 2  State management
+    # -----------------------------------------------------------------------
+
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
         with self._state_lock:
@@ -279,6 +314,10 @@ class SyncEngine:
                 self._category_cache = self.queue.get_all_categories()
             return self._category_cache.get(app_name)
 
+    # -----------------------------------------------------------------------
+    # § 3  Configuration fetching
+    # -----------------------------------------------------------------------
+
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
         try:
@@ -300,6 +339,10 @@ class SyncEngine:
             raise
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
+
+    # -----------------------------------------------------------------------
+    # § 4  Orchestration — main sync loop
+    # -----------------------------------------------------------------------
 
     def sync(self) -> SyncStats:
         """Perform a sync cycle.
@@ -493,6 +536,10 @@ class SyncEngine:
 
         return stats
 
+    # -----------------------------------------------------------------------
+    # § 5  Source fetching
+    # -----------------------------------------------------------------------
+
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats
     ) -> tuple[list[AWEvent], datetime]:
@@ -520,6 +567,67 @@ class SyncEngine:
         # AW returns newest-first; sort oldest-first for gap-filling
         events.sort(key=lambda e: e.timestamp)
         return events, lookback_start
+
+    def _sync_bucket(
+        self, bucket_id: str, bucket_type: str, stats: SyncStats
+    ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
+        """Sync events from a single bucket.
+
+        ActivityWatch extends the duration of the current (most recent) event
+        via heartbeats.  If we only fetch events *after* the checkpoint we miss
+        that growing duration.  To fix this we look back a short overlap window
+        before the checkpoint so recently-synced events whose duration has
+        grown are re-sent with the updated value.  The backend uses the AW
+        event id to upsert, so the duration is simply patched in place.
+
+        Returns (transformed_events, pending_checkpoint).
+        """
+        events, _ = self._fetch_bucket_events(bucket_id, stats)
+        if not events:
+            return [], None
+        return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
+
+    def _get_afk_events_for_range(
+        self, start: datetime, end: datetime
+    ) -> list[AWEvent]:
+        """Fetch AFK events covering [start, end] from all AFK buckets.
+
+        Looks back up to 10 minutes before ``start`` to catch AFK events
+        whose timestamp predates the query range but whose duration extends
+        into it (ActivityWatch filters by timestamp only). 10 minutes is
+        more than enough to bridge any AFK heartbeat gap; larger lookbacks
+        risk hitting the limit=5000 cap on busy machines.
+        """
+        try:
+            afk_buckets = self.aw.get_afk_buckets()
+        except AWClientError:
+            return []
+
+        # Look back to capture AFK events that started earlier but are
+        # still active during [start, end].
+        lookback_start = start - timedelta(minutes=10)
+
+        all_afk: list[AWEvent] = []
+        for bucket in afk_buckets:
+            try:
+                events = self.aw.get_events(
+                    bucket.id, start=lookback_start, end=end, limit=5000
+                )
+                if len(events) == 5000:
+                    logger.warning(
+                        f"AFK bucket {bucket.id} returned max 5000 events; "
+                        f"activity classification for tail of window may be inaccurate"
+                    )
+                all_afk.extend(events)
+            except AWClientError as e:
+                logger.debug("AFK bucket %s fetch failed: %s", bucket.id, e)
+
+        all_afk.sort(key=lambda e: e.timestamp)
+        return all_afk
+
+    # -----------------------------------------------------------------------
+    # § 6  Transformation
+    # -----------------------------------------------------------------------
 
     def _transform_and_checkpoint(
         self,
@@ -607,21 +715,6 @@ class SyncEngine:
 
         return transformed, pending_checkpoint
 
-    @staticmethod
-    def _overlap_range(
-        start: datetime,
-        end: datetime,
-        other_start: datetime,
-        other_end: datetime,
-    ) -> Optional[tuple[datetime, datetime]]:
-        """Return the overlapped range, if any."""
-        overlap_start = max(start, other_start)
-        overlap_end = min(end, other_end)
-        if overlap_end <= overlap_start:
-            return None
-
-        return overlap_start, overlap_end
-
     def _active_ranges_from_afk(self, event: AWEvent) -> list[tuple[datetime, datetime]]:
         """Return the non-AFK slices for a window/web event."""
         event_start = event.timestamp
@@ -634,7 +727,7 @@ class SyncEngine:
 
             afk_start = afk_event.timestamp
             afk_end = afk_event.timestamp + timedelta(seconds=afk_event.duration)
-            overlap = self._overlap_range(event_start, event_end, afk_start, afk_end)
+            overlap = _overlap_range_fn(event_start, event_end, afk_start, afk_end)
             if overlap is not None:
                 afk_ranges.append(overlap)
 
@@ -766,108 +859,6 @@ class SyncEngine:
 
         return transformed
 
-    def _sync_bucket(
-        self, bucket_id: str, bucket_type: str, stats: SyncStats
-    ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
-        """Sync events from a single bucket.
-
-        ActivityWatch extends the duration of the current (most recent) event
-        via heartbeats.  If we only fetch events *after* the checkpoint we miss
-        that growing duration.  To fix this we look back a short overlap window
-        before the checkpoint so recently-synced events whose duration has
-        grown are re-sent with the updated value.  The backend uses the AW
-        event id to upsert, so the duration is simply patched in place.
-
-        Returns (transformed_events, pending_checkpoint).
-        """
-        events, _ = self._fetch_bucket_events(bucket_id, stats)
-        if not events:
-            return [], None
-        return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
-
-    def _get_afk_events_for_range(
-        self, start: datetime, end: datetime
-    ) -> list[AWEvent]:
-        """Fetch AFK events covering [start, end] from all AFK buckets.
-
-        Looks back up to 10 minutes before ``start`` to catch AFK events
-        whose timestamp predates the query range but whose duration extends
-        into it (ActivityWatch filters by timestamp only). 10 minutes is
-        more than enough to bridge any AFK heartbeat gap; larger lookbacks
-        risk hitting the limit=5000 cap on busy machines.
-        """
-        try:
-            afk_buckets = self.aw.get_afk_buckets()
-        except AWClientError:
-            return []
-
-        # Look back to capture AFK events that started earlier but are
-        # still active during [start, end].
-        lookback_start = start - timedelta(minutes=10)
-
-        all_afk: list[AWEvent] = []
-        for bucket in afk_buckets:
-            try:
-                events = self.aw.get_events(
-                    bucket.id, start=lookback_start, end=end, limit=5000
-                )
-                if len(events) == 5000:
-                    logger.warning(
-                        f"AFK bucket {bucket.id} returned max 5000 events; "
-                        f"activity classification for tail of window may be inaccurate"
-                    )
-                all_afk.extend(events)
-            except AWClientError as e:
-                logger.debug("AFK bucket %s fetch failed: %s", bucket.id, e)
-
-        all_afk.sort(key=lambda e: e.timestamp)
-        return all_afk
-
-    @staticmethod
-    def _is_active_during(
-        start: datetime, end: datetime, afk_events: list[AWEvent]
-    ) -> bool:
-        """Check that the entire [start, end) interval is covered by not-afk.
-
-        Walks AFK events chronologically.  Returns False if any portion of the
-        interval is not covered by a ``not-afk`` event.
-        """
-        if not afk_events:
-            return False
-
-        cursor = start
-        for ev in afk_events:
-            ev_start = ev.timestamp
-            ev_end = ev.timestamp + timedelta(seconds=ev.duration)
-
-            # Skip events that end before our cursor
-            if ev_end <= cursor:
-                continue
-            # If this event starts after the cursor, there's an uncovered gap
-            if ev_start > cursor:
-                return False
-            # Event must be not-afk to count as active
-            if ev.status != "not-afk":
-                return False
-            # Advance cursor to the end of this event
-            cursor = ev_end
-            if cursor >= end:
-                return True
-
-        # If we exhausted events without reaching ``end``, gap is uncovered
-        return cursor >= end
-
-    @staticmethod
-    def _status_at(timestamp: datetime, afk_events: list[AWEvent]) -> str | None:
-        """Return the AFK status covering ``timestamp``, if any."""
-        for ev in afk_events:
-            ev_start = ev.timestamp
-            ev_end = ev.timestamp + timedelta(seconds=ev.duration)
-            if ev_start <= timestamp < ev_end:
-                return ev.status
-
-        return None
-
     def _fill_window_gaps(
         self,
         window_events: list[AWEvent],
@@ -900,7 +891,7 @@ class SyncEngine:
                 continue
 
             # Verify user was active during the entire gap
-            if not self._is_active_during(current_end, next_ev.timestamp, afk_events):
+            if not _is_active_during_fn(current_end, next_ev.timestamp, afk_events):
                 continue
 
             old_duration = current.duration
@@ -977,12 +968,12 @@ class SyncEngine:
                 if privacy.collect_full_urls and len(url) <= MAX_URL_LENGTH:
                     data["url"] = url
                 elif privacy.collect_full_urls or privacy.domain_only_urls:
-                    domain = self._extract_domain(url)
+                    domain = _extract_domain_fn(url)
                     if domain and len(domain) <= MAX_URL_LENGTH:
                         data["url"] = domain
 
                 if privacy.collect_page_category:
-                    data["page_category"] = self._infer_page_category(event.url, event.title)
+                    data["page_category"] = _infer_page_category_fn(event.url, event.title)
 
             if app and privacy.auto_categorize:
                 category = self._get_category(app)
@@ -1086,7 +1077,7 @@ class SyncEngine:
                         f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
                     )
                 elif has_afk:
-                    is_active = self._is_active_during(
+                    is_active = _is_active_during_fn(
                         event.timestamp, event_end, self._current_afk_events
                     )
                     # Fallback: treat as active when event end falls inside
@@ -1094,7 +1085,7 @@ class SyncEngine:
                     if not is_active:
                         probe_time = event_end - timedelta(milliseconds=1)
                         is_active = (
-                            self._status_at(probe_time, self._current_afk_events)
+                            _status_at_fn(probe_time, self._current_afk_events)
                             == "not-afk"
                         )
                     activity_state = "active" if is_active else "inactive"
@@ -1138,45 +1129,51 @@ class SyncEngine:
 
         return result
 
+    # Static wrappers kept for backward-compat (e.g. existing test-suite
+    # calls ``SyncEngine._is_active_during(...)`` and ``SyncEngine._status_at(...)``
+    # directly on the class).  They simply delegate to the module-level
+    # functions in ``sync.transform``.
+
+    @staticmethod
+    def _overlap_range(
+        start: datetime,
+        end: datetime,
+        other_start: datetime,
+        other_end: datetime,
+    ) -> Optional[tuple[datetime, datetime]]:
+        """Return the overlapped range, if any."""
+        return _overlap_range_fn(start, end, other_start, other_end)
+
+    @staticmethod
+    def _is_active_during(
+        start: datetime, end: datetime, afk_events: list[AWEvent]
+    ) -> bool:
+        """Check that the entire [start, end) interval is covered by not-afk."""
+        return _is_active_during_fn(start, end, afk_events)
+
+    @staticmethod
+    def _status_at(timestamp: datetime, afk_events: list[AWEvent]) -> str | None:
+        """Return the AFK status covering ``timestamp``, if any."""
+        return _status_at_fn(timestamp, afk_events)
+
     @staticmethod
     def _extract_domain(url: str) -> Optional[str]:
         """Extract domain from URL safely."""
-        try:
-            parsed = urlparse(url)
-            return parsed.netloc or None
-        except Exception:
-            return None
+        return _extract_domain_fn(url)
 
-    # Each category resolves to a precompiled word-boundary regex. Earlier
-    # entries win: "code" is checked before "review" so repo URLs aren't
-    # reclassified as reviews. Word boundaries prevent substring leaks —
-    # "code" won't match "decode"/"encode", "diff" won't match "different".
-    _PAGE_CATEGORY_RULES: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
-        (
-            category,
-            re.compile(
-                r"\b(?:" + "|".join(re.escape(kw) for kw in keywords) + r")\b",
-                re.IGNORECASE,
-            ),
-        )
-        for category, keywords in (
-            ("code", ("github", "gitlab", "bitbucket", "repo", "pull request", "merge request")),
-            ("review", ("review", "diff", "changes")),
-            ("documentation", ("docs", "confluence", "notion", "wiki")),
-            ("communication", ("mail", "inbox", "slack", "teams", "chat", "meet")),
-            ("planning", ("jira", "asana", "trello", "linear", "backlog", "sprint")),
-            ("design", ("figma", "miro", "canva", "adobe")),
-        )
-    )
+    # Keep class-level PAGE_CATEGORY_RULES and _infer_page_category for any
+    # callers that reference them via ``SyncEngine._PAGE_CATEGORY_RULES`` or
+    # ``SyncEngine._infer_page_category()``.
+    _PAGE_CATEGORY_RULES = _PAGE_CATEGORY_RULES
 
     @classmethod
     def _infer_page_category(cls, url: Optional[str], title: Optional[str]) -> str:
         """Infer a coarse page category from URL/title."""
-        haystack = f"{url or ''} {title or ''}"
-        for category, pattern in cls._PAGE_CATEGORY_RULES:
-            if pattern.search(haystack):
-                return category
-        return "other"
+        return _infer_page_category_fn(url, title)
+
+    # -----------------------------------------------------------------------
+    # § 7  Persistence / send
+    # -----------------------------------------------------------------------
 
     def _send_status_span(
         self,
@@ -1401,7 +1398,7 @@ class SyncEngine:
 
             # Version compatibility check
             min_version = response.get("minimum_agent_version")
-            if min_version and self._version_below(AGENT_VERSION, min_version):
+            if min_version and _version_below_fn(AGENT_VERSION, min_version):
                 logger.warning(
                     f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
                 )
@@ -1439,13 +1436,11 @@ class SyncEngine:
         Returns True (conservative) on parse failure so the user sees
         the update warning rather than silently skipping it.
         """
-        try:
-            cur = tuple(int(x.split("-")[0]) for x in current.split(".")[:3])
-            min_ = tuple(int(x.split("-")[0]) for x in minimum.split(".")[:3])
-            return cur < min_
-        except (ValueError, AttributeError):
-            logger.warning(f"Cannot parse version strings: current={current!r}, minimum={minimum!r}")
-            return True
+        return _version_below_fn(current, minimum)
+
+    # -----------------------------------------------------------------------
+    # § 8  Status & lifecycle
+    # -----------------------------------------------------------------------
 
     def get_status(self) -> dict:
         """Get current sync status."""
