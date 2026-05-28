@@ -8,7 +8,8 @@ import re
 import sys
 import threading
 import uuid
-from dataclasses import dataclass, field, fields as dc_fields, asdict
+from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dc_fields
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -460,10 +461,18 @@ class Config:
             aw=_safe(AWSettings, aw_data) if aw_data else AWSettings(),
             sync=_safe(SyncSettings, sync_data) if sync_data else SyncSettings(),
             privacy=_safe(PrivacySettings, privacy_data) if privacy_data else PrivacySettings(),
-            reminders=_safe(ReminderSettings, reminders_data) if reminders_data else ReminderSettings(),
-            engagement=_safe(EngagementConfig, engagement_data) if engagement_data else EngagementConfig(),
-            fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
-            call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
+            reminders=_safe(ReminderSettings, reminders_data)
+            if reminders_data
+            else ReminderSettings(),
+            engagement=_safe(EngagementConfig, engagement_data)
+            if engagement_data
+            else EngagementConfig(),
+            fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data)
+            if fraud_detection_data
+            else FraudDetectionConfig(),
+            call_detection=_safe(CallDetectionSettings, call_detection_data)
+            if call_detection_data
+            else CallDetectionSettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -525,7 +534,9 @@ class Config:
         if "collection" in server_config:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
-                self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])
+                self.privacy.collect_page_category = self._to_bool(
+                    collection["collect_page_category"]
+                )
             if "auto_categorize" in collection:
                 self.privacy.auto_categorize = self._to_bool(collection["auto_categorize"])
             if "track_display_info" in collection:
@@ -534,7 +545,8 @@ class Config:
                 cats = collection["default_categories"]
                 if isinstance(cats, dict):
                     valid = {
-                        k: v for k, v in cats.items()
+                        k: v
+                        for k, v in cats.items()
                         if isinstance(k, str) and isinstance(v, str) and k and v
                     }
                     # Merge: server entries override matching keys but
@@ -581,7 +593,9 @@ class Config:
             eng = server_config["engagement"]
             try:
                 if "sustained_typing_presses" in eng:
-                    self.engagement.sustained_typing_presses = max(1, int(eng["sustained_typing_presses"]))
+                    self.engagement.sustained_typing_presses = max(
+                        1, int(eng["sustained_typing_presses"])
+                    )
                 if "window_changes_min" in eng:
                     self.engagement.window_changes_min = max(1, int(eng["window_changes_min"]))
                 if "scroll_threshold" in eng:
@@ -603,13 +617,19 @@ class Config:
                     if math.isfinite(val) and val > 0:
                         self.fraud_detection.keystroke_cv_threshold = val
                 if "min_windows_for_variance" in fd:
-                    self.fraud_detection.min_windows_for_variance = max(2, int(fd["min_windows_for_variance"]))
+                    self.fraud_detection.min_windows_for_variance = max(
+                        2, int(fd["min_windows_for_variance"])
+                    )
                 if "mouse_only_streak_threshold" in fd:
-                    self.fraud_detection.mouse_only_streak_threshold = max(1, int(fd["mouse_only_streak_threshold"]))
+                    self.fraud_detection.mouse_only_streak_threshold = max(
+                        1, int(fd["mouse_only_streak_threshold"])
+                    )
                 if "min_app_diversity" in fd:
                     self.fraud_detection.min_app_diversity = max(1, int(fd["min_app_diversity"]))
                 if "app_diversity_min_minutes" in fd:
-                    self.fraud_detection.app_diversity_min_minutes = max(1, int(fd["app_diversity_min_minutes"]))
+                    self.fraud_detection.app_diversity_min_minutes = max(
+                        1, int(fd["app_diversity_min_minutes"])
+                    )
                 if "click_keystroke_ratio_threshold" in fd:
                     val = float(fd["click_keystroke_ratio_threshold"])
                     if math.isfinite(val) and val > 0:
@@ -619,7 +639,9 @@ class Config:
                     if math.isfinite(val) and val > 0:
                         self.fraud_detection.input_regularity_cv_threshold = val
                 if "min_input_events_for_regularity" in fd:
-                    self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
+                    self.fraud_detection.min_input_events_for_regularity = max(
+                        2, int(fd["min_input_events_for_regularity"])
+                    )
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid fraud_detection config from server: {e}")
 
@@ -661,7 +683,9 @@ def setup_logging(debug: bool = False) -> None:
         h.close()
 
     file_handler = RotatingFileHandler(
-        log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
+        log_file,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
     )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)

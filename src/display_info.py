@@ -26,10 +26,10 @@ class DisplayState:
     the tracker atomically swaps self._state to a new instance.
     """
 
-    monitor_name: Optional[str] = None      # e.g. "Built-in Retina Display", "DELL U2720Q"
-    monitor_index: Optional[int] = None      # 0-based index in screen list
-    desktop_id: Optional[str] = None         # Space ID (macOS) or VD GUID (Windows)
-    desktop_index: Optional[int] = None      # 1-based discovery-order index
+    monitor_name: Optional[str] = None  # e.g. "Built-in Retina Display", "DELL U2720Q"
+    monitor_index: Optional[int] = None  # 0-based index in screen list
+    desktop_id: Optional[str] = None  # Space ID (macOS) or VD GUID (Windows)
+    desktop_index: Optional[int] = None  # 1-based discovery-order index
 
 
 class DisplayTracker:
@@ -46,9 +46,8 @@ class DisplayTracker:
         pass
 
 
-# ---------------------------------------------------------------------------
 # macOS implementation
-# ---------------------------------------------------------------------------
+
 
 def _start_macos_tracker() -> DisplayTracker:
     """Start a macOS display tracker using NSScreen and CGSGetActiveSpace."""
@@ -59,7 +58,8 @@ def _start_macos_tracker() -> DisplayTracker:
     CGSMainConnectionID = None
     CGSGetActiveSpace = None
     try:
-        from Quartz import CGSMainConnectionID, CGSGetActiveSpace  # type: ignore[attr-defined]
+        from Quartz import CGSGetActiveSpace, CGSMainConnectionID  # type: ignore[attr-defined]
+
         _cgs_available = True
     except (ImportError, AttributeError):
         logger.debug("Quartz CGS APIs unavailable -- desktop tracking will use fallback counter")
@@ -162,9 +162,8 @@ def _start_macos_tracker() -> DisplayTracker:
     return tracker
 
 
-# ---------------------------------------------------------------------------
 # Windows implementation
-# ---------------------------------------------------------------------------
+
 
 def _start_windows_tracker() -> DisplayTracker:
     """Start a Windows display tracker using ctypes Win32 APIs."""
@@ -198,8 +197,8 @@ def _start_windows_tracker() -> DisplayTracker:
     GUID = None
     try:
         import comtypes  # noqa: F401
-        from ctypes import byref
-        from comtypes import GUID as _GUID, CoCreateInstance, CLSCTX_ALL  # type: ignore[attr-defined]
+        from comtypes import CLSCTX_ALL, CoCreateInstance
+        from comtypes import GUID as _GUID  # type: ignore[attr-defined]
 
         GUID = _GUID
 
@@ -237,7 +236,9 @@ def _start_windows_tracker() -> DisplayTracker:
         )
         _vd_available = True
     except Exception:
-        logger.debug("COM IVirtualDesktopManager unavailable -- desktop tracking disabled on Windows")
+        logger.debug(
+            "COM IVirtualDesktopManager unavailable -- desktop tracking disabled on Windows"
+        )
 
     def _get_monitor_info():
         """Get current monitor name and index."""
@@ -260,7 +261,13 @@ def _start_windows_tracker() -> DisplayTracker:
             # Enumerate monitors to find index
             monitors = []
 
-            @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.wintypes.RECT), ctypes.c_void_p)
+            @ctypes.WINFUNCTYPE(
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.wintypes.RECT),
+                ctypes.c_void_p,
+            )
             def enum_callback(hmon_enum, hdc, rect, lparam):
                 monitors.append(hmon_enum)
                 return 1
@@ -341,9 +348,8 @@ def _start_windows_tracker() -> DisplayTracker:
     return tracker
 
 
-# ---------------------------------------------------------------------------
 # Factory
-# ---------------------------------------------------------------------------
+
 
 def start_display_tracker() -> DisplayTracker:
     """Create and start a platform-appropriate display tracker.

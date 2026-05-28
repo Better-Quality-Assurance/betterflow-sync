@@ -3,13 +3,11 @@
 import base64
 import hashlib
 import threading
-import pytest
-from unittest.mock import Mock, patch, MagicMock
-from http.server import HTTPServer
+from unittest.mock import MagicMock, Mock, patch
 
 from src.auth.browser_auth import (
-    BrowserAuthFlow,
     AuthFlowResult,
+    BrowserAuthFlow,
     _CallbackHandler,
 )
 from src.auth.pkce import generate_pkce_pair
@@ -247,6 +245,7 @@ class TestBrowserAuthFlow:
         def simulate_callback():
             """Simulate browser callback after short delay."""
             import time
+
             import requests
 
             time.sleep(0.1)
@@ -285,6 +284,7 @@ class TestBrowserAuthFlow:
         def simulate_wrong_state_callback():
             """Simulate callback with wrong state."""
             import time
+
             import requests
 
             time.sleep(0.1)
@@ -317,6 +317,7 @@ class TestBrowserAuthFlow:
         def simulate_error_callback():
             """Simulate OAuth error callback."""
             import time
+
             import requests
 
             time.sleep(0.1)

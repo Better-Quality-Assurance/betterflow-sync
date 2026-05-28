@@ -25,9 +25,7 @@ Stateless pure helpers (``extract_domain``, ``infer_page_category``,
 live in ``sync.transform``.
 """
 
-# ---------------------------------------------------------------------------
 # Standard-library imports
-# ---------------------------------------------------------------------------
 
 import logging
 import math
@@ -37,9 +35,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-# ---------------------------------------------------------------------------
 # Version detection (try package-mode path first, then PyInstaller flat path)
-# ---------------------------------------------------------------------------
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -49,15 +45,12 @@ except ImportError:
     except ImportError:
         AGENT_VERSION = "0.0.0"
 
-# ---------------------------------------------------------------------------
 # Local imports (try relative first, fall back for PyInstaller bundle)
-# ---------------------------------------------------------------------------
 
 try:
     from ..config import Config
+    from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .aw_client import (
-        AWClientError,
-        AWEvent,
         BUCKET_TYPE_AFK,
         BUCKET_TYPE_AFK_ALT,
         BUCKET_TYPE_CALL,
@@ -65,29 +58,46 @@ try:
         BUCKET_TYPE_WEB,
         BUCKET_TYPE_WINDOW,
         BUCKET_TYPE_WINDOW_ALT,
+        AWClientError,
+        AWEvent,
     )
     from .bf_client import BetterFlowAuthError, BetterFlowClientError
-    from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
-    from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
-    from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
+    from .daily_time_tracker import DailyTimeTracker
+
     # Data models
-    from .models import BoundedLRU, SyncStats, MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH
+    from .models import MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH, BoundedLRU, SyncStats
+    from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
+    from .transform import (
+        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
+    )
+
     # Pure transformation helpers
     from .transform import (
         extract_domain as _extract_domain_fn,
+    )
+    from .transform import (
         infer_page_category as _infer_page_category_fn,
-        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
-        overlap_range as _overlap_range_fn,
+    )
+    from .transform import (
         is_active_during as _is_active_during_fn,
+    )
+    from .transform import (
+        overlap_range as _overlap_range_fn,
+    )
+    from .transform import (
         status_at as _status_at_fn,
+    )
+    from .transform import (
         version_below as _version_below_fn,
     )
 except ImportError:
     from config import Config  # type: ignore[no-redef]
+    from sync.activity_analyzer import (  # type: ignore[no-redef]
+        ActivityAnalyzer,
+        EngagementThresholds,
+    )
     from sync.aw_client import (  # type: ignore[no-redef]
-        AWClientError,
-        AWEvent,
         BUCKET_TYPE_AFK,
         BUCKET_TYPE_AFK_ALT,
         BUCKET_TYPE_CALL,
@@ -95,29 +105,51 @@ except ImportError:
         BUCKET_TYPE_WEB,
         BUCKET_TYPE_WINDOW,
         BUCKET_TYPE_WINDOW_ALT,
+        AWClientError,
+        AWEvent,
     )
     from sync.bf_client import BetterFlowAuthError, BetterFlowClientError  # type: ignore[no-redef]
-    from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol  # type: ignore[no-redef]
-    from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds  # type: ignore[no-redef]
-    from sync.daily_time_tracker import DailyTimeTracker  # type: ignore[no-redef]
     from sync.call_detector import CallDetector, CallEvent  # type: ignore[no-redef]
-    from sync.models import BoundedLRU, SyncStats, MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH  # type: ignore[no-redef]
+    from sync.daily_time_tracker import DailyTimeTracker  # type: ignore[no-redef]
+    from sync.models import (  # type: ignore[no-redef]
+        MAX_APP_LENGTH,
+        MAX_TITLE_LENGTH,
+        MAX_URL_LENGTH,
+        BoundedLRU,
+        SyncStats,
+    )
+    from sync.protocols import (  # type: ignore[no-redef]
+        AWClientProtocol,
+        BFClientProtocol,
+        OfflineQueueProtocol,
+    )
+    from sync.transform import (
+        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
+    )
     from sync.transform import (  # type: ignore[no-redef]
         extract_domain as _extract_domain_fn,
+    )
+    from sync.transform import (
         infer_page_category as _infer_page_category_fn,
-        PAGE_CATEGORY_RULES as _PAGE_CATEGORY_RULES,
-        overlap_range as _overlap_range_fn,
+    )
+    from sync.transform import (
         is_active_during as _is_active_during_fn,
+    )
+    from sync.transform import (
+        overlap_range as _overlap_range_fn,
+    )
+    from sync.transform import (
         status_at as _status_at_fn,
+    )
+    from sync.transform import (
         version_below as _version_below_fn,
     )
 
 logger = logging.getLogger(__name__)
 
 
-# ===========================================================================
 # SyncEngine
-# ===========================================================================
+
 
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow.
@@ -138,9 +170,7 @@ class SyncEngine:
       § 8  Status & lifecycle
     """
 
-    # -----------------------------------------------------------------------
     # § 1  Construction & setup
-    # -----------------------------------------------------------------------
 
     def __init__(
         self,
@@ -232,9 +262,7 @@ class SyncEngine:
             window_minutes=eng.window_minutes,
         )
 
-    # -----------------------------------------------------------------------
     # § 2  State management
-    # -----------------------------------------------------------------------
 
     def pause(self) -> None:
         """Pause syncing and drop buffered events until resume."""
@@ -314,9 +342,7 @@ class SyncEngine:
                 self._category_cache = self.queue.get_all_categories()
             return self._category_cache.get(app_name)
 
-    # -----------------------------------------------------------------------
     # § 3  Configuration fetching
-    # -----------------------------------------------------------------------
 
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
@@ -328,9 +354,7 @@ class SyncEngine:
             logger.info("Server configuration applied")
 
             # Update activity analyzer thresholds from new config
-            self._activity_analyzer.update_thresholds(
-                self._create_engagement_thresholds()
-            )
+            self._activity_analyzer.update_thresholds(self._create_engagement_thresholds())
             self._activity_analyzer.update_fraud_config(self.config.fraud_detection)
 
             if self._on_config_updated:
@@ -340,9 +364,7 @@ class SyncEngine:
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
 
-    # -----------------------------------------------------------------------
     # § 4  Orchestration — main sync loop
-    # -----------------------------------------------------------------------
 
     def sync(self) -> SyncStats:
         """Perform a sync cycle.
@@ -536,9 +558,7 @@ class SyncEngine:
 
         return stats
 
-    # -----------------------------------------------------------------------
     # § 5  Source fetching
-    # -----------------------------------------------------------------------
 
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats
@@ -587,9 +607,7 @@ class SyncEngine:
             return [], None
         return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
 
-    def _get_afk_events_for_range(
-        self, start: datetime, end: datetime
-    ) -> list[AWEvent]:
+    def _get_afk_events_for_range(self, start: datetime, end: datetime) -> list[AWEvent]:
         """Fetch AFK events covering [start, end] from all AFK buckets.
 
         Looks back up to 10 minutes before ``start`` to catch AFK events
@@ -610,9 +628,7 @@ class SyncEngine:
         all_afk: list[AWEvent] = []
         for bucket in afk_buckets:
             try:
-                events = self.aw.get_events(
-                    bucket.id, start=lookback_start, end=end, limit=5000
-                )
+                events = self.aw.get_events(bucket.id, start=lookback_start, end=end, limit=5000)
                 if len(events) == 5000:
                     logger.warning(
                         f"AFK bucket {bucket.id} returned max 5000 events; "
@@ -625,9 +641,7 @@ class SyncEngine:
         all_afk.sort(key=lambda e: e.timestamp)
         return all_afk
 
-    # -----------------------------------------------------------------------
     # § 6  Transformation
-    # -----------------------------------------------------------------------
 
     def _transform_and_checkpoint(
         self,
@@ -668,7 +682,9 @@ class SyncEngine:
             # re-send when AW's duration catches up past what we sent.
             if prev_duration is not None and event.duration < prev_duration - 0.5:
                 with self._cache_lock:
-                    is_gap_filled = self._gap_filled_originals.get((bucket_id, event.id)) is not None
+                    is_gap_filled = (
+                        self._gap_filled_originals.get((bucket_id, event.id)) is not None
+                    )
                 if is_gap_filled:
                     stats.events_filtered += 1
                     continue
@@ -699,7 +715,8 @@ class SyncEngine:
             last_event = events[-1]  # sorted oldest-first, use newest for assessment
             total_active = sum(ev.get("duration", 0) for ev in transformed)
             fraud = self._activity_analyzer.get_fraud_assessment(
-                last_event.timestamp, app=last_event.app,
+                last_event.timestamp,
+                app=last_event.app,
                 active_seconds=total_active,
             )
             for ev in transformed:
@@ -811,8 +828,7 @@ class SyncEngine:
             active_ranges = ranges
         if not active_ranges:
             logger.info(
-                "Window event skipped after inactivity cutoff/AFK overlap: "
-                "event=%s->%s",
+                "Window event skipped after inactivity cutoff/AFK overlap: event=%s->%s",
                 event.timestamp.isoformat(),
                 event_end.isoformat(),
             )
@@ -938,7 +954,9 @@ class SyncEngine:
 
         # Reject non-finite durations (NaN/inf from corrupt AW data)
         if not math.isfinite(event.duration):
-            logger.warning(f"Skipping event id={event.id} with non-finite duration={event.duration}")
+            logger.warning(
+                f"Skipping event id={event.id} with non-finite duration={event.duration}"
+            )
             return None
 
         # Skip very short events.
@@ -988,7 +1006,7 @@ class SyncEngine:
                                 should_persist = True
                 if should_persist:
                     try:
-                        self.queue.set_category(app, category, source='fallback')
+                        self.queue.set_category(app, category, source="fallback")
                     except Exception as exc:
                         logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
                 if category:
@@ -1084,10 +1102,7 @@ class SyncEngine:
                     # a not-afk span, even if AFK doesn't fully cover start.
                     if not is_active:
                         probe_time = event_end - timedelta(milliseconds=1)
-                        is_active = (
-                            _status_at_fn(probe_time, self._current_afk_events)
-                            == "not-afk"
-                        )
+                        is_active = _status_at_fn(probe_time, self._current_afk_events) == "not-afk"
                     activity_state = "active" if is_active else "inactive"
                     if not is_active:
                         logger.debug(
@@ -1145,9 +1160,7 @@ class SyncEngine:
         return _overlap_range_fn(start, end, other_start, other_end)
 
     @staticmethod
-    def _is_active_during(
-        start: datetime, end: datetime, afk_events: list[AWEvent]
-    ) -> bool:
+    def _is_active_during(start: datetime, end: datetime, afk_events: list[AWEvent]) -> bool:
         """Check that the entire [start, end) interval is covered by not-afk."""
         return _is_active_during_fn(start, end, afk_events)
 
@@ -1171,9 +1184,7 @@ class SyncEngine:
         """Infer a coarse page category from URL/title."""
         return _infer_page_category_fn(url, title)
 
-    # -----------------------------------------------------------------------
     # § 7  Persistence / send
-    # -----------------------------------------------------------------------
 
     def _send_status_span(
         self,
@@ -1269,9 +1280,7 @@ class SyncEngine:
                         if failed:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
-                            stats.queued_bucket_ids.update(
-                                e.get("bucket_id", "") for e in failed
-                            )
+                            stats.queued_bucket_ids.update(e.get("bucket_id", "") for e in failed)
                     else:
                         # N11: server returned non-success without accepted_ids
                         logger.warning(
@@ -1280,9 +1289,7 @@ class SyncEngine:
                         )
                         self.queue.enqueue(batch)
                         stats.events_queued += len(batch)
-                        stats.queued_bucket_ids.update(
-                            e.get("bucket_id", "") for e in batch
-                        )
+                        stats.queued_bucket_ids.update(e.get("bucket_id", "") for e in batch)
                     if result.error:
                         stats.errors.append(result.error)
             except BetterFlowAuthError as e:
@@ -1293,9 +1300,7 @@ class SyncEngine:
                 for remaining in batches[i:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
-                    stats.queued_bucket_ids.update(
-                        e.get("bucket_id", "") for e in remaining
-                    )
+                    stats.queued_bucket_ids.update(e.get("bucket_id", "") for e in remaining)
                 stats.errors.append(f"Authentication error: {e}")
                 raise
             except BetterFlowClientError:
@@ -1303,9 +1308,7 @@ class SyncEngine:
                 for remaining in batches[i:]:
                     self.queue.enqueue(remaining)
                     stats.events_queued += len(remaining)
-                    stats.queued_bucket_ids.update(
-                        e.get("bucket_id", "") for e in remaining
-                    )
+                    stats.queued_bucket_ids.update(e.get("bucket_id", "") for e in remaining)
                 break
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
@@ -1347,8 +1350,11 @@ class SyncEngine:
                 elif result.accepted_ids:
                     # Partial success: remove accepted, increment retry on rest
                     accepted_set = set(result.accepted_ids)
-                    succeeded_ids = [eid for eid, ev in zip(event_ids, events)
-                                     if ev.get("id") in accepted_set or ev.get("id") is None]
+                    succeeded_ids = [
+                        eid
+                        for eid, ev in zip(event_ids, events)
+                        if ev.get("id") in accepted_set or ev.get("id") is None
+                    ]
                     failed_ids = [eid for eid in event_ids if eid not in succeeded_ids]
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
@@ -1376,7 +1382,9 @@ class SyncEngine:
         # 60s, 120s, 240s, 480s, max 600s (10 min)
         delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
         self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
+        logger.info(
+            f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})"
+        )
 
     def _send_heartbeat(self) -> None:
         """Send heartbeat to server and process commands."""
@@ -1407,9 +1415,7 @@ class SyncEngine:
             server_time_str = response.get("server_time")
             if server_time_str:
                 try:
-                    server_time = datetime.fromisoformat(
-                        server_time_str.replace("Z", "+00:00")
-                    )
+                    server_time = datetime.fromisoformat(server_time_str.replace("Z", "+00:00"))
                     if server_time.tzinfo is None:
                         server_time = server_time.replace(tzinfo=timezone.utc)
                     local_time = datetime.now(timezone.utc)
@@ -1438,9 +1444,7 @@ class SyncEngine:
         """
         return _version_below_fn(current, minimum)
 
-    # -----------------------------------------------------------------------
     # § 8  Status & lifecycle
-    # -----------------------------------------------------------------------
 
     def get_status(self) -> dict:
         """Get current sync status."""
@@ -1476,7 +1480,9 @@ class SyncEngine:
                 for bucket in fetcher():
                     bucket_ids.add(bucket.id)
             except (AWClientError, TypeError, AttributeError) as e:
-                logger.debug(f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}")
+                logger.debug(
+                    f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}"
+                )
 
         _collect(self.aw.get_window_buckets)
         _collect(self.aw.get_web_buckets)
@@ -1489,9 +1495,7 @@ class SyncEngine:
         for bucket_id in bucket_ids:
             self.queue.set_checkpoint(bucket_id, now)
 
-        logger.info(
-            f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
-        )
+        logger.info(f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}")
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active work time for today.

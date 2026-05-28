@@ -23,9 +23,8 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # URL helpers
-# ---------------------------------------------------------------------------
+
 
 def extract_domain(url: str) -> Optional[str]:
     """Extract domain from URL safely.
@@ -39,9 +38,7 @@ def extract_domain(url: str) -> Optional[str]:
         return None
 
 
-# ---------------------------------------------------------------------------
 # Page-category classification
-# ---------------------------------------------------------------------------
 
 # Each category resolves to a precompiled word-boundary regex. Earlier
 # entries win: "code" is checked before "review" so repo URLs aren't
@@ -79,9 +76,7 @@ def infer_page_category(url: Optional[str], title: Optional[str]) -> str:
     return "other"
 
 
-# ---------------------------------------------------------------------------
 # AFK / time-interval helpers
-# ---------------------------------------------------------------------------
 
 # Import AWEvent here to avoid a circular dependency at module level.
 # sync_engine → transform → aw_client (no cycle; aw_client has no local deps)
@@ -105,9 +100,7 @@ def overlap_range(
     return overlap_start, overlap_end
 
 
-def is_active_during(
-    start: datetime, end: datetime, afk_events: list[AWEvent]
-) -> bool:
+def is_active_during(start: datetime, end: datetime, afk_events: list[AWEvent]) -> bool:
     """Check that the entire [start, end) interval is covered by not-afk.
 
     Walks AFK events chronologically.  Returns False if any portion of the
@@ -149,9 +142,8 @@ def status_at(timestamp: datetime, afk_events: list[AWEvent]) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
 # Version comparison
-# ---------------------------------------------------------------------------
+
 
 def version_below(current: str, minimum: str) -> bool:
     """Compare semver-style version strings.
@@ -164,7 +156,5 @@ def version_below(current: str, minimum: str) -> bool:
         min_ = tuple(int(x.split("-")[0]) for x in minimum.split(".")[:3])
         return cur < min_
     except (ValueError, AttributeError):
-        logger.warning(
-            "Cannot parse version strings: current=%r, minimum=%r", current, minimum
-        )
+        logger.warning("Cannot parse version strings: current=%r, minimum=%r", current, minimum)
         return True

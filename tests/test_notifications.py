@@ -1,9 +1,9 @@
 """Tests for OS notification delivery."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from src.notifications import clear_notifications, send_notification
 import src.notifications as notifications_module
+from src.notifications import clear_notifications, send_notification
 
 
 class TestSendNotification:
@@ -45,9 +45,7 @@ class TestSendNotification:
     @patch("src.notifications._try_load_macos_pyobjc", return_value=True)
     @patch("src.notifications._send_macos_pyobjc", return_value=True)
     @patch("src.notifications._send_macos_osascript")
-    def test_macos_pyobjc_preferred(
-        self, mock_osascript, mock_pyobjc_send, _mock_try, _mock_sys
-    ):
+    def test_macos_pyobjc_preferred(self, mock_osascript, mock_pyobjc_send, _mock_try, _mock_sys):
         """When pyobjc is available, osascript path is skipped entirely."""
         send_notification("Title", "Body")
         mock_pyobjc_send.assert_called_once()
@@ -106,9 +104,7 @@ class TestClearNotifications:
     @patch("src.notifications.platform.system", return_value="Darwin")
     @patch("src.notifications._try_load_macos_pyobjc", return_value=False)
     @patch("src.notifications._clear_macos_pyobjc")
-    def test_macos_clear_noop_without_pyobjc(
-        self, mock_clear, _mock_try, _mock_sys
-    ):
+    def test_macos_clear_noop_without_pyobjc(self, mock_clear, _mock_try, _mock_sys):
         """With no pyobjc, clear is a no-op (can't clear Script Editor notifications)."""
         clear_notifications()
         mock_clear.assert_not_called()

@@ -67,6 +67,7 @@ def ensure_synced() -> None:
 
 # -- macOS: LaunchAgent plist --------------------------------------------------
 
+
 def _plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHAGENT_LABEL}.plist"
 
@@ -171,9 +172,7 @@ _WIN_VALUE_NAME = "BetterFlow"
 def _set_windows(enabled: bool) -> bool:
     import winreg
 
-    key = winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE
-    )
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE)
     try:
         if enabled:
             if not getattr(sys, "frozen", False):
@@ -196,9 +195,7 @@ def _get_windows() -> bool:
     import winreg
 
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_READ
-        )
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_READ)
         try:
             winreg.QueryValueEx(key, _WIN_VALUE_NAME)
             return True

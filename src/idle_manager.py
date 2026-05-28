@@ -141,6 +141,7 @@ class IdleManager:
             return None
         try:
             import subprocess as _sp
+
             out = _sp.check_output(
                 ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
                 timeout=5,
@@ -152,7 +153,9 @@ class IdleManager:
                     try:
                         return int(val) / 1_000_000_000
                     except ValueError:
-                        logger.debug(f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}")
+                        logger.debug(
+                            f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}"
+                        )
                         return None
         except Exception as e:
             logger.debug(f"_get_system_idle_seconds failed: {e}")

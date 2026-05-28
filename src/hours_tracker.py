@@ -3,7 +3,6 @@
 import logging
 import threading
 import time
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +89,9 @@ class HoursTracker:
             cache = {
                 "hours_this_week": self.format_hours(int(data.get("week_total_seconds", 0))),
                 "hours_this_month": self.format_hours(int(data.get("month_total_seconds", 0))),
-                "daily_avg_this_week": self.format_hours(int(data.get("week_daily_avg_seconds", 0))),
+                "daily_avg_this_week": self.format_hours(
+                    int(data.get("week_daily_avg_seconds", 0))
+                ),
             }
             with self._state_lock:
                 self._trends_cache = cache

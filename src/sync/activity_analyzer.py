@@ -4,7 +4,7 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 try:
@@ -155,7 +155,12 @@ class FraudSignalDetector:
             self._unique_apps.add(app)
 
         # Track mouse-only streaks: clicks > 0 but no presses, scrolls, or switches
-        if metrics.clicks > 0 and metrics.presses == 0 and metrics.scrolls == 0 and metrics.window_changes == 0:
+        if (
+            metrics.clicks > 0
+            and metrics.presses == 0
+            and metrics.scrolls == 0
+            and metrics.window_changes == 0
+        ):
             self._mouse_only_streak += 1
         else:
             self._mouse_only_streak = 0
@@ -510,7 +515,9 @@ class ActivityAnalyzer:
             self._fraud_detector.record_window_metrics(metrics, app=app)
             # Track active time for app diversity checks (inside guard to avoid double-counting)
             if metrics.is_engaged(self._thresholds):
-                actual = active_seconds if active_seconds > 0 else self._thresholds.window_minutes * 60
+                actual = (
+                    active_seconds if active_seconds > 0 else self._thresholds.window_minutes * 60
+                )
                 self._fraud_detector.add_active_time(actual)
             self._last_fraud_seq = self._fraud_seq
 
@@ -561,9 +568,7 @@ class ActivityAnalyzer:
             Number of window changes.
         """
         # Filter events in range
-        events_in_range = [
-            e for e in self._window_events if start <= e.timestamp <= end
-        ]
+        events_in_range = [e for e in self._window_events if start <= e.timestamp <= end]
 
         if len(events_in_range) < 2:
             return 0
@@ -574,10 +579,7 @@ class ActivityAnalyzer:
             curr = events_in_range[i]
 
             # Check if app changed
-            if prev.app != curr.app:
-                changes += 1
-            # Or if title changed (different task in same app)
-            elif prev.title != curr.title:
+            if prev.app != curr.app or prev.title != curr.title:
                 changes += 1
 
         return changes

@@ -12,12 +12,12 @@ import requests
 try:
     from .. import __version__
     from ..config import DEFAULT_API_URL, get_machine_uuid
-    from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from .http_client import BaseApiClient, BetterFlowAuthError, BetterFlowClientError
     from .retry import RetryConfig
 except ImportError:
-    from src import __version__
     from config import DEFAULT_API_URL, get_machine_uuid
-    from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from src import __version__
+    from sync.http_client import BaseApiClient, BetterFlowAuthError, BetterFlowClientError
     from sync.retry import RetryConfig
 
 __all__ = [
@@ -135,9 +135,7 @@ class BetterFlowClient(BaseApiClient):
             retry_config=retry_config,
         )
 
-    # =========================================================================
     # Authentication
-    # =========================================================================
 
     def exchange_code(
         self,
@@ -237,9 +235,7 @@ class BetterFlowClient(BaseApiClient):
             logger.warning("Revoke failed: %s", e)
             return False
 
-    # =========================================================================
     # Event Sync
-    # =========================================================================
 
     def send_events(self, events: list[dict]) -> SyncResult:
         """Send a batch of events to BetterFlow.
@@ -259,7 +255,8 @@ class BetterFlowClient(BaseApiClient):
             # the response (N1).
             idempotency_key = str(uuid.uuid4())
             response = self._request(
-                "POST", "events/batch",
+                "POST",
+                "events/batch",
                 data={"events": events},
                 compress=True,
                 extra_headers={"X-Idempotency-Key": idempotency_key},
@@ -299,7 +296,9 @@ class BetterFlowClient(BaseApiClient):
         Returns server commands (pause/deregister) and config update flag.
         """
         return self._request(
-            "POST", "heartbeat", data={
+            "POST",
+            "heartbeat",
+            data={
                 "agent_version": agent_version,
                 "timezone": self._detect_timezone(),
             },
@@ -311,7 +310,8 @@ class BetterFlowClient(BaseApiClient):
     def _detect_timezone() -> str:
         """Detect local IANA timezone name, falling back to UTC offset."""
         import os
-        from datetime import datetime, timezone as tz
+        from datetime import datetime
+        from datetime import timezone as tz
 
         # macOS/Linux: read /etc/localtime symlink
         try:
@@ -325,6 +325,7 @@ class BetterFlowClient(BaseApiClient):
         # Windows: use tzlocal if available
         try:
             from tzlocal import get_localzone
+
             return str(get_localzone())
         except ImportError:
             pass
@@ -341,9 +342,7 @@ class BetterFlowClient(BaseApiClient):
         """Get weekly/monthly trend summaries (non-critical, short timeout)."""
         return self._request("GET", "events/trends", retry=False, timeout_override=10)
 
-    # =========================================================================
     # Configuration
-    # =========================================================================
 
     def get_config(self) -> dict:
         """Get configuration from server."""

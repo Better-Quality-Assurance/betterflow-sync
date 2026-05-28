@@ -22,10 +22,12 @@ _IS_MACOS = platform.system() == "Darwin"
 # Whitelist of TCC services we will ever insert into TCC.db. Guards
 # grant_tcc_permissions() against accidental SQL injection if callers ever
 # route user input into the services list.
-_ALLOWED_TCC_SERVICES = frozenset({
-    "kTCCServiceAccessibility",
-    "kTCCServiceListenEvent",
-})
+_ALLOWED_TCC_SERVICES = frozenset(
+    {
+        "kTCCServiceAccessibility",
+        "kTCCServiceListenEvent",
+    }
+)
 
 # Reverse-DNS bundle ID format (letters, digits, dots, hyphens, underscores).
 _BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$")
@@ -60,9 +62,7 @@ def check_accessibility() -> bool:
         import ctypes
         import ctypes.util
 
-        lib = ctypes.cdll.LoadLibrary(
-            ctypes.util.find_library("ApplicationServices")
-        )
+        lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
         lib.AXIsProcessTrusted.restype = ctypes.c_bool
         if lib.AXIsProcessTrusted():
             return True
@@ -74,8 +74,14 @@ def check_accessibility() -> bool:
     # AXIsProcessTrusted() lies (Rosetta/unsigned binary edge case).
     try:
         result = subprocess.run(
-            ["osascript", "-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
-            capture_output=True, text=True, timeout=3,
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to get name of first process whose frontmost is true',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         if result.returncode == 0 and result.stdout.strip():
             logger.debug("AXIsProcessTrusted=False but AppleScript works, treating as granted")
@@ -120,10 +126,12 @@ def open_accessibility_settings() -> None:
         return
 
     try:
-        subprocess.Popen([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        ])
+        subprocess.Popen(
+            [
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            ]
+        )
     except Exception as e:
         logger.warning(f"Failed to open Accessibility settings: {e}")
 
@@ -134,10 +142,12 @@ def open_input_monitoring_settings() -> None:
         return
 
     try:
-        subprocess.Popen([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
-        ])
+        subprocess.Popen(
+            [
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+            ]
+        )
     except Exception as e:
         logger.warning(f"Failed to open Input Monitoring settings: {e}")
 
@@ -214,16 +224,18 @@ def grant_tcc_permissions() -> bool:
 
     # Use osascript to show the native admin password prompt and run sqlite3 as root
     script = (
-        f'do shell script '
+        f"do shell script "
         f'"sqlite3 \\"/Library/Application Support/com.apple.TCC/TCC.db\\" '
         f'\\"{sql}\\"" '
-        f'with administrator privileges'
+        f"with administrator privileges"
     )
 
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         if result.returncode == 0:
             logger.info("TCC permissions granted via admin auth")

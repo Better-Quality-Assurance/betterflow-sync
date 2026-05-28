@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,11 +20,15 @@ try:
     from .__init__ import __version__
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
+    from .break_manager import BreakManager
     from .config import Config, setup_logging
     from .display_info import start_display_tracker
+    from .hours_tracker import HoursTracker
+    from .idle_manager import IdleManager
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError
+    from .system_event_handler import SystemEventHandler
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -33,20 +37,20 @@ try:
     )
     from .ui.tray import TrayIcon, TrayState
     from .update_checker import check_for_update
-    from .break_manager import BreakManager
-    from .idle_manager import IdleManager
-    from .hours_tracker import HoursTracker
     from .update_handler import UpdateHandler
-    from .system_event_handler import SystemEventHandler
 except ImportError:
-    from src import __version__
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
+    from break_manager import BreakManager
     from config import Config, setup_logging
     from display_info import start_display_tracker
+    from hours_tracker import HoursTracker
+    from idle_manager import IdleManager
     from reminders import ReminderManager
+    from src import __version__
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError
+    from system_event_handler import SystemEventHandler
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -55,17 +59,13 @@ except ImportError:
     )
     from ui.tray import TrayIcon, TrayState
     from update_checker import check_for_update
-    from break_manager import BreakManager
-    from idle_manager import IdleManager
-    from hours_tracker import HoursTracker
     from update_handler import UpdateHandler
-    from system_event_handler import SystemEventHandler
 
 # Import send_notification at module level so tests can patch src.main.send_notification
 try:
-    from .notifications import send_notification, clear_notifications
+    from .notifications import clear_notifications, send_notification
 except ImportError:
-    from notifications import send_notification, clear_notifications  # type: ignore[no-redef]
+    from notifications import clear_notifications, send_notification  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,7 @@ def _day_greeting() -> str:
     elif day >= 5:
         return "Enjoy your weekend!"
     return "Have a productive day!"
+
 
 # Resolve version string once (handles both str and module forms from PyInstaller)
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
@@ -208,9 +209,7 @@ class SyncCoordinator:
                 replace_existing=True,
             )
             self.scheduler.start()
-            logger.info(
-                f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
-            )
+            logger.info(f"Sync loop started (interval: {self.config.sync.interval_seconds}s)")
 
         now = datetime.now(timezone.utc)
         self.scheduler.add_job(
@@ -268,11 +267,15 @@ class SyncCoordinator:
             # Auto-select when there's exactly one project and none is active
             if not current_project and len(projects) == 1:
                 current_project = projects[0]
-                logger.info(f"Auto-selected sole project: {current_project.get('name', '<unnamed>')}")
+                logger.info(
+                    f"Auto-selected sole project: {current_project.get('name', '<unnamed>')}"
+                )
             self.tray.set_projects(projects, current_project=current_project)
             if current_project:
                 self.sync_engine.set_current_project(current_project)
-            logger.info(f"Loaded {len(projects)} projects (active: {current_project.get('name') if current_project else 'none'})")
+            logger.info(
+                f"Loaded {len(projects)} projects (active: {current_project.get('name') if current_project else 'none'})"
+            )
         except Exception as e:
             logger.warning(f"Failed to fetch projects: {e}")
 
@@ -289,8 +292,12 @@ class SyncCoordinator:
             has_accessibility = check_accessibility()
             granted = has_accessibility
             high_priority = (
-                TrayState.PAUSED, TrayState.PRIVATE, TrayState.ON_BREAK,
-                TrayState.ERROR, TrayState.QUEUE_WARNING, TrayState.QUEUED,
+                TrayState.PAUSED,
+                TrayState.PRIVATE,
+                TrayState.ON_BREAK,
+                TrayState.ERROR,
+                TrayState.QUEUE_WARNING,
+                TrayState.QUEUED,
                 TrayState.WAITING_AUTH,
             )
             with self.tray.model.lock:
@@ -367,7 +374,9 @@ class SyncCoordinator:
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
-            logger.error("_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE)
+            logger.error(
+                "_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE
+            )
             try:
                 self.bf.reset_session()
                 self.aw.reset_session()
@@ -443,11 +452,7 @@ class SyncCoordinator:
             )
 
             if stats.events_sent > 0 or stats.events_queued > 0:
-                gaps_info = (
-                    f", {stats.gaps_filled} gaps filled"
-                    if stats.gaps_filled > 0
-                    else ""
-                )
+                gaps_info = f", {stats.gaps_filled} gaps filled" if stats.gaps_filled > 0 else ""
                 logger.info(
                     f"Sync complete: {stats.events_sent} sent, "
                     f"{stats.events_queued} queued, {stats.events_filtered} filtered"
@@ -457,9 +462,7 @@ class SyncCoordinator:
         except BetterFlowAuthError as e:
             logger.warning(f"Auth error during sync: {e} — triggering re-login")
             self.logged_in = False
-            self.tray.set_state(
-                TrayState.WAITING_AUTH, "Session expired, re-login required"
-            )
+            self.tray.set_state(TrayState.WAITING_AUTH, "Session expired, re-login required")
             if self._on_auth_error:
                 self._on_auth_error()
         except Exception as e:
@@ -493,6 +496,7 @@ class SyncCoordinator:
             self.queue.expire_old(max_age_days=30)
         except Exception as e:
             logger.debug(f"Failed to expire old queue events: {e}")
+
 
 class BetterFlowApp:
     """Main application orchestrator.
@@ -544,11 +548,11 @@ class BetterFlowApp:
         self.input_watcher = None
         if sys.platform == "darwin":
             try:
-                from .sync.macos_window_watcher import MacOSWindowWatcher
                 from .sync.macos_input_watcher import MacOSInputWatcher
+                from .sync.macos_window_watcher import MacOSWindowWatcher
             except ImportError:
-                from sync.macos_window_watcher import MacOSWindowWatcher
                 from sync.macos_input_watcher import MacOSInputWatcher
+                from sync.macos_window_watcher import MacOSWindowWatcher
             self.window_watcher = MacOSWindowWatcher(self.aw)
             self.input_watcher = MacOSInputWatcher(self.aw)
             self.aw_manager.disable_component("bf-window-tracker")
@@ -928,7 +932,9 @@ class BetterFlowApp:
         self.sync_engine.pause()
         self.tray.set_paused(True)
         self.reminder_manager.on_tracking_stopped()
-        send_notification("Tracking Paused", "Your activity is no longer being recorded.", sound=False)
+        send_notification(
+            "Tracking Paused", "Your activity is no longer being recorded.", sound=False
+        )
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
@@ -958,7 +964,9 @@ class BetterFlowApp:
             self.tray.set_paused(True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
-            send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
+            send_notification(
+                "Private Time", "Tracking is paused — your activity is private.", sound=False
+            )
         else:
             logger.info("Private time ended — recording resumed")
             self._set_user_paused(False)
@@ -1046,6 +1054,7 @@ class BetterFlowApp:
                 config_file = Config.get_config_file()
                 if config_file.exists():
                     import json
+
                     with open(config_file) as f:
                         cfg = json.load(f)
                     # Redact sensitive fields
@@ -1056,6 +1065,7 @@ class BetterFlowApp:
 
             # Open the containing folder
             import subprocess
+
             if sys.platform == "darwin":
                 subprocess.Popen(["open", "-R", str(zip_path)])
             elif sys.platform == "win32":
@@ -1124,6 +1134,7 @@ class BetterFlowApp:
         All work is offloaded to a background thread so the tray callback
         (main thread on macOS) is never blocked for more than a few ms.
         """
+
         def _do_logout() -> None:
             # Phase 1 — shutdown (lock held).
             # Acquire login lock to prevent a concurrent _on_login thread from
@@ -1285,9 +1296,7 @@ class SingleInstanceLock:
         """Try to acquire the lock. Returns True on success."""
         if self._path is None:
             try:
-                self._path = os.path.join(
-                    Config.get_config_dir(), ".betterflow.lock"
-                )
+                self._path = os.path.join(Config.get_config_dir(), ".betterflow.lock")
             except Exception:
                 return True  # fail open - don't block startup
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
@@ -1295,9 +1304,11 @@ class SingleInstanceLock:
         try:
             if sys.platform == "win32":
                 import msvcrt
+
                 msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(self._file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self._file.seek(0)
             self._file.truncate(0)
@@ -1315,12 +1326,14 @@ class SingleInstanceLock:
             try:
                 if sys.platform == "win32":
                     import msvcrt
+
                     try:
                         msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
                     except OSError as e:
                         logger.debug("msvcrt unlock failed: %s", e)
                 else:
                     import fcntl
+
                     fcntl.flock(self._file, fcntl.LOCK_UN)
                 self._file.close()
                 os.unlink(self._path)

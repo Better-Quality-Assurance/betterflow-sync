@@ -15,7 +15,7 @@ try:
     from .. import __version__
 except ImportError:
     from src import __version__
-from .retry import RetryConfig, retry_with_backoff, RetryExhausted
+from .retry import RetryConfig, RetryExhausted, retry_with_backoff
 
 __all__ = [
     "BaseApiClient",
@@ -233,9 +233,7 @@ class BaseApiClient:
                 cause = e.__cause__
                 while cause is not None:
                     if isinstance(cause, socket.gaierror):
-                        raise BetterFlowClientError(
-                            f"DNS resolution failed: {cause}"
-                        ) from e
+                        raise BetterFlowClientError(f"DNS resolution failed: {cause}") from e
                     cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
                 raise _TransientError("Cannot connect to BetterFlow API")
             except requests.exceptions.ChunkedEncodingError:

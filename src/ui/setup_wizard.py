@@ -4,6 +4,7 @@ A polished onboarding wizard: Welcome → Browser login → Success.
 Runs only when config.setup_complete is False.
 """
 
+import itertools
 import logging
 import platform
 import sys
@@ -12,7 +13,6 @@ import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import itertools
 
 from PIL import Image, ImageTk
 
@@ -155,7 +155,9 @@ class SetupWizard:
         self._login_manager.cancel_login()
         self._window.destroy()
 
-    def _make_button(self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True) -> str:
+    def _make_button(
+        self, text: str, command: callable, x: int, y: int, width: int = 248, primary: bool = True
+    ) -> str:
         """Create a cross-platform canvas button (macOS tk.Button ignores custom bg)."""
         bg = PRIMARY_COLOR if primary else ACCENT_COLOR
         hover_bg = PRIMARY_HOVER if primary else "#362654"
@@ -166,7 +168,15 @@ class SetupWizard:
         tag = f"btn_{next(self._button_id)}"
 
         rect_id = self._create_rounded_rect(
-            x1, y1, x2, y2, radius=BTN_BORDER_RADIUS, fill=bg, outline=border, width=1, tags=(tag, "btn")
+            x1,
+            y1,
+            x2,
+            y2,
+            radius=BTN_BORDER_RADIUS,
+            fill=bg,
+            outline=border,
+            width=1,
+            tags=(tag, "btn"),
         )
         self._canvas.create_text(
             x, y, text=text, font=FONT_BUTTON, fill=text_color, tags=(tag, "btn")
@@ -187,21 +197,35 @@ class SetupWizard:
         self._canvas.tag_bind(tag, "<Button-1>", lambda _event: self._window.after(1, command))
         return tag
 
-    def _create_rounded_rect(self, x1: int, y1: int, x2: int, y2: int, radius: int = 10, **kwargs) -> int:
+    def _create_rounded_rect(
+        self, x1: int, y1: int, x2: int, y2: int, radius: int = 10, **kwargs
+    ) -> int:
         """Draw a rounded rectangle on canvas and return item id."""
         points = [
-            x1 + radius, y1,
-            x2 - radius, y1,
-            x2, y1,
-            x2, y1 + radius,
-            x2, y2 - radius,
-            x2, y2,
-            x2 - radius, y2,
-            x1 + radius, y2,
-            x1, y2,
-            x1, y2 - radius,
-            x1, y1 + radius,
-            x1, y1,
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
         ]
         return self._canvas.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
 
@@ -233,13 +257,15 @@ class SetupWizard:
         self._draw_card_shell()
         cx = WINDOW_WIDTH // 2
         self._canvas.create_text(
-            cx, 126,
+            cx,
+            126,
             text=title,
             font=FONT_TITLE,
             fill=TEXT_COLOR,
         )
         self._canvas.create_text(
-            cx, 160,
+            cx,
+            160,
             text=subtitle,
             font=FONT_SUBTITLE,
             fill=TEXT_MUTED,
@@ -267,11 +293,11 @@ class SetupWizard:
             # Fallback: text logo
             r = 44
             self._canvas.create_oval(
-                cx - r, logo_y - r, cx + r, logo_y + r,
-                fill=PRIMARY_COLOR, outline=""
+                cx - r, logo_y - r, cx + r, logo_y + r, fill=PRIMARY_COLOR, outline=""
             )
             self._canvas.create_text(
-                cx, logo_y,
+                cx,
+                logo_y,
                 text="B",
                 font=(FONT_FAMILY, 32, "bold"),
                 fill="#ffffff",
@@ -279,7 +305,8 @@ class SetupWizard:
 
         # Description
         self._canvas.create_text(
-            cx, 332,
+            cx,
+            332,
             text=(
                 "Runs in your menu bar, captures activity on-device,\n"
                 "and syncs private summaries to BetterFlow."
@@ -290,7 +317,8 @@ class SetupWizard:
         )
 
         self._canvas.create_text(
-            cx, 384,
+            cx,
+            384,
             text="The next step opens your browser for secure sign-in.",
             font=FONT_SMALL,
             fill="#9a87c4",
@@ -314,7 +342,8 @@ class SetupWizard:
 
         # Subtitle
         self._status_id = self._canvas.create_text(
-            cx, 332,
+            cx,
+            332,
             text="Your browser is opening now. Complete sign-in there.",
             font=FONT_BODY,
             fill=TEXT_MUTED,
@@ -328,9 +357,11 @@ class SetupWizard:
         def do_login():
             try:
                 state = self._login_manager.login_via_browser()
-            except Exception as exc:
+            except Exception:
                 logger.exception("Login thread raised unexpectedly")
-                state = LoginState(logged_in=False, error="An unexpected error occurred. Please try again.")
+                state = LoginState(
+                    logged_in=False, error="An unexpected error occurred. Please try again."
+                )
             if self._closing:
                 return
             try:
@@ -348,7 +379,10 @@ class SetupWizard:
         r = SPINNER_RADIUS
         self._canvas.delete("spinner")
         self._canvas.create_arc(
-            cx - r, cy - r, cx + r, cy + r,
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
             start=self._spinner_angle,
             extent=80,
             style=tk.ARC,
@@ -358,7 +392,10 @@ class SetupWizard:
         )
         # Background ring (reuse r from above)
         self._canvas.create_arc(
-            cx - r, cy - r, cx + r, cy + r,
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
             start=0,
             extent=359,
             style=tk.ARC,
@@ -378,7 +415,10 @@ class SetupWizard:
             self._spinner_angle = (self._spinner_angle + 10) % 360
             r = SPINNER_RADIUS
             self._canvas.create_arc(
-                cx - r, cy - r, cx + r, cy + r,
+                cx - r,
+                cy - r,
+                cx + r,
+                cy + r,
                 start=self._spinner_angle,
                 extent=80,
                 style=tk.ARC,
@@ -414,19 +454,18 @@ class SetupWizard:
 
         # Error icon
         r = 35
-        self._canvas.create_oval(
-            cx - r, 250 - r, cx + r, 250 + r,
-            fill=ERROR_COLOR, outline=""
-        )
+        self._canvas.create_oval(cx - r, 250 - r, cx + r, 250 + r, fill=ERROR_COLOR, outline="")
         self._canvas.create_text(
-            cx, 250,
+            cx,
+            250,
             text="!",
             font=(FONT_FAMILY, 34, "bold"),
             fill=BTN_TEXT,
         )
 
         self._canvas.create_text(
-            cx, 332,
+            cx,
+            332,
             text=error,
             font=FONT_BODY,
             fill=TEXT_MUTED,
@@ -445,12 +484,10 @@ class SetupWizard:
 
         # Success checkmark circle
         r = 35
-        self._canvas.create_oval(
-            cx - r, 240 - r, cx + r, 240 + r,
-            fill=SUCCESS_COLOR, outline=""
-        )
+        self._canvas.create_oval(cx - r, 240 - r, cx + r, 240 + r, fill=SUCCESS_COLOR, outline="")
         self._canvas.create_text(
-            cx, 238,
+            cx,
+            238,
             text="\u2713",
             font=(FONT_FAMILY, 33, "bold"),
             fill=BTN_TEXT,
@@ -459,7 +496,8 @@ class SetupWizard:
         # Email
         if email:
             self._canvas.create_text(
-                cx, 304,
+                cx,
+                304,
                 text=f"Signed in as {email}",
                 font=(FONT_FAMILY, 12, "bold"),
                 fill=SUCCESS_COLOR,
@@ -467,7 +505,8 @@ class SetupWizard:
 
         # Description
         self._canvas.create_text(
-            cx, 352,
+            cx,
+            352,
             text=(
                 "BetterFlow will now run in your menu bar.\n"
                 "It will automatically track and sync your activity."

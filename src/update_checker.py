@@ -123,7 +123,9 @@ def check_for_update(
         try:
             effective_channel = channel
             if effective_channel not in UPDATE_CHANNELS:
-                logger.warning(f"Unknown update channel '{effective_channel}', defaulting to 'stable'")
+                logger.warning(
+                    f"Unknown update channel '{effective_channel}', defaulting to 'stable'"
+                )
                 effective_channel = "stable"
 
             if effective_channel == "stable":

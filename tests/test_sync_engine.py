@@ -1,17 +1,16 @@
 """Tests for sync engine."""
 
 import threading
-import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
 
-from src.config import Config, PrivacySettings
-from src.sync.aw_client import AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT
-from src.sync.sync_engine import SyncEngine
-from src.sync.activity_analyzer import ActivityAnalyzer
-from src.sync.daily_time_tracker import DailyTimeTracker
+from src.config import Config
 from src.main import SyncCoordinator
 from src.reminders import ReminderManager
+from src.sync.activity_analyzer import ActivityAnalyzer
+from src.sync.aw_client import BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT, BUCKET_TYPE_WINDOW, AWEvent
+from src.sync.daily_time_tracker import DailyTimeTracker
+from src.sync.sync_engine import SyncEngine
 from src.ui.tray import TrayState
 
 
@@ -390,7 +389,9 @@ class TestSyncEngine:
         self.engine._category_cache = None
 
         event = AWEvent(
-            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
             data={"app": "Claude", "title": "Chat"},
         )
         result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
@@ -403,7 +404,9 @@ class TestSyncEngine:
         self.engine._category_cache = None
 
         event = AWEvent(
-            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
             data={"app": "Claude", "title": "Chat"},
         )
         self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
@@ -560,7 +563,12 @@ class TestSyncEngine:
         now = datetime.now(timezone.utc)
         # AFK says user is active during this window
         self.engine._current_afk_events = [
-            AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "not-afk"}),
+            AWEvent(
+                id=10,
+                timestamp=now - timedelta(seconds=10),
+                duration=120,
+                data={"status": "not-afk"},
+            ),
         ]
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
 
@@ -577,7 +585,9 @@ class TestSyncEngine:
         now = datetime.now(timezone.utc)
         # AFK says user is idle during this window
         self.engine._current_afk_events = [
-            AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "afk"}),
+            AWEvent(
+                id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "afk"}
+            ),
         ]
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
 
@@ -598,7 +608,9 @@ class TestSyncEngine:
         self.engine._current_afk_events = []
         self.engine._afk_watcher_available = False
         event = AWEvent(
-            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
             data={"app": "Firefox", "title": "Test"},
         )
 
@@ -617,7 +629,9 @@ class TestSyncEngine:
         self.engine._current_afk_events = []
         self.engine._afk_watcher_available = True
         event = AWEvent(
-            id=1, timestamp=datetime.now(timezone.utc), duration=60,
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
             data={"app": "Firefox", "title": "Test"},
         )
 
@@ -797,7 +811,9 @@ class TestSyncEngine:
 
         # _cache_lock should have been acquired for _time_cache operations
         # _transform_event accesses _time_cache when activity_state is "active"
-        assert acquire_count >= 1, f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"
+        assert acquire_count >= 1, (
+            f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"
+        )
 
 
 class TestSyncCoordinatorBreak:
@@ -849,7 +865,9 @@ class TestSyncCoordinatorBreak:
     def test_end_break_clears_flag(self):
         """end_break clears _on_break."""
         self.coordinator.break_mgr._on_break = True
-        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(
+            seconds=120
+        )
         self.coordinator.break_mgr._pre_break_paused = False
         self.coordinator.break_mgr._pre_break_private = False
         self.coordinator.end_break()
@@ -859,7 +877,9 @@ class TestSyncCoordinatorBreak:
     def test_end_break_restores_paused_state(self):
         """end_break should not resume if app was paused before break."""
         self.coordinator.break_mgr._on_break = True
-        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(
+            seconds=120
+        )
         self.coordinator.break_mgr._pre_break_paused = True
         self.coordinator.break_mgr._pre_break_private = False
 
@@ -876,7 +896,9 @@ class TestSyncCoordinatorBreak:
         This ensures both flags are consistent: paused=False, private=True.
         """
         self.coordinator.break_mgr._on_break = True
-        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(
+            seconds=120
+        )
         self.coordinator.break_mgr._pre_break_paused = False
         self.coordinator.break_mgr._pre_break_private = True
 
@@ -889,7 +911,9 @@ class TestSyncCoordinatorBreak:
     def test_end_break_silent_no_notification(self):
         """end_break(silent=True) should not send notification."""
         self.coordinator.break_mgr._on_break = True
-        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(seconds=120)
+        self.coordinator.break_mgr._break_start = datetime.now(timezone.utc) - timedelta(
+            seconds=120
+        )
         self.coordinator.break_mgr._pre_break_paused = False
         self.coordinator.break_mgr._pre_break_private = False
 
@@ -940,7 +964,9 @@ class TestConfigDefaultCategories:
     def test_save_load_roundtrip_restores_default_categories(self, tmp_path, monkeypatch):
         """default_categories must come from dataclass defaults, not config.json."""
         monkeypatch.setattr(Config, "get_config_dir", classmethod(lambda cls: tmp_path))
-        monkeypatch.setattr(Config, "get_config_file", classmethod(lambda cls: tmp_path / "config.json"))
+        monkeypatch.setattr(
+            Config, "get_config_file", classmethod(lambda cls: tmp_path / "config.json")
+        )
         config = Config()
         assert "Claude" in config.privacy.default_categories
         config.save()

@@ -2,27 +2,26 @@
 
 import gzip
 import json
-import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch
 
+import pytest
 import requests.exceptions
 import responses
-from responses import matchers
 
 from src.sync.bf_client import (
+    BetterFlowAuthError,
     BetterFlowClient,
     BetterFlowClientError,
-    BetterFlowAuthError,
     DeviceInfo,
-    AuthResult,
-    SyncResult,
 )
 
 
 class TestDeviceInfo:
     """Tests for DeviceInfo dataclass."""
 
-    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    @patch(
+        "src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666"
+    )
     def test_collect(self, _mock_uuid):
         """Test collecting device information including machine_id."""
         info = DeviceInfo.collect(agent_version="1.2.3")
@@ -36,6 +35,7 @@ class TestDeviceInfo:
     def test_to_dict(self):
         """Test converting to dictionary."""
         from dataclasses import asdict
+
         info = DeviceInfo(
             hostname="test-host",
             os_name="Darwin",
@@ -51,13 +51,17 @@ class TestDeviceInfo:
         assert result["agent_version"] == "1.0.0"
         assert result["machine_id"] == "test-uuid"
 
-    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    @patch(
+        "src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666"
+    )
     def test_collect_uses_persistent_uuid(self, _mock_uuid):
         """Test collect() resolves machine_id from the persistent UUID."""
         info = DeviceInfo.collect()
         assert info.machine_id == "aaaabbbb-1111-2222-3333-444455556666"
 
-    @patch("src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666")
+    @patch(
+        "src.sync.bf_client.get_machine_uuid", return_value="aaaabbbb-1111-2222-3333-444455556666"
+    )
     def test_machine_id_stable_across_hostname_changes(self, _mock_uuid):
         """Test machine_id stays the same when hostname changes."""
         with patch("src.sync.bf_client.platform.node", return_value="MacBookPro"):
@@ -67,18 +71,23 @@ class TestDeviceInfo:
         assert info_a.hostname != info_b.hostname
         assert info_a.machine_id == info_b.machine_id
 
-
-    @pytest.mark.parametrize("os_name,expected_key", [
-        ("Darwin", "darwin"),
-        ("Windows", "win32"),
-        ("Linux", "linux"),
-        ("FreeBSD", "linux"),  # Unknown OS falls back to linux
-    ])
+    @pytest.mark.parametrize(
+        "os_name,expected_key",
+        [
+            ("Darwin", "darwin"),
+            ("Windows", "win32"),
+            ("Linux", "linux"),
+            ("FreeBSD", "linux"),  # Unknown OS falls back to linux
+        ],
+    )
     def test_platform_key_mapping(self, os_name, expected_key):
         """Test platform_key maps OS names correctly."""
         info = DeviceInfo(
-            hostname="test", os_name=os_name, os_version="1.0",
-            agent_version="1.0.0", machine_id="test-uuid",
+            hostname="test",
+            os_name=os_name,
+            os_version="1.0",
+            agent_version="1.0.0",
+            machine_id="test-uuid",
         )
         assert info.platform_key == expected_key
 
@@ -272,8 +281,7 @@ class TestBetterFlowClient:
         )
 
         events = [
-            {"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}
-            for _ in range(5)
+            {"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}} for _ in range(5)
         ]
         result = self.client.send_events(events)
 
@@ -292,6 +300,7 @@ class TestBetterFlowClient:
     @responses.activate
     def test_send_events_with_compression(self):
         """Test events are gzip compressed."""
+
         def check_gzip(request):
             assert request.headers.get("Content-Encoding") == "gzip"
             # Decompress and verify
@@ -391,6 +400,7 @@ class TestBetterFlowClient:
     @responses.activate
     def test_exchange_code_with_pkce_verifier(self):
         """Test code exchange includes PKCE verifier."""
+
         def check_verifier(request):
             data = json.loads(request.body)
             assert data["code_verifier"] == "pkce-verifier-123"
@@ -409,9 +419,12 @@ class TestBetterFlowClient:
         )
 
     @responses.activate
-    @patch("src.sync.bf_client.get_machine_uuid", return_value="aabbccdd-1111-4222-8333-444455556666")
+    @patch(
+        "src.sync.bf_client.get_machine_uuid", return_value="aabbccdd-1111-4222-8333-444455556666"
+    )
     def test_exchange_code_sends_hostname_and_machine_uuid(self, _mock_uuid):
         """Test exchange_code payload includes hostname and UUID-based machine_id."""
+
         def check_payload(request):
             data = json.loads(request.body)
             assert "hostname" in data, "hostname missing from payload"
@@ -436,7 +449,9 @@ class TestBetterFlowClient:
             status=401,
         )
 
-        result = self.client.exchange_code(code="bad-code", device_name="device", code_verifier="verifier")
+        result = self.client.exchange_code(
+            code="bad-code", device_name="device", code_verifier="verifier"
+        )
 
         assert result.success is False
         assert "Invalid" in result.error
@@ -450,7 +465,9 @@ class TestBetterFlowClient:
             body=requests.exceptions.ConnectionError("Connection refused"),
         )
 
-        result = self.client.exchange_code(code="code", device_name="device", code_verifier="verifier")
+        result = self.client.exchange_code(
+            code="code", device_name="device", code_verifier="verifier"
+        )
 
         assert result.success is False
         assert "connect" in result.error.lower()
@@ -581,6 +598,7 @@ class TestRetryBehavior:
     def setup_method(self):
         """Set up test fixtures."""
         from src.sync.retry import RetryConfig
+
         # Fast retries for testing
         self.fast_retry = RetryConfig(
             max_retries=2,

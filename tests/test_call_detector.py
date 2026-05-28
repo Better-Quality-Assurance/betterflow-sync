@@ -125,14 +125,20 @@ class TestCallDetector:
         detector = CallDetector(min_duration=10)
 
         result = detector.process_event(
-            "Google Chrome", "Meeting - Google Meet",
-            "https://meet.google.com/abc-defg-hij", _ts(0), 5.0
+            "Google Chrome",
+            "Meeting - Google Meet",
+            "https://meet.google.com/abc-defg-hij",
+            _ts(0),
+            5.0,
         )
         assert result is None
 
         result = detector.process_event(
-            "Google Chrome", "Meeting - Google Meet",
-            "https://meet.google.com/abc-defg-hij", _ts(5), 300.0
+            "Google Chrome",
+            "Meeting - Google Meet",
+            "https://meet.google.com/abc-defg-hij",
+            _ts(5),
+            300.0,
         )
         assert result is None
 
@@ -218,16 +224,12 @@ class TestCallDetector:
         detector.process_event("zoom.us", "Zoom Meeting", None, _ts(5), 300.0)
 
         # Switch to Teams call
-        result = detector.process_event(
-            "Microsoft Teams", "Meeting with Bob", None, _ts(10), 5.0
-        )
+        result = detector.process_event("Microsoft Teams", "Meeting with Bob", None, _ts(10), 5.0)
         assert result is not None
         assert result.app == "Zoom"
 
         # Teams call is now active; add more events so it exceeds min_duration
-        detector.process_event(
-            "Microsoft Teams", "Meeting with Bob", None, _ts(15), 300.0
-        )
+        detector.process_event("Microsoft Teams", "Meeting with Bob", None, _ts(15), 300.0)
         result = detector.flush()
         assert result is not None
         assert result.app == "Microsoft Teams"
@@ -293,7 +295,9 @@ class TestSyncEngineCallIntegration:
             to_dict=lambda: {"presses": 0, "clicks": 0, "scrolls": 0, "window_changes": 0}
         )
         self.activity_analyzer.get_fraud_assessment.return_value = Mock(
-            score=0, signals=[], extra_metrics={"unique_apps": 0, "keystroke_variance": None},
+            score=0,
+            signals=[],
+            extra_metrics={"unique_apps": 0, "keystroke_variance": None},
         )
 
         self.time_tracker = Mock(spec=DailyTimeTracker)
@@ -313,11 +317,14 @@ class TestSyncEngineCallIntegration:
 
     def test_call_detector_none_when_disabled(self):
         from src.sync.sync_engine import SyncEngine
+
         config = Config()
         config.call_detection.enabled = False
 
         engine = SyncEngine(
-            aw=self.aw, bf=self.bf, queue=self.queue,
+            aw=self.aw,
+            bf=self.bf,
+            queue=self.queue,
             config=config,
             activity_analyzer=self.activity_analyzer,
             time_tracker=self.time_tracker,
@@ -343,8 +350,11 @@ class TestSyncEngineCallIntegration:
     def test_make_call_bf_event_with_project(self):
         self.engine.set_current_project({"id": 42, "name": "Test"})
         ce = CallEvent(
-            app="Google Meet", start=_ts(0), end=_ts(30),
-            duration=1800.0, call_type="browser",
+            app="Google Meet",
+            start=_ts(0),
+            end=_ts(30),
+            duration=1800.0,
+            call_type="browser",
         )
         result = self.engine._make_call_bf_event(ce)
         assert result["project_id"] == 42

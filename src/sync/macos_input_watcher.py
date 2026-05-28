@@ -77,9 +77,8 @@ class MacOSInputWatcher:
     @property
     def is_running(self) -> bool:
         """True if threads are alive."""
-        return (
-            (self._tap_thread is not None and self._tap_thread.is_alive())
-            or (self._emit_thread is not None and self._emit_thread.is_alive())
+        return (self._tap_thread is not None and self._tap_thread.is_alive()) or (
+            self._emit_thread is not None and self._emit_thread.is_alive()
         )
 
     def start(self) -> bool:
@@ -92,9 +91,9 @@ class MacOSInputWatcher:
         try:
             from Quartz import (  # noqa: F401
                 CGEventTapCreate,
-                kCGSessionEventTap,
-                kCGHeadInsertEventTap,
                 kCGEventTapOptionListenOnly,
+                kCGHeadInsertEventTap,
+                kCGSessionEventTap,
             )
         except ImportError:
             logger.warning("Quartz not available — input tracking disabled")
@@ -133,16 +132,19 @@ class MacOSInputWatcher:
         self._tap_ref = None
 
         self._tap_thread = threading.Thread(
-            target=self._run_tap, daemon=True, name="macos-input-tap",
+            target=self._run_tap,
+            daemon=True,
+            name="macos-input-tap",
         )
         self._emit_thread = threading.Thread(
-            target=self._run_emitter, daemon=True, name="macos-input-emitter",
+            target=self._run_emitter,
+            daemon=True,
+            name="macos-input-emitter",
         )
         self._tap_thread.start()
         self._emit_thread.start()
         logger.info(
-            f"MacOSInputWatcher started (bucket={self._bucket_id}, "
-            f"interval={self._emit_interval}s)"
+            f"MacOSInputWatcher started (bucket={self._bucket_id}, interval={self._emit_interval}s)"
         )
         return True
 
@@ -172,9 +174,7 @@ class MacOSInputWatcher:
             # prompt=False so we don't keep showing dialogs on every retry;
             # the first start() already registered the app in System Settings.
             if check_accessibility() and check_input_monitoring(prompt=False):
-                logger.info(
-                    "Input watcher permissions now granted — starting capture"
-                )
+                logger.info("Input watcher permissions now granted — starting capture")
                 if self.start():
                     return
                 # start() failed for some other reason; keep retrying.
@@ -204,6 +204,7 @@ class MacOSInputWatcher:
         if self._run_loop is not None:
             try:
                 from CoreFoundation import CFRunLoopStop
+
                 CFRunLoopStop(self._run_loop)
             except Exception as e:
                 logger.warning("CFRunLoopStop failed during shutdown: %s", e)
@@ -227,6 +228,7 @@ class MacOSInputWatcher:
         """
         try:
             from AppKit import NSWorkspace
+
             app = NSWorkspace.sharedWorkspace().frontmostApplication()
             if app is None:
                 return (None, None)
@@ -244,6 +246,7 @@ class MacOSInputWatcher:
             if self._tap_ref is not None:
                 try:
                     from Quartz import CGEventTapEnable
+
                     CGEventTapEnable(self._tap_ref, True)
                     logger.debug("Re-enabled CGEventTap after timeout")
                 except Exception as e:
@@ -267,19 +270,19 @@ class MacOSInputWatcher:
     def _run_tap(self) -> None:
         """Create CGEventTap and run its CFRunLoop."""
         try:
+            from CoreFoundation import (
+                CFMachPortCreateRunLoopSource,
+                CFRunLoopAddSource,
+                CFRunLoopGetCurrent,
+                CFRunLoopRun,
+                kCFRunLoopCommonModes,
+            )
             from Quartz import (
                 CGEventTapCreate,
                 CGEventTapEnable,
-                kCGSessionEventTap,
-                kCGHeadInsertEventTap,
                 kCGEventTapOptionListenOnly,
-            )
-            from CoreFoundation import (
-                CFMachPortCreateRunLoopSource,
-                CFRunLoopGetCurrent,
-                CFRunLoopAddSource,
-                CFRunLoopRun,
-                kCFRunLoopCommonModes,
+                kCGHeadInsertEventTap,
+                kCGSessionEventTap,
             )
         except ImportError:
             logger.error("Failed to import Quartz/CoreFoundation for input tap")
@@ -350,11 +353,16 @@ class MacOSInputWatcher:
                     data["app"] = app_name
                 if app_bundle:
                     data["bundle"] = app_bundle
-                self._aw.post_events(self._bucket_id, [{
-                    "timestamp": now,
-                    "duration": self._emit_interval,
-                    "data": data,
-                }])
+                self._aw.post_events(
+                    self._bucket_id,
+                    [
+                        {
+                            "timestamp": now,
+                            "duration": self._emit_interval,
+                            "data": data,
+                        }
+                    ],
+                )
             except Exception as e:
                 # Leave the counters alone so the next tick re-sends them.
                 logger.warning("Input emitter post failed (will retry): %s", e)

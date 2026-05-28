@@ -33,7 +33,7 @@ def start_system_event_listener(
     on_wake: Callable,
     on_shutdown: Callable,
     on_network_change: Callable,  # fn(is_online: bool)
-    on_screen_lock: Callable = None,   # fn() — screen locked
+    on_screen_lock: Callable = None,  # fn() — screen locked
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
     reachability_host: str = "",  # Host to check for network reachability
     reachability_port: int = 443,  # Port to check for network reachability
@@ -54,7 +54,9 @@ def start_system_event_listener(
             if on_screen_lock or on_screen_unlock:
                 _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
         elif _system == "Windows":
-            _start_windows_listener(on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock)
+            _start_windows_listener(
+                on_sleep, on_wake, on_shutdown, on_screen_lock, on_screen_unlock
+            )
         elif _system == "Linux":
             _start_linux_power_listener(on_sleep, on_wake)
         return
@@ -74,9 +76,8 @@ def start_system_event_listener(
         logger.warning(f"System events not supported on {_system}")
 
 
-# ---------------------------------------------------------------------------
 # macOS: NSWorkspace notifications for power events
-# ---------------------------------------------------------------------------
+
 
 def _start_macos_power_listener(
     on_sleep: Callable,
@@ -98,13 +99,17 @@ def _start_macos_power_listener(
         def handleSleep_(self, notification):
             if not state["sleeping"]:
                 state["sleeping"] = True
-                logger.info("System sleep detected on %s - pausing", threading.current_thread().name)
+                logger.info(
+                    "System sleep detected on %s - pausing", threading.current_thread().name
+                )
                 _safe_call(on_sleep)
 
         def handleWake_(self, notification):
             if state["sleeping"]:
                 state["sleeping"] = False
-                logger.info("System wake detected on %s - resuming", threading.current_thread().name)
+                logger.info(
+                    "System wake detected on %s - resuming", threading.current_thread().name
+                )
                 _safe_call(on_wake)
 
         def handleShutdown_(self, notification):
@@ -117,28 +122,38 @@ def _start_macos_power_listener(
 
         # Sleep notifications
         center.addObserver_selector_name_object_(
-            observer, "handleSleep:",
-            "NSWorkspaceWillSleepNotification", None,
+            observer,
+            "handleSleep:",
+            "NSWorkspaceWillSleepNotification",
+            None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleSleep:",
-            "NSWorkspaceScreensDidSleepNotification", None,
+            observer,
+            "handleSleep:",
+            "NSWorkspaceScreensDidSleepNotification",
+            None,
         )
 
         # Wake notifications
         center.addObserver_selector_name_object_(
-            observer, "handleWake:",
-            "NSWorkspaceDidWakeNotification", None,
+            observer,
+            "handleWake:",
+            "NSWorkspaceDidWakeNotification",
+            None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleWake:",
-            "NSWorkspaceScreensDidWakeNotification", None,
+            observer,
+            "handleWake:",
+            "NSWorkspaceScreensDidWakeNotification",
+            None,
         )
 
         # Shutdown
         center.addObserver_selector_name_object_(
-            observer, "handleShutdown:",
-            "NSWorkspaceWillPowerOffNotification", None,
+            observer,
+            "handleShutdown:",
+            "NSWorkspaceWillPowerOffNotification",
+            None,
         )
 
         # Store refs for cleanup (M5)
@@ -160,9 +175,8 @@ def _start_macos_power_listener(
     thread.start()
 
 
-# ---------------------------------------------------------------------------
 # macOS: Screen lock/unlock detection via distributed notifications
-# ---------------------------------------------------------------------------
+
 
 def _start_macos_screen_lock_listener(
     on_lock: Callable = None,
@@ -170,7 +184,7 @@ def _start_macos_screen_lock_listener(
 ) -> None:
     """Detect macOS screen lock/unlock via DistributedNotificationCenter."""
     try:
-        from Foundation import NSObject, NSDistributedNotificationCenter
+        from Foundation import NSDistributedNotificationCenter, NSObject
     except ImportError:
         logger.warning("pyobjc not available — screen lock detection disabled")
         return
@@ -187,18 +201,22 @@ def _start_macos_screen_lock_listener(
                 _safe_call(on_unlock)
 
     def run_loop():
-        from Foundation import NSRunLoop, NSDefaultRunLoopMode, NSDate
+        from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop
 
         observer = _LockObserver.alloc().init()
         center = NSDistributedNotificationCenter.defaultCenter()
 
         center.addObserver_selector_name_object_(
-            observer, "handleLock:",
-            "com.apple.screenIsLocked", None,
+            observer,
+            "handleLock:",
+            "com.apple.screenIsLocked",
+            None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleUnlock:",
-            "com.apple.screenIsUnlocked", None,
+            observer,
+            "handleUnlock:",
+            "com.apple.screenIsUnlocked",
+            None,
         )
 
         # Store refs for cleanup (M5)
@@ -239,9 +257,8 @@ def cleanup_observers() -> None:
         _registered_observers.clear()
 
 
-# ---------------------------------------------------------------------------
 # macOS: SCNetworkReachability for network changes
-# ---------------------------------------------------------------------------
+
 
 def _start_macos_network_listener(
     on_network_change: Callable,
@@ -249,15 +266,15 @@ def _start_macos_network_listener(
 ) -> None:
     """Monitor network reachability on macOS via SystemConfiguration."""
     try:
+        from Foundation import NSDefaultRunLoopMode, NSRunLoop
         from SystemConfiguration import (
             SCNetworkReachabilityCreateWithName,
-            SCNetworkReachabilitySetCallback,
-            SCNetworkReachabilityScheduleWithRunLoop,
             SCNetworkReachabilityGetFlags,
-            kSCNetworkReachabilityFlagsReachable,
+            SCNetworkReachabilityScheduleWithRunLoop,
+            SCNetworkReachabilitySetCallback,
             kSCNetworkReachabilityFlagsConnectionRequired,
+            kSCNetworkReachabilityFlagsReachable,
         )
-        from Foundation import NSRunLoop, NSDefaultRunLoopMode
     except ImportError:
         logger.debug("SystemConfiguration not available — falling back to network poller")
         _start_network_poller(on_network_change, host)
@@ -289,7 +306,9 @@ def _start_macos_network_listener(
 
         loop = NSRunLoop.currentRunLoop()
         SCNetworkReachabilityScheduleWithRunLoop(
-            target, loop.getCFRunLoop(), NSDefaultRunLoopMode,
+            target,
+            loop.getCFRunLoop(),
+            NSDefaultRunLoopMode,
         )
 
         # Get initial state
@@ -300,6 +319,7 @@ def _start_macos_network_listener(
         logger.debug("macOS network reachability listener started")
         # Use interruptible run loop instead of blocking loop.run()
         from Foundation import NSDate
+
         while not _stop_event.is_set():
             ran = loop.runMode_beforeDate_(
                 NSDefaultRunLoopMode,
@@ -314,9 +334,8 @@ def _start_macos_network_listener(
     thread.start()
 
 
-# ---------------------------------------------------------------------------
 # Windows: hidden message-only window for power/session events
-# ---------------------------------------------------------------------------
+
 
 def _start_windows_listener(
     on_sleep: Callable,
@@ -349,7 +368,11 @@ def _start_windows_listener(
     HWND_MESSAGE = -3
 
     WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM,
+        ctypes.c_long,
+        wintypes.HWND,
+        ctypes.c_uint,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
     )
 
     def wnd_proc(hwnd, msg, wparam, lparam):
@@ -402,9 +425,18 @@ def _start_windows_listener(
             return
 
         hwnd = user32.CreateWindowExW(
-            0, class_name, "BetterFlow Events", 0,
-            0, 0, 0, 0,
-            HWND_MESSAGE, None, wc.hInstance, None,
+            0,
+            class_name,
+            "BetterFlow Events",
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            wc.hInstance,
+            None,
         )
         if not hwnd:
             logger.warning("Failed to create message window for system events")
@@ -428,9 +460,8 @@ def _start_windows_listener(
     thread.start()
 
 
-# ---------------------------------------------------------------------------
 # Linux: systemd-logind PrepareForSleep signal (via jeepney)
-# ---------------------------------------------------------------------------
+
 
 def _start_linux_power_listener(
     on_sleep: Callable,
@@ -499,9 +530,8 @@ def _start_linux_power_listener(
     thread.start()
 
 
-# ---------------------------------------------------------------------------
 # Fallback: socket-based network poller
-# ---------------------------------------------------------------------------
+
 
 def _start_network_poller(
     on_change: Callable,
@@ -539,9 +569,8 @@ def _start_network_poller(
     logger.debug(f"Network poller started (interval: {interval}s)")
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
+
 
 def _safe_call(fn: Callable, *args) -> None:
     """Call a function, catching and logging any exceptions."""

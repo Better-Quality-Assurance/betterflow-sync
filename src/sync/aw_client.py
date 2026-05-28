@@ -147,7 +147,7 @@ class AWClient:
         except requests.exceptions.ConnectionError as e:
             raise AWClientError(f"Cannot connect to ActivityWatch at {self.base_url}") from e
         except requests.exceptions.Timeout as e:
-            raise AWClientError(f"ActivityWatch request timed out") from e
+            raise AWClientError("ActivityWatch request timed out") from e
         except requests.exceptions.HTTPError as e:
             raise AWClientError(f"ActivityWatch API error: {e}") from e
         except Exception as e:
@@ -197,20 +197,25 @@ class AWClient:
         """
         with self._buckets_lock:
             now = time.monotonic()
-            if self._buckets_cache is not None and (now - self._buckets_cache_time) < self._buckets_cache_ttl:
+            if (
+                self._buckets_cache is not None
+                and (now - self._buckets_cache_time) < self._buckets_cache_ttl
+            ):
                 return self._buckets_cache
 
         # Fetch outside lock to avoid blocking other callers
         response = self._request("GET", "buckets/")
         result = {
-            bucket_id: AWBucket.from_dict(bucket_id, data)
-            for bucket_id, data in response.items()
+            bucket_id: AWBucket.from_dict(bucket_id, data) for bucket_id, data in response.items()
         }
 
         with self._buckets_lock:
             # Re-check in case another thread populated the cache while we fetched
             now2 = time.monotonic()
-            if self._buckets_cache is not None and (now2 - self._buckets_cache_time) < self._buckets_cache_ttl:
+            if (
+                self._buckets_cache is not None
+                and (now2 - self._buckets_cache_time) < self._buckets_cache_ttl
+            ):
                 return self._buckets_cache
             self._buckets_cache = result
             self._buckets_cache_time = now2
@@ -254,7 +259,9 @@ class AWClient:
     def get_window_buckets(self) -> list[AWBucket]:
         """Get all window watcher buckets."""
         buckets = self.get_buckets()
-        return [b for b in buckets.values() if b.type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT)]
+        return [
+            b for b in buckets.values() if b.type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT)
+        ]
 
     def get_afk_buckets(self) -> list[AWBucket]:
         """Get all AFK watcher buckets."""
@@ -273,27 +280,35 @@ class AWClient:
 
     def create_bucket(self, bucket_id: str, bucket_type: str, hostname: str) -> None:
         """Create a bucket (idempotent — AW ignores if already exists)."""
-        self._request("POST", f"buckets/{bucket_id}", json={
-            "client": "betterflow",
-            "type": bucket_type,
-            "hostname": hostname,
-        })
+        self._request(
+            "POST",
+            f"buckets/{bucket_id}",
+            json={
+                "client": "betterflow",
+                "type": bucket_type,
+                "hostname": hostname,
+            },
+        )
 
-    def post_heartbeat(self, bucket_id: str, timestamp: str, data: dict, pulsetime: float = 5.0) -> None:
+    def post_heartbeat(
+        self, bucket_id: str, timestamp: str, data: dict, pulsetime: float = 5.0
+    ) -> None:
         """Send a heartbeat event (AW merges with previous if same data within pulsetime)."""
-        self._request("POST", f"buckets/{bucket_id}/heartbeat?pulsetime={pulsetime}", json={
-            "timestamp": timestamp,
-            "duration": 0,
-            "data": data,
-        })
+        self._request(
+            "POST",
+            f"buckets/{bucket_id}/heartbeat?pulsetime={pulsetime}",
+            json={
+                "timestamp": timestamp,
+                "duration": 0,
+                "data": data,
+            },
+        )
 
     def post_events(self, bucket_id: str, events: list[dict]) -> None:
         """Insert events into a bucket (no merging, unlike heartbeat)."""
         self._request("POST", f"buckets/{bucket_id}/events", json=events)
 
-    def get_events_since(
-        self, bucket_id: str, since: datetime, limit: int = 1000
-    ) -> list[AWEvent]:
+    def get_events_since(self, bucket_id: str, since: datetime, limit: int = 1000) -> list[AWEvent]:
         """Get events since a specific timestamp.
 
         Convenience method for incremental sync.

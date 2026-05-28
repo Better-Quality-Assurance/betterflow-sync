@@ -17,8 +17,14 @@ import pytest
 
 # ── 1. models ────────────────────────────────────────────────────────────────
 
+
 def test_models_import():
-    from src.sync.models import SyncStats, BoundedLRU, MAX_APP_LENGTH, MAX_TITLE_LENGTH, MAX_URL_LENGTH
+    from src.sync.models import (
+        MAX_APP_LENGTH,
+        MAX_TITLE_LENGTH,
+        MAX_URL_LENGTH,
+    )
+
     assert MAX_APP_LENGTH == 256
     assert MAX_TITLE_LENGTH == 1024
     assert MAX_URL_LENGTH == 2048
@@ -26,6 +32,7 @@ def test_models_import():
 
 def test_sync_stats_defaults():
     from src.sync.models import SyncStats
+
     s = SyncStats()
     assert s.events_fetched == 0
     assert s.success is True
@@ -35,6 +42,7 @@ def test_sync_stats_defaults():
 
 def test_bounded_lru_eviction():
     from src.sync.models import BoundedLRU
+
     lru = BoundedLRU(maxsize=3)
     for i in range(5):
         lru[i] = i * 10
@@ -51,14 +59,17 @@ def test_bounded_lru_eviction():
 
 def test_bounded_lru_rejects_nonpositive_maxsize():
     from src.sync.models import BoundedLRU
+
     with pytest.raises(ValueError):
         BoundedLRU(maxsize=0)
 
 
 # ── 2. transform ─────────────────────────────────────────────────────────────
 
+
 def test_transform_import():
     from src.sync import transform
+
     assert callable(transform.extract_domain)
     assert callable(transform.infer_page_category)
     assert callable(transform.overlap_range)
@@ -69,11 +80,13 @@ def test_transform_import():
 
 def test_extract_domain_happy_path():
     from src.sync.transform import extract_domain
+
     assert extract_domain("https://github.com/org/repo") == "github.com"
 
 
 def test_extract_domain_invalid_returns_none():
     from src.sync.transform import extract_domain
+
     # urlparse won't raise on garbage — it returns empty netloc
     result = extract_domain("not-a-url")
     assert result is None
@@ -81,18 +94,23 @@ def test_extract_domain_invalid_returns_none():
 
 def test_infer_page_category_code():
     from src.sync.transform import infer_page_category
+
     assert infer_page_category("https://github.com/pull/123", "PR review") == "code"
 
 
 def test_infer_page_category_other():
     from src.sync.transform import infer_page_category
+
     assert infer_page_category("https://example.com", "Homepage") == "other"
 
 
 def test_overlap_range_overlap():
     from src.sync.transform import overlap_range
+
     now = datetime.now(timezone.utc)
-    result = overlap_range(now, now + timedelta(minutes=5), now + timedelta(minutes=2), now + timedelta(minutes=7))
+    result = overlap_range(
+        now, now + timedelta(minutes=5), now + timedelta(minutes=2), now + timedelta(minutes=7)
+    )
     assert result is not None
     start, end = result
     assert start == now + timedelta(minutes=2)
@@ -101,47 +119,55 @@ def test_overlap_range_overlap():
 
 def test_overlap_range_no_overlap():
     from src.sync.transform import overlap_range
+
     now = datetime.now(timezone.utc)
-    result = overlap_range(now, now + timedelta(minutes=2), now + timedelta(minutes=3), now + timedelta(minutes=5))
+    result = overlap_range(
+        now, now + timedelta(minutes=2), now + timedelta(minutes=3), now + timedelta(minutes=5)
+    )
     assert result is None
 
 
 def test_version_below_true():
     from src.sync.transform import version_below
+
     assert version_below("1.0.0", "2.0.0") is True
 
 
 def test_version_below_false():
     from src.sync.transform import version_below
+
     assert version_below("2.1.0", "2.0.0") is False
 
 
 def test_version_below_conservative_on_bad_input():
     from src.sync.transform import version_below
+
     # Should return True (conservative) rather than crash
     assert version_below("not-a-version", "1.0.0") is True
 
 
 # ── 3. sync package re-exports ────────────────────────────────────────────────
 
+
 def test_sync_package_exports_new_symbols():
     from src.sync import (
-        SyncStats, BoundedLRU,
-        extract_domain, infer_page_category,
-        overlap_range, is_active_during, status_at, version_below,
+        BoundedLRU,
+        SyncStats,
     )
+
     assert SyncStats is not None
     assert BoundedLRU is not None
 
 
 # ── 4. SyncEngine instantiation (full constructor smoke) ─────────────────────
 
+
 def test_sync_engine_instantiation():
     """SyncEngine must be fully constructible from mock dependencies."""
-    from src.sync.sync_engine import SyncEngine
+    from src.config import Config
     from src.sync.activity_analyzer import ActivityAnalyzer
     from src.sync.daily_time_tracker import DailyTimeTracker
-    from src.config import Config
+    from src.sync.sync_engine import SyncEngine
 
     aw = Mock()
     bf = Mock()
@@ -171,25 +197,30 @@ def test_sync_engine_instantiation():
 
 # ── 5. Backward-compat static wrappers on SyncEngine ─────────────────────────
 
+
 def test_sync_engine_static_extract_domain_compat():
     from src.sync.sync_engine import SyncEngine
+
     assert SyncEngine._extract_domain("https://example.com/path") == "example.com"
 
 
 def test_sync_engine_static_version_below_compat():
     from src.sync.sync_engine import SyncEngine
+
     assert SyncEngine._version_below("1.0.0", "2.0.0") is True
     assert SyncEngine._version_below("3.0.0", "2.0.0") is False
 
 
 def test_sync_engine_classmethod_infer_page_category_compat():
     from src.sync.sync_engine import SyncEngine
+
     assert SyncEngine._infer_page_category("https://github.com", None) == "code"
     assert SyncEngine._infer_page_category("https://example.com", "nothing") == "other"
 
 
 def test_sync_engine_static_overlap_range_compat():
     from src.sync.sync_engine import SyncEngine
+
     now = datetime.now(timezone.utc)
     result = SyncEngine._overlap_range(
         now,

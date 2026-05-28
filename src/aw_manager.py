@@ -11,11 +11,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-import urllib.error
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,9 +34,7 @@ BF_WATCHERS = ["bf-window-tracker", "bf-idle-tracker"]
 ALL_COMPONENTS = [BF_SERVER] + BF_WATCHERS
 
 AW_VERSION = "v0.13.2"
-RELEASE_BASE = (
-    f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
-)
+RELEASE_BASE = f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
     "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
@@ -133,9 +131,8 @@ def _download_aw_binaries(install_dir: str) -> bool:
         fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
         req = urllib.request.Request(url, headers={"User-Agent": "BetterFlow-Sync"})
-        with urllib.request.urlopen(req, timeout=120) as response:
-            with open(tmp_zip, "wb") as f:
-                shutil.copyfileobj(response, f)
+        with urllib.request.urlopen(req, timeout=120) as response, open(tmp_zip, "wb") as f:
+            shutil.copyfileobj(response, f)
 
         size_mb = os.path.getsize(tmp_zip) / (1024 * 1024)
         logger.info(f"Downloaded {size_mb:.1f} MB, extracting binaries...")
@@ -153,7 +150,7 @@ def _download_aw_binaries(install_dir: str) -> bool:
                 if original_name in AW_TO_BF_NAMES and not info.is_dir():
                     launchers[original_name] = info.filename
 
-            missing = [name for name in AW_TO_BF_NAMES.keys() if name not in launchers]
+            missing = [name for name in AW_TO_BF_NAMES if name not in launchers]
             if missing:
                 logger.error(f"Missing binaries in archive: {missing}")
                 return False
@@ -178,7 +175,11 @@ def _download_aw_binaries(install_dir: str) -> bool:
                     if not prefix and member.filename != launcher_path:
                         continue
 
-                    rel_name = member.filename[len(prefix):] if prefix else os.path.basename(member.filename)
+                    rel_name = (
+                        member.filename[len(prefix) :]
+                        if prefix
+                        else os.path.basename(member.filename)
+                    )
                     source_base = os.path.basename(member.filename)
                     if source_base == os.path.basename(launcher_path):
                         rel_name = branded_name + ext
@@ -212,9 +213,7 @@ def _download_aw_binaries(install_dir: str) -> bool:
                     path = os.path.join(root, file_name)
                     if os.path.basename(path).startswith("bf-"):
                         st = os.stat(path)
-                        os.chmod(
-                            path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
-                        )
+                        os.chmod(path, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
                     if plat == "darwin":
                         subprocess.run(
                             ["xattr", "-d", "com.apple.quarantine", path],
@@ -288,8 +287,7 @@ class AWManager:
 
         if server_already_running:
             logger.info(
-                f"Tracker server already running on port {self.aw_port}, "
-                "using external instance"
+                f"Tracker server already running on port {self.aw_port}, using external instance"
             )
             self._using_external = True
         else:
@@ -395,9 +393,7 @@ class AWManager:
             if name in self._disabled_components:
                 continue
             if proc.poll() is not None:
-                logger.info(
-                    f"Restarting {name} (exited with code {proc.returncode})"
-                )
+                logger.info(f"Restarting {name} (exited with code {proc.returncode})")
                 self._start_component(name, binaries_dir)
                 restarted = True
 
@@ -426,9 +422,7 @@ class AWManager:
                 restarted = True
 
         # If server was restarted, wait for it
-        if restarted and BF_SERVER in [
-            n for n, p in self._processes.items() if p.poll() is None
-        ]:
+        if restarted and BF_SERVER in [n for n, p in self._processes.items() if p.poll() is None]:
             self._wait_for_server()
 
         return self.check_health()
@@ -528,10 +522,7 @@ class AWManager:
             # Check if process died
             proc = self._processes.get(BF_SERVER)
             if proc and proc.poll() is not None:
-                logger.error(
-                    f"Tracker server exited during startup "
-                    f"(code {proc.returncode})"
-                )
+                logger.error(f"Tracker server exited during startup (code {proc.returncode})")
                 return False
 
             try:

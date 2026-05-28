@@ -111,9 +111,7 @@ class KeychainManager:
         must surface this to the user. We never write plaintext to disk.
         """
         try:
-            keyring.set_password(
-                self.service_name, ACCOUNT_NAME, credentials.to_json()
-            )
+            keyring.set_password(self.service_name, ACCOUNT_NAME, credentials.to_json())
         except KeyringError as e:
             logger.error("Keychain write failed — credentials NOT stored: %s", e)
             return False

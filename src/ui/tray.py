@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 try:
-    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE  # module execution
+    from .._build_info import APP_VERSION as _APP_VERSION  # module execution
+    from .._build_info import BUILD_DATE
 except ImportError:
     try:
         import _build_info as _bi  # PyInstaller bundle (src/ is root, no parent package)
+
         _APP_VERSION = _bi.APP_VERSION
         BUILD_DATE = _bi.BUILD_DATE
     except ImportError:
@@ -123,7 +125,9 @@ class TrayModel:
         # Projects
         self.projects: list[ProjectDict] = []
         self.current_project: Optional[ProjectDict] = None
-        self.project_started_at: Optional[float] = None  # time.monotonic() when project was selected
+        self.project_started_at: Optional[float] = (
+            None  # time.monotonic() when project was selected
+        )
 
         # Preferences
         self.sync_interval: int = 30
@@ -318,9 +322,12 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
     minute_angle = math.radians(minute * 6 - 90)
     minute_len = int(tick_outer * 0.82)
     draw.line(
-        [cx, cy,
-         cx + int(minute_len * math.cos(minute_angle)),
-         cy + int(minute_len * math.sin(minute_angle))],
+        [
+            cx,
+            cy,
+            cx + int(minute_len * math.cos(minute_angle)),
+            cy + int(minute_len * math.sin(minute_angle)),
+        ],
         fill=color,
         width=max(2, big // 32),
     )
@@ -329,9 +336,12 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
     hour_angle = math.radians((hour * 30 + minute * 0.5) - 90)
     hour_len = int(tick_outer * 0.55)
     draw.line(
-        [cx, cy,
-         cx + int(hour_len * math.cos(hour_angle)),
-         cy + int(hour_len * math.sin(hour_angle))],
+        [
+            cx,
+            cy,
+            cx + int(hour_len * math.cos(hour_angle)),
+            cy + int(hour_len * math.sin(hour_angle)),
+        ],
         fill=color,
         width=max(3, big // 24),
     )
@@ -344,7 +354,9 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         elif platform.system() == "Windows":
             font = ImageFont.truetype("segoeui.ttf", font_size)
         else:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
+            )
     except (OSError, IOError):
         font = ImageFont.load_default()
     bbox = draw.textbbox((0, 0), "B", font=font)
@@ -510,11 +522,17 @@ class TrayIcon:
 
         items.append(Item(f"App status: {self._get_status_text(s)}", None, enabled=False))
         items.append(Item(f"Hours today: {s['hours_today']}", None, enabled=False))
-        items.append(Item("Trends", pystray.Menu(
-            Item(f"Hours this week: {s['hours_this_week']}", None, enabled=False),
-            Item(f"Hours this month: {s['hours_this_month']}", None, enabled=False),
-            Item(f"Daily avg this week: {s['daily_avg_this_week']}", None, enabled=False),
-        ), enabled=logged_in))
+        items.append(
+            Item(
+                "Trends",
+                pystray.Menu(
+                    Item(f"Hours this week: {s['hours_this_week']}", None, enabled=False),
+                    Item(f"Hours this month: {s['hours_this_month']}", None, enabled=False),
+                    Item(f"Daily avg this week: {s['daily_avg_this_week']}", None, enabled=False),
+                ),
+                enabled=logged_in,
+            )
+        )
 
         # ── Dashboard link ─────────────────────────────────
         items.append(Item("Show My Hours", self._handle_show_dashboard, enabled=logged_in))
@@ -526,28 +544,33 @@ class TrayIcon:
             items.append(Item("Assigned Projects", None, enabled=False))
             for proj in s["projects"]:
                 is_current = (
-                    s["current_project"] is not None
-                    and s["current_project"]["id"] == proj["id"]
+                    s["current_project"] is not None and s["current_project"]["id"] == proj["id"]
                 )
-                items.append(Item(
-                    f"  {proj['name']}",
-                    self._make_project_handler(proj),
-                    checked=lambda item, p=proj: self._is_current_project(p),
-                    enabled=logged_in and not is_current,
-                ))
+                items.append(
+                    Item(
+                        f"  {proj['name']}",
+                        self._make_project_handler(proj),
+                        checked=lambda item, p=proj: self._is_current_project(p),
+                        enabled=logged_in and not is_current,
+                    )
+                )
             stop_label = f"  Stop ({s['hours_today']})"
-            items.append(Item(
-                stop_label,
-                self._handle_stop_project,
-                enabled=logged_in and s["current_project"] is not None,
-            ))
+            items.append(
+                Item(
+                    stop_label,
+                    self._handle_stop_project,
+                    enabled=logged_in and s["current_project"] is not None,
+                )
+            )
             items.append(Item("─" * 20, None, enabled=False))
 
         # ── Break toggle ───────────────────────────────────
         if s["on_break"]:
             items.append(Item("End Break", self._handle_end_break, enabled=logged_in))
         else:
-            items.append(Item("Start Break", self._handle_start_break, enabled=logged_in and not s["paused"]))
+            items.append(
+                Item("Start Break", self._handle_start_break, enabled=logged_in and not s["paused"])
+            )
 
         # ── Private Time toggle (replaces both pause and old private time) ──
         if s["private_mode"] or (s["paused"] and not s["on_break"]):
@@ -556,64 +579,84 @@ class TrayIcon:
             items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
 
         # ── Private Time Reminder submenu ───────────────────
-        items.append(Item("Private Time Reminder", pystray.Menu(
+        items.append(
             Item(
-                "Disabled",
-                self._make_private_reminder_handler(enabled=False),
-                checked=lambda item: self._is_private_reminder(False),
-            ),
-            Item(
-                "Every 15 Minutes",
-                self._make_private_reminder_handler(enabled=True, minutes=15),
-                checked=lambda item: self._is_private_reminder(True, 15),
-            ),
-            Item(
-                "Every 35 Minutes",
-                self._make_private_reminder_handler(enabled=True, minutes=35),
-                checked=lambda item: self._is_private_reminder(True, 35),
-            ),
-            Item(
-                "Every 45 Minutes",
-                self._make_private_reminder_handler(enabled=True, minutes=45),
-                checked=lambda item: self._is_private_reminder(True, 45),
-            ),
-        ), enabled=logged_in))
+                "Private Time Reminder",
+                pystray.Menu(
+                    Item(
+                        "Disabled",
+                        self._make_private_reminder_handler(enabled=False),
+                        checked=lambda item: self._is_private_reminder(False),
+                    ),
+                    Item(
+                        "Every 15 Minutes",
+                        self._make_private_reminder_handler(enabled=True, minutes=15),
+                        checked=lambda item: self._is_private_reminder(True, 15),
+                    ),
+                    Item(
+                        "Every 35 Minutes",
+                        self._make_private_reminder_handler(enabled=True, minutes=35),
+                        checked=lambda item: self._is_private_reminder(True, 35),
+                    ),
+                    Item(
+                        "Every 45 Minutes",
+                        self._make_private_reminder_handler(enabled=True, minutes=45),
+                        checked=lambda item: self._is_private_reminder(True, 45),
+                    ),
+                ),
+                enabled=logged_in,
+            )
+        )
 
         # ── Break Time Reminder submenu ─────────────────────
-        items.append(Item("Break Time Reminder", pystray.Menu(
+        items.append(
             Item(
-                "Disabled",
-                self._make_break_reminder_handler(enabled=False),
-                checked=lambda item: self._is_break_reminder(False),
-            ),
-            Item(
-                "After 1 Hour",
-                self._make_break_reminder_handler(enabled=True, hours=1),
-                checked=lambda item: self._is_break_reminder(True, 1),
-            ),
-            Item(
-                "After 2 Hours",
-                self._make_break_reminder_handler(enabled=True, hours=2),
-                checked=lambda item: self._is_break_reminder(True, 2),
-            ),
-            Item(
-                "After 3 Hours",
-                self._make_break_reminder_handler(enabled=True, hours=3),
-                checked=lambda item: self._is_break_reminder(True, 3),
-            ),
-            Item(
-                "After 4 Hours",
-                self._make_break_reminder_handler(enabled=True, hours=4),
-                checked=lambda item: self._is_break_reminder(True, 4),
-            ),
-        ), enabled=logged_in))
+                "Break Time Reminder",
+                pystray.Menu(
+                    Item(
+                        "Disabled",
+                        self._make_break_reminder_handler(enabled=False),
+                        checked=lambda item: self._is_break_reminder(False),
+                    ),
+                    Item(
+                        "After 1 Hour",
+                        self._make_break_reminder_handler(enabled=True, hours=1),
+                        checked=lambda item: self._is_break_reminder(True, 1),
+                    ),
+                    Item(
+                        "After 2 Hours",
+                        self._make_break_reminder_handler(enabled=True, hours=2),
+                        checked=lambda item: self._is_break_reminder(True, 2),
+                    ),
+                    Item(
+                        "After 3 Hours",
+                        self._make_break_reminder_handler(enabled=True, hours=3),
+                        checked=lambda item: self._is_break_reminder(True, 3),
+                    ),
+                    Item(
+                        "After 4 Hours",
+                        self._make_break_reminder_handler(enabled=True, hours=4),
+                        checked=lambda item: self._is_break_reminder(True, 4),
+                    ),
+                ),
+                enabled=logged_in,
+            )
+        )
 
         items.append(Item("─" * 20, None, enabled=False))
 
         # ── Diagnostics submenu ─────────────────────────────
         diag_items = [
-            Item(f"ActivityWatch: {'Running' if self._check_aw_status(s) else 'Not running'}", None, enabled=False),
-            Item(f"API: {'Connected' if self._check_api_status(s) else 'Unreachable'}", None, enabled=False),
+            Item(
+                f"ActivityWatch: {'Running' if self._check_aw_status(s) else 'Not running'}",
+                None,
+                enabled=False,
+            ),
+            Item(
+                f"API: {'Connected' if self._check_api_status(s) else 'Unreachable'}",
+                None,
+                enabled=False,
+            ),
             Item(f"Queue: {s['queue_size']} events", None, enabled=False),
             Item(f"Last sync: {s['last_sync']}", None, enabled=False),
         ]
@@ -643,15 +686,19 @@ class TrayIcon:
             pref_items.append(Item(s["update_status"] or "Updating...", None, enabled=False))
         elif s["update_version"]:
             if s["update_asset_url"]:
-                pref_items.append(Item(
-                    f"Install v{s['update_version']} & Restart",
-                    self._handle_install_update,
-                ))
+                pref_items.append(
+                    Item(
+                        f"Install v{s['update_version']} & Restart",
+                        self._handle_install_update,
+                    )
+                )
             else:
-                pref_items.append(Item(
-                    f"Update available (v{s['update_version']})",
-                    self._handle_open_update,
-                ))
+                pref_items.append(
+                    Item(
+                        f"Update available (v{s['update_version']})",
+                        self._handle_open_update,
+                    )
+                )
         else:
             pref_items.append(Item("Check for Update", self._handle_check_update))
 
@@ -715,7 +762,10 @@ class TrayIcon:
         with self.model.lock:
             if not enabled:
                 return not self.model.private_reminders_enabled
-            return self.model.private_reminders_enabled and self.model.private_interval_minutes == minutes
+            return (
+                self.model.private_reminders_enabled
+                and self.model.private_interval_minutes == minutes
+            )
 
     def _is_break_reminder(self, enabled: bool, hours: int = 0) -> bool:
         with self.model.lock:
@@ -825,6 +875,7 @@ class TrayIcon:
 
     def _make_project_handler(self, project: Optional[ProjectDict]) -> Callable:
         """Create a handler for switching to a project."""
+
         def handler(icon, item):
             with self.model.lock:
                 self.model.current_project = project
@@ -832,6 +883,7 @@ class TrayIcon:
             if self._on_project_change:
                 self._on_project_change(project)
             self._update_menu()
+
         return handler
 
     def _handle_logout(self, icon, item) -> None:
@@ -874,26 +926,31 @@ class TrayIcon:
 
     def _make_interval_handler(self, seconds: int) -> Callable:
         """Create a handler for setting sync interval."""
+
         def handler(icon, item):
             with self.model.lock:
                 self.model.sync_interval = seconds
             if self._on_preferences:
                 self._on_preferences("sync_interval", seconds)
             self._update_menu()
+
         return handler
 
     def _make_toggle_handler(self, attr: str, key: str) -> Callable:
         """Create a handler that toggles a boolean preference."""
+
         def handler(icon, item):
             with self.model.lock:
                 new_value = not getattr(self.model, attr)
                 setattr(self.model, attr, new_value)
             if self._on_preferences:
                 self._on_preferences(key, new_value)
+
         return handler
 
     def _make_break_reminder_handler(self, enabled: bool, hours: int = 0) -> Callable:
         """Create a combined handler for break reminder radio selection."""
+
         def handler(icon, item):
             with self.model.lock:
                 self.model.break_reminders_enabled = enabled
@@ -905,10 +962,12 @@ class TrayIcon:
                 if self._on_preferences:
                     self._on_preferences("break_interval_hours", hours)
             self._update_menu()
+
         return handler
 
     def _make_private_reminder_handler(self, enabled: bool, minutes: int = 0) -> Callable:
         """Create a combined handler for private time reminder radio selection."""
+
         def handler(icon, item):
             with self.model.lock:
                 self.model.private_reminders_enabled = enabled
@@ -920,16 +979,19 @@ class TrayIcon:
                 if self._on_preferences:
                     self._on_preferences("private_interval_minutes", minutes)
             self._update_menu()
+
         return handler
 
     def _make_channel_handler(self, channel: str) -> Callable:
         """Create a handler for switching update channel."""
+
         def handler(icon, item):
             with self.model.lock:
                 self.model.update_channel = channel
             if self._on_preferences:
                 self._on_preferences("update_channel", channel)
             self._update_menu()
+
         return handler
 
     def _handle_export_logs(self, icon, item) -> None:
@@ -952,6 +1014,7 @@ class TrayIcon:
     def set_config(self, config: "Config") -> None:
         """Sync tray preferences state from Config object."""
         from urllib.parse import urlparse
+
         parsed = urlparse(config.api_url)
         dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
         with self.model.lock:
@@ -1046,7 +1109,9 @@ class TrayIcon:
                 self.model.daily_avg_this_week = daily_avg_this_week
         self._update_menu()
 
-    def set_user(self, email: Optional[str], name: Optional[str] = None, role: Optional[str] = None) -> None:
+    def set_user(
+        self, email: Optional[str], name: Optional[str] = None, role: Optional[str] = None
+    ) -> None:
         """Set current user info."""
         with self.model.lock:
             self.model.user_email = email
@@ -1054,7 +1119,9 @@ class TrayIcon:
             self.model.user_role = role
         self._update_menu()
 
-    def set_projects(self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None) -> None:
+    def set_projects(
+        self, projects: list[ProjectDict], current_project: Optional[ProjectDict] = None
+    ) -> None:
         """Set available projects and current selection."""
         with self.model.lock:
             self.model.projects = projects
@@ -1157,6 +1224,7 @@ class TrayIcon:
         color = STATE_COLORS.get(state, STATE_COLORS[TrayState.STARTING])
 
         from datetime import datetime as _dt
+
         _now = _dt.now()
         icon_key = (_now.hour % 12, _now.minute, color)
 
@@ -1185,9 +1253,10 @@ class TrayIcon:
         Wrapped in an autorelease pool so NSData/NSImage temporaries
         created on background threads are freed promptly.
         """
+        import io
+
         import AppKit
         import Foundation
-        import io
         import objc
 
         with objc.autorelease_pool():
@@ -1219,7 +1288,9 @@ class TrayIcon:
             button = self._icon._status_item.button()
             if button:
                 button.performSelectorOnMainThread_withObject_waitUntilDone_(
-                    b"setImage:", ns_img, False,
+                    b"setImage:",
+                    ns_img,
+                    False,
                 )
         except AttributeError:
             logger.debug("pystray _status_item unavailable, falling back to icon assignment")
@@ -1309,10 +1380,15 @@ class TrayIcon:
             return
         proxy._pystray_icon = self._icon
         timer = Foundation.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.0, proxy, b"rebuildMenu:", None, False,
+            0.0,
+            proxy,
+            b"rebuildMenu:",
+            None,
+            False,
         )
         Foundation.NSRunLoop.mainRunLoop().addTimer_forMode_(
-            timer, Foundation.NSDefaultRunLoopMode,
+            timer,
+            Foundation.NSDefaultRunLoopMode,
         )
 
     def start(self) -> None:
@@ -1389,7 +1465,9 @@ class TrayIcon:
 
             logger.warning(
                 "Tray event loop exited after %.1fs (attempt %d/%d)",
-                elapsed, attempt, max_retries,
+                elapsed,
+                attempt,
+                max_retries,
             )
             self._icon = None  # Reset for retry
             time.sleep(0.5)

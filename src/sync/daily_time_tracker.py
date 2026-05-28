@@ -131,9 +131,7 @@ class DailyTimeTracker:
             else:
                 self._today_seconds = 0.0
 
-        logger.debug(
-            f"Loaded daily time for {today}: {self._today_seconds:.1f}s"
-        )
+        logger.debug(f"Loaded daily time for {today}: {self._today_seconds:.1f}s")
 
     def _get_local_date(self) -> date:
         """Get the current local date.

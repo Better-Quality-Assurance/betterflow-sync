@@ -9,19 +9,15 @@ Contains:
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-
-# ---------------------------------------------------------------------------
 # Field-length caps (applied before sending to the API)
-# ---------------------------------------------------------------------------
 
 MAX_APP_LENGTH = 256
 MAX_TITLE_LENGTH = 1024
 MAX_URL_LENGTH = 2048
 
 
-# ---------------------------------------------------------------------------
 # SyncStats
-# ---------------------------------------------------------------------------
+
 
 @dataclass
 class SyncStats:
@@ -43,9 +39,8 @@ class SyncStats:
         return len(self.errors) == 0
 
 
-# ---------------------------------------------------------------------------
 # BoundedLRU
-# ---------------------------------------------------------------------------
+
 
 class BoundedLRU:
     """Ordered dict with hard-capped size.

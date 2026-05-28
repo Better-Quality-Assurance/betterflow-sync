@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Generate icon files for BetterFlow Sync."""
 
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -93,8 +92,7 @@ def create_simple_icon(size: int = 1024) -> Image.Image:
     center = size // 2
     dot_radius = size // 8
     draw.ellipse(
-        [center - dot_radius, center - dot_radius,
-         center + dot_radius, center + dot_radius],
+        [center - dot_radius, center - dot_radius, center + dot_radius, center + dot_radius],
         fill="white",
     )
 
@@ -182,6 +180,7 @@ def main():
 
     # Try to create icns (macOS only)
     import platform
+
     if platform.system() == "Darwin":
         save_icns(icon, resources_dir / "icon.icns")
     else:

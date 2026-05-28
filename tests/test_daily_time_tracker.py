@@ -1,11 +1,12 @@
 """Tests for daily time tracker."""
 
-import pytest
 import sqlite3
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from src.sync.daily_time_tracker import DailyTimeTracker
 

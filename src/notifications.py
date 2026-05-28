@@ -63,6 +63,7 @@ def _try_load_macos_pyobjc() -> bool:
         return _MACOS_PYOBJC_AVAILABLE
     try:
         import Foundation  # noqa: F401 — probing availability
+
         _MACOS_PYOBJC_AVAILABLE = True
     except ImportError as e:
         logger.warning(
@@ -118,9 +119,7 @@ def clear_notifications() -> None:
         logger.warning("Failed to clear notifications: %s", e)
 
 
-# --------------------------------------------------------------------------
 # macOS — pyobjc (preferred)
-# --------------------------------------------------------------------------
 
 
 def _send_macos_pyobjc(title: str, message: str, sound: bool) -> bool:
@@ -146,6 +145,7 @@ def _send_macos_pyobjc(title: str, message: str, sound: bool) -> bool:
         if icon_path is not None:
             try:
                 from AppKit import NSImage
+
                 ns_image = NSImage.alloc().initWithContentsOfFile_(str(icon_path))
                 if ns_image is not None:
                     note.setContentImage_(ns_image)
@@ -173,9 +173,7 @@ def _clear_macos_pyobjc() -> None:
         logger.warning("pyobjc clear failed: %s", e)
 
 
-# --------------------------------------------------------------------------
 # macOS — osascript fallback (only used when pyobjc is unavailable)
-# --------------------------------------------------------------------------
 
 
 def _send_macos_osascript(title: str, message: str, sound: bool) -> None:
@@ -183,14 +181,15 @@ def _send_macos_osascript(title: str, message: str, sound: bool) -> None:
     and CANNOT be cleared by ``clear_notifications()`` — use only as a
     last-resort fallback.
     """
-    safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)[:200].replace("\\", "\\\\").replace('"', '\\"')
-    safe_message = re.sub(r'[\x00-\x1f\x7f]', '', message)[:500].replace("\\", "\\\\").replace('"', '\\"')
+    safe_title = (
+        re.sub(r"[\x00-\x1f\x7f]", "", title)[:200].replace("\\", "\\\\").replace('"', '\\"')
+    )
+    safe_message = (
+        re.sub(r"[\x00-\x1f\x7f]", "", message)[:500].replace("\\", "\\\\").replace('"', '\\"')
+    )
 
     sound_clause = ' sound name "default"' if sound else ""
-    script = (
-        f'display notification "{safe_message}" '
-        f'with title "{safe_title}"{sound_clause}'
-    )
+    script = f'display notification "{safe_message}" with title "{safe_title}"{sound_clause}'
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
@@ -204,17 +203,15 @@ def _send_macos_osascript(title: str, message: str, sound: bool) -> None:
         )
 
 
-# --------------------------------------------------------------------------
 # Windows
-# --------------------------------------------------------------------------
 
 
 def _send_windows(title: str, message: str) -> None:
     """Send toast notification via PowerShell on Windows."""
     # Sanitize for PowerShell single-quoted string literals:
     # strip control chars, limit length, escape single quotes.
-    safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)[:200].replace("'", "''")
-    safe_message = re.sub(r'[\x00-\x1f\x7f]', '', message)[:500].replace("'", "''")
+    safe_title = re.sub(r"[\x00-\x1f\x7f]", "", title)[:200].replace("'", "''")
+    safe_message = re.sub(r"[\x00-\x1f\x7f]", "", message)[:500].replace("'", "''")
 
     # Upgrade from ToastText02 to ToastImageAndText02 when we have an icon
     # available — same two-line layout plus a logo on the left.
@@ -279,9 +276,7 @@ def _clear_windows() -> None:
         )
 
 
-# --------------------------------------------------------------------------
 # Linux — notify-send (libnotify)
-# --------------------------------------------------------------------------
 
 
 def _send_linux(title: str, message: str) -> None:
@@ -291,8 +286,8 @@ def _send_linux(title: str, message: str) -> None:
     quoting; we still strip control chars and cap length defensively. If
     notify-send is not installed we log at debug and return rather than raise.
     """
-    safe_title = re.sub(r'[\x00-\x1f\x7f]', '', title)[:200]
-    safe_message = re.sub(r'[\x00-\x1f\x7f]', '', message)[:500]
+    safe_title = re.sub(r"[\x00-\x1f\x7f]", "", title)[:200]
+    safe_message = re.sub(r"[\x00-\x1f\x7f]", "", message)[:500]
 
     args = ["notify-send", "--app-name=BetterFlow"]
     icon_path = _resolve_icon_path()

@@ -39,9 +39,7 @@ AW_TO_BF_NAMES = {
 BF_BINARIES = list(AW_TO_BF_NAMES.values())
 
 # GitHub release URLs
-RELEASE_BASE = (
-    f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
-)
+RELEASE_BASE = f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
 RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
     "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
@@ -169,7 +167,7 @@ def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
             if original_stem in AW_TO_BF_NAMES and not info.is_dir():
                 launchers[original_stem] = info.filename
 
-        missing = [name for name in AW_TO_BF_NAMES.keys() if name not in launchers]
+        missing = [name for name in AW_TO_BF_NAMES if name not in launchers]
         if missing:
             print(f"WARNING: Missing binaries in archive: {missing}")
             return
@@ -193,7 +191,9 @@ def extract_binaries(zip_path: str, output_dir: str, plat: str) -> None:
                 if not prefix and member.filename != launcher_path:
                     continue
 
-                rel_name = member.filename[len(prefix):] if prefix else os.path.basename(member.filename)
+                rel_name = (
+                    member.filename[len(prefix) :] if prefix else os.path.basename(member.filename)
+                )
                 if os.path.basename(member.filename) == os.path.basename(launcher_path):
                     rel_name = branded_name + ext
 

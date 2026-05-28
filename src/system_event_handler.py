@@ -73,7 +73,7 @@ class SystemEventHandler:
         try:
             from .main import _day_greeting
         except ImportError:
-            from main import _day_greeting
+            pass
 
         self.bf.reset_session()
         self.aw.reset_session()

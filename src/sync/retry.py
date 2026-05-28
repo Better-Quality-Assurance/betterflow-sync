@@ -51,7 +51,7 @@ def calculate_delay(
     Returns:
         Delay in seconds
     """
-    delay = base_delay * (exponential_base ** attempt)
+    delay = base_delay * (exponential_base**attempt)
     delay = min(delay, max_delay)
 
     if jitter:
@@ -116,10 +116,7 @@ def retry_with_backoff(
             if on_retry:
                 on_retry(attempt, e, delay)
             else:
-                logger.warning(
-                    f"Attempt {attempt + 1} failed: {e}. "
-                    f"Retrying in {delay:.1f}s..."
-                )
+                logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
 
             # Use cancel_event.wait() for interruptible sleep when available
             if cancel_event is not None:

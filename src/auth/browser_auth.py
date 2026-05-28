@@ -14,9 +14,9 @@ import secrets
 import threading
 import webbrowser
 from dataclasses import dataclass
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import parse_qs, quote, urlparse
 
 from .pkce import generate_pkce_pair
 
@@ -33,6 +33,7 @@ class AuthFlowResult:
     code: Optional[str] = None
     code_verifier: Optional[str] = None  # For PKCE token exchange
     error: Optional[str] = None
+
 
 _SUCCESS_HTML = """\
 <!DOCTYPE html>
@@ -85,7 +86,6 @@ _ERROR_HTML = """\
 </body>
 </html>
 """
-
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):

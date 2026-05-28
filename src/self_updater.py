@@ -265,8 +265,8 @@ def _apply_local_artifact(
                 if '"' in p or "%" in p:
                     _status("Update aborted: install path contains unsupported characters")
                     return False
-            bat_content = '@echo off\r\n'
-            bat_content += 'timeout /t 2 /nobreak >nul\r\n'
+            bat_content = "@echo off\r\n"
+            bat_content += "timeout /t 2 /nobreak >nul\r\n"
             bat_content += f'xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"\r\n'
             bat_content += f'start "" "{exe_path}"\r\n'
             bat_content += f'rd /s /q "{tmp_dir}"\r\n'
@@ -374,9 +374,19 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
         # mount time. Signature verification still happens post-extract.
         subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly",
-             "-mountpoint", str(mount_point), str(dmg_path)],
-            capture_output=True, text=True, timeout=60, check=True,
+            [
+                "hdiutil",
+                "attach",
+                "-nobrowse",
+                "-readonly",
+                "-mountpoint",
+                str(mount_point),
+                str(dmg_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
         )
         # Find .app inside mounted volume
         app_found = None
@@ -397,7 +407,9 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         try:
             result = subprocess.run(
                 ["hdiutil", "detach", str(mount_point), "-quiet"],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             if result.returncode != 0:
                 logger.error(
@@ -447,7 +459,9 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
     try:
         result = subprocess.run(
             ["codesign", "--display", "--verbose=2", str(app_path)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         stderr = result.stderr  # codesign writes to stderr
         if result.returncode == 0:
@@ -467,7 +481,9 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
         try:
             result = subprocess.run(
                 ["defaults", "read", str(plist_path), "CFBundleShortVersionString"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if result.returncode == 0:
                 version = result.stdout.strip()
@@ -489,7 +505,9 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
     try:
         result = subprocess.run(
             ["codesign", "--verify", "--deep", "--strict", str(app_path)],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode == 0:
             logger.info("Code signature verified successfully")
@@ -534,6 +552,7 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
         if current.version and new.version:
             try:
                 from packaging.version import Version
+
                 if Version(new.version) < Version(current.version):
                     logger.error(
                         f"Rejecting update: version downgrade ({current.version} -> {new.version})"
@@ -572,9 +591,8 @@ def apply_update_async(
     thread.start()
 
 
-# ---------------------------------------------------------------------------
 # Staged updates: download in the background, apply on next launch / idle.
-# ---------------------------------------------------------------------------
+
 
 def _staging_dir() -> Path:
     return Config.get_data_dir() / "staged_update"
@@ -611,11 +629,15 @@ def stage_update(
         dest = staging / filename
         logger.info("Staging update %s -> %s", version, dest)
         _download_to_file(download_url, dest, on_progress)
-        _staging_meta_path().write_text(json.dumps({
-            "version": str(version),
-            "artifact": filename,
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-        }))
+        _staging_meta_path().write_text(
+            json.dumps(
+                {
+                    "version": str(version),
+                    "artifact": filename,
+                    "staged_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        )
         return True
     except Exception as e:
         logger.warning("Failed to stage update: %s", e)

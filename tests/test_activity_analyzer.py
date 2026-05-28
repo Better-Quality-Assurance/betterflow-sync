@@ -1,8 +1,6 @@
 """Tests for activity analyzer."""
 
-import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
 
 from src.config import FraudDetectionConfig
 from src.sync.activity_analyzer import (
@@ -187,9 +185,7 @@ class TestActivityAnalyzer:
     def test_events_outside_window_not_counted(self):
         """Events outside the rolling window should not be counted."""
         # Add typing event outside the window (6 minutes ago, window is 5 min)
-        old_event = self._make_input_event(
-            self.now - timedelta(minutes=6), presses=100
-        )
+        old_event = self._make_input_event(self.now - timedelta(minutes=6), presses=100)
         self.analyzer.add_input_events([old_event])
 
         state = self.analyzer.get_activity_state(self.now)
@@ -234,9 +230,7 @@ class TestActivityAnalyzer:
         events = [
             self._make_window_event(self.now - timedelta(minutes=3), app="App1"),
             self._make_window_event(self.now - timedelta(minutes=2), app="App2"),
-            self._make_window_event(
-                self.now - timedelta(minutes=1), app="App2", title="Different"
-            ),
+            self._make_window_event(self.now - timedelta(minutes=1), app="App2", title="Different"),
         ]
         self.analyzer.add_window_events(events)
 
@@ -265,12 +259,8 @@ class TestActivityAnalyzer:
         # Add an old event AND a recent one. Pruning is anchored to the
         # latest event timestamp (not wall clock). With a 5-min window
         # (2x = 10 min cutoff), an event 20 min before the latest is pruned.
-        old_event = self._make_input_event(
-            self.now - timedelta(minutes=20), presses=100
-        )
-        recent_event = self._make_input_event(
-            self.now, presses=1, event_id=99
-        )
+        old_event = self._make_input_event(self.now - timedelta(minutes=20), presses=100)
+        recent_event = self._make_input_event(self.now, presses=1, event_id=99)
         self.analyzer.add_input_events([old_event, recent_event])
 
         # The old event should have been pruned, only recent remains
@@ -295,9 +285,7 @@ class TestActivityAnalyzer:
     def test_custom_window_size(self):
         """Custom window size should be respected."""
         # Create analyzer with 2-minute window
-        analyzer = ActivityAnalyzer(
-            thresholds=EngagementThresholds(window_minutes=2)
-        )
+        analyzer = ActivityAnalyzer(thresholds=EngagementThresholds(window_minutes=2))
 
         # Add event 3 minutes ago (outside 2-min window)
         event = self._make_input_event(self.now - timedelta(minutes=3), presses=100)

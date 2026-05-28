@@ -20,6 +20,7 @@ from src.update_checker import _ASSET_PATTERNS, _find_platform_asset
 # update_checker: Linux .AppImage asset selection
 # ---------------------------------------------------------------------------
 
+
 class TestUpdateCheckerLinux:
     def test_linux_pattern_registered(self):
         assert _ASSET_PATTERNS["Linux"] == "BetterFlow-linux"
@@ -29,19 +30,27 @@ class TestUpdateCheckerLinux:
             "assets": [
                 {"name": "BetterFlow-macOS-arm64.dmg", "browser_download_url": "https://x/m.dmg"},
                 {"name": "BetterFlow-Windows.zip", "browser_download_url": "https://x/w.zip"},
-                {"name": "BetterFlow-linux-x86_64.AppImage", "browser_download_url": "https://x/l.AppImage"},
+                {
+                    "name": "BetterFlow-linux-x86_64.AppImage",
+                    "browser_download_url": "https://x/l.AppImage",
+                },
             ]
         }
         assert _find_platform_asset(release, system="Linux") == "https://x/l.AppImage"
 
     def test_returns_none_when_no_appimage(self):
-        release = {"assets": [{"name": "BetterFlow-Windows.zip", "browser_download_url": "https://x/w.zip"}]}
+        release = {
+            "assets": [
+                {"name": "BetterFlow-Windows.zip", "browser_download_url": "https://x/w.zip"}
+            ]
+        }
         assert _find_platform_asset(release, system="Linux") is None
 
 
 # ---------------------------------------------------------------------------
 # aw_manager / download_aw: Linux platform key, asset, paths
 # ---------------------------------------------------------------------------
+
 
 class TestAwManagerLinux:
     def test_release_asset_present(self):
@@ -88,6 +97,7 @@ class TestDownloadAwScriptLinux:
 # autostart: XDG .desktop entry
 # ---------------------------------------------------------------------------
 
+
 class TestAutostartLinux:
     def test_write_and_remove(self, monkeypatch, tmp_path):
         monkeypatch.setattr(autostart.platform, "system", lambda: "Linux")
@@ -128,11 +138,13 @@ class TestAutostartLinux:
 # notifications: notify-send dispatch
 # ---------------------------------------------------------------------------
 
+
 class TestNotificationsLinux:
     def test_dispatch_calls_notify_send(self, monkeypatch):
         monkeypatch.setattr(notifications_module.platform, "system", lambda: "Linux")
-        with patch("src.notifications.subprocess.run") as mock_run, patch(
-            "src.notifications._resolve_icon_path", return_value=None
+        with (
+            patch("src.notifications.subprocess.run") as mock_run,
+            patch("src.notifications._resolve_icon_path", return_value=None),
         ):
             mock_run.return_value = MagicMock(returncode=0)
             send_notification("Title", "Body")
@@ -145,8 +157,9 @@ class TestNotificationsLinux:
 
     def test_missing_notify_send_is_silent(self, monkeypatch):
         monkeypatch.setattr(notifications_module.platform, "system", lambda: "Linux")
-        with patch("src.notifications.subprocess.run", side_effect=FileNotFoundError), patch(
-            "src.notifications._resolve_icon_path", return_value=None
+        with (
+            patch("src.notifications.subprocess.run", side_effect=FileNotFoundError),
+            patch("src.notifications._resolve_icon_path", return_value=None),
         ):
             # Should not raise.
             send_notification("Title", "Body")
@@ -155,6 +168,7 @@ class TestNotificationsLinux:
 # ---------------------------------------------------------------------------
 # self_updater: AppImage path resolution
 # ---------------------------------------------------------------------------
+
 
 class TestSelfUpdaterLinux:
     def test_app_bundle_path_from_appimage_env(self, monkeypatch, tmp_path):

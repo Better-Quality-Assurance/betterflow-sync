@@ -1,6 +1,7 @@
 """Minimal config directory access to avoid circular imports with config.py."""
 
 from pathlib import Path
+
 from platformdirs import user_config_dir
 
 APP_NAME = "BetterFlow"

@@ -23,27 +23,21 @@ class TestGetMachineUuid:
 
     def test_generates_valid_uuid4(self, tmp_path, monkeypatch):
         """First call with no file generates a valid UUID4."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         result = config_module.get_machine_uuid()
         parsed = uuid.UUID(result, version=4)
         assert str(parsed) == result
 
     def test_persists_to_file(self, tmp_path, monkeypatch):
         """Generated UUID is written to .machine_id file."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         result = config_module.get_machine_uuid()
         file_content = (tmp_path / ".machine_id").read_text().strip()
         assert file_content == result
 
     def test_cache_returns_same_value(self, tmp_path, monkeypatch):
         """Second call returns cached value without file I/O."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         first = config_module.get_machine_uuid()
         # Delete the file to prove second call uses cache, not disk.
         (tmp_path / ".machine_id").unlink()
@@ -52,18 +46,14 @@ class TestGetMachineUuid:
 
     def test_reads_existing_valid_file(self, tmp_path, monkeypatch):
         """Reads and caches a pre-existing valid UUID from disk."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         expected = "12345678-1234-4234-8234-123456789012"
         (tmp_path / ".machine_id").write_text(expected)
         assert config_module.get_machine_uuid() == expected
 
     def test_rejects_invalid_uuid_in_file(self, tmp_path, monkeypatch):
         """Non-UUID content in file is rejected; a new UUID is generated."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         (tmp_path / ".machine_id").write_text("not-a-uuid")
         result = config_module.get_machine_uuid()
         assert result != "not-a-uuid"
@@ -71,9 +61,7 @@ class TestGetMachineUuid:
 
     def test_rejects_multiline_content(self, tmp_path, monkeypatch):
         """Multi-line file content fails UUID validation."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         (tmp_path / ".machine_id").write_text("line1\nline2")
         result = config_module.get_machine_uuid()
         assert "\n" not in result
@@ -81,27 +69,21 @@ class TestGetMachineUuid:
 
     def test_handles_empty_file(self, tmp_path, monkeypatch):
         """Empty file falls through to UUID generation."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         (tmp_path / ".machine_id").write_text("   \n   ")
         result = config_module.get_machine_uuid()
         assert _UUID_RE.match(result)
 
     def test_handles_unicode_decode_error(self, tmp_path, monkeypatch):
         """Binary file content triggers UnicodeDecodeError, falls through."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         (tmp_path / ".machine_id").write_bytes(b"\x80\x81\x82\xff")
         result = config_module.get_machine_uuid()
         assert _UUID_RE.match(result)
 
     def test_handles_read_permission_error(self, tmp_path, monkeypatch):
         """OSError on read falls through to UUID generation."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         id_file = tmp_path / ".machine_id"
         id_file.write_text("12345678-1234-4234-8234-123456789012")
         id_file.chmod(0o000)
@@ -111,7 +93,9 @@ class TestGetMachineUuid:
         finally:
             id_file.chmod(0o644)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="chmod read-only not enforced on Windows dirs")
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="chmod read-only not enforced on Windows dirs"
+    )
     def test_handles_write_failure(self, tmp_path, monkeypatch):
         """Write failure still returns a UUID (graceful degradation)."""
         monkeypatch.setattr(
@@ -131,18 +115,14 @@ class TestGetMachineUuid:
 
     def test_atomic_write_no_leftover_tmp(self, tmp_path, monkeypatch):
         """Successful write should not leave a .tmp file behind."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         config_module.get_machine_uuid()
         assert not (tmp_path / ".machine_id.tmp").exists()
         assert (tmp_path / ".machine_id").exists()
 
     def test_tmp_cleaned_up_on_replace_failure(self, tmp_path, monkeypatch):
         """Stale .tmp file is removed when os.replace() fails."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         # Let write_text succeed but os.replace fail
         with patch("src.config.os.replace", side_effect=OSError("replace failed")):
             result = config_module.get_machine_uuid()
@@ -152,9 +132,7 @@ class TestGetMachineUuid:
 
     def test_thread_safety_single_uuid(self, tmp_path, monkeypatch):
         """Concurrent calls from multiple threads all get the same UUID."""
-        monkeypatch.setattr(
-            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
-        )
+        monkeypatch.setattr("src.config.user_config_dir", lambda *a, **kw: str(tmp_path))
         results = []
         import threading
 

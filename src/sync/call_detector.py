@@ -30,7 +30,11 @@ class CallEvent:
 # Each entry: (app name substring, title regex or None, display name)
 _NATIVE_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
     ("zoom.us", re.compile(r"Zoom (Meeting|Webinar)|\d{9,11}", re.IGNORECASE), "Zoom"),
-    ("Microsoft Teams", re.compile(r"(Meeting|Call) with|In a call", re.IGNORECASE), "Microsoft Teams"),
+    (
+        "Microsoft Teams",
+        re.compile(r"(Meeting|Call) with|In a call", re.IGNORECASE),
+        "Microsoft Teams",
+    ),
     ("Slack", re.compile(r"Huddle", re.IGNORECASE), "Slack"),
     ("Discord", re.compile(r"Voice Connected|voice channel", re.IGNORECASE), "Discord"),
     ("FaceTime", None, "FaceTime"),  # Any active FaceTime window = call
@@ -40,8 +44,16 @@ _NATIVE_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
 # -- Browser URL patterns -----------------------------------------------
 # Each entry: (url substring, extra url regex or None, display name)
 _BROWSER_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
-    ("meet.google.com/", re.compile(r"meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}"), "Google Meet"),
-    ("teams.microsoft.com/", re.compile(r"teams\.microsoft\.com.*/meeting", re.IGNORECASE), "Microsoft Teams"),
+    (
+        "meet.google.com/",
+        re.compile(r"meet\.google\.com/[a-z]{3}-[a-z]{4}-[a-z]{3}"),
+        "Google Meet",
+    ),
+    (
+        "teams.microsoft.com/",
+        re.compile(r"teams\.microsoft\.com.*/meeting", re.IGNORECASE),
+        "Microsoft Teams",
+    ),
     ("zoom.us/j/", None, "Zoom"),
     ("zoom.us/wc/", None, "Zoom"),
     ("app.slack.com/", re.compile(r"huddle", re.IGNORECASE), "Slack"),
@@ -159,9 +171,7 @@ class CallDetector:
             return self._end_call()
         return None
 
-    def _start_call(
-        self, name: str, call_type: Optional[str], timestamp: datetime
-    ) -> None:
+    def _start_call(self, name: str, call_type: Optional[str], timestamp: datetime) -> None:
         self._call_app = name
         self._call_type = call_type or "native"
         self._call_start = timestamp

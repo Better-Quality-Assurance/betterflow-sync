@@ -30,10 +30,16 @@ _BROWSER_BUNDLE_IDS: dict[str, str] = {
     "Firefox": "org.mozilla.firefox",
 }
 
-_CHROMIUM_BROWSERS = frozenset({
-    "Google Chrome", "Google Chrome Canary", "Chromium", "Brave Browser",
-    "Microsoft Edge", "Arc",
-})
+_CHROMIUM_BROWSERS = frozenset(
+    {
+        "Google Chrome",
+        "Google Chrome Canary",
+        "Chromium",
+        "Brave Browser",
+        "Microsoft Edge",
+        "Arc",
+    }
+)
 _URL_BROWSERS = _CHROMIUM_BROWSERS | {"Safari"}
 
 # Terminal apps with AppleScript support for tab-specific titles.
@@ -86,11 +92,16 @@ class MacOSWindowWatcher:
                 AXIsProcessTrusted,
                 AXUIElementCreateApplication,
             )
+
             trusted = AXIsProcessTrusted()
             if not trusted:
-                logger.warning("Process does NOT have Accessibility permission — window titles will be empty")
+                logger.warning(
+                    "Process does NOT have Accessibility permission — window titles will be empty"
+                )
         except ImportError:
-            logger.error("Cannot start MacOSWindowWatcher: pyobjc-framework-ApplicationServices not installed")
+            logger.error(
+                "Cannot start MacOSWindowWatcher: pyobjc-framework-ApplicationServices not installed"
+            )
             return False
 
         try:
@@ -99,10 +110,14 @@ class MacOSWindowWatcher:
             logger.warning(f"Failed to create window bucket (will retry on heartbeat): {e}")
 
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="macos-window-watcher",
+            target=self._run,
+            daemon=True,
+            name="macos-window-watcher",
         )
         self._thread.start()
-        logger.info(f"MacOSWindowWatcher started (bucket={self._bucket_id}, poll={self._poll_interval}s)")
+        logger.info(
+            f"MacOSWindowWatcher started (bucket={self._bucket_id}, poll={self._poll_interval}s)"
+        )
         return True
 
     def set_poll_interval(self, interval: float) -> None:
@@ -141,11 +156,15 @@ class MacOSWindowWatcher:
         title = ""
         app_ref = AXUIElementCreateApplication(pid)
         err, focused_window = AXUIElementCopyAttributeValue(
-            app_ref, "AXFocusedWindow", None,
+            app_ref,
+            "AXFocusedWindow",
+            None,
         )
         if err == 0 and focused_window:
             err2, ax_title = AXUIElementCopyAttributeValue(
-                focused_window, "AXTitle", None,
+                focused_window,
+                "AXTitle",
+                None,
             )
             if err2 == 0 and ax_title:
                 title = str(ax_title)
@@ -207,7 +226,9 @@ class MacOSWindowWatcher:
                 script = f'tell application id "{bundle_id}" to return URL of current tab of front window'
                 result = subprocess.run(
                     ["osascript", "-e", script],
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
                 if result.returncode == 0:
                     return result.stdout.strip(), None
@@ -219,7 +240,9 @@ class MacOSWindowWatcher:
                 )
                 result = subprocess.run(
                     ["osascript", "-e", script],
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
                 if result.returncode == 0:
                     lines = result.stdout.strip().split("\n")
@@ -249,7 +272,9 @@ class MacOSWindowWatcher:
 
             result = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
             if result.returncode == 0:
                 title = result.stdout.strip()
@@ -265,6 +290,7 @@ class MacOSWindowWatcher:
         """Poll loop: get active window via PyObjC, post heartbeat."""
         try:
             import objc
+
             _has_objc = True
         except ImportError:
             _has_objc = False
@@ -289,12 +315,14 @@ class MacOSWindowWatcher:
         grant flips. Title fetches already work transparently once the
         permission appears — this just makes the change visible in logs."""
         import time
+
         now = time.monotonic()
         if now - self._last_accessibility_check_ts < self._ACCESSIBILITY_RECHECK_INTERVAL_S:
             return
         self._last_accessibility_check_ts = now
         try:
             from ApplicationServices import AXIsProcessTrusted
+
             trusted = bool(AXIsProcessTrusted())
         except Exception:
             return
@@ -302,13 +330,9 @@ class MacOSWindowWatcher:
             self._last_accessibility = trusted
             return
         if trusted and not self._last_accessibility:
-            logger.info(
-                "Accessibility permission now granted — window titles will be tracked"
-            )
+            logger.info("Accessibility permission now granted — window titles will be tracked")
         elif not trusted and self._last_accessibility:
-            logger.warning(
-                "Accessibility permission revoked — window titles will be empty"
-            )
+            logger.warning("Accessibility permission revoked — window titles will be empty")
         self._last_accessibility = trusted
 
     def _poll_once(self) -> None:
@@ -328,6 +352,8 @@ class MacOSWindowWatcher:
 
         timestamp = datetime.now(timezone.utc).isoformat()
         self._aw.post_heartbeat(
-            self._bucket_id, timestamp, heartbeat_data,
+            self._bucket_id,
+            timestamp,
+            heartbeat_data,
             pulsetime=self._poll_interval + 1.0,
         )

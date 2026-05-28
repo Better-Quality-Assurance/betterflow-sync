@@ -1,11 +1,10 @@
 """Tests for offline queue."""
 
-import pytest
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.sync.queue import OfflineQueue, QueuedEvent
+from src.sync.queue import OfflineQueue
 
 
 class TestOfflineQueue:

@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 try:
-    from ..config import Config, MAX_QUEUE_SIZE
+    from ..config import MAX_QUEUE_SIZE, Config
 except ImportError:
-    from config import Config, MAX_QUEUE_SIZE
+    from config import MAX_QUEUE_SIZE, Config
 
 __all__ = ["OfflineQueue", "QueuedEvent"]
 
@@ -228,7 +228,7 @@ class OfflineQueue:
 
         # If batch is larger than max_size, only keep newest events
         if len(events) > self.max_size:
-            events = events[-self.max_size:]
+            events = events[-self.max_size :]
             logger.warning(f"Batch larger than max_size, truncated to {len(events)} events")
 
         now = datetime.now(timezone.utc).isoformat()
@@ -289,7 +289,8 @@ class OfflineQueue:
                 (max_retries, batch_size),
             )
             return [
-                e for e in (QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall())
+                e
+                for e in (QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall())
                 if e is not None
             ]
 
@@ -502,9 +503,7 @@ class OfflineQueue:
             cursor.execute("SELECT app_name, category FROM app_categories")
             return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def set_category(
-        self, app_name: str, category: str, source: str = "server"
-    ) -> None:
+    def set_category(self, app_name: str, category: str, source: str = "server") -> None:
         """Set or update a single app category.
 
         User overrides (source='user') are never clobbered by server or

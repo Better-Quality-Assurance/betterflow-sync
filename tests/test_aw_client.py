@@ -1,12 +1,10 @@
 """Tests for ActivityWatch client."""
 
-import pytest
-from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from datetime import timezone
 
 import responses
 
-from src.sync.aw_client import AWClient, AWEvent, AWBucket, AWClientError
+from src.sync.aw_client import AWBucket, AWClient, AWEvent
 
 
 class TestAWEvent:

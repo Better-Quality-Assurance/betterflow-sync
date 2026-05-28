@@ -3,24 +3,24 @@
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 from .browser_auth import BrowserAuthFlow
 from .keychain import KeychainManager, StoredCredentials
 
 try:
     from ..sync.bf_client import (
-        BetterFlowClient,
-        DeviceInfo,
-        BetterFlowClientError,
         BetterFlowAuthError,
+        BetterFlowClient,
+        BetterFlowClientError,
+        DeviceInfo,
     )
 except ImportError:
     from sync.bf_client import (
-        BetterFlowClient,
-        DeviceInfo,
-        BetterFlowClientError,
         BetterFlowAuthError,
+        BetterFlowClient,
+        BetterFlowClientError,
+        DeviceInfo,
     )
 
 __all__ = ["LoginManager", "LoginState"]
@@ -146,7 +146,9 @@ class LoginManager:
         device_info = DeviceInfo.collect()
         device_name = f"sync:{device_info.machine_id[:12]}"
         result = self.bf.exchange_code(
-            auth_result.code, device_name, auth_result.code_verifier,
+            auth_result.code,
+            device_name,
+            auth_result.code_verifier,
             device_info=device_info,
         )
 
@@ -201,7 +203,8 @@ class LoginManager:
             logger.warning(
                 "Failed to revoke token server-side — token may remain "
                 "valid until it expires. Revoke manually from the web "
-                "interface if needed. Error: %s", e,
+                "interface if needed. Error: %s",
+                e,
             )
 
         # Always clear local credentials even if revocation failed
