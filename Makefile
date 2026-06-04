@@ -82,8 +82,15 @@ appimage: build-linux
 run:
 	.venv-arm64/bin/python -m src.main
 
-# Create macOS DMG (requires create-dmg)
+# Create an arch-suffixed macOS DMG. TARGET_ARCH defaults to the host
+# arch (via uname). update_checker._find_platform_asset requires the
+# arch string in the asset filename, so the suffix is mandatory for
+# the in-app updater to pick the correct download.
+TARGET_ARCH ?= $(shell uname -m | sed 's/aarch64/arm64/')
+
 dmg: build-mac
+	@dmg_path="dist/BetterFlow-macOS-$(TARGET_ARCH).dmg"; \
+	rm -f "$$dmg_path"; \
 	create-dmg \
 		--volname "BetterFlow" \
 		--volicon "resources/icon.icns" \
@@ -92,16 +99,17 @@ dmg: build-mac
 		--icon-size 100 \
 		--icon "BetterFlow.app" 150 190 \
 		--app-drop-link 450 185 \
-		"dist/BetterFlow.dmg" \
-		"dist/BetterFlow.app"
+		"$$dmg_path" \
+		"dist/BetterFlow.app"; \
+	echo "[dmg] Created $$dmg_path"
 	rm -rf "dist/BetterFlow"
 	@# Set custom file icon on the DMG so it shows BetterFlow logo in Finder
-	python3 -c "\
-	import Cocoa, os; \
-	ws = Cocoa.NSWorkspace.sharedWorkspace(); \
-	img = Cocoa.NSImage.alloc().initWithContentsOfFile_(os.path.abspath('resources/icon.png')); \
-	ws.setIcon_forFile_options_(img, os.path.abspath('dist/BetterFlow.dmg'), 0); \
-	print('Custom icon set on DMG')"
+	@dmg_path="dist/BetterFlow-macOS-$(TARGET_ARCH).dmg"; \
+	python3 -c "import Cocoa, os; \
+ws = Cocoa.NSWorkspace.sharedWorkspace(); \
+img = Cocoa.NSImage.alloc().initWithContentsOfFile_(os.path.abspath('resources/icon.png')); \
+ws.setIcon_forFile_options_(img, os.path.abspath('$$dmg_path'), 0); \
+print('Custom icon set on', '$$dmg_path')"
 
 # Development server (auto-reload)
 dev:
