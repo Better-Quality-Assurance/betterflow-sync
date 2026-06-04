@@ -40,6 +40,11 @@ except ImportError:  # PyInstaller bundle (src/ is import root)
 
 logger = logging.getLogger(__name__)
 
+# The only Apple Developer ID team we ever ship production releases under.
+# Pinned to make _verify_codesign reject updates signed by any other team,
+# even on a fresh install with no prior team-ID context to compare against.
+EXPECTED_TEAM_ID = "87NVC57J44"  # Better Quality Assurance SRL
+
 
 def _get_app_bundle_path() -> Optional[Path]:
     """Return the path to the running app: .app bundle (macOS), .exe dir
@@ -477,15 +482,8 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
     return _SigningInfo(is_signed=is_signed, team_id=team_id, version=version)
 
 
-def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) -> bool:
-    """Verify macOS code signature on the extracted .app bundle.
-
-    Checks:
-    1. Signature integrity (tampered signatures rejected)
-    2. Signed->unsigned downgrade rejected
-    3. Team ID mismatch rejected
-    4. Version downgrade rejected
-    """
+def _codesign_verify(app_path: Path) -> bool:
+    """Run `codesign --verify --deep --strict` and return True on success."""
     try:
         result = subprocess.run(
             ["codesign", "--verify", "--deep", "--strict", str(app_path)],
@@ -493,14 +491,13 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
         )
         if result.returncode == 0:
             logger.info("Code signature verified successfully")
+            return True
+        stderr = result.stderr.strip()
+        if "code object is not signed at all" in stderr:
+            logger.error("Rejecting update: new app is not signed")
         else:
-            stderr = result.stderr.strip()
-            if "code object is not signed at all" in stderr:
-                logger.error("Rejecting update: new app is not signed")
-                return False
-            else:
-                logger.error(f"codesign verification failed: {stderr}")
-                return False
+            logger.error(f"codesign verification failed: {stderr}")
+        return False
     except FileNotFoundError:
         logger.error("codesign binary not found - update aborted (cannot verify signature)")
         return False
@@ -508,10 +505,35 @@ def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) ->
         logger.error("codesign verification timed out")
         return False
 
+
+def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) -> bool:
+    """Verify macOS code signature on the extracted .app bundle.
+
+    Checks:
+    1. Signature integrity (tampered signatures rejected)
+    2. Team ID matches EXPECTED_TEAM_ID (pinned to our Apple team)
+    3. Signed->unsigned downgrade rejected
+    4. Team ID mismatch vs current install rejected (legacy check, kept)
+    5. Version downgrade rejected
+    """
+    if not _codesign_verify(app_path):
+        return False
+
+    new = _get_signing_info(app_path)
+
+    # Pin check: refuse any update whose team is not our team.
+    # Catches malicious updates on a fresh install where there is no
+    # current_app_path to compare against.
+    if new.team_id != EXPECTED_TEAM_ID:
+        logger.error(
+            f"Rejecting update: team ID {new.team_id!r} does not match "
+            f"expected {EXPECTED_TEAM_ID!r}"
+        )
+        return False
+
     # Downgrade protection: compare against current app if provided
     if current_app_path is not None:
         current = _get_signing_info(current_app_path)
-        new = _get_signing_info(app_path)
 
         # Reject signed -> unsigned downgrade
         if current.is_signed and not new.is_signed:
