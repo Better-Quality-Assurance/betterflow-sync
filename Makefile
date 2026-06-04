@@ -74,6 +74,25 @@ NOTARIZE_DMG ?= dist/BetterFlow-macOS-arm64.dmg
 notarize-mac:
 	python3 scripts/notarize-mac.py "$(NOTARIZE_DMG)"
 
+# Staple the notarization ticket onto the DMG (and the .app inside
+# dist/, if present). Stapling embeds the ticket so Gatekeeper does
+# not need to phone home on first launch.
+#
+# Override:  make staple-mac STAPLE_DMG=path/to/file.dmg
+STAPLE_DMG ?= dist/BetterFlow-macOS-arm64.dmg
+STAPLE_APP ?= dist/BetterFlow.app
+
+staple-mac:
+	@echo "[staple-mac] Stapling $(STAPLE_DMG)"
+	xcrun stapler staple "$(STAPLE_DMG)"
+	xcrun stapler validate "$(STAPLE_DMG)"
+	@if [ -d "$(STAPLE_APP)" ]; then \
+		echo "[staple-mac] Stapling $(STAPLE_APP)"; \
+		xcrun stapler staple "$(STAPLE_APP)"; \
+		xcrun stapler validate "$(STAPLE_APP)"; \
+	fi
+	@echo "[staple-mac] Done"
+
 # Build for Windows (run on Windows)
 build-windows: download-aw
 	pyinstaller build.spec --clean
