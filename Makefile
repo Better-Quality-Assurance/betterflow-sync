@@ -145,6 +145,52 @@ print('Custom icon set on', '$$dmg_path')"
 dev:
 	watchmedo auto-restart -d src/ -p "*.py" -- python -m src.main
 
+# Full release pipeline: build, sign, notarize, staple for both
+# architectures. Runs serially. Each architecture takes ~5-15 min
+# wall-clock (PyInstaller build + Apple notary turnaround).
+#
+# Does NOT tag or push — those remain manual gates to avoid
+# accidentally cutting a release from a dirty working copy.
+ship: ship-arm64 ship-x86_64
+	@echo "[ship] Both architectures shipped:"
+	@ls -la dist/BetterFlow-macOS-*.dmg
+
+ship-arm64:
+	@echo "[ship] === arm64 ==="
+	rm -rf dist build
+	TARGET_ARCH=arm64 $(MAKE) dmg
+	NOTARIZE_DMG=dist/BetterFlow-macOS-arm64.dmg $(MAKE) notarize-mac
+	STAPLE_DMG=dist/BetterFlow-macOS-arm64.dmg $(MAKE) staple-mac
+	mv dist/BetterFlow.app dist/BetterFlow-arm64.app
+
+ship-x86_64:
+	@echo "[ship] === x86_64 ==="
+	rm -rf build
+	# build.spec reads TARGET_ARCH; PyInstaller runs under Rosetta via
+	# the x86_64 venv. .app overwrites the renamed arm64 build above.
+	arch -x86_64 .venv-x86_64/bin/python -m PyInstaller build.spec --clean
+	./scripts/sign-mac.sh dist/BetterFlow.app
+	TARGET_ARCH=x86_64 $(MAKE) _ship-x86-dmg
+	NOTARIZE_DMG=dist/BetterFlow-macOS-x86_64.dmg $(MAKE) notarize-mac
+	STAPLE_DMG=dist/BetterFlow-macOS-x86_64.dmg $(MAKE) staple-mac
+
+# Internal: build the x86_64 DMG without re-running PyInstaller via
+# the regular `dmg` prerequisite chain.
+_ship-x86-dmg:
+	@dmg_path="dist/BetterFlow-macOS-x86_64.dmg"; \
+	rm -f "$$dmg_path"; \
+	create-dmg \
+		--volname "BetterFlow" \
+		--volicon "resources/icon.icns" \
+		--window-pos 200 120 \
+		--window-size 600 400 \
+		--icon-size 100 \
+		--icon "BetterFlow.app" 150 190 \
+		--app-drop-link 450 185 \
+		"$$dmg_path" \
+		"dist/BetterFlow.app"; \
+	echo "[ship] Created $$dmg_path"
+
 # Generate icon files from PNG
 icons:
 	@echo "Generating icons..."
