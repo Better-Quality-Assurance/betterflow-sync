@@ -63,6 +63,17 @@ sign-mac:
 	fi
 	./scripts/sign-mac.sh dist/BetterFlow.app
 
+# Submit a signed DMG to Apple's notary service and wait synchronously
+# for the verdict. On rejection, prints the notary log before failing.
+# Uses keychain profile 'betterqa' — set up via PF.3 in
+# docs/superpowers/plans/2026-06-03-notarized-ship.md.
+#
+# Override DMG path:  make notarize-mac NOTARIZE_DMG=path/to/file.dmg
+NOTARIZE_DMG ?= dist/BetterFlow-macOS-arm64.dmg
+
+notarize-mac:
+	python3 scripts/notarize-mac.py "$(NOTARIZE_DMG)"
+
 # Build for Windows (run on Windows)
 build-windows: download-aw
 	pyinstaller build.spec --clean
