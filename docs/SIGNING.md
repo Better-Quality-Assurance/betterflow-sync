@@ -1,0 +1,94 @@
+# Signing + Notarization Setup
+
+BetterFlow Sync is signed and notarized for distribution outside the Mac App Store. This doc covers the one-time setup a new developer must do on their Mac before they can run `make ship`.
+
+## Prerequisites
+
+- Be a member of the **Better Quality Assurance SRL** Apple Developer team (Team ID `87NVC57J44`) with role Admin or higher
+- Sign Xcode into your `@betterqa.eu` Apple ID at Xcode → Settings → Accounts
+- Xcode 15+ installed (for `xcrun notarytool`)
+
+## One-time setup
+
+### 1. Request the Developer ID Application certificate
+
+Only the team's **Account Holder** can request Developer ID certs (verified 2026-06-03 — Admins see the row greyed out with "This operation can only be performed by the Account Holder."). If you are not the Account Holder:
+
+1. Generate a CSR on your Mac:
+   ```bash
+   mkdir -p ~/Developer/betterqa-devid && cd ~/Developer/betterqa-devid
+   openssl genrsa -out devid.key 2048
+   openssl req -new -key devid.key -out devid.certSigningRequest \
+       -subj "/emailAddress=<your>@betterqa.eu/CN=Better Quality Assurance SRL/C=RO"
+   ```
+2. Send `devid.certSigningRequest` to the Account Holder.
+3. Account Holder uploads it at developer.apple.com → Certificates → "+" → **Developer ID Application** → **G2 Sub-CA** → Choose File → downloads `developerID_application.cer` and sends it back.
+4. Pair the cert with your private key and import into login keychain:
+   ```bash
+   openssl x509 -inform DER -in developerID_application.cer -out devid.pem
+   openssl pkcs12 -export -inkey devid.key -in devid.pem \
+       -name "Developer ID Application: Better Quality Assurance SRL (87NVC57J44)" \
+       -out devid.p12 -passout pass:transport -legacy
+   security import devid.p12 -k ~/Library/Keychains/login.keychain-db -P transport \
+       -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/productsign
+   ```
+5. Verify:
+   ```bash
+   security find-identity -v -p codesigning | grep "Developer ID Application: Better Quality Assurance SRL"
+   ```
+   Should print one line with a 40-char SHA1 hash.
+
+### 2. Generate an app-specific password for notarization
+
+At appleid.apple.com → Sign-In and Security → App-Specific Passwords → "+" with label "notarytool-betterflow". Copy the 19-character password (format `xxxx-xxxx-xxxx-xxxx`).
+
+### 3. Store notarytool credentials in your Keychain
+
+```bash
+xcrun notarytool store-credentials betterqa \
+    --apple-id <your>@betterqa.eu \
+    --team-id 87NVC57J44 \
+    --password <paste app-specific password>
+```
+
+Verify:
+```bash
+xcrun notarytool history --keychain-profile betterqa
+```
+Should print an empty (or populated) history table, NOT a missing-keychain-item error.
+
+## Releasing
+
+Once setup is done, the release pipeline is:
+
+```bash
+# 1. Bump version
+$EDITOR src/__init__.py
+
+# 2. Build, sign, notarize, staple both archs
+make ship
+
+# 3. Tag and push
+git commit -am "chore(release): 1.5.X"
+git tag v1.5.X
+git push --tags
+
+# 4. Create GitHub Release with both DMGs
+gh release create v1.5.X \
+    dist/BetterFlow-macOS-arm64.dmg \
+    dist/BetterFlow-macOS-x86_64.dmg \
+    --notes-from-tag
+```
+
+## Renewing credentials
+
+- **App-specific password:** revoke + regenerate at appleid.apple.com, then re-run `xcrun notarytool store-credentials betterqa …`
+- **Developer ID cert:** Apple-issued certs are valid ~5 years (current one expires 2031-06-05). Renew via the same Account-Holder flow as the original request. Stapled tickets on already-released DMGs keep them trusted even after the signing cert expires.
+
+## Why we sign + notarize
+
+- **TCC grant stability:** stable code-signing identity means macOS recognizes every build as "the same app", so users keep their Input Monitoring + Accessibility grants across updates.
+- **Gatekeeper friction:** notarization removes the "unidentified developer — cannot be opened" dialog on first launch.
+- **Self-updater safety:** `self_updater.py` pins `EXPECTED_TEAM_ID = "87NVC57J44"` and rejects any update signed by a different team, so the auto-update path can only deliver our team's binaries.
+
+For the full design rationale see `docs/superpowers/specs/2026-06-03-notarized-ship-design.md`.
