@@ -631,6 +631,8 @@ class TrayIcon:
             Item(f"API: {'Connected' if self._check_api_status(s) else 'Unreachable'}", None, enabled=False),
             Item(f"Queue: {s['queue_size']} events", None, enabled=False),
             Item(f"Last sync: {s['last_sync']}", None, enabled=False),
+            Item("─" * 20, None, enabled=False),
+            Item("Privacy Policy", self._handle_open_privacy),
         ]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
         items.append(Item("Sync Now", self._handle_sync_now, enabled=logged_in))
@@ -843,6 +845,18 @@ class TrayIcon:
         with self.model.lock:
             url = self.model.dashboard_url
         webbrowser.open(url)
+
+    def _handle_open_privacy(self, icon, item) -> None:
+        """Open the public privacy policy in the user's default browser.
+
+        Surfaced from Diagnostics so the disclosure stays one click away
+        from any session, not just the first-run permission gate.
+        """
+        try:
+            from .setup_wizard import PRIVACY_POLICY_URL
+        except ImportError:
+            from ui.setup_wizard import PRIVACY_POLICY_URL
+        webbrowser.open(PRIVACY_POLICY_URL)
 
     def _handle_stop_project(self, icon, item) -> None:
         """Clear the currently running project."""

@@ -9,10 +9,13 @@ import platform
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import itertools
+
+PRIVACY_POLICY_URL = "https://betterqa.co/privacy-policy-terms-of-service/"
 
 from PIL import Image, ImageTk
 
@@ -548,56 +551,100 @@ class SetupWizard:
         has_input = input_monitoring_active()
 
         cx = self._draw_scene(
-            title="Grant Permission",
-            subtitle="One permission lets BetterFlow protect your hours",
+            title="Grant Input Monitoring",
+            subtitle="Required for fraud detection. We count events. We never read content.",
         )
 
-        # Friendly label — the literal macOS pane is "Input Monitoring", which
-        # reads as surveillance; the instruction line names the pane for findability.
+        # Two-column disclosure: what we DO vs DON'T collect. This is the
+        # legally meaningful disclosure — keystroke content capture would
+        # break EU labour law and US wiretap statutes, so the gate states
+        # the boundary plainly at permission-grant time, not buried in a
+        # privacy policy PDF the user will never open.
+        self._draw_disclosure_columns(cx, top_y=178)
+
+        # One-line rationale + privacy policy link.
+        self._canvas.create_text(
+            cx, 318,
+            text="Required by your employment / service agreement for fraud detection.",
+            font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
+        )
+        self._make_text_link(
+            "Read the full Privacy Policy →",
+            lambda: webbrowser.open(PRIVACY_POLICY_URL),
+            cx, 338,
+        )
+
+        # Status row + actions.
         self._perm_row(
-            cx, 258, "Keyboard & Click Activity", has_input,
-            "Counts keystrokes & clicks (no content) — prevents false fraud flags",
+            cx, 376, "Input Monitoring", has_input,
+            "macOS permission required for the counting to work",
         )
 
         if has_input:
-            self._canvas.create_text(
-                cx, 332,
-                text="All set — you're ready to go.",
-                font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
-            )
             self._make_button(
-                "Continue", lambda: self._finish_gate("granted"), cx, 430, width=280
+                "Continue", lambda: self._finish_gate("granted"), cx, 446, width=280
             )
             return
 
-        self._canvas.create_text(
-            cx, 322,
-            text=("In System Settings, turn BetterFlow ON under “Input Monitoring”.\n"
-                  "If it isn't listed, click ＋ and add /Applications/BetterFlow.app.\n"
-                  "Then click Refresh."),
-            font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
-        )
         self._make_button(
             "Open System Settings", self._open_permission_settings,
-            cx - 132, 424, width=236, primary=False,
+            cx - 132, 440, width=236, primary=False,
         )
-        # Refresh re-checks in place (re-creates the event tap, which reads the
-        # current grant) — no relaunch needed when macOS reports it live.
         self._make_button(
             "Refresh", self._render_permissions,
-            cx + 132, 424, width=196, primary=True,
+            cx + 132, 440, width=196, primary=True,
         )
-        # Fallback: macOS sometimes caches the denial until the process restarts.
-        # If a refresh can't see a grant the user just enabled, this forces it.
         self._make_text_link(
             "Still not detected after enabling? Restart",
-            lambda: self._finish_gate("restart"), cx, 468,
+            lambda: self._finish_gate("restart"), cx, 482,
         )
 
         # Auto-poll so the badge flips on its own the moment the grant lands.
-        # _draw_scene -> _clear cancels this id before the next redraw, so there's
-        # no overlapping callback leak.
         self._spinner_after_id = self._window.after(1500, self._render_permissions)
+
+    def _draw_disclosure_columns(self, cx: int, top_y: int) -> None:
+        """Render the two-column DO / DON'T disclosure block.
+
+        Anchored at top_y; each column is ~280px wide. Column headers carry
+        a coloured badge so the contrast is unmissable even on quick glance.
+        """
+        col_gap = 320
+        left_x = cx - col_gap // 2 - 110
+        right_x = cx + col_gap // 2 - 110
+
+        # Column headers
+        self._canvas.create_text(
+            left_x, top_y, text="✓  WHAT WE COLLECT",
+            font=(FONT_FAMILY, 12, "bold"), fill=SUCCESS_COLOR, anchor="w",
+        )
+        self._canvas.create_text(
+            right_x, top_y, text="✗  WHAT WE DON'T",
+            font=(FONT_FAMILY, 12, "bold"), fill=ERROR_COLOR, anchor="w",
+        )
+
+        do_items = [
+            "Counts of keys / clicks / scrolls",
+            "Active app name & window title",
+            "Idle vs. active state",
+        ]
+        dont_items = [
+            "The keys you press or text you type",
+            "Passwords or message content",
+            "Screenshots of your screen",
+        ]
+
+        for i, text in enumerate(do_items):
+            self._canvas.create_text(
+                left_x, top_y + 26 + i * 22,
+                text=f"•  {text}",
+                font=FONT_SMALL, fill=TEXT_COLOR, anchor="w",
+            )
+        for i, text in enumerate(dont_items):
+            self._canvas.create_text(
+                right_x, top_y + 26 + i * 22,
+                text=f"•  {text}",
+                font=FONT_SMALL, fill=TEXT_COLOR, anchor="w",
+            )
 
     def _make_text_link(self, text: str, command, x: int, y: int) -> str:
         """Draw a small clickable text link for low-emphasis fallback actions."""
