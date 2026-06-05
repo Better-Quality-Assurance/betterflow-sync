@@ -4,6 +4,7 @@ A polished onboarding wizard: Welcome → Browser login → Success.
 Runs only when config.setup_complete is False.
 """
 
+import itertools
 import logging
 import platform
 import sys
@@ -13,18 +14,15 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import itertools
-
-PRIVACY_POLICY_URL = "https://betterqa.co/privacy-policy-terms-of-service/"
 
 from PIL import Image, ImageTk
 
 try:
     from ..auth.login import LoginManager, LoginState
-    from ..config import Config
+    from ..config import PRIVACY_POLICY_URL, Config
 except ImportError:
     from auth.login import LoginManager, LoginState
-    from config import Config
+    from config import PRIVACY_POLICY_URL, Config
 
 logger = logging.getLogger(__name__)
 
@@ -576,27 +574,46 @@ class SetupWizard:
 
         # Status row + actions.
         self._perm_row(
-            cx, 376, "Input Monitoring", has_input,
+            cx, 372, "Input Monitoring", has_input,
             "macOS permission required for the counting to work",
         )
 
         if has_input:
+            # Positive confirmation on grant — without this the success
+            # state was indistinguishable from the needs-grant state at
+            # a glance, since the disclosure block always renders.
+            self._canvas.create_text(
+                cx, 410,
+                text="Permission granted — counting is active.",
+                font=FONT_SMALL, fill=SUCCESS_COLOR, justify=tk.CENTER,
+            )
             self._make_button(
                 "Continue", lambda: self._finish_gate("granted"), cx, 446, width=280
             )
             return
 
+        # Step-by-step instructions for the macOS Settings dance. The
+        # disclosure block tells the user WHAT and WHY; this tells them
+        # HOW. A user who has never seen the Privacy & Security pane
+        # has no idea what to toggle without these lines.
+        self._canvas.create_text(
+            cx, 408,
+            text=("In System Settings, turn BetterFlow ON under “Input Monitoring”.\n"
+                  "If it is not listed, click + and add /Applications/BetterFlow.app.\n"
+                  "Then click Refresh."),
+            font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
+        )
         self._make_button(
             "Open System Settings", self._open_permission_settings,
-            cx - 132, 440, width=236, primary=False,
+            cx - 132, 460, width=236, primary=False,
         )
         self._make_button(
             "Refresh", self._render_permissions,
-            cx + 132, 440, width=196, primary=True,
+            cx + 132, 460, width=196, primary=True,
         )
         self._make_text_link(
             "Still not detected after enabling? Restart",
-            lambda: self._finish_gate("restart"), cx, 482,
+            lambda: self._finish_gate("restart"), cx, 498,
         )
 
         # Auto-poll so the badge flips on its own the moment the grant lands.

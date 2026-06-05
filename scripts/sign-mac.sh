@@ -26,34 +26,52 @@ if ! security find-identity -v -p codesigning | grep -q "87NVC57J44"; then
     exit 1
 fi
 
+# Refuse to sign if the dist app we're about to mutate is currently
+# running — codesign --force on an mmap'd binary races and can produce
+# subtly-broken signatures that notarization still accepts but
+# Gatekeeper later rejects on launch.
+if pgrep -f "$APP/Contents/MacOS/BetterFlow" > /dev/null; then
+    echo "[sign-mac] $APP is running — kill it before signing" >&2
+    exit 1
+fi
+
 echo "[sign-mac] Signing nested binaries inside $APP"
 
+# Process-substitution form keeps the `while` body in the parent shell.
+# A pipe ( find | while ) puts the loop in a subshell where `set -e`
+# cannot abort the outer script — a single codesign failure would be
+# logged and silently swallowed, the outer bundle would seal anyway,
+# and notary would reject the build with a per-binary error days later.
 # Find every Mach-O file under Contents/. The `file` filter is needed
 # because PyInstaller also bundles non-Mach-O files (icons, plist, etc.)
 # that codesign would refuse.
-find "$APP/Contents" -type f \( -perm -u+x -o -name "*.dylib" -o -name "*.so" \) -print0 |
 while IFS= read -r -d '' binary; do
     if file "$binary" | grep -q "Mach-O"; then
         echo "[sign-mac]   $binary"
-        codesign --force --options runtime \
-            --entitlements "$ENTITLEMENTS" \
-            --sign "$IDENTITY" \
-            --timestamp \
-            "$binary"
+        if ! codesign --force --options runtime \
+                --entitlements "$ENTITLEMENTS" \
+                --sign "$IDENTITY" \
+                --timestamp \
+                "$binary"; then
+            echo "[sign-mac] codesign FAILED on $binary" >&2
+            exit 1
+        fi
     fi
-done
+done < <(find "$APP/Contents" -type f \( -perm -u+x -o -name "*.dylib" -o -name "*.so" \) -print0)
 
 # Sign all framework bundles (Python.framework, etc.). Frameworks are
 # directories ending in .framework — codesign treats them as a unit.
-find "$APP/Contents" -type d -name "*.framework" -print0 |
 while IFS= read -r -d '' fw; do
     echo "[sign-mac]   framework: $fw"
-    codesign --force --options runtime \
-        --entitlements "$ENTITLEMENTS" \
-        --sign "$IDENTITY" \
-        --timestamp \
-        "$fw"
-done
+    if ! codesign --force --options runtime \
+            --entitlements "$ENTITLEMENTS" \
+            --sign "$IDENTITY" \
+            --timestamp \
+            "$fw"; then
+        echo "[sign-mac] codesign FAILED on framework $fw" >&2
+        exit 1
+    fi
+done < <(find "$APP/Contents" -type d -name "*.framework" -print0)
 
 echo "[sign-mac] Sealing outer bundle"
 codesign --force --options runtime \

@@ -853,9 +853,9 @@ class TrayIcon:
         from any session, not just the first-run permission gate.
         """
         try:
-            from .setup_wizard import PRIVACY_POLICY_URL
+            from ..config import PRIVACY_POLICY_URL
         except ImportError:
-            from ui.setup_wizard import PRIVACY_POLICY_URL
+            from config import PRIVACY_POLICY_URL
         webbrowser.open(PRIVACY_POLICY_URL)
 
     def _handle_stop_project(self, icon, item) -> None:

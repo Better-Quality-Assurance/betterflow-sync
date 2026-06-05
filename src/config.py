@@ -28,6 +28,7 @@ __all__ = [
     "get_machine_uuid",
     "DEFAULT_API_URL",
     "DEFAULT_WEB_BASE_URL",
+    "PRIVACY_POLICY_URL",
     "MAX_QUEUE_SIZE",
 ]
 
@@ -88,6 +89,11 @@ if "pytest" not in sys.modules:
 DEFAULT_API_URL = os.getenv("BETTERFLOW_API_URL", "https://app.betterflow.eu/api/agent").rstrip("/")
 DEFAULT_WEB_BASE_URL = os.getenv("BETTERFLOW_WEB_BASE_URL")
 STAGING_API_URL = "https://staging.betterflow.eu/api/agent"
+
+# Public privacy policy. Surfaced at the Input Monitoring gate and the
+# tray Diagnostics submenu so the legal disclosure is one click away
+# from any session. Update here, not in UI modules.
+PRIVACY_POLICY_URL = "https://betterqa.co/privacy-policy-terms-of-service/"
 
 # ActivityWatch defaults
 DEFAULT_AW_HOST = "localhost"

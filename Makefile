@@ -151,6 +151,9 @@ dev:
 #
 # Does NOT tag or push — those remain manual gates to avoid
 # accidentally cutting a release from a dirty working copy.
+# Both archs share dist/, so they must run serially even under `make -jN`.
+.NOTPARALLEL: ship ship-arm64 ship-x86_64
+
 ship: ship-arm64 ship-x86_64
 	@echo "[ship] Both architectures shipped:"
 	@ls -la dist/BetterFlow-macOS-*.dmg
@@ -167,10 +170,16 @@ ship-arm64:
 	NOTARIZE_DMG=dist/BetterFlow-macOS-arm64.dmg $(MAKE) notarize-mac
 	STAPLE_DMG=dist/BetterFlow-macOS-arm64.dmg $(MAKE) staple-mac
 	mv dist/BetterFlow.app dist/BetterFlow-arm64.app
+	# Drop the COLLECT one-dir orphan before x86_64 runs PyInstaller,
+	# which refuses to overwrite a non-empty output dir.
+	rm -rf dist/BetterFlow
 
 ship-x86_64:
 	@echo "[ship] === x86_64 ==="
-	rm -rf build
+	# Explicit cleanup of every PyInstaller output path before re-build.
+	# `rm -rf build` alone leaves dist/BetterFlow/ from arm64 in place
+	# and PyInstaller aborts: "output directory ... is not empty".
+	rm -rf build dist/BetterFlow dist/BetterFlow.app
 	# build.spec reads TARGET_ARCH; PyInstaller runs under Rosetta via
 	# the x86_64 venv. .app overwrites the renamed arm64 build above.
 	TARGET_ARCH=x86_64 arch -x86_64 .venv-x86_64/bin/python -m PyInstaller build.spec --clean
@@ -178,6 +187,8 @@ ship-x86_64:
 	TARGET_ARCH=x86_64 $(MAKE) _dmg-only
 	NOTARIZE_DMG=dist/BetterFlow-macOS-x86_64.dmg $(MAKE) notarize-mac
 	STAPLE_DMG=dist/BetterFlow-macOS-x86_64.dmg $(MAKE) staple-mac
+	mv dist/BetterFlow.app dist/BetterFlow-x86_64.app
+	rm -rf dist/BetterFlow
 
 # Internal: package whatever is currently in dist/BetterFlow.app as
 # dist/BetterFlow-macOS-$(TARGET_ARCH).dmg. Used by both ship targets
