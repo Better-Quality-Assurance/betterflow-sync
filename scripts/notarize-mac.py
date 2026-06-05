@@ -48,7 +48,13 @@ def main(argv: list[str]) -> int:
             capture_output=True, text=True,
             timeout=NOTARYTOOL_WAIT_TIMEOUT_SEC,
         )
-    except subprocess.TimeoutExpired as exc:
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            print(
+                "[notarize-mac] xcrun not found — install Xcode CLT: xcode-select --install",
+                file=sys.stderr,
+            )
+            return 1
         # The submission is still queued/processing on Apple's side; we
         # just could not wait any longer. Tell the caller how to resume.
         print(
@@ -108,7 +114,10 @@ def main(argv: list[str]) -> int:
             capture_output=True, text=True,
             timeout=NOTARYTOOL_LOG_TIMEOUT_SEC,
         )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            print("[notarize-mac] xcrun not found", file=sys.stderr)
+            return 1
         print(
             f"[notarize-mac] log fetch timed out. Status was {status}, submission {submission_id}. "
             f"Run `xcrun notarytool log {submission_id} --keychain-profile {KEYCHAIN_PROFILE}` manually.",

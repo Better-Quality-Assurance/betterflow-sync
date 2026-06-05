@@ -59,6 +59,26 @@ xcrun notarytool history --keychain-profile betterqa
 ```
 Should print an empty (or populated) history table, NOT a missing-keychain-item error.
 
+### 0. Create arch-specific virtual environments
+
+`make ship` invokes `.venv-arm64/bin/python` and `.venv-x86_64/bin/python` directly. These venvs are not created by any Makefile target — you must create them once before running `make ship` for the first time.
+
+```bash
+# arm64 (native on Apple Silicon)
+python3 -m venv .venv-arm64
+.venv-arm64/bin/pip install -r requirements.txt pyinstaller
+
+# x86_64 (Rosetta — must use an x86_64 Python interpreter)
+arch -x86_64 /usr/bin/python3 -m venv .venv-x86_64
+arch -x86_64 .venv-x86_64/bin/pip install -r requirements.txt pyinstaller
+```
+
+Verify each venv has the right architecture:
+```bash
+file .venv-arm64/bin/python3    # should say "arm64"
+file .venv-x86_64/bin/python3   # should say "x86_64"
+```
+
 ## Releasing
 
 Once setup is done, the release pipeline is:

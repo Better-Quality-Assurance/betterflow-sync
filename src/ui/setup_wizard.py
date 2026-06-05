@@ -145,7 +145,7 @@ class SetupWizard:
     def run_permission_gate(self) -> str:
         """Show only the permission gate; block until resolved.
 
-        Returns 'granted' (both permissions present), 'restart' (the user asked
+        Returns 'granted' (Input Monitoring permission present), 'restart' (the user asked
         to relaunch so a new grant takes effect) or 'quit' (window closed).
         """
         self._gate_only = True
@@ -779,7 +779,7 @@ def show_setup_wizard(config: Config, login_manager: LoginManager) -> SetupResul
 def run_permission_gate(config: Optional[Config] = None) -> str:
     """Show the macOS permission gate, blocking until it is resolved.
 
-    Returns 'granted' (both permissions present), 'restart' (relaunch so a new
+    Returns 'granted' (Input Monitoring permission present), 'restart' (relaunch so a new
     grant takes effect) or 'quit' (the user closed the window without granting).
 
     ``config`` is optional — the gate-only code path never accesses it.
