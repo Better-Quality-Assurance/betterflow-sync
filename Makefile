@@ -1,6 +1,6 @@
 # BetterFlow - Build Makefile
 
-.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows build-linux appimage run download-aw clean-aw
+.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows build-linux appimage run download-aw clean-aw sign-mac notarize-mac staple-mac dmg _dmg-only ship ship-arm64 ship-x86_64 dev icons
 
 # Install production dependencies
 install:

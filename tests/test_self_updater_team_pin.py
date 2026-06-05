@@ -56,3 +56,51 @@ class TestExpectedTeamIDPin:
         with patch("src.self_updater._codesign_verify", return_value=False), \
              patch("src.self_updater._get_signing_info", return_value=good):
             assert su._verify_codesign(new_app, current_app_path=None) is False
+
+    def test_rejects_version_downgrade(self, tmp_path):
+        new_app = tmp_path / "new.app"
+        current_app = tmp_path / "current.app"
+        new_app.mkdir()
+        current_app.mkdir()
+        current_info = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.26")
+        new_info = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.25")
+
+        def _fake_signing_info(path):
+            return current_info if path == current_app else new_info
+
+        with patch("src.self_updater._codesign_verify", return_value=True), \
+             patch("src.self_updater._get_signing_info", side_effect=_fake_signing_info):
+            assert su._verify_codesign(new_app, current_app_path=current_app) is False
+
+    def test_allows_newer_version(self, tmp_path):
+        new_app = tmp_path / "new.app"
+        current_app = tmp_path / "current.app"
+        new_app.mkdir()
+        current_app.mkdir()
+        current_info = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.25")
+        new_info = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.26")
+
+        def _fake_signing_info(path):
+            return current_info if path == current_app else new_info
+
+        with patch("src.self_updater._codesign_verify", return_value=True), \
+             patch("src.self_updater._get_signing_info", side_effect=_fake_signing_info):
+            assert su._verify_codesign(new_app, current_app_path=current_app) is True
+
+    def test_rejects_signed_to_unsigned_downgrade(self, tmp_path):
+        new_app = tmp_path / "new.app"
+        current_app = tmp_path / "current.app"
+        new_app.mkdir()
+        current_app.mkdir()
+        current_info = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.26")
+        new_info = su._SigningInfo(is_signed=False, team_id=None, version="1.5.26")
+
+        def _fake_signing_info(path):
+            return current_info if path == current_app else new_info
+
+        # The pin check (team_id != EXPECTED_TEAM_ID) fires before the
+        # current_app_path branch because new_info.team_id is None.
+        # Both guards independently reject this update.
+        with patch("src.self_updater._codesign_verify", return_value=True), \
+             patch("src.self_updater._get_signing_info", side_effect=_fake_signing_info):
+            assert su._verify_codesign(new_app, current_app_path=current_app) is False
