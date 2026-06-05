@@ -5,6 +5,7 @@
 # must not be evaluated at definition time.
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -36,6 +37,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
     from ..config import Config
+
+try:
+    from ..config import PRIVACY_POLICY_URL
+except ImportError:
+    with contextlib.suppress(ImportError):
+        import _build_info  # noqa: F401 — ensure bundle path detection runs first
+    from config import PRIVACY_POLICY_URL  # type: ignore[no-redef]
 
 
 def _prevent_termination() -> None:
@@ -852,10 +860,6 @@ class TrayIcon:
         Surfaced from Diagnostics so the disclosure stays one click away
         from any session, not just the first-run permission gate.
         """
-        try:
-            from ..config import PRIVACY_POLICY_URL
-        except ImportError:
-            from config import PRIVACY_POLICY_URL
         webbrowser.open(PRIVACY_POLICY_URL)
 
     def _handle_stop_project(self, icon, item) -> None:

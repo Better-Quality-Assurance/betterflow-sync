@@ -20,6 +20,12 @@ if [ ! -d "$APP" ]; then
     exit 1
 fi
 
+if [ ! -f "$ENTITLEMENTS" ]; then
+    echo "[sign-mac] Entitlements file not found: $ENTITLEMENTS" >&2
+    echo "[sign-mac] Run this script from the repo root, not from scripts/" >&2
+    exit 1
+fi
+
 if ! security find-identity -v -p codesigning | grep -q "87NVC57J44"; then
     echo "[sign-mac] Developer ID Application cert for Team 87NVC57J44 not in Keychain" >&2
     echo "[sign-mac] See docs/SIGNING.md for setup" >&2

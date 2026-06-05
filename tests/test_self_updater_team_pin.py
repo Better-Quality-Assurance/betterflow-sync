@@ -48,3 +48,11 @@ class TestExpectedTeamIDPin:
         with patch("src.self_updater._codesign_verify", return_value=True), \
              patch("src.self_updater._get_signing_info", return_value=evil):
             assert su._verify_codesign(new_app, current_app_path=current_app) is False
+
+    def test_rejects_when_codesign_verify_fails(self, tmp_path):
+        new_app = tmp_path / "new.app"
+        new_app.mkdir()
+        good = su._SigningInfo(is_signed=True, team_id="87NVC57J44", version="1.5.26")
+        with patch("src.self_updater._codesign_verify", return_value=False), \
+             patch("src.self_updater._get_signing_info", return_value=good):
+            assert su._verify_codesign(new_app, current_app_path=None) is False
