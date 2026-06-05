@@ -466,7 +466,7 @@ class SetupWizard:
     def _show_success(self, email: str) -> None:
         """Show success screen."""
         cx = self._draw_scene(
-            title="You’re All Set",
+            title="You're All Set",
             subtitle="BetterFlow is ready to run",
         )
 
@@ -598,7 +598,7 @@ class SetupWizard:
         # has no idea what to toggle without these lines.
         self._canvas.create_text(
             cx, 408,
-            text=("In System Settings, turn BetterFlow ON under “Input Monitoring”.\n"
+            text=("In System Settings, turn BetterFlow ON under \"Input Monitoring\".\n"
                   "If it is not listed, click + and add /Applications/BetterFlow.app.\n"
                   "Then click Refresh."),
             font=FONT_SMALL, fill=TEXT_MUTED, justify=tk.CENTER,
