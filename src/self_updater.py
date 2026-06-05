@@ -458,9 +458,13 @@ def _get_signing_info(app_path: Path) -> _SigningInfo:
         if result.returncode == 0:
             is_signed = True
             # Extract TeamIdentifier from output like "TeamIdentifier=ABC123XYZ"
-            match = re.search(r"TeamIdentifier=(\S+)", stderr)
-            if match and match.group(1) != "not set":
-                team_id = match.group(1)
+            # Use (.+) not (\S+) so ad-hoc bundles ("TeamIdentifier=not set") are
+            # captured in full; the strip()+guard then correctly leaves team_id=None.
+            match = re.search(r"TeamIdentifier=(.+)", stderr)
+            if match:
+                raw = match.group(1).strip()
+                if raw != "not set":
+                    team_id = raw
         elif "code object is not signed at all" in stderr:
             is_signed = False
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:

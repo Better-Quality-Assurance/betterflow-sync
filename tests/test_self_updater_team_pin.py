@@ -6,7 +6,7 @@ defense-in-depth on top of the existing team-ID-mismatch check, which
 only catches changes between two installs.
 """
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import src.self_updater as su
 
@@ -104,3 +104,78 @@ class TestExpectedTeamIDPin:
         with patch("src.self_updater._codesign_verify", return_value=True), \
              patch("src.self_updater._get_signing_info", side_effect=_fake_signing_info):
             assert su._verify_codesign(new_app, current_app_path=current_app) is False
+
+
+class TestGetSigningInfo:
+    """Unit tests for _get_signing_info parsing, especially the ad-hoc edge case.
+
+    Prior to the fix, the regex for TeamIdentifier matched only the first
+    word of "TeamIdentifier=not set", capturing "not" instead of None.  The
+    fixed regex with strip() and the != "not set" guard now correctly returns
+    team_id=None for ad-hoc-signed bundles.
+    """
+
+    def _make_codesign_result(self, returncode: int, stderr: str):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stderr = stderr
+        result.stdout = ""
+        return result
+
+    def test_adhoc_signed_returns_team_id_none(self, tmp_path):
+        """'TeamIdentifier=not set' must produce team_id=None, not team_id='not'."""
+        adhoc_stderr = (
+            "Executable=/Applications/BetterFlow.app/Contents/MacOS/BetterFlow\n"
+            "Identifier=com.betterqa.betterflow\n"
+            "Format=app bundle with Mach-O thin (arm64)\n"
+            "CodeDirectory v=20400 size=1234 flags=0x2(adhoc)\n"
+            "TeamIdentifier=not set\n"
+            "Sealed Resources version=2 rules=13 files=42\n"
+        )
+        codesign_result = self._make_codesign_result(0, adhoc_stderr)
+        defaults_result = MagicMock()
+        defaults_result.returncode = 0
+        defaults_result.stdout = "1.5.26\n"
+
+        with patch("subprocess.run", side_effect=[codesign_result, defaults_result]):
+            info = su._get_signing_info(tmp_path)
+
+        assert info.is_signed is True
+        assert info.team_id is None, (
+            "Ad-hoc-signed bundle must yield team_id=None, not 'not'"
+        )
+
+    def test_developer_id_signed_returns_team_id(self, tmp_path):
+        """A Developer ID signature with a real team ID is parsed correctly."""
+        dev_stderr = (
+            "Executable=/Applications/BetterFlow.app/Contents/MacOS/BetterFlow\n"
+            "Identifier=com.betterqa.betterflow\n"
+            "Format=app bundle with Mach-O thin (arm64)\n"
+            "CodeDirectory v=20400 size=1234 flags=0x0(none)\n"
+            "TeamIdentifier=87NVC57J44\n"
+            "Sealed Resources version=2 rules=13 files=42\n"
+        )
+        codesign_result = self._make_codesign_result(0, dev_stderr)
+        defaults_result = MagicMock()
+        defaults_result.returncode = 0
+        defaults_result.stdout = "1.5.26\n"
+
+        with patch("subprocess.run", side_effect=[codesign_result, defaults_result]):
+            info = su._get_signing_info(tmp_path)
+
+        assert info.is_signed is True
+        assert info.team_id == "87NVC57J44"
+
+    def test_unsigned_binary_returns_is_signed_false(self, tmp_path):
+        """codesign non-zero with 'code object is not signed' sets is_signed=False."""
+        unsigned_stderr = "BetterFlow.app: code object is not signed at all\n"
+        codesign_result = self._make_codesign_result(1, unsigned_stderr)
+        defaults_result = MagicMock()
+        defaults_result.returncode = 0
+        defaults_result.stdout = "1.5.26\n"
+
+        with patch("subprocess.run", side_effect=[codesign_result, defaults_result]):
+            info = su._get_signing_info(tmp_path)
+
+        assert info.is_signed is False
+        assert info.team_id is None
