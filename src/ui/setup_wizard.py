@@ -81,7 +81,7 @@ class SetupResult:
 class SetupWizard:
     """First-run setup wizard window."""
 
-    def __init__(self, config: Config, login_manager: Optional[LoginManager] = None):
+    def __init__(self, config: Optional[Config] = None, login_manager: Optional[LoginManager] = None):
         self._config = config
         self._login_manager = login_manager
         self._result = SetupResult()
@@ -751,7 +751,8 @@ class SetupWizard:
             auto_start_ok = set_auto_start(True)
         except Exception:
             pass  # Non-critical — user can enable manually
-        self._config.auto_start = auto_start_ok
+        if self._config is not None:
+            self._config.auto_start = auto_start_ok
 
         self._result = SetupResult(
             completed=True,
@@ -775,10 +776,14 @@ def show_setup_wizard(config: Config, login_manager: LoginManager) -> SetupResul
     return wizard.show()
 
 
-def run_permission_gate(config: Config) -> str:
+def run_permission_gate(config: Optional[Config] = None) -> str:
     """Show the macOS permission gate, blocking until it is resolved.
 
     Returns 'granted' (both permissions present), 'restart' (relaunch so a new
     grant takes effect) or 'quit' (the user closed the window without granting).
+
+    ``config`` is optional — the gate-only code path never accesses it.
+    It is accepted for backwards compatibility with call-sites that already
+    construct a Config before calling this function.
     """
     return SetupWizard(config).run_permission_gate()
