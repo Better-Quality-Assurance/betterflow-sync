@@ -96,16 +96,16 @@ def _download_to_file(
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Stream a download to ``dest``, reporting percent progress."""
-    resp = requests.get(download_url, stream=True, timeout=120)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-    downloaded = 0
-    with open(dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=256 * 1024):
-            f.write(chunk)
-            downloaded += len(chunk)
-            if total > 0 and on_progress:
-                on_progress(f"Downloading... {int(downloaded / total * 100)}%")
+    with requests.get(download_url, stream=True, timeout=120) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=256 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0 and on_progress:
+                    on_progress(f"Downloading... {int(downloaded / total * 100)}%")
 
 
 def apply_update(

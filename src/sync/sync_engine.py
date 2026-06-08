@@ -1208,11 +1208,21 @@ class SyncEngine:
             project = self._current_project
         if project:
             event["project_id"] = project["id"]
+        # bf.send_events() returns SyncResult(success=False) on network errors —
+        # it does NOT raise BetterFlowClientError — so the previous `except`
+        # block was unreachable and break/idle/private events were silently
+        # dropped on the first offline cycle. Inspect the result instead.
         try:
-            self.bf.send_events([event])
+            result = self.bf.send_events([event])
+        except BetterFlowAuthError as e:
+            # Auth errors are not retryable without re-login; queueing risks
+            # sending under a different user's session after re-auth. Drop.
+            logger.warning("Auth error sending %s event — not queued: %s", bucket_type, e)
+            return
+        if result.success:
             logger.info("Sent %s event (%.0fs)", bucket_type, duration)
-        except BetterFlowClientError as e:
-            logger.warning("Failed to send %s event: %s", bucket_type, e)
+        else:
+            logger.warning("Failed to send %s event: %s — queueing", bucket_type, result.error or "unknown")
             self.queue.enqueue([event])
 
     def send_break_event(self, start: datetime, end: Optional[datetime] = None) -> None:
@@ -1285,7 +1295,12 @@ class SyncEngine:
                                 e.get("bucket_id", "") for e in failed
                             )
                     else:
-                        # N11: server returned non-success without accepted_ids
+                        # N11: server returned non-success without accepted_ids.
+                        # This branch also covers network failures: bf_client
+                        # catches BetterFlowClientError internally and returns
+                        # SyncResult(success=False), so there is no separate
+                        # network-error except branch — see Important-2 in
+                        # commit history.
                         logger.warning(
                             "Server returned partial failure without accepted_ids - "
                             "re-queuing entire batch"
@@ -1310,15 +1325,6 @@ class SyncEngine:
                     )
                 stats.errors.append(f"Authentication error: {e}")
                 raise
-            except BetterFlowClientError:
-                # Network error — queue this and all remaining batches, then stop
-                for remaining in batches[i:]:
-                    self.queue.enqueue(remaining)
-                    stats.events_queued += len(remaining)
-                    stats.queued_bucket_ids.update(
-                        e.get("bucket_id", "") for e in remaining
-                    )
-                break
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
 
