@@ -521,13 +521,7 @@ class SyncCoordinator:
                 )
 
         except BetterFlowAuthError as e:
-            logger.warning(f"Auth error during sync: {e} — triggering re-login")
-            self.logged_in = False
-            self.tray.set_state(
-                TrayState.WAITING_AUTH, "Session expired, re-login required"
-            )
-            if self._on_auth_error:
-                self._on_auth_error()
+            self._handle_auth_error(e, source="sync")
         except Exception as e:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
@@ -538,7 +532,22 @@ class SyncCoordinator:
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
         # the lock during a blocking HTTP call that can take 30s on timeout.
-        self.sync_engine.send_heartbeat_if_due(stats)
+        # send_heartbeat_if_due returns the auth error rather than raising,
+        # because raising in the post-lock tail would surface as an uncaught
+        # exception in the APScheduler thread.
+        auth_err = self.sync_engine.send_heartbeat_if_due(stats)
+        if auth_err is not None:
+            self._handle_auth_error(auth_err, source="heartbeat")
+
+    def _handle_auth_error(self, e: BetterFlowAuthError, *, source: str) -> None:
+        """Trigger re-login on a 401/403 from sync or heartbeat."""
+        logger.warning(f"Auth error during {source}: {e} — triggering re-login")
+        self.logged_in = False
+        self.tray.set_state(
+            TrayState.WAITING_AUTH, "Session expired, re-login required"
+        )
+        if self._on_auth_error:
+            self._on_auth_error()
 
     def _fetch_hours_today(self) -> str:
         return self.hours.fetch_hours_today()

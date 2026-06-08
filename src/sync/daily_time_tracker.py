@@ -156,6 +156,14 @@ class DailyTimeTracker:
         if seconds <= 0:
             return
 
+        # Shutdown race: if close() ran while a sync cycle was in flight,
+        # _get_connection raises sqlite3.ProgrammingError. Skip silently —
+        # the in-flight delta is small (one sync interval) and forcing a
+        # spurious sync error on app quit is worse than losing it.
+        with self._conn_lock:
+            if self._closed:
+                return
+
         rollover_date = None
         rollover_seconds = 0.0
         with self._lock:
@@ -171,10 +179,15 @@ class DailyTimeTracker:
             self._today_seconds += seconds
 
         # All SQLite I/O happens outside the lock
-        if rollover_date is not None:
-            self._persist_date(rollover_date, rollover_seconds)
-            self._load_new_day(event_date)
-        self._persist()
+        try:
+            if rollover_date is not None:
+                self._persist_date(rollover_date, rollover_seconds)
+                self._load_new_day(event_date)
+            self._persist()
+        except sqlite3.ProgrammingError:
+            # close() raced with us between the _closed check above and the
+            # actual DB write. Same rationale: don't surface as a sync error.
+            logger.debug("DailyTimeTracker closed mid-write — skipping persist")
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active time for today.

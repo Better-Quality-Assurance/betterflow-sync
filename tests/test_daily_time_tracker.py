@@ -207,14 +207,19 @@ class TestDailyTimeTracker:
         self.tracker.close()
         self.tracker.close()  # Should not raise
 
-    def test_adding_after_close_raises(self):
-        """Adding time after close raises ProgrammingError (no silent reconnect)."""
-        import sqlite3
+    def test_adding_after_close_is_silent_noop(self):
+        """Adding time after close returns without persisting or reopening.
 
+        Earlier behavior raised ProgrammingError; that surfaced as a
+        spurious sync error in _do_sync on the shutdown race. The new
+        contract: no-op silently, but never silently reopen the DB
+        (which would leak connections during shutdown).
+        """
         self.tracker.add_active_time(60.0, self.today)
         self.tracker.close()
 
-        # After close() the tracker must not silently reopen -- doing so
-        # would leak connections during shutdown.
-        with pytest.raises(sqlite3.ProgrammingError):
-            self.tracker.add_active_time(60.0, self.today)
+        # Must not raise.
+        self.tracker.add_active_time(60.0, self.today)
+
+        # Must not have reopened the connection.
+        assert self.tracker._all_connections == []

@@ -1401,18 +1401,29 @@ class SyncEngine:
         self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
         logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
 
-    def send_heartbeat_if_due(self, stats: "SyncStats") -> None:
+    def send_heartbeat_if_due(self, stats: "SyncStats") -> Optional["BetterFlowAuthError"]:
         """Public entry point: send heartbeat iff the sync stats marked it due.
 
         Encapsulates the heartbeat dispatch decision so callers don't reach
         into private state. Safe to call unconditionally after sync() — no-op
         when stats._should_heartbeat is False.
+
+        Returns the BetterFlowAuthError if the heartbeat (or any server-driven
+        config refresh it triggers) returned a 401/403; callers should treat
+        this as a "session expired" signal and trigger re-login. Returns None
+        on success or non-auth failures (which are logged internally).
         """
         if stats and stats._should_heartbeat:
-            self._send_heartbeat()
+            return self._send_heartbeat()
+        return None
 
-    def _send_heartbeat(self) -> None:
-        """Send heartbeat to server and process commands."""
+    def _send_heartbeat(self) -> Optional["BetterFlowAuthError"]:
+        """Send heartbeat to server and process commands.
+
+        Returns BetterFlowAuthError on 401/403 so the caller can trigger
+        re-login. Other client errors are logged at debug and swallowed —
+        a transient heartbeat failure should not surface as a user error.
+        """
         try:
             response = self.bf.heartbeat()
 
@@ -1459,8 +1470,15 @@ class SyncEngine:
             if response.get("config_updated"):
                 self.fetch_server_config()
 
+        except BetterFlowAuthError as e:
+            # Surface auth errors to the caller so re-login can fire.
+            # The generic BetterFlowClientError handler below would otherwise
+            # swallow this at debug level (auth-error subclasses client-error).
+            logger.warning("Heartbeat auth error — session likely expired: %s", e)
+            return e
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
+        return None
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:
