@@ -12,11 +12,29 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 KEYCHAIN_PROFILE = "betterqa"
+
+
+def _auth_args() -> list[str]:
+    """notarytool credential args.
+
+    Prefer explicit env-var credentials — CI runners have no stored keychain
+    profile, so they pass the Apple ID / team / app-specific password directly:
+    ``BF_NOTARY_APPLE_ID`` + ``BF_NOTARY_TEAM_ID`` + ``BF_NOTARY_PASSWORD``.
+    Fall back to the local ``betterqa`` keychain profile on developer machines
+    (set up via ``xcrun notarytool store-credentials``; see docs/SIGNING.md).
+    """
+    apple_id = os.environ.get("BF_NOTARY_APPLE_ID")
+    team_id = os.environ.get("BF_NOTARY_TEAM_ID")
+    password = os.environ.get("BF_NOTARY_PASSWORD")
+    if apple_id and team_id and password:
+        return ["--apple-id", apple_id, "--team-id", team_id, "--password", password]
+    return ["--keychain-profile", KEYCHAIN_PROFILE]
 
 # Apple's notary is usually 2-10 min but occasionally hangs ~30 min on
 # bad days. Cap the --wait at 45 min so a stuck submission doesn't tie
@@ -41,7 +59,7 @@ def main(argv: list[str]) -> int:
         result = subprocess.run(
             [
                 "xcrun", "notarytool", "submit", str(dmg),
-                "--keychain-profile", KEYCHAIN_PROFILE,
+                *_auth_args(),
                 "--wait",
                 "--output-format", "json",
             ],
@@ -109,7 +127,7 @@ def main(argv: list[str]) -> int:
         log_result = subprocess.run(
             [
                 "xcrun", "notarytool", "log", submission_id,
-                "--keychain-profile", KEYCHAIN_PROFILE,
+                *_auth_args(),
             ],
             capture_output=True, text=True,
             timeout=NOTARYTOOL_LOG_TIMEOUT_SEC,

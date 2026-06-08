@@ -102,6 +102,38 @@ gh release create v1.5.X \
     --notes-from-tag
 ```
 
+## CI signing (GitHub Actions)
+
+`make ship` signs + notarizes on a developer Mac. CI (`.github/workflows/build.yml`)
+does the same for every macOS build it publishes — but only once these repo
+secrets are set. **Until they are set, CI builds are ad-hoc (Gatekeeper-blocked);
+on a tagged release the build hard-fails rather than ship an unsigned DMG.**
+
+Set these under repo **Settings → Secrets and variables → Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERT_P12_BASE64` | The Developer ID Application cert + private key as a base64'd `.p12` (see below) |
+| `MACOS_CERT_PASSWORD` | The export password used when creating the `.p12` |
+| `MACOS_NOTARY_APPLE_ID` | Apple ID that owns the app-specific password (currently `ana@betterqa.co`) |
+| `MACOS_NOTARY_TEAM_ID` | `87NVC57J44` |
+| `MACOS_NOTARY_PASSWORD` | The 19-char app-specific password from step 2 above |
+
+Export the `.p12` from the same login keychain where the cert lives — in Keychain
+Access, right-click the "Developer ID Application: Better Quality Assurance SRL"
+identity → Export → `.p12` (or reuse `devid.p12` from the one-time setup above),
+then:
+
+```bash
+security find-identity -v -p codesigning | grep 87NVC57J44   # confirm it's present
+base64 -i devid.p12 | pbcopy   # paste into MACOS_CERT_P12_BASE64
+```
+
+CI imports the cert into a throwaway keychain, runs `scripts/sign-mac.sh`, then
+notarizes via `scripts/notarize-mac.py` (which reads the `BF_NOTARY_*` env vars
+CI maps from the `MACOS_NOTARY_*` secrets) and staples the ticket. The keychain
+is deleted at job end.
+
 ## Renewing credentials
 
 - **App-specific password:** revoke + regenerate at appleid.apple.com, then re-run `xcrun notarytool store-credentials betterqa …`

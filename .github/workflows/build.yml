@@ -87,6 +87,44 @@ jobs:
         if: runner.os == 'Linux'
         run: ls -la dist/
 
+      # Developer ID-sign the .app before packaging. No-op until the
+      # MACOS_CERT_P12_BASE64 secret is set; on tagged releases signing is
+      # REQUIRED (an unsigned tag fails the build). Imports the cert into a
+      # throwaway keychain so scripts/sign-mac.sh's `security find-identity`
+      # resolves the Developer ID identity, then signs inside-out.
+      - name: Sign macOS app
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::MACOS_CERT_P12_BASE64 not set — refusing to ship an unsigned tagged release."
+              exit 1
+            fi
+            echo "MACOS_CERT_P12_BASE64 not set — skipping macOS signing (ad-hoc build)."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/betterflow-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          CERT_PATH="$RUNNER_TEMP/betterflow-devid.p12"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "${MACOS_CERT_PASSWORD:-}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # Allow codesign to use the imported key non-interactively.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+          # Prepend our keychain to the search list so find-identity sees the cert.
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$CERT_PATH"
+          ./scripts/sign-mac.sh dist/BetterFlow.app
+
       - name: Create macOS DMG
         if: runner.os == 'macOS'
         run: |
@@ -101,6 +139,37 @@ jobs:
             --app-drop-link 450 185 \
             "dist/${{ matrix.asset_name }}.dmg" \
             "dist/BetterFlow.app"
+
+      # Submit the signed DMG to Apple's notary service and staple the ticket
+      # so Gatekeeper trusts it offline on first launch. Same gate as signing:
+      # no-op without the cert secret, REQUIRED on tagged releases. notarytool
+      # reads BF_NOTARY_* creds via scripts/notarize-mac.py (CI has no stored
+      # keychain profile).
+      - name: Notarize and staple macOS DMG
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          BF_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          BF_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          BF_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          DMG="dist/${{ matrix.asset_name }}.dmg"
+          if [ -z "${MACOS_CERT_P12_BASE64:-}" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error::macOS signing secrets not set — refusing to ship an un-notarized tagged release."
+              exit 1
+            fi
+            echo "macOS signing secrets not set — skipping notarization."
+            exit 0
+          fi
+          if [ -z "${BF_NOTARY_APPLE_ID:-}" ] || [ -z "${BF_NOTARY_TEAM_ID:-}" ] || [ -z "${BF_NOTARY_PASSWORD:-}" ]; then
+            echo "::error::Cert present but MACOS_NOTARY_* credentials missing — cannot notarize."
+            exit 1
+          fi
+          python3 scripts/notarize-mac.py "$DMG"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
 
       - name: Create Windows ZIP
         if: matrix.os == 'windows-latest'
@@ -123,6 +192,15 @@ jobs:
             dist/${{ matrix.asset_name }}.zip
             dist/${{ matrix.asset_name }}.AppImage
           retention-days: 30
+
+      # Best-effort teardown of the throwaway signing keychain + cert, even on
+      # failure. Runners are ephemeral, but leaving the cert key around mid-job
+      # is sloppy.
+      - name: Clean up signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/betterflow-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/betterflow-devid.p12"
 
   release:
     needs: build
