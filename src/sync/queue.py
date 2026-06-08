@@ -288,10 +288,32 @@ class OfflineQueue:
                 """,
                 (max_retries, batch_size),
             )
-            return [
-                e for e in (QueuedEvent.from_row(tuple(row)) for row in cursor.fetchall())
-                if e is not None
-            ]
+            rows = cursor.fetchall()
+            result: list[QueuedEvent] = []
+            corrupt_ids: list[int] = []
+            for row in rows:
+                event = QueuedEvent.from_row(tuple(row))
+                if event is None:
+                    # Corrupt JSON: schedule for removal so it doesn't
+                    # permanently shrink every future dequeue batch.
+                    # Without this, retry_count never increments for these
+                    # rows (only dequeued events go through increment_retry),
+                    # so remove_failed never sees them and expire_old is the
+                    # only cleanup path (up to 30 days later).
+                    corrupt_ids.append(row[0])
+                else:
+                    result.append(event)
+            if corrupt_ids:
+                placeholders = ",".join("?" * len(corrupt_ids))
+                cursor.execute(
+                    f"DELETE FROM queued_events WHERE id IN ({placeholders})",
+                    corrupt_ids,
+                )
+                logger.warning(
+                    "[queue] Removed %d corrupt event row(s) during dequeue",
+                    len(corrupt_ids),
+                )
+            return result
 
     def remove(self, event_ids: list[int]) -> int:
         """Remove events from the queue.
