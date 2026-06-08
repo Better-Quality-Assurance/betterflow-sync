@@ -397,14 +397,28 @@ class SyncCoordinator:
 
         Order: tick_clock first (ghost detection), then idle check (may
         pause sync), then hours refresh, then lightweight checks.
-        Each sub-task has its own try/except so one failure won't block others.
+
+        Each sub-task is wrapped in try/except so one failure can't kill
+        the APScheduler job — if the job raises, APScheduler would log
+        once and stop re-scheduling, freezing the 60s tick entirely
+        (idle detection, hours, permissions, reminders all silently dead).
+        Several callees already self-guard but tray.tick_clock() does not.
         """
-        self.tray.tick_clock()
-        self._check_idle_status()
-        self._refresh_hours_today()
-        self._check_permissions()
+        for fn, label in (
+            (self.tray.tick_clock, "tick_clock"),
+            (self._check_idle_status, "idle_check"),
+            (self._refresh_hours_today, "hours_refresh"),
+            (self._check_permissions, "permissions"),
+        ):
+            try:
+                fn()
+            except Exception as e:
+                logger.warning("_tick_60s/%s failed: %s", label, e)
         if self.reminder_manager:
-            self.reminder_manager.check()
+            try:
+                self.reminder_manager.check()
+            except Exception as e:
+                logger.warning("_tick_60s/reminders failed: %s", e)
 
     def _check_idle_status(self) -> None:
         self.idle_mgr.check_idle_status(
