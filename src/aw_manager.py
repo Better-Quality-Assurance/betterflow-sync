@@ -391,6 +391,7 @@ class AWManager:
             return False
 
         restarted = False
+        server_restarted = False
         for name, proc in list(self._processes.items()):
             if name in self._disabled_components:
                 continue
@@ -400,6 +401,8 @@ class AWManager:
                 )
                 self._start_component(name, binaries_dir)
                 restarted = True
+                if name == BF_SERVER:
+                    server_restarted = True
 
         # Detect stalled window tracker (process alive but no new events)
         watcher = "bf-window-tracker"
@@ -425,10 +428,11 @@ class AWManager:
                 self._start_component(watcher, binaries_dir)
                 restarted = True
 
-        # If server was restarted, wait for it
-        if restarted and BF_SERVER in [
-            n for n, p in self._processes.items() if p.poll() is None
-        ]:
+        # Only block waiting for the server when the server itself was
+        # restarted. The previous check (`BF_SERVER in <currently-running>`)
+        # fired on every watcher restart, polling the info endpoint
+        # unnecessarily.
+        if server_restarted:
             self._wait_for_server()
 
         return self.check_health()

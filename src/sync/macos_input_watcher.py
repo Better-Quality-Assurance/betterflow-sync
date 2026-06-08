@@ -362,8 +362,12 @@ class MacOSInputWatcher:
 
             # Post succeeded — atomically subtract the counts we just sent.
             # Subtracting (rather than zeroing) preserves any events the event
-            # tap recorded between the snapshot and this point.
+            # tap recorded between the snapshot and this point. Clamp to zero
+            # to defend against the (narrow) permission-retry race where two
+            # emitter threads briefly run concurrently and would otherwise
+            # double-subtract the same snapshot into negative counts —
+            # negative values would corrupt the server-side fraud signal.
             with self._lock:
-                self._presses -= presses
-                self._clicks -= clicks
-                self._scrolls -= scrolls
+                self._presses = max(0, self._presses - presses)
+                self._clicks = max(0, self._clicks - clicks)
+                self._scrolls = max(0, self._scrolls - scrolls)
