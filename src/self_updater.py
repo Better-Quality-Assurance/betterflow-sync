@@ -731,4 +731,10 @@ def apply_staged_update(
     clear_staged_update()
 
     logger.info("Applying staged update from %s", artifact)
-    return _apply_local_artifact(artifact, on_progress, on_pre_exit)
+    try:
+        return _apply_local_artifact(artifact, on_progress, on_pre_exit)
+    finally:
+        # On success the process relaunches (execvp / os._exit) and this
+        # finally never runs. On failure we leak hundreds of MB (the DMG)
+        # in /tmp unless we clean up here.
+        shutil.rmtree(tmp_dir, ignore_errors=True)

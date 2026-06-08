@@ -1233,9 +1233,18 @@ class SyncEngine:
         self._send_status_span(kind="private", start=start)
 
     def _make_call_bf_event(self, call_event: "CallEvent") -> dict:
-        """Convert a CallEvent into a BetterFlow event dict."""
+        """Convert a CallEvent into a BetterFlow event dict.
+
+        Includes a deterministic id so the server can dedupe and so the
+        offline-queue partial-success path (_process_queue) can match the
+        event against the server's accepted_ids list. Without an id, a
+        partial server reply that omits this event would otherwise be
+        ambiguous between "accepted" and "not yet acknowledged".
+        """
         hostname = self._hostname
+        call_id = f"call_{call_event.app}_{int(call_event.start.timestamp())}"
         result: dict = {
+            "id": call_id,
             "timestamp": call_event.start.isoformat(),
             "duration": call_event.duration,
             "bucket_id": f"bf-call-detector_{hostname}",
@@ -1348,10 +1357,15 @@ class SyncEngine:
                     processed += len(events)
                     self._queue_consecutive_failures = 0
                 elif result.accepted_ids:
-                    # Partial success: remove accepted, increment retry on rest
+                    # Partial success: remove accepted, increment retry on rest.
+                    # An event without an "id" cannot be matched against
+                    # accepted_ids — treat it as failed so it gets retried
+                    # rather than silently dropped. All event producers
+                    # (regular events, status spans, call events) now include
+                    # a stable id; this is defensive against future regressions.
                     accepted_set = set(result.accepted_ids)
                     succeeded_ids = [eid for eid, ev in zip(event_ids, events)
-                                     if ev.get("id") in accepted_set or ev.get("id") is None]
+                                     if ev.get("id") in accepted_set]
                     failed_ids = [eid for eid in event_ids if eid not in succeeded_ids]
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
@@ -1380,6 +1394,16 @@ class SyncEngine:
         delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
         self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
         logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
+
+    def send_heartbeat_if_due(self, stats: "SyncStats") -> None:
+        """Public entry point: send heartbeat iff the sync stats marked it due.
+
+        Encapsulates the heartbeat dispatch decision so callers don't reach
+        into private state. Safe to call unconditionally after sync() — no-op
+        when stats._should_heartbeat is False.
+        """
+        if stats and stats._should_heartbeat:
+            self._send_heartbeat()
 
     def _send_heartbeat(self) -> None:
         """Send heartbeat to server and process commands."""

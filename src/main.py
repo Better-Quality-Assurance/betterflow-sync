@@ -538,8 +538,7 @@ class SyncCoordinator:
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
         # the lock during a blocking HTTP call that can take 30s on timeout.
-        if stats and stats._should_heartbeat:
-            self.sync_engine._send_heartbeat()
+        self.sync_engine.send_heartbeat_if_due(stats)
 
     def _fetch_hours_today(self) -> str:
         return self.hours.fetch_hours_today()
