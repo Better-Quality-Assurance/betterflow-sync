@@ -573,8 +573,10 @@ class OfflineQueue:
                 except Exception as e:
                     logger.debug("OfflineQueue conn.close() raised: %s", e)
             self._connections.clear()
-        # Clear the calling thread's reference; other threads will get
-        # a sqlite3.ProgrammingError on next use of their stale handle,
-        # which _get_connection detects via hasattr and replaces.
+        # Clear the calling thread's reference. Other threads calling into
+        # _get_connection will raise sqlite3.ProgrammingError immediately
+        # via the `if self._closed` guard — they do NOT fall through to the
+        # stale-handle replacement path (that path only handles open-but-stale
+        # handles after a previous close, when the queue is then reopened).
         if hasattr(self._local, "connection"):
             del self._local.connection
