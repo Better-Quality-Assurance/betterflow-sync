@@ -5,9 +5,21 @@ a Gatekeeper translocation path) should offer to move into /Applications and
 relaunch from there; everywhere else it's a no-op.
 """
 
+import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.main import BetterFlowApp
+
+# These tests force sys.platform="darwin" to exercise the macOS-only relocate
+# path. On Windows that path falls through to a real tkinter modal (pathlib
+# uses backslashes, so the "/Applications/" guard never matches), which blocks
+# CI forever. Production gates this on `sys.platform != "darwin"`, so the
+# logic never runs off macOS anyway — skip the tests there.
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin", reason="exercises macOS-only relocate logic"
+)
 
 
 class TestRelocate:
