@@ -427,7 +427,14 @@ class SetupWizard:
 
         if state.logged_in:
             self._login_state = state
-            self._show_success(state.user_email or "")
+            # macOS surfaces the tracking boundary via the Input Monitoring
+            # permission gate (after this wizard). Windows/Linux have no OS
+            # permission to grant, so show a one-time transparency + consent
+            # screen here before tracking starts.
+            if sys.platform == "darwin":
+                self._show_success(state.user_email or "")
+            else:
+                self._show_consent(state.user_email or "")
         else:
             safe_error = (state.error or "Login failed")[:200]
             self._show_error(safe_error)
@@ -508,6 +515,60 @@ class SetupWizard:
         # the always-on permission gate (see SetupWizard.run_permission_gate),
         # which runs after this wizard and on every subsequent launch.
         self._make_button("Continue", self._finish, cx, 438, width=280)
+
+    # ── Consent / Transparency (Windows / Linux) ─────────────────────
+
+    def _show_consent(self, email: str) -> None:
+        """First-run tracking transparency + consent screen.
+
+        Shown only on platforms without an OS permission gate (Windows/Linux);
+        macOS uses the Input Monitoring gate as the equivalent boundary. The
+        window close handler aborts setup, so tracking never starts without an
+        explicit acknowledgement.
+        """
+        cx = self._draw_scene(
+            title="How BetterFlow Tracks Time",
+            subtitle="Please review before tracking starts",
+        )
+
+        if email:
+            self._canvas.create_text(
+                cx,
+                210,
+                text=f"Signed in as {email}",
+                font=(FONT_FAMILY, 12, "bold"),
+                fill=SUCCESS_COLOR,
+            )
+
+        self._canvas.create_text(
+            cx,
+            262,
+            text=(
+                "BetterFlow records which apps and windows are active\n"
+                "while you work, to build your automatic timesheet."
+            ),
+            font=FONT_BODY,
+            fill=TEXT_MUTED,
+            justify=tk.CENTER,
+        )
+
+        self._canvas.create_text(
+            cx,
+            344,
+            text=(
+                "Your privacy is protected by default:\n"
+                "•  Window titles are hashed on your device\n"
+                "•  URLs are reduced to the domain only\n"
+                "•  Excluded apps are never tracked"
+            ),
+            font=FONT_SMALL,
+            fill="#9a87c4",
+            justify=tk.LEFT,
+        )
+
+        self._make_button(
+            "I Agree & Continue", lambda: self._show_success(email), cx, 446, width=280
+        )
 
     # ── Permissions Gate (macOS) ─────────────────────────────────────
 
