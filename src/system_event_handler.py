@@ -61,7 +61,18 @@ class SystemEventHandler:
 
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
-            self._sleep_start = datetime.now(timezone.utc)
+            # Keep the EARLIEST sleep start across a sequence of sleep events
+            # without an intervening wake (macOS can fire Display Sleep then
+            # System Sleep separately; some lid-close → reopen → reclose
+            # paths emit two sleeps without a wake between them). Overwriting
+            # would silently truncate the front of the sleep span.
+            if self._sleep_start is None:
+                self._sleep_start = datetime.now(timezone.utc)
+            else:
+                logger.debug(
+                    "on_system_sleep fired while a prior _sleep_start is still pending "
+                    "(no wake yet) — keeping the earlier timestamp"
+                )
         self.coordinator.paused_by_network = False
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()

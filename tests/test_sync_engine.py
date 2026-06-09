@@ -914,6 +914,24 @@ class TestSystemSleepWakeEmitsSleepSpan:
         handler.on_system_wake()
         sync_engine.send_sleep_event.assert_not_called()
 
+    def test_two_sleeps_without_wake_keep_earliest_timestamp(self):
+        """macOS can fire Display Sleep then System Sleep without a wake between.
+
+        Overwriting _sleep_start would silently truncate the front of the
+        sleep span — emit the *earliest* timestamp instead.
+        """
+        handler, sync_engine = self._make_handler()
+        handler.on_system_sleep()
+        first_start = handler._sleep_start
+        assert first_start is not None
+        import time as _time
+        _time.sleep(0.01)  # ensure a measurable timestamp difference
+        handler.on_system_sleep()
+        second_start = handler._sleep_start
+        assert second_start == first_start, (
+            "second sleep without an intervening wake must NOT overwrite _sleep_start"
+        )
+
     def test_send_sleep_event_failure_does_not_break_wake_flow(self):
         handler, sync_engine = self._make_handler()
         sync_engine.send_sleep_event.side_effect = RuntimeError("queue full")
