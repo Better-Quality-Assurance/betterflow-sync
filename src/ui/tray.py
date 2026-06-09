@@ -1428,16 +1428,23 @@ class TrayIcon:
             except Exception:
                 logger.debug("Failed to check/set activation policy", exc_info=True)
 
-            # Make the icon visible on the main thread BEFORE the event
-            # loop starts.  pystray's default setup runs visible=True on
-            # a background thread, and AppKit calls from background threads
-            # silently fail in PyInstaller .app bundles on macOS.
-            self._icon.visible = True
-
             start = time.monotonic()
             logger.info("Tray event loop starting (attempt %d/%d)", attempt, max_retries)
-            # Pass no-op setup since we already set visible=True above.
-            self._icon.run(setup=lambda icon: None)
+            if sys.platform == "darwin":
+                # macOS: pystray's default setup flips visible=True on a
+                # background thread, and AppKit calls off the main thread
+                # silently fail inside PyInstaller .app bundles. So make the
+                # icon visible on THIS (main) thread before the loop and pass
+                # a no-op setup.
+                self._icon.visible = True
+                self._icon.run(setup=lambda icon: None)
+            else:
+                # Windows/Linux: the tray icon's native handle isn't created
+                # until run() starts, so setting visible beforehand is a no-op
+                # and the icon never appears at all. Make it visible from the
+                # setup callback, which pystray invokes once the backend is
+                # ready — the supported way to show an icon on launch.
+                self._icon.run(setup=lambda icon: setattr(icon, "visible", True))
             elapsed = time.monotonic() - start
 
             if elapsed > 2.0:
