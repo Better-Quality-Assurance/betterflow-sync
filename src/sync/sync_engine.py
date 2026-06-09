@@ -1195,6 +1195,17 @@ class SyncEngine:
             end = datetime.now(timezone.utc)
         duration = (end - start).total_seconds()
         if duration < 1:
+            # Distinguish "expected sub-second guard" (scheduler race / no-op)
+            # from "clock went backwards between sleep and wake" (NTP correction
+            # during a long Mac sleep silently discarded the entire span until
+            # this log was added). Sleep events are the only kind regularly
+            # exposed to multi-hour spans across a possible NTP step.
+            if duration < 0:
+                logger.warning(
+                    "Discarding %s_time event: end<start by %.1fs "
+                    "(NTP clock correction?). start=%s end=%s",
+                    kind, -duration, start.isoformat(), end.isoformat(),
+                )
             return
         bucket_type = f"{kind}_time"
         event = {

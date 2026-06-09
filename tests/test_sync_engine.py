@@ -849,6 +849,25 @@ class TestStatusSpanEvents:
         queued = self.queue.enqueue.call_args[0][0]
         assert queued[0]["bucket_type"] == "sleep_time"
 
+    def test_send_sleep_event_with_end_before_start_is_dropped_with_warning(self, caplog):
+        """NTP step backwards during a long Mac sleep could make end<start.
+
+        Without the explicit log, the existing `if duration < 1: return`
+        silently discarded the entire span (potentially hours long). We
+        still drop the event — submitting negative durations would poison
+        the server aggregator — but the warning makes the drop observable.
+        """
+        import logging
+        start = datetime(2026, 6, 9, 8, 0, 0, tzinfo=timezone.utc)
+        end = start - timedelta(seconds=30)
+        with caplog.at_level(logging.WARNING, logger="src.sync.sync_engine"):
+            self.engine.send_sleep_event(start, end)
+        self.bf.send_events.assert_not_called()
+        self.queue.enqueue.assert_not_called()
+        assert any("NTP clock correction" in r.message for r in caplog.records), (
+            "negative-duration drop must log a warning so it is observable"
+        )
+
     def test_sleep_idle_break_get_distinct_id_prefixes(self):
         """Status spans with same start must not collide on event id."""
         from src.sync.bf_client import SyncResult
