@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -955,7 +956,20 @@ class BetterFlowApp:
                 exe = Path(sys.executable)
                 bundle = exe.parents[2] if len(exe.parents) >= 3 else None
                 if bundle is not None and bundle.suffix == ".app":
-                    subprocess.Popen(["open", str(bundle)])
+                    # `open` on a still-running app just reactivates the current
+                    # (about-to-exit) instance instead of launching a new one —
+                    # so the app would vanish and never reopen. Wait for THIS
+                    # process to exit, then open a fresh instance. Detached so
+                    # the helper survives our os._exit below.
+                    subprocess.Popen(
+                        [
+                            "/bin/sh",
+                            "-c",
+                            f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
+                            f"open {shlex.quote(str(bundle))}",
+                        ],
+                        start_new_session=True,
+                    )
                 else:
                     subprocess.Popen([str(exe)])
             else:
