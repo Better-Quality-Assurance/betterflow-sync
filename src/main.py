@@ -840,6 +840,11 @@ class BetterFlowApp:
         # newer is staged. Relaunches (os._exit) on success.
         self._apply_staged_update_on_launch()
 
+        # macOS: if launched from the DMG, ~/Downloads, or a Gatekeeper
+        # translocation path, offer to move into /Applications and relaunch
+        # from there. No-op when already installed or on other platforms.
+        self._maybe_relocate_to_applications()
+
         # Self-heal auto-start: if config says it should be on but the OS-level
         # LaunchAgent isn't actually loaded (drift from a prior install,
         # manual launchctl bootout, or migration to a new bundle path),
@@ -956,20 +961,7 @@ class BetterFlowApp:
                 exe = Path(sys.executable)
                 bundle = exe.parents[2] if len(exe.parents) >= 3 else None
                 if bundle is not None and bundle.suffix == ".app":
-                    # `open` on a still-running app just reactivates the current
-                    # (about-to-exit) instance instead of launching a new one —
-                    # so the app would vanish and never reopen. Wait for THIS
-                    # process to exit, then open a fresh instance. Detached so
-                    # the helper survives our os._exit below.
-                    subprocess.Popen(
-                        [
-                            "/bin/sh",
-                            "-c",
-                            f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
-                            f"open {shlex.quote(str(bundle))}",
-                        ],
-                        start_new_session=True,
-                    )
+                    self._spawn_deferred_open(bundle)
                 else:
                     subprocess.Popen([str(exe)])
             else:
@@ -979,6 +971,80 @@ class BetterFlowApp:
         except Exception:
             logger.exception("Relaunch failed")
         os._exit(0)
+
+    def _spawn_deferred_open(self, target: Path) -> None:
+        """Spawn a detached helper that runs ``open <target>`` only after THIS
+        process has exited.
+
+        macOS ``open`` on a still-running app reactivates the current
+        (about-to-exit) instance instead of launching a new one, so the caller
+        must ``os._exit`` immediately after calling this.
+        """
+        subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
+                f"open {shlex.quote(str(target))}",
+            ],
+            start_new_session=True,
+        )
+
+    def _maybe_relocate_to_applications(self) -> None:
+        """On macOS, offer to move a non-installed .app into /Applications.
+
+        A frozen bundle launched from the DMG, ~/Downloads, or a Gatekeeper
+        translocation path is not in /Applications, so it never appears under
+        Applications/Launchpad and its code-signing identity (and the TCC
+        grants tied to it) churn across updates. Offer a one-click move, then
+        relaunch from the installed copy. Best-effort: any failure is logged
+        and the app keeps running from its current location.
+        """
+        if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+            return
+        try:
+            exe = Path(sys.executable)
+            bundle = exe.parents[2] if len(exe.parents) >= 3 else None
+            if bundle is None or bundle.suffix != ".app":
+                return
+            if str(bundle).startswith("/Applications/"):
+                return  # already installed
+
+            dest = Path("/Applications") / bundle.name
+
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+            except Exception:
+                logger.warning("tkinter unavailable; skipping move-to-Applications prompt")
+                return
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                move = messagebox.askyesno(
+                    "Move to Applications?",
+                    "BetterFlow works best from your Applications folder.\n\n"
+                    "Move it there now? This keeps permissions and automatic "
+                    "updates working correctly.",
+                )
+            finally:
+                root.destroy()
+            if not move:
+                return
+
+            # ditto preserves the Developer ID signature + notarization ticket
+            # (shutil.copytree strips the xattrs that carry them). Replace any
+            # older copy first so we don't merge two versions.
+            if dest.exists():
+                subprocess.run(["rm", "-rf", str(dest)], check=True)
+            subprocess.run(["ditto", str(bundle), str(dest)], check=True)
+
+            logger.info("Relocated to %s; relaunching from there", dest)
+            self._spawn_deferred_open(dest)
+            os._exit(0)
+        except Exception:
+            logger.exception("Move to Applications failed; continuing from current location")
 
     # -- Event handlers ---------------------------------------------------
 
