@@ -177,6 +177,20 @@ jobs:
           cd dist
           Compress-Archive -Path "BetterFlow.exe" -DestinationPath "${{ matrix.asset_name }}.zip"
 
+      # Build a real installer so the app registers in Windows "Installed apps"
+      # (with an uninstaller) and gets a Start Menu shortcut — a zipped bare exe
+      # never does. Per-user install, no admin. Version is read from
+      # src/__init__.py and injected into the .iss.
+      - name: Build Windows installer (Inno Setup)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $ver = (Select-String -Path src/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "Installer version: $ver"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$ver installer\windows\betterflow.iss
+          Get-ChildItem dist\BetterFlow-Windows-Setup.exe
+
       - name: Create Linux AppImage
         if: runner.os == 'Linux'
         run: |
@@ -190,6 +204,7 @@ jobs:
           path: |
             dist/${{ matrix.asset_name }}.dmg
             dist/${{ matrix.asset_name }}.zip
+            dist/${{ matrix.asset_name }}-Setup.exe
             dist/${{ matrix.asset_name }}.AppImage
           retention-days: 30
 
@@ -239,6 +254,7 @@ jobs:
             artifacts/BetterFlow-macOS-arm64.dmg
             artifacts/BetterFlow-macOS-x86_64.dmg
             artifacts/BetterFlow-Windows.zip
+            artifacts/BetterFlow-Windows-Setup.exe
             artifacts/BetterFlow-linux-x86_64.AppImage
           draft: true
           generate_release_notes: true
