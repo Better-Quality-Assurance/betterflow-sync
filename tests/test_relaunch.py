@@ -5,22 +5,12 @@ The permission gate's 'restart' outcome calls _relaunch, which (on a frozen
 reactivates the about-to-die instance and the app never reopens.
 """
 
-import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from src.main import BetterFlowApp
 
 
-# TestRelaunch forces sys.platform="darwin" and asserts on a macOS-style
-# "/Applications/..." path; on Windows pathlib yields backslashes, so the
-# assertion fails. The relaunch-delegation logic only runs on macOS in
-# production — skip off-Mac. TestSpawnDeferredOpen below is platform-agnostic.
-@pytest.mark.skipif(
-    sys.platform != "darwin", reason="exercises macOS-only relaunch delegation"
-)
 class TestRelaunch:
     def test_macos_frozen_delegates_to_deferred_open(self):
         self_mock = MagicMock()
@@ -31,7 +21,11 @@ class TestRelaunch:
 
         self_mock._spawn_deferred_open.assert_called_once()
         target = self_mock._spawn_deferred_open.call_args.args[0]
-        assert str(target) == "/Applications/BetterFlow.app"
+        # Assert on the basename, not the full string: _relaunch passes the
+        # .app bundle (parents[2]) and on Windows CI pathlib renders it with
+        # backslashes, so an exact "/Applications/..." compare would falsely
+        # fail. The bundle's name ending in ".app" is the real invariant.
+        assert target.name == "BetterFlow.app"
         exit_mock.assert_called_once_with(0)
 
 
