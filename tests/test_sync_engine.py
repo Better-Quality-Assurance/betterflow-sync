@@ -868,28 +868,42 @@ class TestStatusSpanEvents:
             "negative-duration drop must log a warning so it is observable"
         )
 
-    def test_sleep_idle_break_get_distinct_id_prefixes(self):
-        """Status spans with same start must not collide on event id."""
+    def test_sleep_idle_break_get_distinct_id_prefixes_and_bucket_types(self):
+        """Status spans with same start must not collide on id OR bucket_type.
+
+        Asserting `bucket_type` for break/idle (not just sleep) protects
+        against a regression where _send_status_span was hardcoded to one
+        kind — the id-prefix-only check alone would silently miss it.
+        """
         from src.sync.bf_client import SyncResult
         self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
         start = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
         end = start + timedelta(minutes=30)
 
         self.engine.send_idle_event(start, end)
-        idle_id = self.bf.send_events.call_args[0][0][0]["id"]
+        idle_ev = self.bf.send_events.call_args[0][0][0]
         self.bf.send_events.reset_mock()
 
         self.engine.send_sleep_event(start, end)
-        sleep_id = self.bf.send_events.call_args[0][0][0]["id"]
+        sleep_ev = self.bf.send_events.call_args[0][0][0]
         self.bf.send_events.reset_mock()
 
         self.engine.send_break_event(start, end)
-        break_id = self.bf.send_events.call_args[0][0][0]["id"]
+        break_ev = self.bf.send_events.call_args[0][0][0]
 
-        assert idle_id != sleep_id != break_id
-        assert idle_id.startswith("idle_")
-        assert sleep_id.startswith("sleep_")
-        assert break_id.startswith("break_")
+        # Ids
+        assert idle_ev["id"].startswith("idle_")
+        assert sleep_ev["id"].startswith("sleep_")
+        assert break_ev["id"].startswith("break_")
+        assert idle_ev["id"] != sleep_ev["id"] != break_ev["id"]
+        # Bucket types — the field the server keys on for event_type inference
+        assert idle_ev["bucket_type"] == "idle_time"
+        assert sleep_ev["bucket_type"] == "sleep_time"
+        assert break_ev["bucket_type"] == "break_time"
+        # data.status (sent through to the timeline)
+        assert idle_ev["data"]["status"] == "idle"
+        assert sleep_ev["data"]["status"] == "sleep"
+        assert break_ev["data"]["status"] == "break"
 
 
 class TestSystemSleepWakeEmitsSleepSpan:
