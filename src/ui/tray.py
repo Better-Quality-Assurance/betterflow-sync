@@ -33,6 +33,11 @@ except ImportError:
             _APP_VERSION = "unknown"
         BUILD_DATE = "dev"
 
+# Tray hover tooltip base. Surfaces the running version on hover even when the
+# icon sits in the Windows hidden-icons overflow, where the right-click menu
+# (and its Preferences > version item) isn't reachable.
+_BASE_TOOLTIP = f"BetterFlow v{_APP_VERSION}"
+
 from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
@@ -1138,7 +1143,7 @@ class TrayIcon:
         minutes = (total_seconds % 3600) // 60
         with self.model.lock:
             self.model.hours_today = f"{hours}h {minutes}m"
-        self._update_tooltip(f"BetterFlow - Today: {hours}h {minutes}m active")
+        self._update_tooltip(f"{_BASE_TOOLTIP} - Today: {hours}h {minutes}m active")
         self._update_menu()
 
     def set_update_available(self, version: str, url: str, asset_url: Optional[str] = None) -> None:
@@ -1382,7 +1387,7 @@ class TrayIcon:
         self._icon = pystray.Icon(
             "BetterFlow",
             create_icon_image(color),
-            "BetterFlow",
+            _BASE_TOOLTIP,
             self._create_menu(),
         )
 
@@ -1413,7 +1418,7 @@ class TrayIcon:
                 self._icon = pystray.Icon(
                     "BetterFlow",
                     create_icon_image(color),
-                    "BetterFlow",
+                    _BASE_TOOLTIP,
                     self._create_menu(),
                 )
 
