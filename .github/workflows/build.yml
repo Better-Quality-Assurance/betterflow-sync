@@ -183,6 +183,9 @@ jobs:
       # src/__init__.py and injected into the .iss.
       - name: Build Windows installer (Inno Setup)
         if: matrix.os == 'windows-latest'
+        # Non-fatal: a .iss/Inno problem must not fail the Windows build and
+        # block the release. Worst case the zip still ships, just no setup.exe.
+        continue-on-error: true
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
