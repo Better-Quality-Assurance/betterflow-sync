@@ -1233,6 +1233,17 @@ class SyncEngine:
         """Send an idle_time event covering the idle duration."""
         self._send_status_span(kind="idle", start=start, end=end)
 
+    def send_sleep_event(self, start: datetime, end: Optional[datetime] = None) -> None:
+        """Send a sleep_time event covering a system sleep span.
+
+        Distinct from idle_time so the server-side aggregator can tell
+        "Mac was asleep" (involuntary, machine-off) apart from "user
+        walked away from a running machine" (idle). Without this, both
+        get rendered as "Break" in the daily activity view, which is
+        misleading for overnight sleep cycles.
+        """
+        self._send_status_span(kind="sleep", start=start, end=end)
+
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""
         if start is None:

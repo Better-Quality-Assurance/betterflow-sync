@@ -800,6 +800,129 @@ class TestSyncEngine:
         assert acquire_count >= 1, f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"
 
 
+class TestStatusSpanEvents:
+    """Tests for break_time / idle_time / sleep_time / private_time emission."""
+
+    def setup_method(self):
+        from src.sync.bf_client import SyncResult
+        self.aw = Mock()
+        self.bf = Mock()
+        self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
+        self.queue = Mock()
+        self.queue.get_checkpoint.return_value = None
+        self.config = Config()
+        self.activity_analyzer = Mock(spec=ActivityAnalyzer)
+        self.time_tracker = Mock(spec=DailyTimeTracker)
+        self.engine = SyncEngine(
+            aw=self.aw, bf=self.bf, queue=self.queue, config=self.config,
+            activity_analyzer=self.activity_analyzer, time_tracker=self.time_tracker,
+        )
+
+    def _captured_event(self):
+        assert self.bf.send_events.call_count == 1
+        events = self.bf.send_events.call_args[0][0]
+        assert len(events) == 1
+        return events[0]
+
+    def test_send_sleep_event_emits_sleep_time_bucket(self):
+        """sleep_time bucket distinguishes machine-asleep from user-idle."""
+        start = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2026, 6, 9, 6, 30, 0, tzinfo=timezone.utc)
+
+        self.engine.send_sleep_event(start, end)
+
+        ev = self._captured_event()
+        assert ev["bucket_type"] == "sleep_time"
+        assert ev["data"]["status"] == "sleep"
+        assert ev["duration"] == pytest.approx(6.5 * 3600)
+        assert ev["id"].startswith("sleep_")
+
+    def test_send_sleep_event_queues_on_network_failure(self):
+        """Network failure paths through queue, not silent drop."""
+        from src.sync.bf_client import SyncResult
+        self.bf.send_events.return_value = SyncResult(success=False, error="network down")
+        start = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
+
+        self.engine.send_sleep_event(start, start + timedelta(hours=6))
+
+        self.queue.enqueue.assert_called_once()
+        queued = self.queue.enqueue.call_args[0][0]
+        assert queued[0]["bucket_type"] == "sleep_time"
+
+    def test_sleep_idle_break_get_distinct_id_prefixes(self):
+        """Status spans with same start must not collide on event id."""
+        from src.sync.bf_client import SyncResult
+        self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
+        start = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(minutes=30)
+
+        self.engine.send_idle_event(start, end)
+        idle_id = self.bf.send_events.call_args[0][0][0]["id"]
+        self.bf.send_events.reset_mock()
+
+        self.engine.send_sleep_event(start, end)
+        sleep_id = self.bf.send_events.call_args[0][0][0]["id"]
+        self.bf.send_events.reset_mock()
+
+        self.engine.send_break_event(start, end)
+        break_id = self.bf.send_events.call_args[0][0][0]["id"]
+
+        assert idle_id != sleep_id != break_id
+        assert idle_id.startswith("idle_")
+        assert sleep_id.startswith("sleep_")
+        assert break_id.startswith("break_")
+
+
+class TestSystemSleepWakeEmitsSleepSpan:
+    """on_system_wake must emit a sleep_time event for the sleep span."""
+
+    def _make_handler(self):
+        from src.system_event_handler import SystemEventHandler
+        sync_engine = Mock()
+        sync_engine.is_private = False
+        coordinator = Mock()
+        coordinator.is_on_break = False
+        coordinator.paused_by_network = False
+        handler = SystemEventHandler(
+            sync_engine=sync_engine,
+            tray=Mock(),
+            coordinator=coordinator,
+            reminder_manager=Mock(),
+            bf=Mock(),
+            aw=Mock(),
+            pause_state_lock=threading.RLock(),
+            shutdown_fn=Mock(),
+        )
+        return handler, sync_engine
+
+    def test_wake_emits_sleep_event_for_captured_span(self):
+        handler, sync_engine = self._make_handler()
+        handler.on_system_sleep()
+        sleep_start = handler._sleep_start
+        assert sleep_start is not None
+
+        handler.on_system_wake()
+
+        sync_engine.send_sleep_event.assert_called_once()
+        passed_start = sync_engine.send_sleep_event.call_args[0][0]
+        assert passed_start == sleep_start
+        # Must be cleared so the next sleep doesn't reuse this start
+        assert handler._sleep_start is None
+
+    def test_wake_without_prior_sleep_does_not_emit(self):
+        handler, sync_engine = self._make_handler()
+        handler.on_system_wake()
+        sync_engine.send_sleep_event.assert_not_called()
+
+    def test_send_sleep_event_failure_does_not_break_wake_flow(self):
+        handler, sync_engine = self._make_handler()
+        sync_engine.send_sleep_event.side_effect = RuntimeError("queue full")
+        handler.on_system_sleep()
+        # Must not raise — wake flow continues even if event emission fails.
+        handler.on_system_wake()
+        sync_engine.resume.assert_called_once()
+
+
 class TestSyncCoordinatorBreak:
     """Tests for SyncCoordinator break state management."""
 

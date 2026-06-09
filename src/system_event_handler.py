@@ -2,6 +2,8 @@
 
 import logging
 import threading
+from datetime import datetime, timezone
+from typing import Optional
 
 try:
     from .notifications import send_notification
@@ -41,6 +43,11 @@ class SystemEventHandler:
         self._user_paused = False
         self._pre_sleep_private = False
         self._pre_lock_private = False
+        # Timestamp set when on_system_sleep fires; consumed on the next
+        # on_system_wake to emit a sleep_time event covering the span.
+        # Without this the overnight gap shows as "Break" in the daily
+        # activity view (server-side aggregator can't tell idle from sleep).
+        self._sleep_start: Optional[datetime] = None
 
         # Update handler reference (set after construction)
         self.update_handler = None
@@ -54,6 +61,7 @@ class SystemEventHandler:
 
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
+            self._sleep_start = datetime.now(timezone.utc)
         self.coordinator.paused_by_network = False
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
@@ -77,9 +85,19 @@ class SystemEventHandler:
 
         self.bf.reset_session()
         self.aw.reset_session()
+        # Emit the sleep_time event before any early-return paths so even
+        # a wake into still-paused / still-on-break states records the
+        # span. Captured under the lock to avoid racing a second sleep.
         with self._pause_state_lock:
             user_paused = self._user_paused
             pre_sleep_private = self._pre_sleep_private
+            sleep_start = self._sleep_start
+            self._sleep_start = None
+        if sleep_start is not None:
+            try:
+                self.sync_engine.send_sleep_event(sleep_start)
+            except Exception as e:
+                logger.warning("send_sleep_event failed: %s", e)
         if user_paused:
             logger.info("System wake - staying paused (user-initiated pause active)")
             return
