@@ -5,12 +5,22 @@ The permission gate's 'restart' outcome calls _relaunch, which (on a frozen
 reactivates the about-to-die instance and the app never reopens.
 """
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.main import BetterFlowApp
 
 
+# TestRelaunch forces sys.platform="darwin" and asserts on a macOS-style
+# "/Applications/..." path; on Windows pathlib yields backslashes, so the
+# assertion fails. The relaunch-delegation logic only runs on macOS in
+# production — skip off-Mac. TestSpawnDeferredOpen below is platform-agnostic.
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="exercises macOS-only relaunch delegation"
+)
 class TestRelaunch:
     def test_macos_frozen_delegates_to_deferred_open(self):
         self_mock = MagicMock()
