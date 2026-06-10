@@ -283,8 +283,10 @@ def _get_logo_template() -> Optional[Image.Image]:
 def create_icon_image(color: str, size: int = 64) -> Image.Image:
     """Create a clock icon with the given state color.
 
-    Draws a round clock face with hour marks, hour/minute hands showing
-    the current local time, and a "B" glyph in the center.
+    Solid-filled disk in the state color with white clock hands, tick marks,
+    and "B" glyph inside. Solid fill is what makes the icon readable against
+    macOS dark menu bars — earlier outline-only design was nearly invisible
+    (Emilian, 2026-06-10).
 
     Args:
         color: Hex color code for the clock color
@@ -306,20 +308,19 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
     draw = ImageDraw.Draw(image)
 
     cx, cy = big // 2, big // 2
-    radius = int(big * 0.42)
-    ring_width = max(2, big // 16)
+    radius = int(big * 0.46)
+    fg = "#FFFFFF"
 
-    # Clock face ring
+    # Solid clock face — this is the part the menu bar actually sees.
     draw.ellipse(
         [cx - radius, cy - radius, cx + radius, cy + radius],
-        outline=color,
-        width=ring_width,
+        fill=color,
     )
 
     # Hour tick marks
-    tick_outer = radius - ring_width // 2 - max(1, big // 64)
-    tick_inner_long = int(tick_outer * 0.72)
-    tick_inner_short = int(tick_outer * 0.84)
+    tick_outer = int(radius * 0.92)
+    tick_inner_long = int(tick_outer * 0.74)
+    tick_inner_short = int(tick_outer * 0.86)
     for i in range(12):
         angle = math.radians(i * 30 - 90)
         inner = tick_inner_long if i % 3 == 0 else tick_inner_short
@@ -328,7 +329,7 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         x2 = cx + int(tick_outer * math.cos(angle))
         y2 = cy + int(tick_outer * math.sin(angle))
         w = max(2, big // 32) if i % 3 == 0 else max(1, big // 48)
-        draw.line([x1, y1, x2, y2], fill=color, width=w)
+        draw.line([x1, y1, x2, y2], fill=fg, width=w)
 
     # Minute hand
     minute_angle = math.radians(minute * 6 - 90)
@@ -337,7 +338,7 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         [cx, cy,
          cx + int(minute_len * math.cos(minute_angle)),
          cy + int(minute_len * math.sin(minute_angle))],
-        fill=color,
+        fill=fg,
         width=max(2, big // 32),
     )
 
@@ -348,12 +349,12 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         [cx, cy,
          cx + int(hour_len * math.cos(hour_angle)),
          cy + int(hour_len * math.sin(hour_angle))],
-        fill=color,
+        fill=fg,
         width=max(3, big // 24),
     )
 
     # "B" letter in the center
-    font_size = int(radius * 1.1)
+    font_size = int(radius * 1.05)
     try:
         if platform.system() == "Darwin":
             font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
@@ -368,7 +369,7 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
     th = bbox[3] - bbox[1]
     tx = cx - tw // 2 - bbox[0]
     ty = cy - th // 2 - bbox[1]
-    draw.text((tx, ty), "B", fill=color, font=font)
+    draw.text((tx, ty), "B", fill=fg, font=font)
 
     # Downsample for smooth result
     image = image.resize((size, size), Image.LANCZOS)
