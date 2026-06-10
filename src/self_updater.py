@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -250,7 +251,23 @@ def _apply_local_artifact(
                 except Exception as e:
                     logger.warning("Pre-exit flush failed: %s", e)
             _status("Restarting...")
-            subprocess.Popen(["open", str(app_path)])
+            # `open` on a still-running app reactivates the current
+            # (about-to-exit) instance instead of launching a new one — so the
+            # app would vanish and never reopen after a self-update. Same bug
+            # the permission-gate Restart path hit (fixed in main.py via
+            # 1cbca58); the self-update path had the same call shape and was
+            # never patched, so v1.5.30 users still saw the symptom. Wait for
+            # THIS process to die, then open a fresh instance. Detached via
+            # start_new_session so the helper survives our os._exit below.
+            subprocess.Popen(
+                [
+                    "/bin/sh",
+                    "-c",
+                    f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
+                    f"open {shlex.quote(str(app_path))}",
+                ],
+                start_new_session=True,
+            )
             # os._exit works from any thread, unlike sys.exit which only raises
             # SystemExit in the calling thread.
             os._exit(0)
