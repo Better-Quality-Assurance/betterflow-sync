@@ -41,6 +41,7 @@ _BASE_TOOLTIP = f"BetterFlow v{_APP_VERSION}"
 from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
+    from datetime import datetime as _datetime
     from ..config import Config
 
 try:
@@ -280,26 +281,66 @@ def _get_logo_template() -> Optional[Image.Image]:
             return None
 
 
-def create_icon_image(color: str, size: int = 64) -> Image.Image:
+def _readable_fg_for(color: str) -> str:
+    """Pick a foreground colour with adequate contrast against the disk fill.
+
+    Uses ITU-R BT.601 perceived luminance: bright fills (yellow, light gray,
+    amber) get a dark glyph; saturated/dark fills (purple, red, blue) keep
+    white. Without this the PAUSED state (#9ca3af, luminance ≈163) and
+    QUEUED state (#eab308, luminance ≈176) rendered white-on-light at
+    roughly 2:1 contrast — invisible on light-mode macOS menu bars.
+
+    PAUSED sits only ~3 units above the cut-off; if STATE_COLORS ever
+    shifts its gray slightly darker the foreground flips back to white,
+    which still works against a dark menu bar but loses on a light one.
+    Adjust the threshold rather than nudging the palette in that case.
+
+    Accepts colours with or without a leading "#" so future callers can
+    pass either form without silently producing the wrong fg.
+    """
+    hex_str = color.lstrip("#")
+    if len(hex_str) != 6:
+        return "#FFFFFF"
+    try:
+        r = int(hex_str[0:2], 16)
+        g = int(hex_str[2:4], 16)
+        b = int(hex_str[4:6], 16)
+    except ValueError:
+        return "#FFFFFF"
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    return "#1a1a1a" if luminance > 160 else "#FFFFFF"
+
+
+def create_icon_image(
+    color: str,
+    size: int = 64,
+    now: "Optional[_datetime]" = None,
+) -> Image.Image:
     """Create a clock icon with the given state color.
 
-    Solid-filled disk in the state color with white clock hands, tick marks,
-    and "B" glyph inside. Solid fill is what makes the icon readable against
-    macOS dark menu bars — earlier outline-only design was nearly invisible
-    (Emilian, 2026-06-10).
+    Solid-filled disk in the state color with hands/ticks/B-glyph drawn in
+    a contrast-aware foreground colour. Solid fill is what makes the icon
+    readable against macOS dark menu bars — earlier outline-only design was
+    nearly invisible (Emilian, 2026-06-10).
 
     Args:
         color: Hex color code for the clock color
         size: Icon size in pixels
+        now: Optional pre-captured datetime so the caller's cache-key
+            matches what gets drawn. When omitted we sample fresh, which
+            is fine for ad-hoc renders but races with the redraw cache in
+            `TrayIcon._set_icon` across minute boundaries.
 
     Returns:
         PIL Image
     """
     from datetime import datetime
 
-    now = datetime.now()
+    if now is None:
+        now = datetime.now()
     hour = now.hour % 12
     minute = now.minute
+    fg = _readable_fg_for(color)
 
     # Use 4x supersampling for smooth anti-aliased lines
     ss = 4
@@ -309,7 +350,6 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
 
     cx, cy = big // 2, big // 2
     radius = int(big * 0.46)
-    fg = "#FFFFFF"
 
     # Solid clock face — this is the part the menu bar actually sees.
     draw.ellipse(
@@ -353,8 +393,10 @@ def create_icon_image(color: str, size: int = 64) -> Image.Image:
         width=max(3, big // 24),
     )
 
-    # "B" letter in the center
-    font_size = int(radius * 1.05)
+    # "B" letter in the center. Sized so the glyph fits inside the inner
+    # tick ring; larger ratios overlap the clock hands at small render sizes
+    # (the macOS menu bar asks for 22px).
+    font_size = int(radius * 0.85)
     try:
         if platform.system() == "Darwin":
             font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
@@ -1225,7 +1267,11 @@ class TrayIcon:
         icon_key = (_now.hour % 12, _now.minute, color)
 
         if icon_key != self._last_icon_key:
-            new_image = create_icon_image(color)
+            # Pass the captured _now so the rendered hands match the cache
+            # key — otherwise create_icon_image samples datetime.now() a
+            # second time and a minute roll-over between the two calls
+            # leaves the icon stale until the next tick.
+            new_image = create_icon_image(color, now=_now)
             self._last_icon_key = icon_key
             self._last_icon_image = new_image
 
@@ -1384,10 +1430,14 @@ class TrayIcon:
         if self._icon is not None:
             return
 
+        from datetime import datetime as _dt
         color = STATE_COLORS[self.model.state]
+        # Pin the initial render's clock-time to a captured `now` for the
+        # same reason _update_icon does — keeps the first paint and the
+        # first tick's cache key on the same minute.
         self._icon = pystray.Icon(
             "BetterFlow",
-            create_icon_image(color),
+            create_icon_image(color, now=_dt.now()),
             _BASE_TOOLTIP,
             self._create_menu(),
         )

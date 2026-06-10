@@ -72,3 +72,8 @@ ignore = ["E501"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+# `from src.* import ...` works today only because pytest's default
+# rootdir-on-sys.path heuristic happens to add the repo root. Pin it
+# explicitly so CI runners or invocations from inside tests/ also
+# resolve the imports.
+pythonpath = ["."]
