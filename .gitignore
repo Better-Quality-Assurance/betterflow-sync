@@ -69,6 +69,9 @@ resources/trackers/
 # Generated at build time - must never be committed (would show wrong date in dev builds)
 src/_build_info.py
 
+# Generated at build time - bakes the error-reporting DSN into the bundle; never commit
+src/_build_secrets.py
+
 # Plans (local only)
 plans.md
 docs/plans/

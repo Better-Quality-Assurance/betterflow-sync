@@ -23,6 +23,7 @@ try:
     from .auth import KeychainManager, LoginManager
     from .aw_manager import AWManager
     from .config import Config, setup_logging
+    from . import error_reporter
     from .display_info import start_display_tracker
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -46,6 +47,7 @@ except ImportError:
     from auth import KeychainManager, LoginManager
     from aw_manager import AWManager
     from config import Config, setup_logging
+    import error_reporter
     from display_info import start_display_tracker
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -121,6 +123,7 @@ class SyncCoordinator:
         tray: TrayIcon,
         aw_manager: AWManager,
         reminder_manager: Optional[ReminderManager] = None,
+        error_reporter: Optional["error_reporter.ErrorReporter"] = None,
     ) -> None:
         self.config = config
         self.aw = aw
@@ -130,9 +133,16 @@ class SyncCoordinator:
         self.tray = tray
         self.aw_manager = aw_manager
         self.reminder_manager = reminder_manager
+        self.error_reporter = error_reporter
 
         self.scheduler = BackgroundScheduler()
         self._last_tick: Optional[datetime] = None
+
+        # Consecutive hard sync failures. Reported to the logs channel once it
+        # crosses the threshold (transient blips are normal and not reported).
+        # Only mutated inside _do_sync, which holds _sync_lock, so no extra lock.
+        self._consecutive_sync_failures = 0
+        self._SYNC_FAILURE_ALERT_THRESHOLD = 3
 
         # Flags set by the app layer - protected by _state_lock
         self._logged_in = False
@@ -449,6 +459,13 @@ class SyncCoordinator:
             if watchdog_cancelled.is_set():
                 return
             logger.error("_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE)
+            if self.error_reporter is not None:
+                self.error_reporter.capture(
+                    f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
+                    level="error",
+                    tags={"component": "sync-watchdog"},
+                    fingerprint="sync-watchdog-timeout",
+                )
             try:
                 self.bf.reset_session()
                 self.aw.reset_session()
@@ -491,6 +508,8 @@ class SyncCoordinator:
             stats = self.sync_engine.sync()
 
             if stats.success or stats.events_sent > 0:
+                # A successful (or partial) sync clears the failure streak.
+                self._consecutive_sync_failures = 0
                 # Partial success: some buckets may fail but data still syncs
                 if stats.errors:
                     for err in stats.errors:
@@ -514,6 +533,9 @@ class SyncCoordinator:
                 self.tray.set_state(
                     TrayState.ERROR,
                     stats.errors[0] if stats.errors else "Sync failed",
+                )
+                self._note_sync_failure(
+                    stats.errors[0] if stats.errors else "Sync failed"
                 )
 
             hours = self._fetch_hours_today()
@@ -540,6 +562,7 @@ class SyncCoordinator:
         except Exception as e:
             logger.exception(f"Sync error: {e}")
             self.tray.set_state(TrayState.ERROR, "Sync error")
+            self._note_sync_failure("Sync error", exc=e)
         finally:
             watchdog_cancelled.set()
             watchdog.cancel()
@@ -553,6 +576,27 @@ class SyncCoordinator:
         auth_err = self.sync_engine.send_heartbeat_if_due(stats)
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="heartbeat")
+
+    def _note_sync_failure(self, reason: str, *, exc: Optional[BaseException] = None) -> None:
+        """Track a hard sync failure and report once it becomes a streak.
+
+        Called from within _do_sync (holding _sync_lock), so the counter needs
+        no extra lock. Auth errors are handled separately and don't count — a
+        re-login is expected, not a failure worth alerting on.
+        """
+        self._consecutive_sync_failures += 1
+        if (
+            self.error_reporter is not None
+            and self._consecutive_sync_failures >= self._SYNC_FAILURE_ALERT_THRESHOLD
+        ):
+            self.error_reporter.capture(
+                f"Sync failing repeatedly ({self._consecutive_sync_failures}×): {reason}",
+                level="error",
+                exc=exc,
+                tags={"component": "sync"},
+                context={"consecutive_failures": self._consecutive_sync_failures},
+                fingerprint="sync-repeated-failure",
+            )
 
     def _handle_auth_error(self, e: BetterFlowAuthError, *, source: str) -> None:
         """Trigger re-login on a 401/403 from sync or heartbeat."""
@@ -676,6 +720,16 @@ class BetterFlowApp:
         )
         self.tray.set_config(self.config)
 
+        # Failure reporting to the betterqa-bot logs channel. A no-op until a
+        # project-scoped DSN is provided via BETTERFLOW_ERROR_DSN, so dev/test
+        # runs never phone home. Install global crash hooks so unhandled
+        # exceptions on any thread are reported before the process dies.
+        self.error_reporter = error_reporter.from_env(
+            release=_VERSION,
+            context_provider=self._error_context,
+        )
+        error_reporter.install_crash_hooks(self.error_reporter)
+
         # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(
             config=self.config,
@@ -685,6 +739,7 @@ class BetterFlowApp:
             sync_engine=self.sync_engine,
             tray=self.tray,
             aw_manager=self.aw_manager,
+            error_reporter=self.error_reporter,
         )
         self.coordinator._on_auth_error = self._on_login
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
@@ -1446,8 +1501,39 @@ class BetterFlowApp:
         never return from the dead Cocoa event loop.
         """
         logger.critical("Tray icon died — force-exiting to prevent ghost process")
+        # Block so the report leaves the machine before os._exit kills the
+        # daemon sender thread.
+        self.error_reporter.capture(
+            "Tray icon died — agent force-exiting (ghost process)",
+            level="fatal",
+            tags={"component": "tray"},
+            fingerprint="tray-died",
+            block=True,
+        )
         self._shutdown()
         os._exit(1)
+
+    # -- Failure reporting ------------------------------------------------
+
+    def _error_context(self) -> dict:
+        """Build the who/what context attached to every error report.
+
+        Reads the current user from the tray model under its lock so a report
+        names which user's agent failed.
+        """
+        ctx: dict = {"app_version": _VERSION}
+        try:
+            with self.tray.model.lock:
+                ctx["user_email"] = self.tray.model.user_email
+                ctx["user_name"] = self.tray.model.user_name
+                ctx["user_role"] = self.tray.model.user_role
+        except Exception as e:
+            logger.debug("Could not read user context for error report: %s", e)
+        try:
+            ctx["device_id"] = self.bf.device_id
+        except Exception as e:
+            logger.debug("Could not read device_id for error report: %s", e)
+        return ctx
 
     def _signal_handler(self, signum, frame) -> None:
         """Handle shutdown signals.

@@ -26,6 +26,17 @@ _build_info.write_text(
     f'BUILD_DATE = "{date.today().isoformat()}"\n'
 )
 
+# Stamp the (optional) error-reporting DSN into a gitignored module so it ships
+# inside the bundle but never lands in source control. Values are empty unless
+# the corresponding BETTERFLOW_ERROR_* env vars are set on the build machine.
+_build_secrets = Path(SPECPATH) / "src" / "_build_secrets.py"
+_build_secrets.write_text(
+    '"""Build-time secrets — generated, gitignored, never committed."""\n\n'
+    f'ERROR_DSN = {os.environ.get("BETTERFLOW_ERROR_DSN")!r}\n'
+    f'ERROR_ENDPOINT = {os.environ.get("BETTERFLOW_ERROR_ENDPOINT")!r}\n'
+    f'ERROR_ENV = {os.environ.get("BETTERFLOW_ERROR_ENV")!r}\n'
+)
+
 # Determine platform
 is_mac = platform.system() == "Darwin"
 is_windows = platform.system() == "Windows"
@@ -123,6 +134,8 @@ hiddenimports = [
     "ui.setup_wizard",
     "aw_manager",
     "autostart",
+    "error_reporter",  # Failure reporting to betterqa-bot logs channel
+    "_build_secrets",  # Generated at build time (baked DSN); gitignored
     "display_info",
     "reminders",
     "notifications",
