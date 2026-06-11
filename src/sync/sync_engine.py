@@ -961,7 +961,7 @@ class SyncEngine:
             return None
 
         # Build data object
-        result_bucket_type = bucket_type  # may be overridden for AFK-as-break
+        result_bucket_type = bucket_type
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
@@ -1015,11 +1015,15 @@ class SyncEngine:
                     data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
-            # Send AFK periods as "break" bucket_type for chart display.
-            # Use a separate variable so the original bucket_type is preserved
-            # for the activity classification logic below.
-            if event.status == "afk":
-                result_bucket_type = "break"
+            # AFK periods are sent with their real AFK bucket_type — NOT relabeled
+            # as "break". A break is an intentional, user-initiated pause
+            # (_send_break_event -> "break_time"); blanket-relabeling every
+            # away-from-keyboard stretch as a break turned ordinary no-input work
+            # (reading, meetings, watching a screen) into phantom "Break" cards
+            # for people who never took a break. The backend already classifies
+            # long AFK spans as Idle (TimelineCardBuilder::appendIdleFromAfk) and
+            # uses AFK status for active-hours, so leaving bucket_type untouched
+            # routes this to the correct "Idle" category.
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection.
             # The MacOSInputWatcher tags each batch with the frontmost app so the
