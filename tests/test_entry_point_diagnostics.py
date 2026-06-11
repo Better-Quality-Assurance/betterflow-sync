@@ -10,49 +10,66 @@ nothing on disk to point at the offending thread — the only path to a
 traceback was attaching lldb live, which by the time the user notices is
 usually too late.
 
-These tests pin the diagnostic setup so a future refactor can't silently
-strip it back out.
+The tests below pin the diagnostic wiring at the SOURCE level rather
+than importing entry_point. Importing the real module would chain into
+main.py (and from there into pystray / AppKit), which registers an
+Objective-C class — that registration fires once per process, so a
+second import inside the test runner throws
+`objc.error: _MenuProxy is overriding existing Objective-C class`. The
+source-text check is intentionally narrow: it catches the only
+regression we care about (someone removed the diagnostic setup) without
+booting the GUI stack.
 """
 
-import faulthandler
-import signal
-from unittest import mock
+import re
+from pathlib import Path
+
+ENTRY_POINT = Path(__file__).parent.parent / "src" / "entry_point.py"
 
 
-def test_faulthandler_is_enabled_after_entry_point_imported():
-    """faulthandler.enable() must run at module import so a hard crash
-    in any subsequent code writes a Python-level traceback to stderr
-    instead of dying silently."""
-    # entry_point.py runs faulthandler.enable() at module top-level. By
-    # the time pytest is importing tests, that import has happened —
-    # either directly via this test suite (if it imports entry_point) or
-    # transitively when the bundled app starts. Either way the global
-    # flag should be set.
-    import src.entry_point  # noqa: F401 — import side effect under test
+def _source() -> str:
+    return ENTRY_POINT.read_text(encoding="utf-8")
 
-    assert faulthandler.is_enabled(), (
-        "faulthandler must remain enabled — without it, the silent-exit "
-        "incident on 2026-06-11 has no on-disk evidence"
+
+def test_entry_point_imports_faulthandler():
+    """Without the import there is nothing to call on a hard crash."""
+    src = _source()
+    assert re.search(r"^import faulthandler\b", src, re.MULTILINE), (
+        "entry_point.py must import faulthandler at module top-level"
     )
 
 
-def test_sigusr1_dumps_all_thread_stacks_when_supported():
-    """SIGUSR1 must be wired to faulthandler.dump_traceback(all_threads=True)
+def test_entry_point_enables_faulthandler_at_startup():
+    """faulthandler.enable() must run unconditionally at import time so a
+    segfault / abort writes a Python-level traceback to stderr instead of
+    dying silently. We assert the textual call rather than the runtime
+    state because importing entry_point here would re-register
+    Objective-C classes via the main.py chain."""
+    src = _source()
+    assert "faulthandler.enable()" in src, (
+        "entry_point.py must call faulthandler.enable() at module load — "
+        "without it, the silent-exit incident on 2026-06-11 has no "
+        "on-disk evidence next time it recurs"
+    )
+
+
+def test_entry_point_registers_sigusr1_for_all_thread_dump():
+    """SIGUSR1 must dispatch to faulthandler.dump_traceback(all_threads=True)
     so an operator can `kill -USR1 <pid>` to capture a snapshot of a hung
     process. all_threads matters: a deadlock between the sync thread and
-    a tracker callback is only visible with BOTH stacks side-by-side."""
-    if not hasattr(signal, "SIGUSR1"):
-        # Windows has no SIGUSR1; the diagnostic is mac/Linux-only and
-        # entry_point.py guards on hasattr already. Don't fail the suite.
-        return
-
-    # Re-register inside a mock so we can verify the parameters without
-    # disturbing the real handler this process needs.
-    with mock.patch("faulthandler.register") as register:
-        # Re-run the registration the same way entry_point.py does.
-        # Inlining it (rather than re-importing entry_point) keeps the
-        # test focused on the contract, not the import order.
-        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
-        register.assert_called_once_with(
-            signal.SIGUSR1, all_threads=True, chain=False
-        )
+    a tracker callback is only visible with both stacks side-by-side."""
+    src = _source()
+    # signal.SIGUSR1 is mac/Linux-only, so the wiring is rightly behind a
+    # hasattr() guard. Verify both: the guard exists AND the registration
+    # asks for all-threads.
+    assert "hasattr(signal, \"SIGUSR1\")" in src or "hasattr(signal, 'SIGUSR1')" in src, (
+        "SIGUSR1 wiring must be guarded by hasattr — Windows has no SIGUSR1"
+    )
+    assert re.search(
+        r"faulthandler\.register\(\s*signal\.SIGUSR1\s*,[^)]*all_threads\s*=\s*True",
+        src,
+        re.DOTALL,
+    ), (
+        "SIGUSR1 must register with all_threads=True — a single-thread "
+        "dump won't show the deadlock partner"
+    )
