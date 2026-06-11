@@ -146,6 +146,15 @@ class SyncCoordinator:
         self._consecutive_sync_failures = 0
         self._SYNC_FAILURE_ALERT_THRESHOLD = 3
 
+        # Consecutive auth (401/403) failures. A single one is almost always
+        # transient — a backend deploy, a momentary token-lookup blip — so
+        # logging out on the first one needlessly stops tracking and leaves the
+        # user "idle" until they re-login. Only treat the session as lost after
+        # this many CONSECUTIVE failures; any successful sync resets the streak.
+        # Mutated only inside _do_sync's call chain (sync thread), no extra lock.
+        self._consecutive_auth_failures = 0
+        self._AUTH_FAILURE_LOGOUT_THRESHOLD = 3
+
         # Flags set by the app layer - protected by _state_lock
         self._logged_in = False
         self._paused_by_network = False
@@ -210,6 +219,10 @@ class SyncCoordinator:
     def logged_in(self, value: bool) -> None:
         with self._state_lock:
             self._logged_in = value
+        # A fresh login starts with a clean auth-failure streak so a later
+        # transient 401 doesn't immediately re-cross the logout threshold.
+        if value:
+            self._consecutive_auth_failures = 0
 
     @property
     def paused_by_network(self) -> bool:
@@ -771,6 +784,9 @@ class SyncCoordinator:
             if stats.success or stats.events_sent > 0:
                 # A successful (or partial) sync clears the failure streak.
                 self._consecutive_sync_failures = 0
+                # A successful authenticated round-trip means the token is fine,
+                # so any earlier 401/403 was transient — clear the auth streak.
+                self._consecutive_auth_failures = 0
                 # Partial success: some buckets may fail but data still syncs
                 if stats.errors:
                     for err in stats.errors:
@@ -860,8 +876,34 @@ class SyncCoordinator:
             )
 
     def _handle_auth_error(self, e: BetterFlowAuthError, *, source: str) -> None:
-        """Trigger re-login on a 401/403 from sync or heartbeat."""
-        logger.warning(f"Auth error during {source}: {e} — triggering re-login")
+        """Handle a 401/403 from sync or heartbeat — tolerating transient ones.
+
+        Logging out on the FIRST auth error is what froze users at "idle" after
+        a backend deploy or a momentary token blip: one 401 → wipe session →
+        tracking stops. We instead require several CONSECUTIVE failures before
+        treating the session as lost. Until the threshold, we keep the session
+        and keep tracking/queuing — the next sync retries, and a success resets
+        the streak (see _do_sync). Only a sustained failure (genuine
+        revoke/logout) crosses the threshold and prompts re-login.
+        """
+        self._consecutive_auth_failures += 1
+        if self._consecutive_auth_failures < self._AUTH_FAILURE_LOGOUT_THRESHOLD:
+            logger.warning(
+                "Auth error during %s (%d/%d consecutive): %s — tolerating as "
+                "likely transient; keeping session, will retry",
+                source,
+                self._consecutive_auth_failures,
+                self._AUTH_FAILURE_LOGOUT_THRESHOLD,
+                e,
+            )
+            return
+
+        logger.warning(
+            "Auth error during %s — %d consecutive failures, session lost: %s",
+            source,
+            self._consecutive_auth_failures,
+            e,
+        )
         self.logged_in = False
         self.tray.set_state(
             TrayState.WAITING_AUTH, "Session expired, re-login required"

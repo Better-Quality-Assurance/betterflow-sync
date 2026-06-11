@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional, Callable
 
@@ -82,28 +83,42 @@ class LoginManager:
         # Set credentials on client
         self.bf.set_credentials(credentials.api_token, credentials.device_id)
 
-        # Verify credentials are still valid
-        try:
-            self.bf.get_status()
-            state = LoginState(
-                logged_in=True,
-                user_email=credentials.user_email,
-                user_name=credentials.user_name or None,
-                user_role=credentials.user_role,
-                device_id=credentials.device_id,
-            )
-            logger.info(f"Auto-login successful for {credentials.user_email}")
-            if self._on_login_callback:
-                self._on_login_callback(state)
-            return state
-        except BetterFlowAuthError as e:
-            logger.warning(f"Auto-login failed (auth): {e}")
-            self.bf.clear_credentials()
-            return LoginState(logged_in=False, error="Stored credentials are invalid")
-        except BetterFlowClientError as e:
-            logger.warning(f"Auto-login failed (network): {e}")
-            # Don't clear credentials on network error - might be temporary
-            return LoginState(logged_in=False, error="Network error - check your connection")
+        # Verify credentials are still valid. A single 401 is often transient
+        # (the agent started mid-deploy, or a momentary backend token-lookup
+        # blip) — clearing credentials on the first failure forces a needless
+        # full re-login. Retry a few times with backoff and only treat the token
+        # as genuinely invalid (and clear it) after the failures persist.
+        auth_attempts = 3
+        auth_backoff = [2.0, 4.0]  # waits between the attempts
+        for attempt in range(auth_attempts):
+            try:
+                self.bf.get_status()
+                state = LoginState(
+                    logged_in=True,
+                    user_email=credentials.user_email,
+                    user_name=credentials.user_name or None,
+                    user_role=credentials.user_role,
+                    device_id=credentials.device_id,
+                )
+                logger.info(f"Auto-login successful for {credentials.user_email}")
+                if self._on_login_callback:
+                    self._on_login_callback(state)
+                return state
+            except BetterFlowAuthError as e:
+                if attempt < auth_attempts - 1:
+                    logger.warning(
+                        "Auto-login auth error (attempt %d/%d): %s — retrying",
+                        attempt + 1, auth_attempts, e,
+                    )
+                    time.sleep(auth_backoff[attempt])
+                    continue
+                logger.warning(f"Auto-login failed (auth) after {auth_attempts} attempts: {e}")
+                self.bf.clear_credentials()
+                return LoginState(logged_in=False, error="Stored credentials are invalid")
+            except BetterFlowClientError as e:
+                logger.warning(f"Auto-login failed (network): {e}")
+                # Don't clear credentials on network error - might be temporary
+                return LoginState(logged_in=False, error="Network error - check your connection")
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.
