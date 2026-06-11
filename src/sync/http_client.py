@@ -6,6 +6,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -112,6 +113,38 @@ class BaseApiClient:
         self._session = session or requests.Session()
         self._owns_session = session is None  # Track if we created the session
         self._session_lock = threading.Lock()
+        # Global rate-limit backoff. When the server returns 429, ALL outbound
+        # calls (sync, hours, trends, heartbeat) pause until this monotonic
+        # deadline — one coordinated pause instead of each endpoint independently
+        # retrying into the same window (the retry storm that amplified the 429s).
+        self._throttle_until = 0.0
+        self._throttle_lock = threading.Lock()
+
+    # ---- Global rate-limit backoff -------------------------------------------
+
+    # Default backoff when a 429 carries no usable Retry-After header.
+    _DEFAULT_THROTTLE_SECONDS = 30.0
+    # Cap so a hostile/buggy Retry-After can't park the agent for minutes.
+    _MAX_THROTTLE_SECONDS = 60.0
+
+    def _throttle_remaining(self) -> float:
+        """Seconds left in the active global backoff window (0 if not throttled)."""
+        with self._throttle_lock:
+            until = self._throttle_until
+        remaining = until - time.monotonic()
+        return remaining if remaining > 0 else 0.0
+
+    def _enter_throttle(self, retry_after: float) -> None:
+        """Open/extend the global backoff window (thread-safe).
+
+        Only ever pushes the deadline later, never earlier, so concurrent 429s
+        from different endpoints can't shorten an existing backoff.
+        """
+        retry_after = max(0.0, min(retry_after, self._MAX_THROTTLE_SECONDS))
+        until = time.monotonic() + retry_after
+        with self._throttle_lock:
+            if until > self._throttle_until:
+                self._throttle_until = until
 
     @property
     def web_base_url(self) -> str:
@@ -197,6 +230,16 @@ class BaseApiClient:
 
         def do_request() -> dict:
             try:
+                # Global backoff: if a recent 429 opened a backoff window, skip the
+                # network call entirely and fail fast so the caller queues/uses
+                # cache. This is what stops every endpoint from hammering a
+                # server that already told us to wait.
+                backoff = self._throttle_remaining()
+                if backoff > 0:
+                    raise BetterFlowClientError(
+                        f"Rate-limit backoff active, {backoff:.0f}s remaining"
+                    )
+
                 with self._session_lock:
                     session = self._session
                 if session is None:
@@ -208,8 +251,28 @@ class BaseApiClient:
                 if response.status_code == 403:
                     raise BetterFlowAuthError("Device not authorized")
 
-                # Retryable HTTP status codes (N12)
-                if response.status_code in (408, 429, 503, 504):
+                # Rate limited: open a GLOBAL backoff window (pauses every
+                # endpoint, not just this call) and fail fast — non-retryable, so
+                # we don't retry into the very window the server asked us to wait
+                # out. Honors Retry-After, capped, with a sane default.
+                if response.status_code == 429:
+                    retry_after_secs = self._DEFAULT_THROTTLE_SECONDS
+                    retry_after_hdr = response.headers.get("Retry-After")
+                    if retry_after_hdr:
+                        try:
+                            retry_after_secs = min(
+                                float(retry_after_hdr), self._MAX_THROTTLE_SECONDS
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                    self._enter_throttle(retry_after_secs)
+                    raise BetterFlowClientError(
+                        f"Server returned 429 (Retry-After: {retry_after_hdr or 'none'}); "
+                        f"backing off {retry_after_secs:.0f}s"
+                    )
+
+                # Other transient HTTP status codes stay per-call retryable (N12).
+                if response.status_code in (408, 503, 504):
                     retry_after_hdr = response.headers.get("Retry-After")
                     retry_after_secs = None
                     msg = f"Server returned {response.status_code}"
