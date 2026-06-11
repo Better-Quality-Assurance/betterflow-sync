@@ -21,6 +21,7 @@ except ImportError:
         AGENT_VERSION = "0.0.0"
 
 try:
+    from ..browser_tracker import is_browser_app
     from ..config import Config
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from .bf_client import BetterFlowClientError, BetterFlowAuthError
@@ -29,6 +30,7 @@ try:
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
 except ImportError:
+    from browser_tracker import is_browser_app
     from config import Config
     from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL
     from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
@@ -121,6 +123,7 @@ class SyncEngine:
         display_tracker=None,
         activity_analyzer: Optional[ActivityAnalyzer] = None,
         time_tracker: Optional[DailyTimeTracker] = None,
+        browser_tracker=None,
     ):
         self.aw = aw
         self.bf = bf
@@ -128,6 +131,7 @@ class SyncEngine:
         self.config = config
         self._on_config_updated = on_config_updated
         self._display_tracker = display_tracker
+        self._browser_tracker = browser_tracker
         self._paused = False
         self._private_mode = False
         self._private_start: Optional[datetime] = None
@@ -968,8 +972,20 @@ class SyncEngine:
             data["app"] = app[:MAX_APP_LENGTH] if app else app
             title = event.title
             data["title"] = title[:MAX_TITLE_LENGTH] if title else title
-            if event.url:
-                url = event.url
+            # The bundled window watcher carries no URL. On macOS, enrich browser
+            # events with the active-tab URL captured around the event's time by
+            # the browser tracker. Raw URL here; the privacy block below applies
+            # domain-only / full-URL rules exactly as it does for extension URLs.
+            raw_url = event.url
+            if (
+                not raw_url
+                and self._browser_tracker is not None
+                and is_browser_app(app)
+            ):
+                event_end = event.timestamp + timedelta(seconds=event.duration)
+                raw_url = self._browser_tracker.url_at(event_end.timestamp())
+            if raw_url:
+                url = raw_url
                 # When the full URL exceeds MAX_URL_LENGTH we deliberately
                 # fall back to the domain rather than silent mid-string
                 # truncation — truncation can change semantics (e.g. turn a
@@ -982,7 +998,7 @@ class SyncEngine:
                         data["url"] = domain
 
                 if privacy.collect_page_category:
-                    data["page_category"] = self._infer_page_category(event.url, event.title)
+                    data["page_category"] = self._infer_page_category(raw_url, event.title)
 
             if app and privacy.auto_categorize:
                 category = self._get_category(app)

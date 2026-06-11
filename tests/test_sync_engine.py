@@ -501,6 +501,48 @@ class TestSyncEngine:
         assert result is not None
         assert result["data"]["status"] == "not-afk"
 
+    def test_transform_event_enriches_browser_url_from_tracker(self):
+        """A browser window event with no URL is enriched from the browser
+        tracker, then domain-stripped by the default privacy policy."""
+
+        class _StubTracker:
+            def url_at(self, ts):
+                return "https://github.com/Better-Quality-Assurance/x/pull/1"
+
+        self.engine._browser_tracker = _StubTracker()
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "Google Chrome", "title": "PR"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        # domain_only_urls=True by default -> domain, not the full URL
+        assert result["data"]["url"] == "github.com"
+
+    def test_transform_event_no_tracker_url_for_non_browser_app(self):
+        """Non-browser apps are never queried for a URL, even with a tracker."""
+
+        class _StubTracker:
+            def url_at(self, ts):
+                raise AssertionError("url_at must not be called for non-browsers")
+
+        self.engine._browser_tracker = _StubTracker()
+        event = AWEvent(
+            id=2,
+            timestamp=datetime.now(timezone.utc),
+            duration=60,
+            data={"app": "Terminal", "title": "zsh"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+
+        assert result is not None
+        assert "url" not in result["data"]
+
     def test_transform_event_afk_status_not_relabeled_as_break(self):
         """AFK (away-from-keyboard) must NOT be sent as a 'break'.
 
