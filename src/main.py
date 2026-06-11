@@ -11,7 +11,7 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -157,6 +157,19 @@ class SyncCoordinator:
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
+
+        # In-process input watcher reference, wired by the App after
+        # construction. Used by `_check_idle_tracker_health` to cross-check
+        # the bf-idle-tracker subprocess's AFK output against in-process
+        # input observations — the only way to detect that the tracker
+        # subprocess is missing its own Input Monitoring grant (a separate
+        # TCC subject from the main app, easy to miss in install).
+        self._input_watcher: Optional[Any] = None
+        # Throttle for the false-AFK warning. Mirrors _last_perm_warn_at
+        # exactly so the user gets at most one notification per
+        # _PERM_REWARN_INTERVAL while the disagreement persists.
+        self._idle_tracker_warn_lock = threading.Lock()
+        self._last_idle_tracker_warn_at: Optional[datetime] = None
 
         # macOS permission-warning throttle. Input Monitoring can be revoked
         # silently (e.g. a new build changes the code signature and macOS drops
@@ -479,6 +492,98 @@ class SyncCoordinator:
             return
         self._maybe_warn_login_required(source="periodic")
 
+    # Window the bf-idle-tracker health check uses to decide whether the
+    # in-process input watcher has seen "recent" input. Must be shorter than
+    # the tracker's --timeout (default 600s = 10 min) so a genuine 10-min
+    # AFK period doesn't show as a disagreement, but long enough that a
+    # short typing pause doesn't trip the warning.
+    _IDLE_TRACKER_RECENT_INPUT_S = 180  # 3 min
+
+    def _check_idle_tracker_health(self) -> None:
+        """Detect when bf-idle-tracker is reporting AFK while the in-process
+        input watcher is seeing keystrokes — Lucian's 2026-06-11 incident.
+
+        bf-idle-tracker runs in a SEPARATE process under its own TCC subject,
+        distinct from the main app. macOS can have Input Monitoring granted
+        for BetterFlow.app but NOT for the bundled tracker binary; the user
+        toggles ONE switch in System Settings and reasonably assumes both
+        are covered, but they're not. The tracker silently sees zero input
+        → reports AFK after its 10-min timeout regardless of how much the
+        user is typing → the dashboard credits them no active time.
+
+        Detection: the in-process input watcher (which DOES have grant —
+        we already check it via _maybe_warn_input_tracking) saw input in
+        the last 3 minutes, AND the latest AFK bucket event says 'afk'.
+        That combination is only possible if the tracker is blind.
+
+        Notification is throttled to one per rewarn window like every other
+        permission-class warning. Best-effort: any error in querying AW
+        falls through silently — this is a diagnostic, not a billing path.
+        """
+        if not self.logged_in:
+            return
+        if self._input_watcher is None:
+            return
+
+        last_input = self._input_watcher.get_last_input_at()
+        if last_input is None:
+            return  # Watcher hasn't seen anything yet — can't compare.
+
+        now = datetime.now(timezone.utc)
+        recent_input_window = timedelta(seconds=self._IDLE_TRACKER_RECENT_INPUT_S)
+        if now - last_input > recent_input_window:
+            return  # No recent in-process input → no disagreement to flag.
+
+        # Query the AFK bucket for the latest event. Best-effort; AW being
+        # transiently unreachable is a different failure mode handled
+        # elsewhere.
+        try:
+            buckets = self.aw.get_afk_buckets()
+        except Exception as e:
+            logger.debug("idle_tracker_health: AW unreachable, skipping: %s", e)
+            return
+        if not buckets:
+            return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
+
+        try:
+            # One event from the most recent bucket is enough — AW returns
+            # them newest-first by default.
+            events = self.aw.get_events(buckets[0].id, limit=1)
+        except Exception as e:
+            logger.debug("idle_tracker_health: AFK fetch failed, skipping: %s", e)
+            return
+        if not events:
+            return
+
+        latest = events[0]
+        status = (latest.data or {}).get("status")
+        if status != "afk":
+            return  # Tracker agrees with the input watcher — nothing to do.
+
+        # Disagreement detected. Throttled warn.
+        with self._idle_tracker_warn_lock:
+            recently_warned = (
+                self._last_idle_tracker_warn_at is not None
+                and (now - self._last_idle_tracker_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_idle_tracker_warn_at = now
+
+        logger.warning(
+            "Idle tracker disagrees with input watcher: input observed at %s "
+            "but AFK bucket reports 'afk' — bf-idle-tracker likely missing "
+            "Input Monitoring permission (separate TCC subject from main app)",
+            last_input.isoformat(),
+        )
+        send_notification(
+            "BetterFlow may not be detecting your input",
+            "Your activity isn't being recorded as work time. The BetterFlow "
+            "idle tracker needs Input Monitoring permission. Click the menu "
+            "bar icon → Diagnostics → Fix Permissions and grant access to "
+            "bf-idle-tracker as well as BetterFlow.",
+        )
+
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
 
@@ -497,6 +602,7 @@ class SyncCoordinator:
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
             (self._check_auth_warn, "auth_warn"),
+            (self._check_idle_tracker_health, "idle_tracker_health"),
         ):
             try:
                 fn()
@@ -819,6 +925,7 @@ class BetterFlowApp:
             error_reporter=self.error_reporter,
         )
         self.coordinator._on_auth_error = self._on_session_expired
+        self.coordinator._input_watcher = self.input_watcher
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
