@@ -231,6 +231,7 @@ class PrivacySettings:
     collect_page_category: bool = True  # Include coarse page category classification
     auto_categorize: bool = True  # Enrich events with app_category from server mappings
     track_display_info: bool = False  # Track monitor name and virtual desktop
+    track_browser_urls: bool = False  # macOS: read active-tab URL via AppleScript (needs Automation permission)
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",
@@ -536,6 +537,8 @@ class Config:
                 self.privacy.auto_categorize = self._to_bool(collection["auto_categorize"])
             if "track_display_info" in collection:
                 self.privacy.track_display_info = self._to_bool(collection["track_display_info"])
+            if "track_browser_urls" in collection:
+                self.privacy.track_browser_urls = self._to_bool(collection["track_browser_urls"])
             if "default_categories" in collection:
                 cats = collection["default_categories"]
                 if isinstance(cats, dict):

@@ -24,6 +24,7 @@ try:
     from .aw_manager import AWManager
     from .config import Config, setup_logging
     from . import error_reporter
+    from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -48,6 +49,7 @@ except ImportError:
     from aw_manager import AWManager
     from config import Config, setup_logging
     import error_reporter
+    from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
@@ -672,6 +674,13 @@ class BetterFlowApp:
         else:
             self.display_tracker = None
 
+        # Active browser-tab URL tracker (macOS). Off unless enabled; without it
+        # browser events carry no URL and collapse to generic "browsing".
+        if self.config.privacy.track_browser_urls:
+            self.browser_tracker = start_browser_tracker()
+        else:
+            self.browser_tracker = None
+
         # In-process window watcher on macOS (inherits Accessibility permission)
         self.window_watcher = None
         self.input_watcher = None
@@ -694,6 +703,7 @@ class BetterFlowApp:
             config=self.config,
             on_config_updated=self._on_config_updated,
             display_tracker=self.display_tracker,
+            browser_tracker=self.browser_tracker,
         )
 
         logger.info("Sync engine created")
@@ -1574,6 +1584,8 @@ class BetterFlowApp:
             self.input_watcher.stop()
         if self.display_tracker is not None:
             self.display_tracker.stop()
+        if getattr(self, "browser_tracker", None) is not None:
+            self.browser_tracker.stop()
         # Clean up macOS notification observers (M5)
         try:
             if sys.platform == "darwin":
