@@ -168,6 +168,16 @@ class SyncCoordinator:
         self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
         self._last_perm_warn_at: Optional[datetime] = None
 
+        # Auth-warn throttle (Emilian, 2026-06-11): after his laptop restart
+        # auto-login silently failed and the tray went to WAITING_AUTH without
+        # any system notification — he could have worked a full day untracked.
+        # Throttled to one warn per OFF transition, then periodically re-warned
+        # while WAITING_AUTH persists. Same shape as _maybe_warn_input_tracking
+        # so the two pathways look the same to anyone debugging.
+        self._auth_warn_lock = threading.Lock()
+        self._last_auth_warn_at: Optional[datetime] = None
+        self._was_logged_in_for_warn: Optional[bool] = None
+
     @property
     def logged_in(self) -> bool:
         with self._state_lock:
@@ -403,6 +413,72 @@ class SyncCoordinator:
             "Fix Permissions to turn on Input Monitoring.",
         )
 
+    def _maybe_warn_login_required(self, *, source: str) -> None:
+        """Notify the user when the session is gone and the app needs a login.
+
+        Mirrors ``_maybe_warn_input_tracking``: one notification at the
+        transition into not-logged-in, then a periodic re-warn every
+        ``_PERM_REWARN_INTERVAL`` while it stays that way. The amber
+        WAITING_AUTH menu bar icon alone is too easy to miss — Emilian's
+        2026-06-11 incident report was "if I had not noticed this, I could
+        have lost an entire day of work."
+
+        Idempotent: callers may invoke from startup auto-login failure, from
+        ``_handle_auth_error`` mid-session, and from the periodic tick — only
+        the first call within the rewarn window emits a notification.
+        """
+        now = datetime.now(timezone.utc)
+        with self._auth_warn_lock:
+            was_logged_in = self._was_logged_in_for_warn
+            self._was_logged_in_for_warn = False
+
+            recently_warned = (
+                self._last_auth_warn_at is not None
+                and (now - self._last_auth_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            # Force a warn on the True → False transition even if we warned
+            # recently for an unrelated reason (e.g. a previous boot of the
+            # process logged in then expired). Otherwise the user gets one
+            # warn per rewarn interval, regardless of state churn in between.
+            transitioned_off = was_logged_in is True
+            if recently_warned and not transitioned_off:
+                return
+            self._last_auth_warn_at = now
+
+        logger.warning(
+            "Login required (%s) — notifying user; tray sync paused until re-login",
+            source,
+        )
+        send_notification(
+            "BetterFlow is not tracking",
+            "Your session ended and the app is no longer recording your work. "
+            "Click the BetterFlow menu bar icon → Retry Login to sign back in.",
+        )
+
+    def _mark_logged_in_for_warn(self) -> None:
+        """Reset the auth-warn throttle on a fresh successful login.
+
+        Lets the next transition to not-logged-in re-emit the notification
+        immediately, even if the previous warn was within the rewarn window.
+        """
+        with self._auth_warn_lock:
+            self._last_auth_warn_at = None
+            self._was_logged_in_for_warn = True
+
+    def _check_auth_warn(self) -> None:
+        """Re-warn periodically while the app is still WAITING_AUTH.
+
+        The startup / session-expired notification fires once at the
+        transition; this tick keeps it from being a one-shot the user
+        misses while heads-down. Throttled via the same rewarn window
+        as the input-monitoring warn.
+        """
+        if self.logged_in:
+            return
+        if self.tray.model.state != TrayState.WAITING_AUTH:
+            return
+        self._maybe_warn_login_required(source="periodic")
+
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
 
@@ -420,6 +496,7 @@ class SyncCoordinator:
             (self._check_idle_status, "idle_check"),
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
+            (self._check_auth_warn, "auth_warn"),
         ):
             try:
                 fn()
@@ -741,7 +818,7 @@ class BetterFlowApp:
             aw_manager=self.aw_manager,
             error_reporter=self.error_reporter,
         )
-        self.coordinator._on_auth_error = self._on_login
+        self.coordinator._on_auth_error = self._on_session_expired
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
@@ -828,6 +905,7 @@ class BetterFlowApp:
             return
 
         self.coordinator.logged_in = True
+        self.coordinator._mark_logged_in_for_warn()
         self.tray.set_user(state.user_email, state.user_name, state.user_role)
         self._set_startup_status("Loading your workspace...")
 
@@ -873,6 +951,7 @@ class BetterFlowApp:
             else:
                 self.coordinator.logged_in = False
                 self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+                self.coordinator._maybe_warn_login_required(source="startup")
                 self._ensure_update_checks_started()
 
             logger.info("Background startup complete")
@@ -1143,6 +1222,18 @@ class BetterFlowApp:
                     logger.debug("Failed to end stale session during crash recovery", exc_info=True)
         except Exception as e:
             logger.debug(f"Stale session check failed: {e}")
+
+    def _on_session_expired(self) -> None:
+        """Bridge from `SyncCoordinator._handle_auth_error` into the App's
+        notification + relogin pipeline.
+
+        Distinct from the user-clicked `_on_login` so the notification only
+        fires on the involuntary path (session died under the user). A user
+        who explicitly clicks Login knows what they did; the case Emilian
+        flagged was the silent path.
+        """
+        self.coordinator._maybe_warn_login_required(source="session_expired")
+        self._on_login()
 
     def _on_login(self) -> None:
         """Handle explicit login action from tray.
