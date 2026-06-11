@@ -1110,6 +1110,11 @@ class BetterFlowApp:
         self.coordinator.fetch_projects()
         self._check_stale_session()
         self.coordinator.start()
+        # Pull data immediately instead of waiting for the scheduler's first
+        # 60s tick — otherwise the tray sits at "Starting… / 0h 0m" with greyed
+        # menus for up to a minute after a successful login. This first sync
+        # fetches today's hours and flips the tray to its live state at once.
+        self.coordinator.trigger_sync("post_login_sync")
         self._ensure_update_checks_started()
 
         if send_greeting:
