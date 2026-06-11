@@ -20,8 +20,14 @@ from src.ui.tray import TrayIcon, TrayState
 
 
 def _make_tray() -> TrayIcon:
-    """Construct a TrayIcon with the icon attribute pre-set to a MagicMock so
-    `_update_icon` and `_update_menu` don't short-circuit on `self._icon`."""
+    """Construct a TrayIcon with the icon attribute pre-set to a MagicMock,
+    and stub `_update_icon` / `_update_menu` to MagicMocks too.
+
+    The icon/menu refresh paths import PIL + AppKit + pystray; on CI Linux
+    those aren't available. We don't need to assert anything about them
+    here — these tests are about model state under set_state(), not about
+    rendering. Patching at the instance level keeps the tests focused.
+    """
     with patch("src.ui.tray.pystray"):
         tray = TrayIcon(
             on_login=lambda: None,
@@ -31,6 +37,10 @@ def _make_tray() -> TrayIcon:
             on_quit=lambda: None,
         )
     tray._icon = MagicMock()
+    # Stub the refresh hooks instance-wide. test_set_state_refreshes_menu...
+    # below re-patches them with `patch.object` to assert call counts.
+    tray._update_icon = MagicMock()
+    tray._update_menu = MagicMock()
     return tray
 
 
