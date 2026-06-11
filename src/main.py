@@ -181,6 +181,14 @@ class SyncCoordinator:
         self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
         self._last_perm_warn_at: Optional[datetime] = None
 
+        # Liveness heartbeat while paused. The normal heartbeat rides _do_sync,
+        # which is skipped when paused (break / lock / manual), so a break longer
+        # than the server's 30-min stale-session cleanup gets its session marked
+        # "crashed" and tracking doesn't resume on return. Send a lightweight
+        # heartbeat from the 60s tick while paused-but-running to keep the
+        # session alive. monotonic-throttled so it's at most one per interval.
+        self._last_liveness_heartbeat: Optional[float] = None
+
         # Auth-warn throttle (Emilian, 2026-06-11): after his laptop restart
         # auto-login silently failed and the tray went to WAITING_AUTH without
         # any system notification — he could have worked a full day untracked.
@@ -625,6 +633,7 @@ class SyncCoordinator:
         for fn, label in (
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
+            (self._liveness_heartbeat, "liveness_heartbeat"),
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
             (self._check_auth_warn, "auth_warn"),
@@ -647,6 +656,47 @@ class SyncCoordinator:
             reschedule=self.reschedule,
             trigger_sync=self.trigger_sync,
         )
+
+    # Keep the server session alive at least this often while paused. Well under
+    # the server's 30-min stale-session cleanup so a long break never trips it.
+    _LIVENESS_HEARTBEAT_INTERVAL = 300  # seconds
+
+    def _liveness_heartbeat(self) -> None:
+        """Heartbeat while paused-but-running so the server keeps the session.
+
+        The normal heartbeat rides _do_sync, which early-returns when paused
+        (break / screen lock / manual / private), so during a break longer than
+        the server's 30-min cleanup the device's last_seen_at goes stale and the
+        session is marked 'crashed' — then tracking doesn't resume on return.
+        A paused agent is alive, not crashed: send a lightweight heartbeat to
+        keep the session open. It only refreshes last_seen_at, never active time.
+
+        Skipped while actively syncing (that path already heartbeats) and while
+        offline (no server to reach). Throttled to one per interval.
+        """
+        if not self.logged_in:
+            return
+        if self.paused_by_network:
+            return  # offline — the heartbeat would just fail; resume on reconnect
+        paused = (
+            self.sync_engine.is_paused
+            or self.sync_engine.is_private
+            or self.is_on_break
+        )
+        if not paused:
+            return  # active sync already sends heartbeats
+
+        now = time.monotonic()
+        if (
+            self._last_liveness_heartbeat is not None
+            and now - self._last_liveness_heartbeat < self._LIVENESS_HEARTBEAT_INTERVAL
+        ):
+            return
+        self._last_liveness_heartbeat = now
+
+        auth_err = self.sync_engine.send_heartbeat_now()
+        if auth_err is not None:
+            self._handle_auth_error(auth_err, source="liveness_heartbeat")
 
     _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
 

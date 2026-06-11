@@ -1443,6 +1443,21 @@ class SyncEngine:
             return self._send_heartbeat()
         return None
 
+    def send_heartbeat_now(self) -> Optional["BetterFlowAuthError"]:
+        """Send a heartbeat immediately, bypassing the sync-cycle counter.
+
+        Used to keep the device alive on the server while the agent is PAUSED
+        (break / screen lock / manual pause). The normal heartbeat rides the
+        sync cycle, which is skipped while paused — so without this the device's
+        last_seen_at goes stale and the server's 30-minute stale-session cleanup
+        marks a long break as a 'crashed' session, and tracking doesn't resume
+        when the user returns. A paused-but-running agent is alive, not crashed.
+        Heartbeats only refresh last_seen_at; they never add active/tracked time.
+
+        Returns a BetterFlowAuthError on 401/403 so the caller can re-login.
+        """
+        return self._send_heartbeat()
+
     def _send_heartbeat(self) -> Optional["BetterFlowAuthError"]:
         """Send heartbeat to server and process commands.
 
