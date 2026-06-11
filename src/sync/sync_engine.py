@@ -1305,8 +1305,9 @@ class SyncEngine:
                 if result.success:
                     stats.events_sent += result.events_synced
                 else:
-                    # Partial batch: only re-queue events the server didn't accept
                     if result.accepted_ids:
+                        # True partial success: re-queue only the events the
+                        # server did NOT accept.
                         accepted_set = set(result.accepted_ids)
                         failed = [e for e in batch if e.get("id") not in accepted_set]
                         stats.events_sent += len(batch) - len(failed)
@@ -1317,15 +1318,18 @@ class SyncEngine:
                                 e.get("bucket_id", "") for e in failed
                             )
                     else:
-                        # N11: server returned non-success without accepted_ids.
-                        # This branch also covers network failures: bf_client
-                        # catches BetterFlowClientError internally and returns
-                        # SyncResult(success=False), so there is no separate
-                        # network-error except branch — see Important-2 in
-                        # commit history.
+                        # N11: total failure with nothing accepted — a transient
+                        # error (429 rate-limit backoff, network drop, timeout;
+                        # bf_client catches BetterFlowClientError internally and
+                        # returns SyncResult(success=False), so there is no
+                        # separate network-error except branch — see Important-2
+                        # in commit history). Re-queue the whole batch; the
+                        # content-derived idempotency key (bf_client.send_events)
+                        # makes the eventual resend safe against duplicates.
                         logger.warning(
-                            "Server returned partial failure without accepted_ids - "
-                            "re-queuing entire batch"
+                            "Batch not accepted (transient failure: %s) - re-queuing all %d events",
+                            result.error or "unknown",
+                            len(batch),
                         )
                         self.queue.enqueue(batch)
                         stats.events_queued += len(batch)
