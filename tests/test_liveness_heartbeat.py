@@ -103,10 +103,14 @@ def test_offline_skips():
     coord.sync_engine.send_heartbeat_now.assert_not_called()
 
 
-def test_auth_error_triggers_relogin():
+def test_auth_error_routes_through_handler_and_is_tolerated():
+    # A single auth error from the liveness heartbeat is routed to
+    # _handle_auth_error, which now TOLERATES one transient failure rather than
+    # logging out immediately (see test_auth_tolerance for the threshold).
     coord = _make_coordinator()
     coord.sync_engine.is_paused = True
     coord.sync_engine.send_heartbeat_now.return_value = BetterFlowAuthError("401")
     coord._liveness_heartbeat()
     coord.sync_engine.send_heartbeat_now.assert_called_once()
-    assert coord.logged_in is False  # _handle_auth_error flipped it
+    assert coord.logged_in is True  # tolerated, not an immediate logout
+    assert coord._consecutive_auth_failures == 1
