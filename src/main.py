@@ -545,20 +545,46 @@ class SyncCoordinator:
         if not buckets:
             return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
 
-        try:
-            # One event from the most recent bucket is enough — AW returns
-            # them newest-first by default.
-            events = self.aw.get_events(buckets[0].id, limit=1)
-        except Exception as e:
-            logger.debug("idle_tracker_health: AFK fetch failed, skipping: %s", e)
-            return
-        if not events:
-            return
+        # A user who migrated from vanilla ActivityWatch can have BOTH a
+        # `bf-idle-tracker` bucket and a stale `aw-watcher-afk` bucket. The
+        # stale one's last event is frozen at "afk" forever, so picking the
+        # wrong one fires a false-positive notification every time the user
+        # types. Prefer the bf-idle-tracker bucket; fall back to picking the
+        # one with the most recent event if neither name matches.
+        bf_buckets = [b for b in buckets if "bf-idle-tracker" in b.id]
+        candidate_buckets = bf_buckets or buckets
 
-        latest = events[0]
+        latest = None
+        for bucket in candidate_buckets:
+            try:
+                events = self.aw.get_events(bucket.id, limit=1)
+            except Exception as e:
+                logger.debug("idle_tracker_health: AFK fetch failed for %s: %s", bucket.id, e)
+                continue
+            if not events:
+                continue
+            event = events[0]
+            if latest is None or event.timestamp > latest.timestamp:
+                latest = event
+
+        if latest is None:
+            return  # No AFK events anywhere — tracker hasn't reported yet.
+
         status = (latest.data or {}).get("status")
         if status != "afk":
             return  # Tracker agrees with the input watcher — nothing to do.
+
+        # Avoid the return-from-AFK transition lag. The user could have been
+        # genuinely AFK for 15 min, returned, and typed within the same
+        # second that this tick runs — the AFK watcher hasn't posted its
+        # "not-afk" transition event yet, but it will within a heartbeat
+        # pulsetime. If the latest "afk" event ENDS later than the input
+        # observation, there's no actual disagreement: the tracker just
+        # hasn't caught up. Require the AFK span to have ended at least
+        # 30s before the most recent input before flagging it as broken.
+        afk_end = latest.timestamp + timedelta(seconds=float(latest.duration))
+        if afk_end > last_input - timedelta(seconds=30):
+            return
 
         # Disagreement detected. Throttled warn.
         with self._idle_tracker_warn_lock:
