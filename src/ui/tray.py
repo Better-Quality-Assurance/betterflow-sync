@@ -1082,13 +1082,29 @@ class TrayIcon:
 
         Args:
             state: New state
-            status_text: Optional status message for error state
+            status_text: Optional status message for error state. Passing None
+                explicitly when transitioning OUT of an error/queue state
+                clears the previous text so it doesn't leak across transitions.
         """
         with self.model.lock:
+            previous_state = self.model.state
             self.model.state = state
-            if status_text:
+            if status_text is not None:
                 self.model.status_text = status_text
+            elif previous_state in (TrayState.ERROR, TrayState.QUEUE_WARNING) and state not in (
+                TrayState.ERROR, TrayState.QUEUE_WARNING,
+            ):
+                # Recovery transition: ERROR/QUEUE_WARNING → anything-healthy.
+                # Old status_text (e.g. "ActivityWatch is not running") would
+                # leak into the next display path until something else writes
+                # to it. Clear at the transition so the recovery is clean.
+                self.model.status_text = None
         self._update_icon()
+        # Also refresh the menu so the "App status: …" line flips with the
+        # state, not on the next tick when something else triggers a menu
+        # rebuild (the recurring "tray stuck on Error" UX bug Tudor saw
+        # multiple times today on bf-data-service transient blips).
+        self._update_menu()
 
     def set_paused(self, paused: bool) -> None:
         """Set paused state."""
