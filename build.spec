@@ -123,6 +123,7 @@ hiddenimports = [
     "ui.setup_wizard",
     "aw_manager",
     "autostart",
+    "windows_tray",  # Windows-only tray GUID + overflow promotion (no-op elsewhere)
     "display_info",
     "reminders",
     "notifications",

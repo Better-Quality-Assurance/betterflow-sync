@@ -51,6 +51,16 @@ except ImportError:
         import _build_info  # noqa: F401 — ensure bundle path detection runs first
     from config import PRIVACY_POLICY_URL  # type: ignore[no-redef]
 
+# Windows-only: keep the tray icon out of the hidden-icons overflow. No-ops on
+# other platforms and degrades gracefully if the module can't be imported.
+try:
+    from .. import windows_tray as _windows_tray  # module execution
+except ImportError:
+    try:
+        import windows_tray as _windows_tray  # PyInstaller bundle (src/ is root)
+    except ImportError:
+        _windows_tray = None  # type: ignore[assignment]
+
 
 def _prevent_termination() -> None:
     """Prevent macOS from silently killing the tray app.
@@ -461,6 +471,11 @@ class TrayIcon:
         """
         if pystray is None:
             raise ImportError("pystray is required for system tray support")
+
+        # Register the icon with a stable GUID before pystray builds it, so
+        # Windows can keep it in the always-visible tray area (no-op elsewhere).
+        if _windows_tray is not None:
+            _windows_tray.install_stable_guid()
 
         self._on_login = on_login
         self._on_pause = on_pause
@@ -1447,6 +1462,10 @@ class TrayIcon:
         self._thread.start()
         logger.info("Tray icon started")
 
+        # Lift the icon out of the Windows hidden-icons overflow once it's live.
+        if _windows_tray is not None:
+            _windows_tray.schedule_promotion()
+
     def stop(self) -> None:
         """Stop the tray icon."""
         if self._icon:
@@ -1461,6 +1480,12 @@ class TrayIcon:
         which can happen on macOS when NSApplication fails to initialise.
         """
         _prevent_termination()
+
+        # Lift the icon out of the Windows hidden-icons overflow once it's live.
+        # Scheduled once here (not per-retry); the worker waits for the icon to
+        # appear before touching the registry.
+        if _windows_tray is not None:
+            _windows_tray.schedule_promotion()
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
