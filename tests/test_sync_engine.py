@@ -501,6 +501,29 @@ class TestSyncEngine:
         assert result is not None
         assert result["data"]["status"] == "not-afk"
 
+    def test_transform_event_afk_status_not_relabeled_as_break(self):
+        """AFK (away-from-keyboard) must NOT be sent as a 'break'.
+
+        A break is an intentional user-initiated pause (break_time). Blanket-
+        relabeling AFK as break turned ordinary no-input work (reading, meetings,
+        watching a screen) into phantom 'Break' cards for people who took no
+        break. AFK keeps its real bucket_type so the backend classifies long
+        spans as Idle.
+        """
+        event = AWEvent(
+            id=1,
+            timestamp=datetime.now(timezone.utc),
+            duration=600,
+            data={"status": "afk"},
+        )
+
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_AFK)
+
+        assert result is not None
+        assert result["data"]["status"] == "afk"
+        assert result["bucket_type"] == BUCKET_TYPE_AFK
+        assert result["bucket_type"] != "break"
+
     def test_transform_event_adds_activity_state_for_window_events(self):
         """Test that window events include activity state and metrics."""
         self.engine._has_input_data = True
