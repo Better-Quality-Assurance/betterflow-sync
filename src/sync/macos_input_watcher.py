@@ -59,6 +59,13 @@ class MacOSInputWatcher:
         self._presses = 0
         self._clicks = 0
         self._scrolls = 0
+        # Most-recent input timestamp — updated on every event, read by the
+        # SyncCoordinator's bf-idle-tracker health check. Distinct from the
+        # emitted counters: those reset to 0 each emit cycle, this stays
+        # monotonic across the watcher's lifetime so a 2-min "did we see ANY
+        # input recently" probe works regardless of where in the emit cycle
+        # we land.
+        self._last_input_at: Optional[datetime] = None
         self._lock = threading.Lock()
 
         # Store CFRunLoop ref so stop() can break out of it
@@ -81,6 +88,21 @@ class MacOSInputWatcher:
             (self._tap_thread is not None and self._tap_thread.is_alive())
             or (self._emit_thread is not None and self._emit_thread.is_alive())
         )
+
+    def get_last_input_at(self) -> Optional[datetime]:
+        """Return the timestamp of the most-recent observed input event.
+
+        Used by the SyncCoordinator's idle-tracker health check to detect
+        when bf-idle-tracker is reporting AFK while the main-process input
+        watcher is still seeing keystrokes — the signature of a missing
+        Input Monitoring grant on the tracker subprocess (which has its own
+        TCC subject distinct from the main app).
+
+        Returns None when the watcher hasn't observed any input yet (fresh
+        start, or running headless during tests).
+        """
+        with self._lock:
+            return self._last_input_at
 
     def start(self) -> bool:
         """Create the AW bucket and start the tap + emitter threads."""
@@ -251,6 +273,7 @@ class MacOSInputWatcher:
             return event
 
         with self._lock:
+            recognized = True
             if event_type == _kCGEventKeyDown:
                 self._presses += 1
             elif event_type in (
@@ -261,6 +284,14 @@ class MacOSInputWatcher:
                 self._clicks += 1
             elif event_type == _kCGEventScrollWheel:
                 self._scrolls += 1
+            else:
+                recognized = False
+            if recognized:
+                # Monotonic input-observed timestamp used by the bf-idle-tracker
+                # health check — see SyncCoordinator._check_idle_tracker_health.
+                # We update under the same lock that guards the counters so a
+                # concurrent reader gets a coherent (count, ts) pair.
+                self._last_input_at = datetime.now(timezone.utc)
 
         return event
 

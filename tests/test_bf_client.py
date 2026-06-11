@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import time
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 
@@ -363,6 +364,145 @@ class TestBetterFlowClient:
 
         assert result.success is False
         assert result.error is not None
+
+    # ---- Deterministic idempotency key ---------------------------------------
+
+    @responses.activate
+    def test_idempotency_key_is_deterministic_for_same_batch(self):
+        """The same batch must carry the SAME idempotency key across resends, so
+        the server can dedup a retried/re-queued batch (a random key per call
+        defeated this and produced duplicate hours)."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={"synced": 2},
+            status=200,
+        )
+
+        events = [
+            {"id": 1, "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+            {"id": 2, "timestamp": "2026-02-18T10:01:00Z", "duration": 30, "data": {}},
+        ]
+        self.client.send_events(events)
+        self.client.send_events(events)  # identical resend
+
+        key1 = responses.calls[0].request.headers["X-Idempotency-Key"]
+        key2 = responses.calls[1].request.headers["X-Idempotency-Key"]
+        assert key1 == key2
+        assert len(key1) == 64  # sha256 hex digest
+
+    @responses.activate
+    def test_idempotency_key_differs_for_different_batches(self):
+        """Distinct batches must get distinct keys (or the server would wrongly
+        dedup unrelated events)."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={"synced": 1},
+            status=200,
+        )
+
+        self.client.send_events([{"id": 1, "duration": 60, "data": {}}])
+        self.client.send_events([{"id": 2, "duration": 60, "data": {}}])
+
+        key1 = responses.calls[0].request.headers["X-Idempotency-Key"]
+        key2 = responses.calls[1].request.headers["X-Idempotency-Key"]
+        assert key1 != key2
+
+    # ---- Global 429 backoff --------------------------------------------------
+
+    def test_enter_throttle_only_extends_and_caps(self):
+        """The backoff window only moves later, never earlier, and is capped."""
+        assert self.client._throttle_remaining() == 0.0
+
+        self.client._enter_throttle(10)
+        assert 8 < self.client._throttle_remaining() <= 10
+
+        # A shorter backoff must NOT shrink an active longer one.
+        self.client._enter_throttle(1)
+        assert self.client._throttle_remaining() > 5
+
+        # Hostile/buggy Retry-After can't park the agent for minutes.
+        self.client._enter_throttle(9999)
+        assert self.client._throttle_remaining() <= 60
+
+    def test_throttle_clears_after_window(self):
+        """Once the deadline passes, requests are allowed again."""
+        self.client._enter_throttle(10)
+        assert self.client._throttle_remaining() > 0
+
+        # Simulate the window elapsing.
+        with self.client._throttle_lock:
+            self.client._throttle_until = time.monotonic() - 1
+        assert self.client._throttle_remaining() == 0.0
+
+    @responses.activate
+    def test_429_opens_global_backoff_and_pauses_every_endpoint(self):
+        """A 429 on ONE endpoint must back off ALL endpoints — the next call (a
+        different endpoint) fails fast WITHOUT touching the network, instead of
+        each endpoint independently retrying into the same window."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            status=429,
+            headers={"Retry-After": "30"},
+        )
+        # If the gate didn't work, this would be hit and return 200.
+        responses.add(
+            responses.GET,
+            "https://betterflow.eu/api/agent/events/status",
+            json={"ok": True},
+            status=200,
+        )
+
+        result = self.client.send_events([{"id": 1, "duration": 60, "data": {}}])
+        assert result.success is False
+        assert "429" in (result.error or "")
+        assert self.client._throttle_remaining() > 0
+
+        calls_after_429 = len(responses.calls)
+        # A different endpoint now short-circuits before any network call.
+        with pytest.raises(BetterFlowClientError, match="backoff"):
+            self.client._request("GET", "events/status")
+        assert len(responses.calls) == calls_after_429, "throttled call must not hit the network"
+
+    @responses.activate
+    def test_429_without_retry_after_uses_default_backoff(self):
+        """A 429 with no usable Retry-After still opens a (default) backoff."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            status=429,
+        )
+
+        self.client.send_events([{"id": 1, "duration": 60, "data": {}}])
+        remaining = self.client._throttle_remaining()
+        assert 0 < remaining <= 60
+
+    @responses.activate
+    def test_requests_resume_after_backoff_clears(self):
+        """After the backoff window elapses, normal requests go through again."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            status=429,
+            headers={"Retry-After": "30"},
+        )
+        responses.add(
+            responses.GET,
+            "https://betterflow.eu/api/agent/events/status",
+            json={"ok": True},
+            status=200,
+        )
+
+        self.client.send_events([{"id": 1, "duration": 60, "data": {}}])
+        assert self.client._throttle_remaining() > 0
+
+        # Window elapses.
+        with self.client._throttle_lock:
+            self.client._throttle_until = time.monotonic() - 1
+
+        assert self.client._request("GET", "events/status") == {"ok": True}
 
     @responses.activate
     def test_exchange_code_success(self):

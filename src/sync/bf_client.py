@@ -1,8 +1,9 @@
 """BetterFlow API client - syncs events to BetterFlow server."""
 
+import hashlib
+import json
 import logging
 import platform
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
@@ -254,10 +255,16 @@ class BetterFlowClient(BaseApiClient):
             return SyncResult(success=True, events_synced=0)
 
         try:
-            # Idempotency key prevents duplicate processing if the connection
-            # drops after the server processes the batch but before we receive
-            # the response (N1).
-            idempotency_key = str(uuid.uuid4())
+            # Idempotency key prevents duplicate processing when the same batch
+            # is re-sent — either the retry loop after the connection drops once
+            # the server has already processed it (N1), or a re-queue/resend on a
+            # transient failure. It MUST be derived from the batch content (not a
+            # fresh random UUID per call), so every resend of the same events
+            # carries the same key and the server can dedup it. A random key
+            # defeated the whole mechanism and produced duplicate/inflated hours.
+            idempotency_key = hashlib.sha256(
+                json.dumps(events, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             response = self._request(
                 "POST", "events/batch",
                 data={"events": events},

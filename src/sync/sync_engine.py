@@ -965,7 +965,7 @@ class SyncEngine:
             return None
 
         # Build data object
-        result_bucket_type = bucket_type  # may be overridden for AFK-as-break
+        result_bucket_type = bucket_type
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
@@ -1031,11 +1031,15 @@ class SyncEngine:
                     data["desktop_index"] = ds.desktop_index
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
-            # Send AFK periods as "break" bucket_type for chart display.
-            # Use a separate variable so the original bucket_type is preserved
-            # for the activity classification logic below.
-            if event.status == "afk":
-                result_bucket_type = "break"
+            # AFK periods are sent with their real AFK bucket_type — NOT relabeled
+            # as "break". A break is an intentional, user-initiated pause
+            # (_send_break_event -> "break_time"); blanket-relabeling every
+            # away-from-keyboard stretch as a break turned ordinary no-input work
+            # (reading, meetings, watching a screen) into phantom "Break" cards
+            # for people who never took a break. The backend already classifies
+            # long AFK spans as Idle (TimelineCardBuilder::appendIdleFromAfk) and
+            # uses AFK status for active-hours, so leaving bucket_type untouched
+            # routes this to the correct "Idle" category.
         elif bucket_type == BUCKET_TYPE_INPUT:
             # Input events track keystrokes, clicks, scrolls for fraud detection.
             # The MacOSInputWatcher tags each batch with the frontmost app so the
@@ -1321,8 +1325,9 @@ class SyncEngine:
                 if result.success:
                     stats.events_sent += result.events_synced
                 else:
-                    # Partial batch: only re-queue events the server didn't accept
                     if result.accepted_ids:
+                        # True partial success: re-queue only the events the
+                        # server did NOT accept.
                         accepted_set = set(result.accepted_ids)
                         failed = [e for e in batch if e.get("id") not in accepted_set]
                         stats.events_sent += len(batch) - len(failed)
@@ -1333,15 +1338,18 @@ class SyncEngine:
                                 e.get("bucket_id", "") for e in failed
                             )
                     else:
-                        # N11: server returned non-success without accepted_ids.
-                        # This branch also covers network failures: bf_client
-                        # catches BetterFlowClientError internally and returns
-                        # SyncResult(success=False), so there is no separate
-                        # network-error except branch — see Important-2 in
-                        # commit history.
+                        # N11: total failure with nothing accepted — a transient
+                        # error (429 rate-limit backoff, network drop, timeout;
+                        # bf_client catches BetterFlowClientError internally and
+                        # returns SyncResult(success=False), so there is no
+                        # separate network-error except branch — see Important-2
+                        # in commit history). Re-queue the whole batch; the
+                        # content-derived idempotency key (bf_client.send_events)
+                        # makes the eventual resend safe against duplicates.
                         logger.warning(
-                            "Server returned partial failure without accepted_ids - "
-                            "re-queuing entire batch"
+                            "Batch not accepted (transient failure: %s) - re-queuing all %d events",
+                            result.error or "unknown",
+                            len(batch),
                         )
                         self.queue.enqueue(batch)
                         stats.events_queued += len(batch)
@@ -1454,6 +1462,21 @@ class SyncEngine:
         if stats and stats._should_heartbeat:
             return self._send_heartbeat()
         return None
+
+    def send_heartbeat_now(self) -> Optional["BetterFlowAuthError"]:
+        """Send a heartbeat immediately, bypassing the sync-cycle counter.
+
+        Used to keep the device alive on the server while the agent is PAUSED
+        (break / screen lock / manual pause). The normal heartbeat rides the
+        sync cycle, which is skipped while paused — so without this the device's
+        last_seen_at goes stale and the server's 30-minute stale-session cleanup
+        marks a long break as a 'crashed' session, and tracking doesn't resume
+        when the user returns. A paused-but-running agent is alive, not crashed.
+        Heartbeats only refresh last_seen_at; they never add active/tracked time.
+
+        Returns a BetterFlowAuthError on 401/403 so the caller can re-login.
+        """
+        return self._send_heartbeat()
 
     def _send_heartbeat(self) -> Optional["BetterFlowAuthError"]:
         """Send heartbeat to server and process commands.

@@ -11,7 +11,7 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -160,6 +160,19 @@ class SyncCoordinator:
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
 
+        # In-process input watcher reference, wired by the App after
+        # construction. Used by `_check_idle_tracker_health` to cross-check
+        # the bf-idle-tracker subprocess's AFK output against in-process
+        # input observations — the only way to detect that the tracker
+        # subprocess is missing its own Input Monitoring grant (a separate
+        # TCC subject from the main app, easy to miss in install).
+        self._input_watcher: Optional[Any] = None
+        # Throttle for the false-AFK warning. Mirrors _last_perm_warn_at
+        # exactly so the user gets at most one notification per
+        # _PERM_REWARN_INTERVAL while the disagreement persists.
+        self._idle_tracker_warn_lock = threading.Lock()
+        self._last_idle_tracker_warn_at: Optional[datetime] = None
+
         # macOS permission-warning throttle. Input Monitoring can be revoked
         # silently (e.g. a new build changes the code signature and macOS drops
         # the TCC grant), which leaves us collecting window time but no
@@ -169,6 +182,24 @@ class SyncCoordinator:
         self._perm_lock = threading.Lock()
         self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
         self._last_perm_warn_at: Optional[datetime] = None
+
+        # Liveness heartbeat while paused. The normal heartbeat rides _do_sync,
+        # which is skipped when paused (break / lock / manual), so a break longer
+        # than the server's 30-min stale-session cleanup gets its session marked
+        # "crashed" and tracking doesn't resume on return. Send a lightweight
+        # heartbeat from the 60s tick while paused-but-running to keep the
+        # session alive. monotonic-throttled so it's at most one per interval.
+        self._last_liveness_heartbeat: Optional[float] = None
+
+        # Auth-warn throttle (Emilian, 2026-06-11): after his laptop restart
+        # auto-login silently failed and the tray went to WAITING_AUTH without
+        # any system notification — he could have worked a full day untracked.
+        # Throttled to one warn per OFF transition, then periodically re-warned
+        # while WAITING_AUTH persists. Same shape as _maybe_warn_input_tracking
+        # so the two pathways look the same to anyone debugging.
+        self._auth_warn_lock = threading.Lock()
+        self._last_auth_warn_at: Optional[datetime] = None
+        self._was_logged_in_for_warn: Optional[bool] = None
 
     @property
     def logged_in(self) -> bool:
@@ -405,6 +436,190 @@ class SyncCoordinator:
             "Fix Permissions to turn on Input Monitoring.",
         )
 
+    def _maybe_warn_login_required(self, *, source: str) -> None:
+        """Notify the user when the session is gone and the app needs a login.
+
+        Mirrors ``_maybe_warn_input_tracking``: one notification at the
+        transition into not-logged-in, then a periodic re-warn every
+        ``_PERM_REWARN_INTERVAL`` while it stays that way. The amber
+        WAITING_AUTH menu bar icon alone is too easy to miss — Emilian's
+        2026-06-11 incident report was "if I had not noticed this, I could
+        have lost an entire day of work."
+
+        Idempotent: callers may invoke from startup auto-login failure, from
+        ``_handle_auth_error`` mid-session, and from the periodic tick — only
+        the first call within the rewarn window emits a notification.
+        """
+        now = datetime.now(timezone.utc)
+        with self._auth_warn_lock:
+            was_logged_in = self._was_logged_in_for_warn
+            self._was_logged_in_for_warn = False
+
+            recently_warned = (
+                self._last_auth_warn_at is not None
+                and (now - self._last_auth_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            # Force a warn on the True → False transition even if we warned
+            # recently for an unrelated reason (e.g. a previous boot of the
+            # process logged in then expired). Otherwise the user gets one
+            # warn per rewarn interval, regardless of state churn in between.
+            transitioned_off = was_logged_in is True
+            if recently_warned and not transitioned_off:
+                return
+            self._last_auth_warn_at = now
+
+        logger.warning(
+            "Login required (%s) — notifying user; tray sync paused until re-login",
+            source,
+        )
+        send_notification(
+            "BetterFlow is not tracking",
+            "Your session ended and the app is no longer recording your work. "
+            "Click the BetterFlow menu bar icon → Retry Login to sign back in.",
+        )
+
+    def _mark_logged_in_for_warn(self) -> None:
+        """Reset the auth-warn throttle on a fresh successful login.
+
+        Lets the next transition to not-logged-in re-emit the notification
+        immediately, even if the previous warn was within the rewarn window.
+        """
+        with self._auth_warn_lock:
+            self._last_auth_warn_at = None
+            self._was_logged_in_for_warn = True
+
+    def _check_auth_warn(self) -> None:
+        """Re-warn periodically while the app is still WAITING_AUTH.
+
+        The startup / session-expired notification fires once at the
+        transition; this tick keeps it from being a one-shot the user
+        misses while heads-down. Throttled via the same rewarn window
+        as the input-monitoring warn.
+        """
+        if self.logged_in:
+            return
+        if self.tray.model.state != TrayState.WAITING_AUTH:
+            return
+        self._maybe_warn_login_required(source="periodic")
+
+    # Window the bf-idle-tracker health check uses to decide whether the
+    # in-process input watcher has seen "recent" input. Must be shorter than
+    # the tracker's --timeout (default 600s = 10 min) so a genuine 10-min
+    # AFK period doesn't show as a disagreement, but long enough that a
+    # short typing pause doesn't trip the warning.
+    _IDLE_TRACKER_RECENT_INPUT_S = 180  # 3 min
+
+    def _check_idle_tracker_health(self) -> None:
+        """Detect when bf-idle-tracker is reporting AFK while the in-process
+        input watcher is seeing keystrokes — Lucian's 2026-06-11 incident.
+
+        bf-idle-tracker runs in a SEPARATE process under its own TCC subject,
+        distinct from the main app. macOS can have Input Monitoring granted
+        for BetterFlow.app but NOT for the bundled tracker binary; the user
+        toggles ONE switch in System Settings and reasonably assumes both
+        are covered, but they're not. The tracker silently sees zero input
+        → reports AFK after its 10-min timeout regardless of how much the
+        user is typing → the dashboard credits them no active time.
+
+        Detection: the in-process input watcher (which DOES have grant —
+        we already check it via _maybe_warn_input_tracking) saw input in
+        the last 3 minutes, AND the latest AFK bucket event says 'afk'.
+        That combination is only possible if the tracker is blind.
+
+        Notification is throttled to one per rewarn window like every other
+        permission-class warning. Best-effort: any error in querying AW
+        falls through silently — this is a diagnostic, not a billing path.
+        """
+        if not self.logged_in:
+            return
+        if self._input_watcher is None:
+            return
+
+        last_input = self._input_watcher.get_last_input_at()
+        if last_input is None:
+            return  # Watcher hasn't seen anything yet — can't compare.
+
+        now = datetime.now(timezone.utc)
+        recent_input_window = timedelta(seconds=self._IDLE_TRACKER_RECENT_INPUT_S)
+        if now - last_input > recent_input_window:
+            return  # No recent in-process input → no disagreement to flag.
+
+        # Query the AFK bucket for the latest event. Best-effort; AW being
+        # transiently unreachable is a different failure mode handled
+        # elsewhere.
+        try:
+            buckets = self.aw.get_afk_buckets()
+        except Exception as e:
+            logger.debug("idle_tracker_health: AW unreachable, skipping: %s", e)
+            return
+        if not buckets:
+            return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
+
+        # A user who migrated from vanilla ActivityWatch can have BOTH a
+        # `bf-idle-tracker` bucket and a stale `aw-watcher-afk` bucket. The
+        # stale one's last event is frozen at "afk" forever, so picking the
+        # wrong one fires a false-positive notification every time the user
+        # types. Prefer the bf-idle-tracker bucket; fall back to picking the
+        # one with the most recent event if neither name matches.
+        bf_buckets = [b for b in buckets if "bf-idle-tracker" in b.id]
+        candidate_buckets = bf_buckets or buckets
+
+        latest = None
+        for bucket in candidate_buckets:
+            try:
+                events = self.aw.get_events(bucket.id, limit=1)
+            except Exception as e:
+                logger.debug("idle_tracker_health: AFK fetch failed for %s: %s", bucket.id, e)
+                continue
+            if not events:
+                continue
+            event = events[0]
+            if latest is None or event.timestamp > latest.timestamp:
+                latest = event
+
+        if latest is None:
+            return  # No AFK events anywhere — tracker hasn't reported yet.
+
+        status = (latest.data or {}).get("status")
+        if status != "afk":
+            return  # Tracker agrees with the input watcher — nothing to do.
+
+        # Avoid the return-from-AFK transition lag. The user could have been
+        # genuinely AFK for 15 min, returned, and typed within the same
+        # second that this tick runs — the AFK watcher hasn't posted its
+        # "not-afk" transition event yet, but it will within a heartbeat
+        # pulsetime. If the latest "afk" event ENDS later than the input
+        # observation, there's no actual disagreement: the tracker just
+        # hasn't caught up. Require the AFK span to have ended at least
+        # 30s before the most recent input before flagging it as broken.
+        afk_end = latest.timestamp + timedelta(seconds=float(latest.duration))
+        if afk_end > last_input - timedelta(seconds=30):
+            return
+
+        # Disagreement detected. Throttled warn.
+        with self._idle_tracker_warn_lock:
+            recently_warned = (
+                self._last_idle_tracker_warn_at is not None
+                and (now - self._last_idle_tracker_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_idle_tracker_warn_at = now
+
+        logger.warning(
+            "Idle tracker disagrees with input watcher: input observed at %s "
+            "but AFK bucket reports 'afk' — bf-idle-tracker likely missing "
+            "Input Monitoring permission (separate TCC subject from main app)",
+            last_input.isoformat(),
+        )
+        send_notification(
+            "BetterFlow may not be detecting your input",
+            "Your activity isn't being recorded as work time. The BetterFlow "
+            "idle tracker needs Input Monitoring permission. Click the menu "
+            "bar icon → Diagnostics → Fix Permissions and grant access to "
+            "bf-idle-tracker as well as BetterFlow.",
+        )
+
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
 
@@ -420,8 +635,11 @@ class SyncCoordinator:
         for fn, label in (
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
+            (self._liveness_heartbeat, "liveness_heartbeat"),
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
+            (self._check_auth_warn, "auth_warn"),
+            (self._check_idle_tracker_health, "idle_tracker_health"),
         ):
             try:
                 fn()
@@ -440,6 +658,47 @@ class SyncCoordinator:
             reschedule=self.reschedule,
             trigger_sync=self.trigger_sync,
         )
+
+    # Keep the server session alive at least this often while paused. Well under
+    # the server's 30-min stale-session cleanup so a long break never trips it.
+    _LIVENESS_HEARTBEAT_INTERVAL = 300  # seconds
+
+    def _liveness_heartbeat(self) -> None:
+        """Heartbeat while paused-but-running so the server keeps the session.
+
+        The normal heartbeat rides _do_sync, which early-returns when paused
+        (break / screen lock / manual / private), so during a break longer than
+        the server's 30-min cleanup the device's last_seen_at goes stale and the
+        session is marked 'crashed' — then tracking doesn't resume on return.
+        A paused agent is alive, not crashed: send a lightweight heartbeat to
+        keep the session open. It only refreshes last_seen_at, never active time.
+
+        Skipped while actively syncing (that path already heartbeats) and while
+        offline (no server to reach). Throttled to one per interval.
+        """
+        if not self.logged_in:
+            return
+        if self.paused_by_network:
+            return  # offline — the heartbeat would just fail; resume on reconnect
+        paused = (
+            self.sync_engine.is_paused
+            or self.sync_engine.is_private
+            or self.is_on_break
+        )
+        if not paused:
+            return  # active sync already sends heartbeats
+
+        now = time.monotonic()
+        if (
+            self._last_liveness_heartbeat is not None
+            and now - self._last_liveness_heartbeat < self._LIVENESS_HEARTBEAT_INTERVAL
+        ):
+            return
+        self._last_liveness_heartbeat = now
+
+        auth_err = self.sync_engine.send_heartbeat_now()
+        if auth_err is not None:
+            self._handle_auth_error(auth_err, source="liveness_heartbeat")
 
     _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
 
@@ -751,7 +1010,8 @@ class BetterFlowApp:
             aw_manager=self.aw_manager,
             error_reporter=self.error_reporter,
         )
-        self.coordinator._on_auth_error = self._on_login
+        self.coordinator._on_auth_error = self._on_session_expired
+        self.coordinator._input_watcher = self.input_watcher
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
@@ -838,6 +1098,7 @@ class BetterFlowApp:
             return
 
         self.coordinator.logged_in = True
+        self.coordinator._mark_logged_in_for_warn()
         self.tray.set_user(state.user_email, state.user_name, state.user_role)
         self._set_startup_status("Loading your workspace...")
 
@@ -883,6 +1144,7 @@ class BetterFlowApp:
             else:
                 self.coordinator.logged_in = False
                 self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+                self.coordinator._maybe_warn_login_required(source="startup")
                 self._ensure_update_checks_started()
 
             logger.info("Background startup complete")
@@ -1153,6 +1415,18 @@ class BetterFlowApp:
                     logger.debug("Failed to end stale session during crash recovery", exc_info=True)
         except Exception as e:
             logger.debug(f"Stale session check failed: {e}")
+
+    def _on_session_expired(self) -> None:
+        """Bridge from `SyncCoordinator._handle_auth_error` into the App's
+        notification + relogin pipeline.
+
+        Distinct from the user-clicked `_on_login` so the notification only
+        fires on the involuntary path (session died under the user). A user
+        who explicitly clicks Login knows what they did; the case Emilian
+        flagged was the silent path.
+        """
+        self.coordinator._maybe_warn_login_required(source="session_expired")
+        self._on_login()
 
     def _on_login(self) -> None:
         """Handle explicit login action from tray.
