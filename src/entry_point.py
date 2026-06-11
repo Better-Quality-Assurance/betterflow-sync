@@ -4,8 +4,25 @@ Sets up import paths for the frozen environment, then delegates
 to the canonical application class in main.py.
 """
 
+import faulthandler
 import os
+import signal
 import sys
+
+# Enable faulthandler at startup so a hard crash (segfault, abort) writes
+# a Python-level traceback to stderr instead of dying silently. Also
+# register SIGUSR1 to dump stacks of every thread on demand — the user
+# can `kill -USR1 <pid>` to capture a snapshot of a hung process without
+# needing a debugger attached. Without this, the only way to investigate
+# a hung-thread scenario (sync loop stops logging, AppKit keeps spinning)
+# was to attach lldb live — which by the time the user notices is usually
+# too late.
+faulthandler.enable()
+if hasattr(signal, "SIGUSR1"):
+    # all_threads=True is the whole point — a deadlock between the sync
+    # thread and a tracker callback only becomes visible when we see
+    # both stacks at once.
+    faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
 
 # Set up import path before any project imports.
 # PyInstaller bundles everything under sys._MEIPASS; for normal
