@@ -31,6 +31,14 @@ def _make_tray() -> TrayIcon:
             on_quit=lambda: None,
         )
     tray._icon = MagicMock()
+    # Stub the actual menu rendering. set_state() now rebuilds the menu via
+    # _create_menu() -> pystray.Menu, but pystray's backend can't initialize on
+    # a headless CI box (no display), so the real call returns None and the
+    # rebuild raises "NoneType object is not callable". These tests only assert
+    # on model.status_text / state, not on rendered menu items, so stub the
+    # render to keep them platform-independent.
+    tray._create_menu = MagicMock(return_value=MagicMock())
+    tray._apply_menu = MagicMock()
     return tray
 
 
