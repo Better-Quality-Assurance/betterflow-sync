@@ -1233,8 +1233,30 @@ class BetterFlowApp:
             except Exception as e:
                 logger.warning("Auto-start sync failed (non-fatal): %s", e)
 
-        # First-run setup wizard
+        # First-run setup wizard.
+        #
+        # Gate on stored CREDENTIALS, not on the setup_complete flag alone. The
+        # flag has been observed to get knocked false across self-update
+        # relaunches; keying the wizard on it alone forced already-onboarded
+        # users to re-sign-in after every auto-update. So: only show the wizard
+        # when the user genuinely isn't set up (no credentials in the keychain).
+        # If credentials exist but the flag is false, it was spuriously reset —
+        # repair it and continue straight to auto-login below.
         wizard_login_state = None
+        has_credentials = False
+        try:
+            has_credentials = self.keychain.load() is not None
+        except Exception as e:
+            logger.warning("Could not read stored credentials at startup: %s", e)
+
+        if not self.config.setup_complete and has_credentials:
+            logger.info(
+                "setup_complete was false but credentials exist — repairing flag "
+                "and skipping the setup wizard (likely reset across an update)"
+            )
+            self.config.setup_complete = True
+            self.config.save()
+
         if not self.config.setup_complete:
             try:
                 from .ui.setup_wizard import show_setup_wizard
