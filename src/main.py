@@ -807,9 +807,8 @@ class SyncCoordinator:
             else:
                 for err in stats.errors:
                     logger.warning(f"Sync failed: {err}")
-                self.tray.set_state(
-                    TrayState.ERROR,
-                    stats.errors[0] if stats.errors else "Sync failed",
+                self._set_sync_failure_state(
+                    stats.errors[0] if stats.errors else "Sync failed"
                 )
                 self._note_sync_failure(
                     stats.errors[0] if stats.errors else "Sync failed"
@@ -838,7 +837,7 @@ class SyncCoordinator:
             self._handle_auth_error(e, source="sync")
         except Exception as e:
             logger.exception(f"Sync error: {e}")
-            self.tray.set_state(TrayState.ERROR, "Sync error")
+            self._set_sync_failure_state("Sync error")
             self._note_sync_failure("Sync error", exc=e)
         finally:
             watchdog_cancelled.set()
@@ -853,6 +852,24 @@ class SyncCoordinator:
         auth_err = self.sync_engine.send_heartbeat_if_due(stats)
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="heartbeat")
+
+    def _set_sync_failure_state(self, error_message: str) -> None:
+        """Pick the right tray state for a failed sync.
+
+        No internet should read "Offline", not "Error" — including the common
+        case where Wi-Fi is "connected" but has no route (NO_INTERNET), which
+        the OS network monitor doesn't always report, so paused_by_network never
+        gets set. Probe reachability: unreachable -> Offline (we're still
+        tracking and queuing locally); reachable but failed -> a real Error.
+        """
+        try:
+            reachable = self.bf.is_reachable()
+        except Exception:
+            reachable = False
+        if not reachable:
+            self.tray.set_state(TrayState.QUEUED, "Offline")
+        else:
+            self.tray.set_state(TrayState.ERROR, error_message)
 
     def _note_sync_failure(self, reason: str, *, exc: Optional[BaseException] = None) -> None:
         """Track a hard sync failure and report once it becomes a streak.
