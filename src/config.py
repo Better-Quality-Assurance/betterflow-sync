@@ -369,6 +369,20 @@ class ReminderSettings:
 
 
 @dataclass
+class WorkingHoursConfig:
+    """Server-enforced working-hours window. When ``enforced``, the agent must
+    NOT record/upload events outside [work_start, work_end] on working_days,
+    evaluated in ``timezone``. For B2E / Trainee-Intern this is 08:00-22:00
+    Mon-Fri; B2B and others are unrestricted (enforced=False)."""
+
+    enforced: bool = False
+    work_start: str = "00:00"
+    work_end: str = "23:59"
+    working_days: list = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
+    timezone: str = ""
+
+
+@dataclass
 class Config:
     """Main configuration object."""
 
@@ -378,6 +392,7 @@ class Config:
     sync: SyncSettings = field(default_factory=SyncSettings)
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     reminders: ReminderSettings = field(default_factory=ReminderSettings)
+    working_hours: WorkingHoursConfig = field(default_factory=WorkingHoursConfig)
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     fraud_detection: FraudDetectionConfig = field(default_factory=FraudDetectionConfig)
     call_detection: CallDetectionSettings = field(default_factory=CallDetectionSettings)
@@ -558,6 +573,19 @@ class Config:
                 val = tracking["afk_timeout_minutes"]
                 if val in (10, 20, 30):
                     self.aw.afk_timeout_minutes = val
+
+        if "working_hours" in server_config:
+            wh = server_config["working_hours"]
+            try:
+                self.working_hours.enforced = bool(wh.get("enforced", False))
+                self.working_hours.work_start = str(wh.get("work_start", "00:00"))
+                self.working_hours.work_end = str(wh.get("work_end", "23:59"))
+                days = wh.get("working_days")
+                if isinstance(days, list) and days:
+                    self.working_hours.working_days = [int(d) for d in days]
+                self.working_hours.timezone = str(wh.get("timezone", "") or "")
+            except (TypeError, ValueError, AttributeError):
+                logger.warning("Invalid working_hours from server, ignoring")
 
         if "sync" in server_config:
             sync = server_config["sync"]
