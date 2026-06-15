@@ -27,14 +27,19 @@ class CallEvent:
 
 
 # -- Native app patterns ------------------------------------------------
-# Each entry: (app name substring, title regex or None, display name)
-_NATIVE_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
-    ("zoom.us", re.compile(r"Zoom (Meeting|Webinar)|\d{9,11}", re.IGNORECASE), "Zoom"),
-    ("Microsoft Teams", re.compile(r"(Meeting|Call) with|In a call", re.IGNORECASE), "Microsoft Teams"),
-    ("Slack", re.compile(r"Huddle", re.IGNORECASE), "Slack"),
-    ("Discord", re.compile(r"Voice Connected|voice channel", re.IGNORECASE), "Discord"),
-    ("FaceTime", None, "FaceTime"),  # Any active FaceTime window = call
-    ("Webex", re.compile(r"Meeting", re.IGNORECASE), "Webex"),
+# Each entry: (app-name substring aliases, title regex or None, display name).
+# Aliases cover macOS app names AND Windows/Linux process names — e.g. macOS
+# reports "zoom.us" / "Microsoft Teams" while Windows reports "Zoom" / the
+# new-Teams "ms-teams". A single macOS-only substring meant native calls went
+# undetected on Windows (Sachi, 2026-06-15). Each entry stays title-gated, so
+# widening the app match can never turn "app merely open" into a false call.
+_NATIVE_PATTERNS: list[tuple[tuple[str, ...], Optional[re.Pattern], str]] = [
+    (("zoom.us", "zoom"), re.compile(r"Zoom (Meeting|Webinar)|\d{9,11}", re.IGNORECASE), "Zoom"),
+    (("microsoft teams", "ms-teams", "msteams", "teams"), re.compile(r"(Meeting|Call) with|In a call", re.IGNORECASE), "Microsoft Teams"),
+    (("slack",), re.compile(r"Huddle", re.IGNORECASE), "Slack"),
+    (("discord",), re.compile(r"Voice Connected|voice channel", re.IGNORECASE), "Discord"),
+    (("facetime",), None, "FaceTime"),  # Any active FaceTime window = call
+    (("webex",), re.compile(r"Meeting", re.IGNORECASE), "Webex"),
 ]
 
 # -- Browser URL patterns -----------------------------------------------
@@ -56,8 +61,11 @@ def _match_native(app: str, title: str) -> Optional[str]:
     """Return display name if (app, title) matches a native call pattern."""
     if not title:
         title = ""
-    for app_substr, title_re, name in _NATIVE_PATTERNS:
-        if app_substr.lower() in app.lower() and (title_re is None or title_re.search(title)):
+    app_lower = app.lower()
+    for app_substrs, title_re, name in _NATIVE_PATTERNS:
+        if any(sub in app_lower for sub in app_substrs) and (
+            title_re is None or title_re.search(title)
+        ):
             return name
     return None
 
