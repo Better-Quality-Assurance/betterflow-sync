@@ -366,3 +366,29 @@ def test_is_in_call_reflects_active_call_state():
     # Flushing ends the call.
     det.flush()
     assert det.is_in_call() is False
+
+
+class TestWindowsNativeAppNames:
+    """Native call apps report different process names on Windows than macOS.
+
+    macOS: "zoom.us" / "Microsoft Teams". Windows: "Zoom" / "ms-teams". The
+    title gate is unchanged, so widening the app aliases cannot create false
+    positives — a non-call window still won't match.
+    """
+
+    def test_zoom_windows_process_name(self):
+        assert _match_native("Zoom", "Zoom Meeting") == "Zoom"
+
+    def test_teams_windows_new_process_name(self):
+        assert _match_native("ms-teams", "Meeting with John") == "Microsoft Teams"
+        assert _match_native("MSTeams", "In a call") == "Microsoft Teams"
+
+    def test_teams_bare_name_in_call(self):
+        assert _match_native("Teams", "Call with Sarah") == "Microsoft Teams"
+
+    def test_teams_windows_chat_still_no_match(self):
+        # Title gate must still reject a non-call Teams window.
+        assert _match_native("ms-teams", "Chat | Microsoft Teams") is None
+
+    def test_zoom_windows_home_still_no_match(self):
+        assert _match_native("Zoom", "Zoom - Home") is None
