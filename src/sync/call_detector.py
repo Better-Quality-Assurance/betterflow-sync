@@ -159,6 +159,16 @@ class CallDetector:
             return self._end_call()
         return None
 
+    def is_in_call(self) -> bool:
+        """True while a call/meeting is currently active (incl. grace period).
+
+        Used by idle detection to avoid marking the user idle during a call:
+        in a meeting they're engaged (listening/watching) even with no
+        keyboard/mouse input, which would otherwise trip the AFK-only idle
+        pause — especially on Windows, which has no in-process input watcher.
+        """
+        return self._call_app is not None
+
     def _start_call(
         self, name: str, call_type: Optional[str], timestamp: datetime
     ) -> None:
