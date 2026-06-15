@@ -222,3 +222,47 @@ class TestOfflineQueue:
 
         assert self.queue.is_near_capacity(threshold=0.5) is True
         assert self.queue.is_near_capacity(threshold=0.6) is False
+
+    # Per-event counted-time persistence (restart-safe time dedup)
+
+    def test_counted_time_roundtrip(self):
+        """set_counted_time then get_counted_times returns the value."""
+        self.queue.set_counted_time("aw-watcher-window_host", "42", 600.0, "2026-06-15")
+        got = self.queue.get_counted_times("2026-06-15")
+        assert got == {("aw-watcher-window_host", "42"): 600.0}
+
+    def test_counted_time_upsert_overwrites(self):
+        """Re-writing the same event updates the cumulative, not appends."""
+        self.queue.set_counted_time("b", "1", 100.0, "2026-06-15")
+        self.queue.set_counted_time("b", "1", 250.0, "2026-06-15")
+        got = self.queue.get_counted_times("2026-06-15")
+        assert got == {("b", "1"): 250.0}
+
+    def test_counted_time_scoped_by_day(self):
+        """get_counted_times only returns rows for the requested day."""
+        self.queue.set_counted_time("b", "1", 100.0, "2026-06-14")
+        self.queue.set_counted_time("b", "2", 200.0, "2026-06-15")
+        assert self.queue.get_counted_times("2026-06-15") == {("b", "2"): 200.0}
+        assert self.queue.get_counted_times("2026-06-14") == {("b", "1"): 100.0}
+
+    def test_counted_time_survives_reopen(self):
+        """Counts persist across an OfflineQueue restart (same db file)."""
+        self.queue.set_counted_time("b", "1", 123.0, "2026-06-15")
+        self.queue.close()
+        reopened = OfflineQueue(db_path=self.db_path, max_size=100)
+        try:
+            assert reopened.get_counted_times("2026-06-15") == {("b", "1"): 123.0}
+        finally:
+            reopened.close()
+        # Re-point self.queue so teardown's close() doesn't double-close.
+        self.queue = OfflineQueue(db_path=self.db_path, max_size=100)
+
+    def test_prune_counted_time_drops_older_days(self):
+        """prune_counted_time removes rows strictly before the cutoff day."""
+        self.queue.set_counted_time("b", "1", 1.0, "2026-06-13")
+        self.queue.set_counted_time("b", "2", 2.0, "2026-06-14")
+        self.queue.set_counted_time("b", "3", 3.0, "2026-06-15")
+        removed = self.queue.prune_counted_time("2026-06-15")
+        assert removed == 2
+        assert self.queue.get_counted_times("2026-06-15") == {("b", "3"): 3.0}
+        assert self.queue.get_counted_times("2026-06-14") == {}

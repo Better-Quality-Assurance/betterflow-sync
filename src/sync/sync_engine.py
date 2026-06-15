@@ -198,6 +198,11 @@ class SyncEngine:
             else None
         )
 
+        # Restore per-event counted-time from the previous process so a restart
+        # (or the start-of-day backlog reconcile that re-fetches the whole day)
+        # does not re-count already-counted events into the local daily total.
+        self._load_counted_time_cache()
+
     def _create_engagement_thresholds(self) -> EngagementThresholds:
         """Create EngagementThresholds from config."""
         eng = self.config.engagement
@@ -513,6 +518,63 @@ class SyncEngine:
 
         return stats
 
+    @staticmethod
+    def _local_day_iso() -> str:
+        """Local calendar date as ISO ``YYYY-MM-DD`` — the key the daily time
+        counter and counted-time persistence are scoped by."""
+        return datetime.now().astimezone().date().isoformat()
+
+    def _load_counted_time_cache(self) -> None:
+        """Repopulate ``_time_cache`` from persisted per-event counted-seconds
+        for the current local day.
+
+        Without this, after a restart the in-memory dedup cache is empty, so
+        ``prev_counted`` reads as 0 and the next sync re-adds each replayed
+        event's full duration to the daily total — double-counting the tray's
+        active time (badly so when the start-of-day backlog reconcile replays
+        the whole day). Persisted counts make the replay a no-op (delta == 0)
+        while still re-sending events to the server (which dedups by event id).
+
+        Tolerant of a mocked/partial queue: a non-dict result is ignored so
+        existing unit tests with ``Mock`` queues are unaffected.
+        """
+        getter = getattr(self.queue, "get_counted_times", None)
+        if not callable(getter):
+            return
+        try:
+            today = self._local_day_iso()
+            persisted = getter(today)
+            if not isinstance(persisted, dict):
+                return
+            with self._cache_lock:
+                for (bucket_id, event_id), seconds in persisted.items():
+                    self._time_cache[(bucket_id, event_id)] = float(seconds)
+            # Housekeeping: drop counts from days we will never replay.
+            pruner = getattr(self.queue, "prune_counted_time", None)
+            if callable(pruner):
+                pruner(today)
+            if persisted:
+                logger.info(
+                    "Restored counted-time for %d events (day %s)",
+                    len(persisted),
+                    today,
+                )
+        except Exception as e:  # never let cache restore block startup
+            logger.warning("Counted-time cache restore failed: %s", e)
+
+    def _persist_counted_time(
+        self, bucket_id: str, event_id: str, counted_seconds: float, day: str
+    ) -> None:
+        """Write-through the cumulative counted-seconds for one event so the
+        dedup survives a restart. Best-effort; never raises into the sync loop."""
+        setter = getattr(self.queue, "set_counted_time", None)
+        if not callable(setter):
+            return
+        try:
+            setter(bucket_id, event_id, counted_seconds, day)
+        except Exception as e:
+            logger.debug("Counted-time persist failed for %s/%s: %s", bucket_id, event_id, e)
+
     def _reconcile_backlog(self, buckets: list) -> None:
         """Rewind each bucket's checkpoint to the start of the local day so the
         next fetch re-sends any locally-stored events the server is missing.
@@ -807,7 +869,7 @@ class SyncEngine:
         # across cycles (e.g. AFK splits differ between syncs).
         if transformed and total_active_duration > 0:
             event_date = event.timestamp.astimezone().date()
-            time_key = (bucket_id, event.id)
+            time_key = (bucket_id, str(event.id))
             with self._cache_lock:
                 prev_counted = self._time_cache.get(time_key, 0.0)
                 delta = total_active_duration - prev_counted
@@ -815,6 +877,12 @@ class SyncEngine:
                     self._time_cache[time_key] = total_active_duration
             if delta > 0:
                 self._time_tracker.add_active_time(delta, event_date)
+                # Persist the new cumulative so a restart/reconcile doesn't
+                # re-count this event (write-through, outside the cache lock).
+                self._persist_counted_time(
+                    bucket_id, str(event.id), total_active_duration,
+                    event_date.isoformat(),
+                )
 
         return transformed
 
@@ -1191,7 +1259,8 @@ class SyncEngine:
                 and activity_state != "inactive"
             ):
                 event_date = event.timestamp.astimezone().date()
-                time_key = (bucket_id, result["id"])
+                event_key = str(result["id"])
+                time_key = (bucket_id, event_key)
                 time_delta = 0.0
                 with self._cache_lock:
                     prev_counted = self._time_cache.get(time_key, 0.0)
@@ -1203,6 +1272,10 @@ class SyncEngine:
                 # dedup checks with SQLite I/O
                 if time_delta > 0:
                     self._time_tracker.add_active_time(time_delta, event_date)
+                    # Persist cumulative so a restart/reconcile doesn't re-count.
+                    self._persist_counted_time(
+                        bucket_id, event_key, event.duration, event_date.isoformat()
+                    )
 
         return result
 
@@ -1699,5 +1772,9 @@ class SyncEngine:
             self._sent_cache = BoundedLRU(maxsize=5_000)
             self._gap_filled_originals = BoundedLRU(maxsize=5_000)
             self._time_cache = BoundedLRU(maxsize=5_000)
+        # Re-sending events on re-login is safe (server dedups by id), but the
+        # daily total must NOT be re-counted — restore the persisted per-event
+        # counts so a same-day re-login doesn't double-count the tray's hours.
+        self._load_counted_time_cache()
         # Close time tracker
         self._time_tracker.close()

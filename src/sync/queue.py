@@ -185,6 +185,30 @@ class OfflineQueue:
                 """
             )
 
+            # Per-event counted active-seconds, persisted so the in-memory
+            # time-dedup cache survives a restart. Without this, a restart
+            # (or the start-of-day backlog reconcile that re-fetches the whole
+            # day) re-counts already-counted events into the local daily total,
+            # inflating the tray's "active time". Keyed by (bucket_id, event_id);
+            # `day` scopes load/prune to the local day the time belongs to.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS counted_time (
+                    bucket_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    counted_seconds REAL NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (bucket_id, event_id)
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_counted_time_day ON counted_time(day)
+                """
+            )
+
     def check_integrity(self) -> bool:
         """Run periodic SQLite integrity check (N2).
 
@@ -494,6 +518,80 @@ class OfflineQueue:
                 row["bucket_id"]: datetime.fromisoformat(row["last_timestamp"])
                 for row in cursor.fetchall()
             }
+
+    # Per-event counted-time persistence (restart-safe time dedup)
+
+    def get_counted_times(self, day: str) -> dict[tuple[str, str], float]:
+        """Return all counted active-seconds for a given local day.
+
+        Args:
+            day: Local date in ISO format (``YYYY-MM-DD``).
+
+        Returns:
+            Dict mapping ``(bucket_id, event_id)`` -> counted_seconds. Used to
+            repopulate the in-memory time-dedup cache on startup so replayed
+            events are not double-counted into the daily total.
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT bucket_id, event_id, counted_seconds FROM counted_time
+                WHERE day = ?
+                """,
+                (day,),
+            )
+            return {
+                (row["bucket_id"], row["event_id"]): float(row["counted_seconds"])
+                for row in cursor.fetchall()
+            }
+
+    def set_counted_time(
+        self, bucket_id: str, event_id: str, counted_seconds: float, day: str
+    ) -> None:
+        """Upsert the cumulative counted active-seconds for one event.
+
+        Idempotent: re-counting the same event with the same total is a no-op
+        for the daily figure because the caller only adds the positive delta.
+
+        Args:
+            bucket_id: ActivityWatch bucket ID.
+            event_id: ActivityWatch event ID (stringified).
+            counted_seconds: Cumulative seconds counted for this event so far.
+            day: Local date the time belongs to (ISO ``YYYY-MM-DD``).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO counted_time
+                    (bucket_id, event_id, day, counted_seconds, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(bucket_id, event_id) DO UPDATE SET
+                    counted_seconds = excluded.counted_seconds,
+                    day = excluded.day,
+                    updated_at = excluded.updated_at
+                """,
+                (bucket_id, event_id, day, float(counted_seconds), now),
+            )
+
+    def prune_counted_time(self, before_day: str) -> int:
+        """Delete counted-time rows for days strictly before ``before_day``.
+
+        Keeps the table bounded — only recent days are ever replayed.
+
+        Args:
+            before_day: Local date in ISO format; rows with ``day < before_day``
+                are removed.
+
+        Returns:
+            Number of rows deleted.
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM counted_time WHERE day < ?",
+                (before_day,),
+            )
+            return cursor.rowcount
 
     # App category management
 
