@@ -168,8 +168,11 @@ class TestSyncEngine:
         assert result is not None
         assert result["activity_state"] == "active"
 
-    def test_transform_and_checkpoint_splits_window_around_afk(self):
-        """Long window events should count only their non-AFK slices."""
+    def test_transform_and_checkpoint_uploads_full_window_no_client_afk_split(self):
+        """1.5.43: the client no longer splits/drops window events around AFK.
+        The full event is uploaded every cycle; active-vs-idle (AFK overlap) is
+        decided server-side. This prevents the client from stranding real work
+        when input detection lags or events arrive zero-duration."""
         self.engine._has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
@@ -198,15 +201,13 @@ class TestSyncEngine:
         )
 
         assert checkpoint == ("bucket-123", now, 21)
-        assert len(transformed) == 2
+        # Full event uploaded as a single slice — no client-side AFK split.
+        assert len(transformed) == 1
         assert transformed[0]["id"] == "21:0"
-        assert transformed[0]["duration"] == 30.0
-        assert transformed[1]["id"] == "21:1"
-        assert transformed[1]["duration"] == 30.0
-        assert all(item["activity_state"] == "active" for item in transformed)
-        # Time tracking is per-event (sum of segments = 60s), not per-segment
+        assert transformed[0]["duration"] == 90.0
+        assert transformed[0]["activity_state"] == "active"
         self.time_tracker.add_active_time.assert_called_once()
-        assert self.time_tracker.add_active_time.call_args[0][0] == 60.0
+        assert self.time_tracker.add_active_time.call_args[0][0] == 90.0
 
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""
@@ -235,8 +236,10 @@ class TestSyncEngine:
         assert transformed[0]["activity_state"] == "active"
         self.time_tracker.add_active_time.assert_called_once()
 
-    def test_transform_and_checkpoint_caps_counting_at_input_timeout(self):
-        """Counted time must stop at last_input + afk_timeout."""
+    def test_transform_and_checkpoint_uploads_full_duration_no_input_cap(self):
+        """1.5.43: no client-side input-timeout cap. The full event duration is
+        uploaded; the server trims idle from the AFK stream. The old cap dropped
+        genuinely-active work whenever input detection lagged."""
         self.engine._has_input_data = True
         self.engine._latest_input_at = datetime.now(timezone.utc)
         now = self.engine._latest_input_at - timedelta(minutes=5)
@@ -256,12 +259,14 @@ class TestSyncEngine:
         )
 
         assert len(transformed) == 1
-        assert transformed[0]["duration"] == 15 * 60.0
+        assert transformed[0]["duration"] == 20 * 60.0
         self.time_tracker.add_active_time.assert_called_once()
-        assert self.time_tracker.add_active_time.call_args[0][0] == 15 * 60.0
+        assert self.time_tracker.add_active_time.call_args[0][0] == 20 * 60.0
 
-    def test_transform_and_checkpoint_skips_window_after_timeout(self):
-        """A window fully beyond last_input + afk_timeout must not count."""
+    def test_transform_and_checkpoint_uploads_window_even_after_input_timeout(self):
+        """1.5.43: a window beyond last_input + afk_timeout is still uploaded —
+        the client never drops it. The server decides if it counts as active.
+        Previously this returned [] and silently stranded real activity."""
         self.engine._has_input_data = True
         self.engine._afk_watcher_available = False
         self.engine._latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
@@ -280,8 +285,35 @@ class TestSyncEngine:
             stats,
         )
 
-        assert transformed == []
-        self.time_tracker.add_active_time.assert_not_called()
+        assert len(transformed) == 1
+        assert transformed[0]["duration"] == 120.0
+        self.time_tracker.add_active_time.assert_called_once()
+
+    def test_within_working_hours_gate(self):
+        """1.5.43: B2E/Trainee working-hours enforcement. When enforced, events
+        outside [work_start, work_end] or on non-working days are rejected; when
+        unenforced (B2B/others), everything passes."""
+        wh = self.engine.config.working_hours
+        wh.enforced = True
+        wh.work_start = "08:00"
+        wh.work_end = "22:00"
+        wh.working_days = [1, 2, 3, 4, 5]  # Mon-Fri
+        wh.timezone = "UTC"
+
+        def ev(dt):
+            return AWEvent(id=1, timestamp=dt, duration=60, data={})
+
+        wed = lambda h, m=0: datetime(2026, 6, 17, h, m, tzinfo=timezone.utc)  # Wednesday
+        assert self.engine._within_working_hours(ev(wed(7, 30))) is False  # before 08:00
+        assert self.engine._within_working_hours(ev(wed(9, 0))) is True    # inside
+        assert self.engine._within_working_hours(ev(wed(22, 30))) is False  # after 22:00
+        # Saturday 2026-06-20 — non-working day
+        sat = datetime(2026, 6, 20, 10, 0, tzinfo=timezone.utc)
+        assert self.engine._within_working_hours(ev(sat)) is False
+
+        # Unrestricted (B2B): any time passes.
+        wh.enforced = False
+        assert self.engine._within_working_hours(ev(wed(3, 0))) is True
 
     def test_transform_and_checkpoint_uses_afk_when_input_is_stale(self):
         """AFK data should remain authoritative when input watcher goes stale."""

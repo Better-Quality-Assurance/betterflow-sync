@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -185,6 +186,10 @@ class SyncEngine:
         self._latest_input_at: Optional[datetime] = None
         self._current_afk_events: list[AWEvent] = []  # AFK events for current sync cycle
         self._afk_watcher_available = False  # True when AFK buckets exist this cycle
+        # One-time-per-process flag: on first sync we rewind checkpoints to the
+        # start of the local day so any locally-stored events the server never
+        # received (sync outage / dropped by the old client filter) get re-sent.
+        self._backlog_reconciled = False
 
         # Call/meeting detection
         self._call_detector: Optional[CallDetector] = (
@@ -362,6 +367,17 @@ class SyncEngine:
         with self._state_lock:
             self._afk_watcher_available = bool(afk_buckets)
 
+        # One-time backlog reconcile (this process): rewind checkpoints to the
+        # start of the local day so events that never reached the server are
+        # re-fetched and re-sent. The backend upserts by AW event id, so
+        # replaying already-stored events is deduped — safe. This is what makes
+        # a simple quit+restart recover a stuck day's data.
+        if not self._backlog_reconciled:
+            self._reconcile_backlog(
+                window_buckets + web_buckets + afk_buckets + input_buckets
+            )
+            self._backlog_reconciled = True
+
         # Fetch input events for activity analysis before processing window events.
         # The lookback must cover both the engagement window and the full AFK
         # grace period so we can cap counted time at last_input + afk_timeout.
@@ -497,6 +513,50 @@ class SyncEngine:
 
         return stats
 
+    def _reconcile_backlog(self, buckets: list) -> None:
+        """Rewind each bucket's checkpoint to the start of the local day so the
+        next fetch re-sends any locally-stored events the server is missing.
+
+        Safe to replay: the backend upserts events by AW event id, so events
+        already stored are deduped. This is what recovers a day stranded by a
+        sync outage or by the (now removed) client-side activity filter — a
+        quit+restart re-uploads everything still on the local DB.
+        """
+        day_start = (
+            datetime.now()
+            .astimezone()
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(timezone.utc)
+        )
+        for bucket in buckets:
+            try:
+                cp = self.queue.get_checkpoint(bucket.id)
+                if cp is None or cp > day_start:
+                    self.queue.set_checkpoint(bucket.id, day_start)
+            except Exception as e:  # never let reconcile break a sync cycle
+                logger.warning("Backlog reconcile failed for %s: %s", bucket.id, e)
+        logger.info(
+            "Backlog reconcile: checkpoints rewound to %s", day_start.isoformat()
+        )
+
+    def _within_working_hours(self, event: AWEvent) -> bool:
+        """True if the event's start falls inside the server-enforced working-
+        hours window. When the schedule is not enforced (B2B / unrestricted)
+        this is always True. Evaluated in the schedule's timezone, falling back
+        to the machine's local timezone when none is provided."""
+        wh = self.config.working_hours
+        if not getattr(wh, "enforced", False):
+            return True
+        try:
+            tz = ZoneInfo(wh.timezone) if wh.timezone else None
+        except Exception:
+            tz = None
+        local = event.timestamp.astimezone(tz) if tz else event.timestamp.astimezone()
+        if wh.working_days and local.isoweekday() not in wh.working_days:
+            return False
+        hhmm = local.strftime("%H:%M")
+        return wh.work_start <= hhmm <= wh.work_end
+
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats
     ) -> tuple[list[AWEvent], datetime]:
@@ -568,6 +628,15 @@ class SyncEngine:
                 if is_gap_filled:
                     stats.events_filtered += 1
                     continue
+
+            # Working-hours gate: for restricted relationships (B2E / Trainee)
+            # the agent must NOT upload activity outside the enforced window
+            # (e.g. before 08:00 / after 22:00, or on non-working days). The
+            # checkpoint still advances past skipped events (computed from all
+            # fetched events below), so they are never re-fetched or sent.
+            if not self._within_working_hours(event):
+                stats.events_filtered += 1
+                continue
 
             if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
                 transformed_events = self._transform_window_event_with_timeout(
@@ -698,36 +767,15 @@ class SyncEngine:
         """Transform only the countable slices of a long window/web event."""
         event_start = event.timestamp
         event_end = event.timestamp + timedelta(seconds=event.duration)
-        ranges: list[tuple[datetime, datetime]]
-        if self._afk_watcher_available:
-            ranges = self._active_ranges_from_afk(event)
-        else:
-            ranges = [(event_start, event_end)]
 
-        # Apply input timeout cap when input data is available and recent
-        # enough to be relevant. The AFK watcher has a lagging timeout
-        # (typically 5 min) during which it reports "not-afk" despite no
-        # actual input. The input cap trims those trailing minutes for more
-        # accurate time. But when input data is stale (e.g. input watcher
-        # crashed 30 min ago), AFK data alone is authoritative.
-        input_is_recent = (
-            self._has_input_data
-            and self._latest_input_at is not None
-            and (event_end - self._latest_input_at).total_seconds()
-            < self.config.aw.afk_timeout_minutes * 60 * 2
-        )
-        if input_is_recent:
-            active_ranges = self._cap_ranges_to_input_timeout(ranges)
-        else:
-            active_ranges = ranges
-        if not active_ranges:
-            logger.info(
-                "Window event skipped after inactivity cutoff/AFK overlap: "
-                "event=%s->%s",
-                event.timestamp.isoformat(),
-                event_end.isoformat(),
-            )
-            return []
+        # NO client-side dropping. Always upload the full window/web event with
+        # its real duration; active-vs-idle is decided SERVER-SIDE from the AFK
+        # stream. The previous inactivity-cutoff + AFK-overlap + input-timeout
+        # filter discarded genuinely-active work whenever input detection lagged
+        # or an event arrived zero-duration, stranding hours of real activity on
+        # users' machines (fleet incident, 2026-06-15). The client must never
+        # decide to throw real activity away — send everything, every cycle.
+        active_ranges = [(event_start, event_end)]
 
         transformed: list[dict] = []
         total_active_duration = 0.0

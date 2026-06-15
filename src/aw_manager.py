@@ -390,7 +390,6 @@ class AWManager:
         if not binaries_dir:
             return False
 
-        restarted = False
         server_restarted = False
         for name, proc in list(self._processes.items()):
             if name in self._disabled_components:
@@ -400,7 +399,6 @@ class AWManager:
                     f"Restarting {name} (exited with code {proc.returncode})"
                 )
                 self._start_component(name, binaries_dir)
-                restarted = True
                 if name == BF_SERVER:
                     server_restarted = True
 
@@ -426,7 +424,44 @@ class AWManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 self._start_component(watcher, binaries_dir)
-                restarted = True
+
+        # Detect a stalled idle/AFK tracker (process alive but emitting no new
+        # events). The AFK watcher heartbeats its current event, so a frozen
+        # end-time means it hung — and a hung AFK watcher silently freezes
+        # "Active time" while the user keeps working (Alexandru, 2026-06-12: AFK
+        # froze at 18:27 while window+input ran to 19:53, so the day read 7h not
+        # 8h). Gate on the WINDOW tracker being fresh: only restart when the user
+        # is demonstrably active but AFK has gone silent — this is the precise
+        # "hung while working" signature and avoids churn during legitimate
+        # full-system idle or a sleep/wake where both watchers are paused.
+        idle_watcher = "bf-idle-tracker"
+        if (
+            idle_watcher not in self._disabled_components
+            and idle_watcher in self._processes
+            and self._processes[idle_watcher].poll() is None
+        ):
+            afk_age = self._get_latest_afk_event_age()
+            window_age = self._get_latest_window_event_age()
+            if (
+                afk_age is not None
+                and afk_age > STALE_THRESHOLD
+                and window_age is not None
+                and window_age <= STALE_THRESHOLD
+            ):
+                self._stale_restart_count += 1
+                logger.warning(
+                    f"{idle_watcher} stale: no AFK events for {afk_age:.0f}s "
+                    f"while the window tracker is fresh ({window_age:.0f}s) "
+                    f"(threshold {STALE_THRESHOLD}s, "
+                    f"restart #{self._stale_restart_count})"
+                )
+                proc = self._processes[idle_watcher]
+                proc.terminate()
+                try:
+                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                self._start_component(idle_watcher, binaries_dir)
 
         # Only block waiting for the server when the server itself was
         # restarted. The previous check (`BF_SERVER in <currently-running>`)
@@ -561,13 +596,20 @@ class AWManager:
             except (ConnectionRefusedError, OSError):
                 return False
 
-    def _get_latest_window_event_age(self) -> Optional[float]:
-        """Return seconds since the most recent window event, or None on error."""
+    def _get_latest_event_age(self, bucket_prefix: str) -> Optional[float]:
+        """Seconds since the most recent event in the host's bucket whose id
+        starts with ``bucket_prefix`` (e.g. ``aw-watcher-window`` /
+        ``aw-watcher-afk``), or None on error/no events.
+
+        Age is measured from the event's END (timestamp + duration). Both the
+        window and AFK watchers heartbeat their current event, so a healthy
+        watcher keeps the end near now; a hung one freezes it.
+        """
         try:
             hostname = urllib.parse.quote(platform.node(), safe="")
             url = (
                 f"http://localhost:{self.aw_port}/api/0/buckets/"
-                f"aw-watcher-window_{hostname}/events?limit=1"
+                f"{bucket_prefix}_{hostname}/events?limit=1"
             )
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=3) as resp:
@@ -582,8 +624,16 @@ class AWManager:
             age = time.time() - event_end
             return max(0, age)
         except Exception as e:
-            logger.debug("_get_latest_window_event_age failed: %s", e)
+            logger.debug("_get_latest_event_age(%s) failed: %s", bucket_prefix, e)
             return None
+
+    def _get_latest_window_event_age(self) -> Optional[float]:
+        """Return seconds since the most recent window event, or None on error."""
+        return self._get_latest_event_age("aw-watcher-window")
+
+    def _get_latest_afk_event_age(self) -> Optional[float]:
+        """Return seconds since the most recent AFK event, or None on error."""
+        return self._get_latest_event_age("aw-watcher-afk")
 
     def _get_binaries_dir(self) -> Optional[str]:
         """Resolve path to tracker binaries directory.

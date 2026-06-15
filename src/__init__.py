@@ -1,4 +1,4 @@
 """BetterFlow - ActivityWatch to BetterFlow sync companion app."""
 
-__version__ = "1.5.42"
+__version__ = "1.5.43"
 __author__ = "BetterQA"
