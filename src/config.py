@@ -231,7 +231,7 @@ class PrivacySettings:
     collect_page_category: bool = True  # Include coarse page category classification
     auto_categorize: bool = True  # Enrich events with app_category from server mappings
     track_display_info: bool = False  # Track monitor name and virtual desktop
-    track_browser_urls: bool = False  # macOS: read active-tab URL via AppleScript (needs Automation permission)
+    track_browser_urls: bool = False  # read active-tab URL without an extension (macOS: AppleScript / Windows: UI Automation)
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",
