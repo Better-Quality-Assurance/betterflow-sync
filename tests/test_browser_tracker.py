@@ -120,3 +120,114 @@ class TestStartBrowserTracker:
         t = bt.start_browser_tracker(enabled=False)
         assert t.url_at(123.0) is None
         t.stop()  # no-op, must not raise
+
+
+# ---------------------------------------------------------------------------
+# Windows UI Automation reader (logic that is testable off-Windows)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeWindowsUrl:
+    def test_passes_through_http_and_https(self):
+        assert bt._normalize_windows_url("https://github.com/x") == "https://github.com/x"
+        assert bt._normalize_windows_url("http://example.com") == "http://example.com"
+
+    def test_adds_scheme_to_bare_host(self):
+        # Chromium hides the scheme in the omnibox.
+        assert bt._normalize_windows_url("github.com/issues") == "https://github.com/issues"
+        assert bt._normalize_windows_url("  app.betterflow.eu  ") == "https://app.betterflow.eu"
+
+    def test_rejects_search_queries(self):
+        assert bt._normalize_windows_url("how to test windows") is None
+
+    def test_rejects_internal_and_non_web(self):
+        assert bt._normalize_windows_url("chrome://settings") is None
+        assert bt._normalize_windows_url("edge://flags") is None
+        assert bt._normalize_windows_url("about:blank") is None
+        assert bt._normalize_windows_url("file:///C:/x.txt") is None
+
+    def test_rejects_empty_and_non_hosts(self):
+        assert bt._normalize_windows_url("") is None
+        assert bt._normalize_windows_url("   ") is None
+        assert bt._normalize_windows_url(None) is None
+        assert bt._normalize_windows_url("localhost") is None  # no dot
+        assert bt._normalize_windows_url("newtab") is None
+
+
+class TestFirstUrlFromValues:
+    def test_returns_first_valid_url(self):
+        assert bt._first_url_from_values(["", "search terms", "github.com"]) == "https://github.com"
+
+    def test_none_when_no_valid(self):
+        assert bt._first_url_from_values(["", "chrome://x", "just text here"]) is None
+
+
+class _FakeControl:
+    """Minimal stand-in for a uiautomation Control for the BFS walk."""
+
+    def __init__(self, type_name="PaneControl", value=None, children=None):
+        self._type = type_name
+        self._value = value
+        self._children = children or []
+
+    @property
+    def ControlTypeName(self):  # noqa: N802
+        return self._type
+
+    def GetChildren(self):  # noqa: N802
+        return self._children
+
+    def GetValuePattern(self):  # noqa: N802
+        v = self._value
+
+        class _VP:
+            Value = v
+
+        return _VP()
+
+
+class TestCollectUiaUrlValues:
+    def test_edits_come_before_documents(self):
+        tree = _FakeControl(children=[
+            _FakeControl("DocumentControl", value="example.org/page"),
+            _FakeControl("ToolbarControl", children=[
+                _FakeControl("EditControl", value="github.com/x"),
+            ]),
+        ])
+        values = bt._collect_uia_url_values(tree)
+        # Edit value precedes Document value so a real URL is preferred.
+        assert values == ["github.com/x", "example.org/page"]
+
+    def test_depth_bound_stops_descent(self):
+        deep = _FakeControl("EditControl", value="deep.com")
+        # Nest the edit far below the depth bound.
+        node = deep
+        for _ in range(12):
+            node = _FakeControl("PaneControl", children=[node])
+        values = bt._collect_uia_url_values(node, max_depth=3)
+        assert "deep.com" not in values
+
+    def test_node_cap_is_respected(self):
+        wide = _FakeControl(children=[_FakeControl("PaneControl") for _ in range(1000)])
+        # Should not raise / hang; just returns what it scanned within the cap.
+        assert bt._collect_uia_url_values(wide, max_nodes=10) == []
+
+
+class TestWindowsTrackerPoll:
+    def test_poll_records_url_into_buffer(self):
+        with patch.object(bt, "get_active_browser_url_windows", return_value="https://x.com"):
+            tracker = bt._start_windows_tracker(
+                poll_interval=0.01, retention_seconds=600.0, match_tolerance_seconds=8.0
+            )
+            try:
+                import time as _t
+                deadline = _t.time() + 2.0
+                got = None
+                while _t.time() < deadline:
+                    got = tracker.url_at(_t.time())
+                    if got:
+                        break
+                    _t.sleep(0.02)
+                assert got == "https://x.com"
+            finally:
+                tracker.stop()

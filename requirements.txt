@@ -8,6 +8,11 @@ Pillow>=10.0
 pyobjc-framework-SystemConfiguration>=10.0; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
 
+# Windows-only dependencies
+# uiautomation -> read the foreground browser's omnibox URL via UI Automation
+# (opt-in active-tab tracking, privacy.track_browser_urls). Fail-closed if absent.
+uiautomation>=2.0; sys_platform == "win32"
+
 # Linux-only dependencies
 # PyGObject -> AppIndicator tray backend; python-xlib -> XOrg fallback backend;
 # jeepney -> systemd-logind sleep/wake D-Bus signals; SecretStorage -> keyring
