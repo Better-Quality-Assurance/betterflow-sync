@@ -62,6 +62,15 @@ class IdleManager:
         if idle_start:
             self.sync_engine.send_idle_event(idle_start)
 
+    def _is_in_call(self) -> bool:
+        """Whether a call/meeting is active, via the sync engine. Defensive:
+        any error (or a sync engine without the method) means 'not in a call'
+        so idle detection still works."""
+        try:
+            return bool(self.sync_engine.is_in_call())
+        except Exception:
+            return False
+
     def check_idle_status(
         self,
         *,
@@ -110,6 +119,18 @@ class IdleManager:
 
             if is_afk and afk_duration >= self._idle_pause_threshold:
                 if not was_idle_paused:
+                    # Don't mark idle while the user is in a call/meeting. In a
+                    # meeting they're engaged (listening/watching) even without
+                    # keyboard/mouse input. The AFK watcher is the only idle
+                    # signal on Windows (no in-process input watcher), so a long
+                    # call otherwise trips this pause and paints the whole span
+                    # as Idle even though the meeting app was focused throughout.
+                    if self._is_in_call():
+                        logger.debug(
+                            "AFK for %ds but a call is active — not pausing as idle",
+                            int(afk_duration),
+                        )
+                        return
                     if idle_start is None:
                         idle_start = datetime.now(timezone.utc)
                     logger.info(

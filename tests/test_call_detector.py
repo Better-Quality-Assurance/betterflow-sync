@@ -348,3 +348,21 @@ class TestSyncEngineCallIntegration:
         )
         result = self.engine._make_call_bf_event(ce)
         assert result["project_id"] == 42
+
+
+def test_is_in_call_reflects_active_call_state():
+    """is_in_call() is True from call start until the call ends."""
+    from datetime import datetime, timezone
+    det = CallDetector(min_duration=1)
+    t0 = datetime(2026, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+    assert det.is_in_call() is False
+    # Enter a Teams meeting.
+    det.process_event("Microsoft Teams", "Meeting with Sachi", None, t0, 60.0)
+    assert det.is_in_call() is True
+    # Still in the call on a later same-call event.
+    det.process_event("Microsoft Teams", "Meeting with Sachi", None,
+                      t0.replace(minute=30), 60.0)
+    assert det.is_in_call() is True
+    # Flushing ends the call.
+    det.flush()
+    assert det.is_in_call() is False

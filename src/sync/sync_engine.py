@@ -261,6 +261,18 @@ class SyncEngine:
         with self._state_lock:
             return self._private_mode
 
+    def is_in_call(self) -> bool:
+        """True while the call/meeting detector reports an active call.
+
+        Idle detection consults this so a meeting/call with no keyboard or
+        mouse input is not mistaken for idle. False when call detection is
+        disabled. The detector's state is advanced as window events are
+        processed each sync cycle and persists across cycles until the call
+        ends, so it stays True for the duration of a meeting.
+        """
+        detector = self._call_detector
+        return bool(detector and detector.is_in_call())
+
     def set_current_project(self, project: Optional[dict]) -> None:
         """Set the current project for event tagging."""
         with self._state_lock:
