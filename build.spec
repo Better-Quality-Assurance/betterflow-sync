@@ -231,7 +231,12 @@ elif is_windows:
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
-        upx=True,
+        # UPX OFF on Windows: UPX-packed binaries are the #1 antivirus heuristic
+        # trigger (Avast/Defender flag them on sight). An unsigned + UPX-packed
+        # one-file exe was getting quarantined ("Suspicious file detected",
+        # Claudia 2026-06-16). Dropping UPX trades a slightly larger exe for far
+        # fewer false positives. The durable fix is Authenticode code-signing.
+        upx=False,
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
