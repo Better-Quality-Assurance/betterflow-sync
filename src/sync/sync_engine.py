@@ -242,6 +242,20 @@ class SyncEngine:
         with self._state_lock:
             return self._paused
 
+    def request_backlog_reconcile(self) -> None:
+        """Re-arm the start-of-day backlog reconcile so the NEXT sync rewinds
+        checkpoints and re-sends any locally-stored events the server never
+        received. The backend upserts by AW event id, so replaying already-
+        stored events is deduped — safe.
+
+        The reconcile normally runs once per process (at startup), which made
+        recovering a stuck day require a quit+restart. Manual "Sync Now" calls
+        this first so a single click recovers the day, as users expect.
+        """
+        with self._state_lock:
+            self._backlog_reconciled = False
+        logger.info("Manual sync: re-armed start-of-day backlog reconcile")
+
     def set_private_mode(self, enabled: bool) -> None:
         """Enable/disable private time (no events recorded)."""
         with self._state_lock:
