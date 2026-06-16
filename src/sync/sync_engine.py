@@ -630,6 +630,21 @@ class SyncEngine:
         prod". skip_time_tracking keeps the replay from touching the local daily
         total (the persisted counted-time cache also makes it a no-op).
         """
+        # Don't pile the whole day on top of a backlog that's already queued and
+        # draining. Re-enqueuing would duplicate events (a batch carrying the same
+        # id twice has the server report processed < len) and balloon the queue —
+        # repeated Sync Now / restarts drove it from 3k to 11k on 2026-06-16. Let
+        # the pending backlog drain first; the next reconcile covers anything new.
+        try:
+            pending = self.queue.size()
+        except Exception:
+            pending = 0
+        if pending > self.config.sync.batch_size:
+            logger.info(
+                "Backlog reconcile skipped: %d events already queued and draining", pending
+            )
+            return
+
         day_start = (
             datetime.now()
             .astimezone()

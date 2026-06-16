@@ -304,8 +304,19 @@ class BetterFlowClient(BaseApiClient):
                 )
 
             events_synced = synced if synced is not None else len(accepted_ids)
+            # Delivered = the server rejected nothing (failed == 0) AND gave some
+            # positive confirmation (processed > 0 or accepted_ids) for a non-empty
+            # batch. Do NOT require processed >= len(events): the server reports
+            # fewer "processed" than sent when a batch already has some events, or
+            # carries the same id more than once (the backlog reconcile can enqueue
+            # duplicates). Those are accepted, not failures — requiring processed >=
+            # len made every such batch look failed → re-queued, retried, dropped,
+            # and the queue stalled in backoff (2026-06-16). The processed>0 clause
+            # still rejects a genuine no-op (processed==0) so we never advance past
+            # events the server didn't actually take.
+            delivered = queued == 0 and (events_synced > 0 or bool(accepted_ids) or not events)
             return SyncResult(
-                success=(queued == 0 and events_synced >= len(events)),
+                success=delivered,
                 events_synced=events_synced,
                 events_queued=queued,
                 accepted_ids=accepted_ids,

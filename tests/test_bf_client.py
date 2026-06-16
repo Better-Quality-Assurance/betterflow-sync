@@ -961,3 +961,40 @@ class TestGetWebLoginUrl:
         )
 
         assert self.client.get_web_login_url() is None
+
+
+class TestBatchPartialProcessedIsDelivered:
+    """processed < len with failed == 0 (deduped or duplicate ids in the batch)
+    must be treated as DELIVERED — not re-queued. Regression for the 2026-06-16
+    stall where re-enqueued duplicates made every batch report processed<len, so
+    the agent re-queued, retried, dropped, and the queue jammed in backoff."""
+
+    def setup_method(self):
+        self.client = BetterFlowClient(
+            api_url="https://betterflow.eu/api/agent", token="t", device_id="d",
+        )
+
+    def teardown_method(self):
+        self.client.close()
+
+    @responses.activate
+    def test_processed_less_than_len_but_no_failures_is_success(self):
+        responses.add(
+            responses.POST, "https://betterflow.eu/api/agent/events/batch",
+            json={"data": {"processed": 40, "failed": 0}}, status=200,
+        )
+        events = [{"id": i, "timestamp": "2026-06-16T05:00:00Z", "duration": 1, "data": {}} for i in range(50)]
+        result = self.client.send_events(events)
+        assert result.success is True
+        assert result.events_queued == 0
+
+    @responses.activate
+    def test_zero_processed_no_failures_is_still_failure(self):
+        # A genuine no-op (nothing processed, nothing accepted) must NOT advance.
+        responses.add(
+            responses.POST, "https://betterflow.eu/api/agent/events/batch",
+            json={"data": {"processed": 0, "failed": 0}}, status=200,
+        )
+        events = [{"id": 1, "timestamp": "2026-06-16T05:00:00Z", "duration": 1, "data": {}}]
+        result = self.client.send_events(events)
+        assert result.success is False
