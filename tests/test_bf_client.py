@@ -833,3 +833,57 @@ class TestRetryBehavior:
 
         assert result["status"] == "ok"
         assert len(responses.calls) == 2
+
+
+class TestGetWebLoginUrl:
+    """Tests for the "Show My Hours" one-time login URL minting."""
+
+    def setup_method(self):
+        self.client = BetterFlowClient(
+            api_url="https://betterflow.eu/api/agent",
+            token="test-token",
+            device_id="test-device",
+        )
+
+    def teardown_method(self):
+        self.client.close()
+
+    @responses.activate
+    def test_returns_url_from_response(self):
+        """A successful mint returns the authenticated URL."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/web-login-link",
+            json={"success": True, "data": {"url": "https://betterflow.eu/agent/auth?ott=abc", "expires_in": 90}},
+            status=200,
+        )
+
+        url = self.client.get_web_login_url()
+
+        assert url == "https://betterflow.eu/agent/auth?ott=abc"
+        # Must POST with the device's bearer token attached.
+        assert responses.calls[0].request.headers["Authorization"] == "Bearer test-token"
+
+    @responses.activate
+    def test_returns_none_when_url_absent(self):
+        """A malformed/empty payload yields None so the tray falls back."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/web-login-link",
+            json={"success": True, "data": {}},
+            status=200,
+        )
+
+        assert self.client.get_web_login_url() is None
+
+    @responses.activate
+    def test_returns_none_when_data_missing(self):
+        """No data key at all still yields None, not an exception."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/web-login-link",
+            json={"success": True},
+            status=200,
+        )
+
+        assert self.client.get_web_login_url() is None

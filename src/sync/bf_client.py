@@ -349,6 +349,24 @@ class BetterFlowClient(BaseApiClient):
         return self._request("GET", "events/trends", retry=False, timeout_override=10)
 
     # =========================================================================
+    # Web login passthrough
+    # =========================================================================
+
+    def get_web_login_url(self) -> Optional[str]:
+        """Mint a one-time URL that opens the web dashboard already authenticated.
+
+        Backs the "Show My Hours" tray action: the server trades this device's
+        token for a short-lived, single-use URL so the user lands on /agent/my
+        without logging in again (a pain for multi-Google-account users).
+
+        Returns the URL, or None if the server response lacks one.
+        """
+        resp = self._request("POST", "web-login-link", retry=False, timeout_override=10)
+        data = resp.get("data") or {}
+        url = data.get("url")
+        return url if isinstance(url, str) and url else None
+
+    # =========================================================================
     # Configuration
     # =========================================================================
 

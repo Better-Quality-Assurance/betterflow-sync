@@ -1045,6 +1045,7 @@ class BetterFlowApp:
             on_install_update=self._on_install_update,
             on_check_update=lambda: self.update_handler._periodic_update_check(),
             on_tray_died=self._on_tray_died,
+            on_show_hours=self._on_show_hours,
         )
         self.tray.set_config(self.config)
 
@@ -1662,6 +1663,18 @@ class BetterFlowApp:
             return
         logger.info("Manual sync triggered")
         self.coordinator.trigger_sync()
+
+    def _on_show_hours(self) -> Optional[str]:
+        """Mint a one-time authenticated dashboard URL for the tray.
+
+        Returns the URL the browser should open, or None so the tray falls back
+        to the plain /agent/my URL. Network/auth errors propagate to the tray's
+        worker, which logs them and uses the fallback.
+        """
+        url = self.bf.get_web_login_url()
+        if url:
+            logger.info("Show My Hours: minted authenticated dashboard URL")
+        return url
 
     def _on_system_sleep(self) -> None:
         if self._shutdown_event.is_set():

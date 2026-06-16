@@ -439,6 +439,7 @@ class TrayIcon:
         on_install_update: Optional[Callable[[str], None]] = None,
         on_check_update: Optional[Callable[[], None]] = None,
         on_tray_died: Optional[Callable[[], None]] = None,
+        on_show_hours: Optional[Callable[[], Optional[str]]] = None,
     ):
         """Initialize tray icon.
 
@@ -478,6 +479,7 @@ class TrayIcon:
         self._on_install_update = on_install_update
         self._on_check_update = on_check_update
         self._on_tray_died = on_tray_died
+        self._on_show_hours = on_show_hours
 
         self.model = TrayModel()
 
@@ -897,10 +899,32 @@ class TrayIcon:
         self._update_menu()
 
     def _handle_show_dashboard(self, icon, item) -> None:
-        """Open dashboard in browser."""
+        """Open the web dashboard in the browser.
+
+        Prefer a one-time authenticated URL (so multi-Google-account users skip
+        the login wall); fall back to the plain /agent/my URL if minting fails
+        or no callback is wired. The mint hits the network, so it runs off the
+        tray thread to keep the menu responsive.
+        """
         with self.model.lock:
-            url = self.model.dashboard_url
-        webbrowser.open(url)
+            fallback_url = self.model.dashboard_url
+        on_show_hours = self._on_show_hours
+
+        def worker() -> None:
+            url = fallback_url
+            if on_show_hours is not None:
+                try:
+                    authenticated = on_show_hours()
+                    if authenticated:
+                        url = authenticated
+                except Exception:
+                    logger.exception(
+                        "Show My Hours: failed to mint authenticated URL; "
+                        "opening plain dashboard instead"
+                    )
+            webbrowser.open(url)
+
+        threading.Thread(target=worker, name="show-my-hours", daemon=True).start()
 
     def _handle_open_privacy(self, icon, item) -> None:
         """Open the public privacy policy in the user's default browser.
