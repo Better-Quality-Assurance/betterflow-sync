@@ -114,6 +114,14 @@ class BoundedLRU:
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow."""
 
+    # Backlog paging: fetch a bounded forward time-window per cycle and take the
+    # OLDEST batch, so a reconcile can walk through a stranded mid-day gap
+    # instead of the newest-first fetch snapping the checkpoint back to now.
+    # 2h holds well under _BACKLOG_FETCH_LIMIT events at realistic rates
+    # (~300 input/h), so the slice keeps the true oldest events.
+    _BACKLOG_WINDOW = timedelta(hours=2)
+    _BACKLOG_FETCH_LIMIT = 1000
+
     def __init__(
         self,
         aw: AWClientProtocol,
@@ -602,13 +610,25 @@ class SyncEngine:
             logger.debug("Counted-time persist failed for %s/%s: %s", bucket_id, event_id, e)
 
     def _reconcile_backlog(self, buckets: list) -> None:
-        """Rewind each bucket's checkpoint to the start of the local day so the
-        next fetch re-sends any locally-stored events the server is missing.
+        """Enqueue the whole current work day's AW events into the offline queue
+        so they drain in the background.
 
-        Safe to replay: the backend upserts events by AW event id, so events
-        already stored are deduped. This is what recovers a day stranded by a
-        sync outage or by the (now removed) client-side activity filter — a
-        quit+restart re-uploads everything still on the local DB.
+        The old approach rewound the forward checkpoint and relied on the next
+        fetch to re-send. But AW returns events NEWEST-first under a ``limit``,
+        so the fetch grabbed the most-recent batch and the checkpoint snapped
+        back to ~now — an older mid-day gap was never reached. And the offline
+        queue only ever held send FAILURES, so "0 queued" could read clean while
+        locally-captured events sat un-synced: there was no reconciliation
+        between AW and prod (furdui.iancu, 2026-06-16: ~1000 events at
+        05:00-07:00 UTC stranded while the queue showed 0).
+
+        This walks start-of-work-day -> now OLDEST-first (paged, since the API is
+        newest-first) and ENQUEUES every event. The backend upserts by AW event
+        id, so re-enqueuing already-synced events is deduped — safe. The queue's
+        size() now reflects the true backlog and ticks down to 0 as
+        _process_queue drains it, so "0 queued" finally means "everything reached
+        prod". skip_time_tracking keeps the replay from touching the local daily
+        total (the persisted counted-time cache also makes it a no-op).
         """
         day_start = (
             datetime.now()
@@ -616,16 +636,46 @@ class SyncEngine:
             .replace(hour=0, minute=0, second=0, microsecond=0)
             .astimezone(timezone.utc)
         )
+        now = datetime.now(timezone.utc)
+        enqueued = 0
         for bucket in buckets:
-            try:
-                cp = self.queue.get_checkpoint(bucket.id)
-                if cp is None or cp > day_start:
-                    self.queue.set_checkpoint(bucket.id, day_start)
-            except Exception as e:  # never let reconcile break a sync cycle
-                logger.warning("Backlog reconcile failed for %s: %s", bucket.id, e)
-        logger.info(
-            "Backlog reconcile: checkpoints rewound to %s", day_start.isoformat()
-        )
+            cursor = day_start
+            while cursor < now:
+                window_end = min(now, cursor + self._BACKLOG_WINDOW)
+                try:
+                    events = self.aw.get_events(
+                        bucket.id,
+                        start=cursor,
+                        end=window_end,
+                        limit=self._BACKLOG_FETCH_LIMIT,
+                    )
+                except AWClientError as e:
+                    logger.warning("Backlog reconcile fetch failed for %s: %s", bucket.id, e)
+                    break  # move on to the next bucket
+                cursor = window_end
+                if not events:
+                    continue
+                events.sort(key=lambda e: e.timestamp)  # AW is newest-first
+                batch: list[dict] = []
+                for event in events:
+                    if bucket.type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+                        batch.extend(
+                            self._transform_window_event_with_timeout(event, bucket.id, bucket.type)
+                        )
+                    else:
+                        transformed = self._transform_event(
+                            event, bucket.id, bucket.type, skip_time_tracking=True
+                        )
+                        if transformed:
+                            batch.append(transformed)
+                if batch:
+                    enqueued += self.queue.enqueue(batch)
+        if enqueued:
+            logger.info(
+                "Backlog reconcile: enqueued %d work-day events (since %s) to drain via the queue",
+                enqueued,
+                day_start.isoformat(),
+            )
 
     def _within_working_hours(self, event: AWEvent) -> bool:
         """True if the event's start falls inside the server-enforced working-
@@ -652,25 +702,53 @@ class SyncEngine:
 
         Returns (events, lookback_start) — events sorted oldest-first.
         """
+        now = datetime.now(timezone.utc)
         checkpoint = self.queue.get_checkpoint(bucket_id)
         if checkpoint is None:
             # First sync for this bucket — start from now so we don't
             # retroactively sync old AW events that accumulated before
             # BetterFlow was running.  Persist immediately so the next
             # cycle uses the 2-min lookback instead of resetting to "now".
-            checkpoint = datetime.now(timezone.utc)
+            checkpoint = now
             self.queue.set_checkpoint(bucket_id, checkpoint)
             lookback_start = checkpoint
         else:
             lookback_start = checkpoint - timedelta(minutes=2)
 
-        events = self.aw.get_events_since(
-            bucket_id, lookback_start, limit=self.config.sync.batch_size
+        # Page OLDEST-first through a bounded forward window.
+        #
+        # AW returns events NEWEST-first, so fetching [checkpoint, now] with a
+        # plain `limit` grabs the most RECENT batch and strands any older
+        # un-synced events further back. That silently defeats the backlog
+        # reconcile: it rewinds the checkpoint to recover a mid-day gap, but the
+        # newest-first fetch snaps the checkpoint straight back to ~now via
+        # max(events) below, so the gap is never reached. (furdui.iancu,
+        # 2026-06-16: ~1000 events at 05:00-07:00 UTC were unrecoverable by
+        # Sync Now / restart for exactly this reason.)
+        #
+        # Capping the fetch to a forward window and taking the OLDEST batch makes
+        # successive cycles walk through the backlog and cover the gap. In steady
+        # state the window is just [checkpoint-2m, now] (fetch_end == now) and
+        # behaviour is unchanged — including the 2-min lookback that re-sends
+        # heartbeat-grown durations.
+        fetch_end = min(now, lookback_start + self._BACKLOG_WINDOW)
+        events = self.aw.get_events(
+            bucket_id, start=lookback_start, end=fetch_end, limit=self._BACKLOG_FETCH_LIMIT
         )
-        stats.events_fetched += len(events)
-
-        # AW returns newest-first; sort oldest-first for gap-filling
+        # AW returns newest-first; sort oldest-first so the slice below keeps the
+        # OLDEST events (and for deterministic gap-filling).
         events.sort(key=lambda e: e.timestamp)
+
+        # Empty leading window (e.g. an overnight quiet stretch right after the
+        # checkpoint): advance past it so we don't re-poll the same empty span
+        # forever while a backlog waits beyond it.
+        if not events and fetch_end < now:
+            self.queue.set_checkpoint(bucket_id, fetch_end)
+            return [], lookback_start
+
+        if len(events) > self.config.sync.batch_size:
+            events = events[: self.config.sync.batch_size]
+        stats.events_fetched += len(events)
         return events, lookback_start
 
     def _transform_and_checkpoint(
