@@ -283,6 +283,80 @@ class TestBetterFlowClient:
         assert result.events_queued == 0
 
     @responses.activate
+    def test_send_events_reads_data_envelope(self):
+        """Real server wraps counts under "data"; we must read them there."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={
+                "success": True,
+                "message": "Operation successful",
+                "data": {"processed": 3, "failed": 0, "errors": []},
+                "meta": {"version": "1.0"},
+            },
+            status=200,
+        )
+
+        events = [
+            {"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}
+            for _ in range(3)
+        ]
+        result = self.client.send_events(events)
+
+        assert result.success is True
+        assert result.events_synced == 3
+        assert result.events_queued == 0
+
+    @responses.activate
+    def test_send_events_empty_body_is_failure(self):
+        """A 2xx with an empty body is NOT a delivery confirmation.
+
+        Regression: a backend 500-then-idempotent-replay returns an empty 2xx.
+        The old code defaulted synced=len(events), claimed success, advanced the
+        checkpoint, and lost the events. We must treat this as a failure so the
+        batch is re-queued instead.
+        """
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            body="",
+            status=200,
+        )
+
+        events = [
+            {"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}
+            for _ in range(4)
+        ]
+        result = self.client.send_events(events)
+
+        assert result.success is False
+        assert result.events_synced == 0
+        assert result.events_queued == 4
+
+    @responses.activate
+    def test_send_events_zero_processed_is_failure(self):
+        """Server reporting processed=0 for a non-empty batch is a failure.
+
+        This is the orphan-dedup-marker case: the server skipped every event
+        and stored nothing. We must not advance the checkpoint past them.
+        """
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={"success": True, "data": {"processed": 0, "failed": 0}},
+            status=200,
+        )
+
+        events = [
+            {"timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}
+            for _ in range(4)
+        ]
+        result = self.client.send_events(events)
+
+        assert result.success is False
+        assert result.events_queued == 0  # server reported 0 failed; caller re-queues whole batch
+
+    @responses.activate
     def test_send_events_empty_list(self):
         """Test sending empty event list."""
         result = self.client.send_events([])
