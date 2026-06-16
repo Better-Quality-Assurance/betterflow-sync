@@ -271,11 +271,44 @@ class BetterFlowClient(BaseApiClient):
                 compress=True,
                 extra_headers={"X-Idempotency-Key": idempotency_key},
             )
+            # Trust ONLY an explicit delivery confirmation from the server.
+            #
+            # The server wraps its payload in an envelope: the real counts live
+            # under response["data"] ({"processed": N, "failed": M, ...}), NOT at
+            # the top level. The previous code read response["processed"] (always
+            # absent) and so ALWAYS fell back to the len(events) default —
+            # reporting "all sent" no matter what the server actually stored.
+            #
+            # Worse: when the server 500s on the first attempt and the retry
+            # returns a 2xx with an empty / confirmation-less body (an idempotent
+            # replay, or a body we don't recognise), _request returns {} and the
+            # old default again claimed full success. The sync checkpoint then
+            # advanced past events the server never persisted and they were lost
+            # for good (the offline queue stayed empty because we "succeeded").
+            #
+            # So: parse the envelope, accept both naming conventions, and when we
+            # CANNOT confirm delivery, report failure. The caller re-queues the
+            # batch and the content-derived idempotency key makes the resend safe.
+            payload = response.get("data", response) if isinstance(response, dict) else {}
+            accepted_ids = payload.get("accepted_ids") or []
+            synced = payload.get("processed", payload.get("synced"))
+            queued = payload.get("failed", payload.get("queued", 0))
+
+            if synced is None and not accepted_ids:
+                # No delivery confirmation — do not assume anything persisted.
+                return SyncResult(
+                    success=False,
+                    events_synced=0,
+                    events_queued=len(events),
+                    error="server returned no delivery confirmation; re-queuing batch",
+                )
+
+            events_synced = synced if synced is not None else len(accepted_ids)
             return SyncResult(
-                success=True,
-                events_synced=response.get("processed", len(events)),
-                events_queued=response.get("failed", 0),
-                accepted_ids=response.get("accepted_ids", []),
+                success=(queued == 0 and events_synced >= len(events)),
+                events_synced=events_synced,
+                events_queued=queued,
+                accepted_ids=accepted_ids,
             )
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login

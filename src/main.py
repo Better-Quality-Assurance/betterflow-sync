@@ -319,8 +319,15 @@ class SyncCoordinator:
                 trigger=IntervalTrigger(seconds=interval_seconds),
             )
 
-    def trigger_sync(self, job_id: str = "immediate_sync") -> None:
-        """Schedule a one-off sync (e.g. after wake or network change)."""
+    def trigger_sync(self, job_id: str = "immediate_sync", force_reconcile: bool = False) -> None:
+        """Schedule a one-off sync (e.g. after wake or network change).
+
+        force_reconcile re-arms the start-of-day backlog reconcile so the sync
+        re-sends any locally-stored events the server never received — used by
+        manual "Sync Now" so one click recovers a stuck day without a restart.
+        """
+        if force_reconcile:
+            self.sync_engine.request_backlog_reconcile()
         if self.scheduler.running:
             self.scheduler.add_job(self._do_sync, id=job_id, replace_existing=True)
 
@@ -1662,7 +1669,10 @@ class BetterFlowApp:
             logger.debug("Sync Now ignored: scheduler not running (not logged in?)")
             return
         logger.info("Manual sync triggered")
-        self.coordinator.trigger_sync()
+        # Force the start-of-day backlog reconcile: a manual "Sync Now" should
+        # push every locally-captured event the server is missing, not just
+        # forward-sync from the checkpoint (which is all the periodic sync does).
+        self.coordinator.trigger_sync(force_reconcile=True)
 
     def _on_show_hours(self) -> Optional[str]:
         """Mint a one-time authenticated dashboard URL for the tray.
