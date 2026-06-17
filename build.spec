@@ -134,6 +134,7 @@ hiddenimports = [
     "ui.setup_wizard",
     "aw_manager",
     "autostart",
+    "windows_tray",  # Windows 11 tray-icon promotion (best-effort, win-only)
     "error_reporter",  # Failure reporting to betterqa-bot logs channel
     "_build_secrets",  # Generated at build time (baked DSN); gitignored
     "display_info",
