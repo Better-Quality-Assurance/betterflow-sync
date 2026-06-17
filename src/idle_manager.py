@@ -36,6 +36,15 @@ class IdleManager:
         self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
         self._IDLE_SYNC_INTERVAL = 300
 
+        # In-process input watcher (macOS), injected post-construction by the
+        # app after it is created. It holds the MAIN app's Input Monitoring
+        # grant, so it is authoritative over the AFK bucket — which comes from
+        # bf-idle-tracker, a SEPARATE TCC subject that can be blind (missing
+        # the grant) or stuck and report 'afk' while the user is typing. See
+        # _has_recent_input(). None on platforms without an in-process watcher
+        # (Windows/Linux) or before startup wiring — handled defensively.
+        self.input_watcher = None
+
     @property
     def idle_paused(self) -> bool:
         with self._state_lock:
@@ -61,6 +70,33 @@ class IdleManager:
             self._idle_paused = False
         if idle_start:
             self.sync_engine.send_idle_event(idle_start)
+
+    def _has_recent_input(self, within_seconds: float) -> bool:
+        """True if the in-process input watcher observed input within
+        `within_seconds`.
+
+        This is the authoritative override for the AFK bucket. bf-idle-tracker
+        runs under its own TCC subject and can be blind (no Input Monitoring
+        grant) or stuck, emitting 'afk' while the user types — the recurring
+        "shows idle while I'm working" report. The in-process watcher DOES hold
+        the main app's grant, so positive recent input means the user is NOT
+        idle no matter what the AFK bucket claims.
+
+        Conservative by design: no watcher, no observation yet, or any error
+        returns False. It can only SUPPRESS a false idle, never fabricate
+        activity — so a genuinely idle user is still detected via the AFK path.
+        """
+        watcher = self.input_watcher
+        if watcher is None:
+            return False
+        try:
+            last_input = watcher.get_last_input_at()
+        except Exception as e:
+            logger.debug("_has_recent_input: input watcher query failed: %s", e)
+            return False
+        if last_input is None:
+            return False
+        return (datetime.now(timezone.utc) - last_input) <= timedelta(seconds=within_seconds)
 
     def _is_in_call(self) -> bool:
         """Whether a call/meeting is active, via the sync engine. Defensive:
@@ -98,13 +134,40 @@ class IdleManager:
                 return
 
         try:
+            # Authoritative override: if the in-process input watcher (which
+            # holds the main app's Input Monitoring grant) saw input within the
+            # idle threshold, the user is active — regardless of the AFK bucket,
+            # which comes from the separate-TCC-subject bf-idle-tracker and can
+            # be blind/stuck and report 'afk' while the user types. Without this
+            # the blind tracker paints live work as Idle until the health-check
+            # restart lands (v1.5.50 still showed this). Checked BEFORE the AFK
+            # fetch so positive input short-circuits the whole pause decision.
+            if self._has_recent_input(self._idle_pause_threshold):
+                if was_idle_paused:
+                    logger.info(
+                        "Recent in-process input - clearing idle pause "
+                        "(AFK bucket was blind/stale)"
+                    )
+                    self.clear_idle_pause(send_event=True)
+                    reschedule(self.config.sync.interval_seconds)
+                    self.tray.set_state(TrayState.SYNCING)
+                    trigger_sync("idle_resume_sync")
+                return
+
             is_afk = False
             afk_duration = 0.0
             idle_start: Optional[datetime] = None
 
             afk_buckets = self.aw.get_afk_buckets()
             if afk_buckets:
-                events = self.aw.get_events(afk_buckets[0].id, limit=1)
+                # Prefer the bf-idle-tracker bucket. A user migrated from
+                # vanilla ActivityWatch can also carry a stale aw-watcher-afk
+                # bucket frozen at 'afk' forever; taking buckets[0] blindly
+                # could pick it and paint permanent false idle. Mirrors
+                # SyncCoordinator._check_idle_tracker_health's selection.
+                bf_buckets = [b for b in afk_buckets if "bf-idle-tracker" in b.id]
+                bucket = (bf_buckets or afk_buckets)[0]
+                events = self.aw.get_events(bucket.id, limit=1)
                 if events:
                     latest = events[0]
                     is_afk = latest.status == "afk"

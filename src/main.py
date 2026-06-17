@@ -1120,6 +1120,12 @@ class BetterFlowApp:
         )
         self.coordinator._on_auth_error = self._on_session_expired
         self.coordinator._input_watcher = self.input_watcher
+        # The idle manager uses the same in-process watcher as an authoritative
+        # override so a blind/stuck bf-idle-tracker can't paint live work as
+        # Idle (it never consulted the input watcher before — only the health
+        # check did, which left a race where idle was painted before the
+        # blind-tracker restart landed).
+        self.coordinator.idle_mgr.input_watcher = self.input_watcher
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
         # Reminder manager (created after coordinator for clean callback injection)
