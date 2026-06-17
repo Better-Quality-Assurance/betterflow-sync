@@ -341,3 +341,46 @@ def test_current_afk_event_is_trusted_and_pauses():
     )
 
     assert idle_mgr.idle_paused is True, "a live afk event over threshold should still pause"
+
+
+def test_afk_event_with_none_duration_falls_back_not_crash():
+    """A malformed AFK event (duration=None — AW returned null) must not raise:
+    it's treated as not-current, so the code reaches the OS-idle fallback and
+    does not pause an active user. Pre-fix this raised TypeError before the
+    fallback (swallowed by the outer handler -> idle check silently no-op'd)."""
+    bad = types.SimpleNamespace(
+        status="afk",
+        duration=None,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=30),
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(bad)
+    with patch.object(IdleManager, "_get_system_idle_seconds", return_value=5.0) as sysidle:
+        idle_mgr.check_idle_status(
+            logged_in=True,
+            is_on_break=False,
+            reschedule=reschedule,
+            trigger_sync=trigger_sync,
+        )
+    assert idle_mgr.idle_paused is False
+    # Post-fix reaches the OS-idle fallback; pre-fix raised before it.
+    sysidle.assert_called()
+
+
+def test_stale_afk_with_no_os_idle_signal_does_not_pause():
+    """Stale AFK + no OS idle clock (Linux, or a Windows API failure -> None):
+    is_afk stays False and the user is not paused. Guards the None-fallback
+    branch so a future change to the default can't silently re-introduce idle."""
+    stale = types.SimpleNamespace(
+        status="afk",
+        duration=25 * 60.0,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=55),  # stale
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(stale)
+    with patch.object(IdleManager, "_get_system_idle_seconds", return_value=None):
+        idle_mgr.check_idle_status(
+            logged_in=True,
+            is_on_break=False,
+            reschedule=reschedule,
+            trigger_sync=trigger_sync,
+        )
+    assert idle_mgr.idle_paused is False
