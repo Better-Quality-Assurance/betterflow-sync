@@ -16,7 +16,7 @@ asserts: in a call -> no idle pause; not in a call -> idle pause as before.
 import sys
 import types
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 # The real tray module imports PIL at module load; stub it only if that import
 # is broken in this environment (no-op in CI where PIL works). IdleManager
@@ -250,3 +250,94 @@ def test_stale_afk_bucket_does_not_pause_when_latest_betterflow_bucket_is_active
 
     assert idle_mgr.idle_paused is False
     tray.set_state.assert_not_called()
+
+
+def _make_with_afk_event(afk_event, *, in_call=False):
+    """Build an IdleManager whose AFK bucket returns the given event."""
+    config = Config()
+    aw = Mock()
+    aw.get_afk_buckets.return_value = [types.SimpleNamespace(id="afk-bucket")]
+    aw.get_events.return_value = [afk_event]
+    aw.get_latest_afk_event.return_value = afk_event
+    sync_engine = Mock()
+    sync_engine.is_paused = False
+    sync_engine.is_private = False
+    sync_engine.is_in_call.return_value = in_call
+    tray = Mock()
+    idle_mgr = IdleManager(sync_engine, tray, aw, config)
+    return idle_mgr, Mock(), Mock(), tray
+
+
+def test_stale_afk_event_does_not_pause_when_os_idle_is_low():
+    """Frozen bf-idle-tracker: its latest event is 'afk' over threshold but it
+    ENDED ~30 min ago (the tracker stopped heartbeating when the user came
+    back). With no in-process input watcher (Windows) and the OS idle clock
+    showing recent activity, the user must NOT be paused. Pre-fix this pinned
+    active users as Idle indefinitely — the bug Sachi/Emilian reported on 1.5.53.
+    """
+    now = datetime.now(timezone.utc)
+    stale_afk = types.SimpleNamespace(
+        status="afk",
+        duration=25 * 60.0,                      # over the 20-min threshold
+        timestamp=now - timedelta(minutes=55),   # end = now - 30min -> stale
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(stale_afk)
+    assert idle_mgr.input_watcher is None  # Windows: no in-process watcher
+
+    with patch.object(IdleManager, "_get_system_idle_seconds", return_value=5.0):
+        idle_mgr.check_idle_status(
+            logged_in=True,
+            is_on_break=False,
+            reschedule=reschedule,
+            trigger_sync=trigger_sync,
+        )
+
+    assert idle_mgr.idle_paused is False, "stale afk + recent OS input must not pause"
+    reschedule.assert_not_called()
+
+
+def test_stale_afk_event_still_detects_genuine_idle_via_os_clock():
+    """A frozen tracker must not COST us idle detection either: when the OS idle
+    clock shows the user genuinely away past threshold, we still pause even
+    though the stale AFK event is ignored."""
+    now = datetime.now(timezone.utc)
+    stale = types.SimpleNamespace(
+        status="not-afk",
+        duration=10.0,
+        timestamp=now - timedelta(minutes=55),   # stale -> ignored
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(stale)
+
+    with patch.object(
+        IdleManager, "_get_system_idle_seconds",
+        return_value=idle_mgr._idle_pause_threshold + 60,
+    ):
+        idle_mgr.check_idle_status(
+            logged_in=True,
+            is_on_break=False,
+            reschedule=reschedule,
+            trigger_sync=trigger_sync,
+        )
+
+    assert idle_mgr.idle_paused is True, "genuine OS idle should still pause via fallback"
+
+
+def test_current_afk_event_is_trusted_and_pauses():
+    """Regression guard: a CURRENT 'afk' event (still heartbeating — end ~now)
+    over threshold is trusted and pauses, exactly as before the freshness fix."""
+    now = datetime.now(timezone.utc)
+    current_afk = types.SimpleNamespace(
+        status="afk",
+        duration=25 * 60.0,
+        timestamp=now - timedelta(minutes=25),   # end ~= now -> current
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(current_afk)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True, "a live afk event over threshold should still pause"

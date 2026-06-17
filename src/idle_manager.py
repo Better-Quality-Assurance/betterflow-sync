@@ -35,6 +35,13 @@ class IdleManager:
         self._idle_start: Optional[datetime] = None
         self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
         self._IDLE_SYNC_INTERVAL = 300
+        # A healthy AFK watcher heartbeats its current event continuously, so the
+        # event's end-time tracks "now". If the latest AFK event ended more than
+        # this many seconds ago, the tracker has frozen/crashed/gone blind — its
+        # stale 'afk' must NOT be trusted as the live idle state (that is what
+        # pins an active user as Idle forever). Generously above any normal
+        # heartbeat/poll cadence so only a genuinely dead tracker trips it.
+        self._afk_staleness_grace = 120.0
 
         # In-process input watcher (macOS), injected post-construction by the
         # app after it is created. It holds the MAIN app's Input Monitoring
@@ -97,6 +104,21 @@ class IdleManager:
         if last_input is None:
             return False
         return (datetime.now(timezone.utc) - last_input) <= timedelta(seconds=within_seconds)
+
+    def _afk_event_is_current(self, event) -> bool:
+        """True if the AFK event still covers ~now.
+
+        The AFK watcher heartbeats its current event (afk OR not-afk), so for a
+        healthy tracker the event's end-time tracks now. A frozen/blind/crashed
+        tracker stops emitting, leaving an old event as "latest" — typically an
+        'afk' whose end is well in the past. Trusting that stale 'afk' is what
+        marks an active user Idle indefinitely (no fresh not-afk event ever
+        lands to clear it). Returns False for such stale events so the caller
+        falls back to the OS idle clock instead.
+        """
+        event_end = event.timestamp + timedelta(seconds=event.duration)
+        age = (datetime.now(timezone.utc) - event_end).total_seconds()
+        return age <= self._afk_staleness_grace
 
     def _is_in_call(self) -> bool:
         """Whether a call/meeting is active, via the sync engine. Defensive:
@@ -164,11 +186,25 @@ class IdleManager:
             # the inline bucket-preference from #46 — same intent, centralized in
             # AWClient.get_latest_afk_event.)
             latest = self.aw.get_latest_afk_event()
-            if latest is not None:
+            if latest is not None and self._afk_event_is_current(latest):
                 is_afk = latest.status == "afk"
                 afk_duration = latest.duration
                 idle_start = latest.timestamp
             else:
+                # No AFK event, OR the tracker froze on a stale one (end well in
+                # the past while a live tracker would be heartbeating now). A
+                # stale 'afk' must never pause an active user — fall back to the
+                # OS idle clock, which reflects real keyboard/mouse activity
+                # independent of the (possibly dead) bf-idle-tracker. On Windows
+                # this is the ONLY safety net (no in-process input watcher).
+                if latest is not None:
+                    logger.debug(
+                        "AFK event is stale (ended %.0fs ago) — tracker likely "
+                        "frozen; using OS idle clock instead of its '%s' status",
+                        (datetime.now(timezone.utc)
+                         - (latest.timestamp + timedelta(seconds=latest.duration))).total_seconds(),
+                        latest.status,
+                    )
                 system_idle = self._get_system_idle_seconds()
                 if system_idle is not None:
                     is_afk = system_idle >= self._idle_pause_threshold
@@ -235,24 +271,52 @@ class IdleManager:
 
     @staticmethod
     def _get_system_idle_seconds() -> Optional[float]:
-        """Query macOS HIDIdleTime for system-level idle duration."""
-        if sys.platform != "darwin":
+        """OS-level idle duration (seconds since last keyboard/mouse input).
+
+        macOS: HIDIdleTime via ioreg. Windows: GetLastInputInfo via ctypes —
+        this is Windows' safety net against a frozen bf-idle-tracker (Windows
+        has no in-process input watcher), giving it the same real-activity
+        signal macOS gets. Returns None on Linux / on any error.
+        """
+        if sys.platform == "darwin":
+            try:
+                import subprocess as _sp
+                out = _sp.check_output(
+                    ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                    timeout=5,
+                    text=True,
+                )
+                for line in out.splitlines():
+                    if "HIDIdleTime" in line and "=" in line:
+                        val = line.split("=")[-1].strip()
+                        try:
+                            return int(val) / 1_000_000_000
+                        except ValueError:
+                            logger.debug(f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}")
+                            return None
+            except Exception as e:
+                logger.debug(f"_get_system_idle_seconds failed: {e}")
             return None
-        try:
-            import subprocess as _sp
-            out = _sp.check_output(
-                ["ioreg", "-c", "IOHIDSystem", "-d", "4"],
-                timeout=5,
-                text=True,
-            )
-            for line in out.splitlines():
-                if "HIDIdleTime" in line and "=" in line:
-                    val = line.split("=")[-1].strip()
-                    try:
-                        return int(val) / 1_000_000_000
-                    except ValueError:
-                        logger.debug(f"_get_system_idle_seconds: unexpected HIDIdleTime value {val!r}")
-                        return None
-        except Exception as e:
-            logger.debug(f"_get_system_idle_seconds failed: {e}")
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                class _LASTINPUTINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+                info = _LASTINPUTINFO()
+                info.cbSize = ctypes.sizeof(info)
+                if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                    return None
+                # Both GetTickCount and dwTime are 32-bit ms tick counts; mask
+                # the difference to 32 bits so it stays correct across the
+                # ~49.7-day GetTickCount wraparound.
+                tick = ctypes.windll.kernel32.GetTickCount()
+                elapsed_ms = (tick - info.dwTime) & 0xFFFFFFFF
+                return elapsed_ms / 1000.0
+            except Exception as e:
+                logger.debug(f"_get_system_idle_seconds (win) failed: {e}")
+            return None
+
         return None
