@@ -182,6 +182,12 @@ def _apply_local_artifact(
             on_progress(msg)
 
     app_path = _get_app_bundle_path()
+    # Instrumentation for the 2026-06-17 relaunch-failure investigation: the
+    # update reached "Installing/Restarting" but /Applications was never updated
+    # and the new process never started, and the cause isn't reproducible by
+    # inspection. Log exactly where we resolved the bundle so a canary shows
+    # whether app_path points at the real install or somewhere unexpected.
+    logger.info("self-update: sys.executable=%s resolved app_path=%s", sys.executable, app_path)
     if app_path is None:
         _status("Cannot determine app location - update aborted")
         return False
@@ -237,6 +243,7 @@ def _apply_local_artifact(
                 shutil.rmtree(backup_path)
 
             _status("Installing...")
+            logger.info("self-update: moving %s aside to %s", app_path, backup_path)
             app_path.rename(backup_path)
             try:
                 shutil.move(str(new_app), str(app_path))
@@ -245,21 +252,19 @@ def _apply_local_artifact(
                 if backup_path.exists() and not app_path.exists():
                     backup_path.rename(app_path)
                 raise
+            # Instrumentation: confirm the new bundle actually landed at app_path
+            # (the 06-17 failure left the old app in place with no error logged).
+            logger.info(
+                "self-update: moved new app to %s (exists=%s)",
+                app_path,
+                app_path.exists(),
+            )
             # Best-effort permission fix — app is already in place so
             # don't rollback on a perms error (would leave no app at all).
             try:
                 _fix_permissions(app_path)
             except Exception as e:
                 logger.warning("Permission fix failed, update may not launch: %s", e)
-
-            # CRITICAL: strip the com.apple.quarantine xattr the new bundle
-            # inherited from the downloaded DMG. Left on, Gatekeeper App-
-            # Translocation runs the app from an ephemeral read-only path (or
-            # blocks the headless `open` below entirely), so the post-update
-            # relaunch never starts and the whole fleet goes dark after an update
-            # (the 2026-06-17 1.5.49 outage). The notarization staple already
-            # makes the app trusted, so removing quarantine is safe.
-            _strip_quarantine(app_path)
 
             shutil.rmtree(backup_path, ignore_errors=True)
 
@@ -273,26 +278,38 @@ def _apply_local_artifact(
             _status("Restarting...")
             # `open` on a still-running app reactivates the current
             # (about-to-exit) instance instead of launching a new one — so the
-            # app would vanish and never reopen after a self-update. Same bug
-            # the permission-gate Restart path hit (fixed in main.py via
-            # 1cbca58); the self-update path had the same call shape and was
-            # never patched, so v1.5.30 users still saw the symptom. Wait for
-            # THIS process to die, then open a fresh instance. Detached via
+            # app would vanish and never reopen after a self-update. We wait for
+            # THIS process to die, then open a fresh instance, retrying a few
+            # times in case Gatekeeper is still settling. Detached via
             # start_new_session so the helper survives our os._exit below.
-            # Retry the open: the first launch right after install can still be
-            # raced by Gatekeeper finishing its checks. Quarantine is already
-            # stripped above, so a retry loop (bounded, breaks on success) is
-            # cheap insurance against the app failing to come back at all.
+            #
+            # CRITICAL instrumentation: the relaunch runs AFTER os._exit, so the
+            # main log can't capture whether `open` actually worked — which is
+            # exactly the unknown in the 06-17 outage (the new process never
+            # logged a line). The helper therefore writes its own outcome (each
+            # open attempt + exit code) to self-update-relaunch.log, which is the
+            # ground truth a canary needs.
             quoted_app = shlex.quote(str(app_path))
-            subprocess.Popen(
-                [
-                    "/bin/sh",
-                    "-c",
-                    f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
-                    f"for i in 1 2 3 4 5; do open {quoted_app} && exit 0; sleep 1; done",
-                ],
-                start_new_session=True,
+            try:
+                relaunch_log = str(Config.get_log_dir() / "self-update-relaunch.log")
+            except Exception:
+                relaunch_log = "/tmp/betterflow-self-update-relaunch.log"
+            quoted_log = shlex.quote(relaunch_log)
+            # Capture rc into a var IMMEDIATELY after open — a $(date) in the same
+            # echo would otherwise reset $? and we'd log rc=0 for every failure.
+            script = (
+                f'L={quoted_log}; A={quoted_app}; '
+                f'echo "$(date -u +%FT%TZ) waiting for pid {os.getpid()}" >> "$L"; '
+                f'while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; '
+                f'echo "$(date -u +%FT%TZ) pid gone; opening $A" >> "$L"; '
+                f'for i in 1 2 3 4 5; do '
+                f'open "$A" >> "$L" 2>&1; rc=$?; '
+                f'if [ "$rc" -eq 0 ]; then echo "$(date -u +%FT%TZ) open OK (try $i)" >> "$L"; exit 0; fi; '
+                f'echo "$(date -u +%FT%TZ) open FAILED rc=$rc (try $i)" >> "$L"; sleep 1; '
+                f'done; '
+                f'echo "$(date -u +%FT%TZ) RELAUNCH FAILED after 5 attempts" >> "$L"'
             )
+            subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
             # os._exit works from any thread, unlike sys.exit which only raises
             # SystemExit in the calling thread.
             os._exit(0)
@@ -457,36 +474,6 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         finally:
             # Remove the mount point directory itself
             shutil.rmtree(mount_point, ignore_errors=True)
-
-
-def _strip_quarantine(app_path: Path) -> None:
-    """Recursively remove com.apple.quarantine from a freshly-installed bundle.
-
-    Best-effort: a failure here means the post-update relaunch may not start
-    (the very bug this prevents), so log loudly, but never raise into the update
-    flow — aborting after the new app is already in place would be worse. The
-    `-r` recurses the bundle; `-s` ignores symlink targets; a missing attribute
-    is not an error for `xattr -d`.
-    """
-    if sys.platform != "darwin":
-        return
-    try:
-        result = subprocess.run(
-            ["xattr", "-dr", "com.apple.quarantine", str(app_path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "xattr quarantine strip returned %s: %s",
-                result.returncode,
-                result.stderr.strip(),
-            )
-        else:
-            logger.info("Stripped com.apple.quarantine from updated app")
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.warning("Could not strip quarantine (relaunch may fail): %s", e)
 
 
 def _fix_permissions(app_path: Path) -> None:
