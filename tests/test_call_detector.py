@@ -61,6 +61,12 @@ class TestPatternMatching:
         # "zoom" matches "Zoom" but not "ZoomText" (a screen magnifier).
         assert _match_native("ZoomText", "Zoom Meeting") is None
 
+    def test_webex_still_matches_compound_process_name(self):
+        # "webex" stays a SUBSTRING match (not word-boundary) so the compound
+        # Windows process "CiscoWebexStart" is still caught — the word-boundary
+        # tightening is scoped to teams/zoom only.
+        assert _match_native("CiscoWebexStart", "Meeting - Sprint Review") == "Webex"
+
     def test_slack_huddle(self):
         assert _match_native("Slack", "Huddle in #engineering") == "Slack"
 

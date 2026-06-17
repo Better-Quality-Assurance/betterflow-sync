@@ -62,17 +62,23 @@ _BROWSER_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
 _DEFAULT_GRACE_PERIOD = 30.0
 
 
+# Bare aliases short/common enough to bleed into an unrelated app name — matched
+# on a WORD BOUNDARY rather than as a substring: "teams" must not match
+# "teamspeak"/"teamviewer", "zoom" must not match "zoomtext". Every other alias
+# stays plain containment — notably "webex", which must still match the compound
+# Windows process name "CiscoWebexStart"; a \b boundary would break that.
+_WORD_BOUNDARY_ALIASES = frozenset({"teams", "zoom"})
+
+
 def _app_contains(app_lower: str, sub: str) -> bool:
     """Match an app-name alias against the (lowercased) app name.
 
-    Bare alphanumeric aliases ("teams", "zoom") match on a WORD BOUNDARY so a
-    short, common alias can't bleed into an unrelated app — "teams" matches the
-    "Teams" app but not "teamspeak"/"teamviewer", "zoom" matches "Zoom" but not
-    "zoomtext". Aliases carrying a separator ("zoom.us", "ms-teams",
-    "microsoft teams") use plain containment, where a \\b boundary would be
-    wrong (the punctuation already disambiguates).
+    Word-boundary for the ambiguous bare aliases in _WORD_BOUNDARY_ALIASES;
+    plain containment for everything else (separator aliases like "ms-teams"
+    where \\b is wrong, and distinctive substrings like "webex" that must still
+    match compound process names).
     """
-    if sub.isalnum():
+    if sub in _WORD_BOUNDARY_ALIASES:
         return re.search(rf"\b{re.escape(sub)}\b", app_lower) is not None
     return sub in app_lower
 

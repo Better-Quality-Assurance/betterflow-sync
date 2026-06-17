@@ -339,7 +339,7 @@ def _collect_uia_url_values(root, max_depth: int = _WIN_UIA_MAX_DEPTH, max_nodes
     docs: list = []
     # deque, not a list: this is a BFS, and list.pop(0) is O(n) per dequeue
     # (O(n^2) over the walk). deque.popleft() is O(1).
-    queue: deque = deque([(root, 0)])
+    queue: Deque[Tuple[object, int]] = deque([(root, 0)])
     seen = 0
     while queue and seen < max_nodes:
         node, depth = queue.popleft()

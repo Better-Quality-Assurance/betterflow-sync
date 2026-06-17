@@ -589,9 +589,9 @@ class SyncEngine:
             # daily total resets at midnight, so drop them before reloading.
             self._time_cache.clear()
         logger.info("Local day rolled over to %s — pruning counted-time cache", today)
-        self._load_counted_time_cache()
+        self._load_counted_time_cache(today)
 
-    def _load_counted_time_cache(self) -> None:
+    def _load_counted_time_cache(self, day: Optional[str] = None) -> None:
         """Repopulate ``_time_cache`` from persisted per-event counted-seconds
         for the current local day.
 
@@ -609,7 +609,7 @@ class SyncEngine:
         if not callable(getter):
             return
         try:
-            today = self._local_day_iso()
+            today = day or self._local_day_iso()
             persisted = getter(today)
             if not isinstance(persisted, dict):
                 return
