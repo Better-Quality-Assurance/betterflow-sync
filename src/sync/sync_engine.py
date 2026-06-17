@@ -1967,7 +1967,10 @@ class SyncEngine:
     @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
         """Return up to the last ``max_bytes`` of a log file (matching the
-        server's per-file tail cap), or None if it can't be read."""
+        server's per-file tail cap). Returns ``None`` if it can't be read
+        (OSError) and ``b""`` for an empty file — callers treat both as "no
+        content" (``if not tail``), so don't rely on None-vs-b"" to distinguish
+        unreadable from empty."""
         try:
             size = path.stat().st_size
             with open(path, "rb") as f:
