@@ -105,6 +105,17 @@ class IdleManager:
             return False
         return (datetime.now(timezone.utc) - last_input) <= timedelta(seconds=within_seconds)
 
+    def _afk_event_age_seconds(self, event) -> Optional[float]:
+        """Seconds since the AFK event ended (``timestamp + duration``), or None
+        if it can't be computed — a missing/None timestamp or duration (e.g. the
+        AW API returned ``{"duration": null}``) is treated as unusable so the
+        caller falls back to the OS idle clock rather than raising."""
+        try:
+            event_end = event.timestamp + timedelta(seconds=event.duration)
+            return (datetime.now(timezone.utc) - event_end).total_seconds()
+        except (TypeError, AttributeError):
+            return None
+
     def _afk_event_is_current(self, event) -> bool:
         """True if the AFK event still covers ~now.
 
@@ -113,12 +124,11 @@ class IdleManager:
         tracker stops emitting, leaving an old event as "latest" — typically an
         'afk' whose end is well in the past. Trusting that stale 'afk' is what
         marks an active user Idle indefinitely (no fresh not-afk event ever
-        lands to clear it). Returns False for such stale events so the caller
-        falls back to the OS idle clock instead.
+        lands to clear it). Returns False for such stale (or malformed) events so
+        the caller falls back to the OS idle clock instead.
         """
-        event_end = event.timestamp + timedelta(seconds=event.duration)
-        age = (datetime.now(timezone.utc) - event_end).total_seconds()
-        return age <= self._afk_staleness_grace
+        age = self._afk_event_age_seconds(event)
+        return age is not None and age <= self._afk_staleness_grace
 
     def _is_in_call(self) -> bool:
         """Whether a call/meeting is active, via the sync engine. Defensive:
@@ -198,12 +208,12 @@ class IdleManager:
                 # independent of the (possibly dead) bf-idle-tracker. On Windows
                 # this is the ONLY safety net (no in-process input watcher).
                 if latest is not None:
+                    age = self._afk_event_age_seconds(latest)
                     logger.debug(
-                        "AFK event is stale (ended %.0fs ago) — tracker likely "
-                        "frozen; using OS idle clock instead of its '%s' status",
-                        (datetime.now(timezone.utc)
-                         - (latest.timestamp + timedelta(seconds=latest.duration))).total_seconds(),
-                        latest.status,
+                        "AFK event not current (age=%s) — tracker likely frozen; "
+                        "using OS idle clock instead of its '%s' status",
+                        f"{age:.0f}s" if age is not None else "unknown",
+                        getattr(latest, "status", "?"),
                     )
                 system_idle = self._get_system_idle_seconds()
                 if system_idle is not None:
@@ -311,7 +321,10 @@ class IdleManager:
                     return None
                 # Both GetTickCount and dwTime are 32-bit ms tick counts; mask
                 # the difference to 32 bits so it stays correct across the
-                # ~49.7-day GetTickCount wraparound.
+                # ~49.7-day GetTickCount wraparound. Pin restype to unsigned so
+                # the value is explicit (the mask makes the result correct
+                # either way, but this avoids a signed-vs-unsigned footgun).
+                ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint32
                 tick = ctypes.windll.kernel32.GetTickCount()
                 elapsed_ms = (tick - info.dwTime) & 0xFFFFFFFF
                 return elapsed_ms / 1000.0
