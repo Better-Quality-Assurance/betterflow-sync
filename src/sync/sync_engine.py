@@ -454,8 +454,64 @@ class SyncEngine:
             self._backlog_reconciled = True
 
         # Fetch input events for activity analysis before processing window events.
-        # The lookback must cover both the engagement window and the full AFK
-        # grace period so we can cap counted time at last_input + afk_timeout.
+        self._prepare_input_analysis(input_buckets)
+
+        # Sync window buckets with gap-filling
+        all_events, call_events, pending_checkpoints = self._sync_window_buckets(
+            window_buckets, stats
+        )
+
+        # Clear window-specific AFK context before processing non-window buckets
+        # to prevent AFK events from one window bucket leaking into unrelated buckets.
+        self._current_afk_events = []
+
+        # Sync non-window buckets normally
+        for bucket in web_buckets + afk_buckets + input_buckets:
+            try:
+                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
+                all_events.extend(events)
+                if checkpoint:
+                    pending_checkpoints.append(checkpoint)
+                stats.buckets_synced += 1
+            except AWClientError as e:
+                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+
+        # Flush any ongoing call at sync boundary
+        if self._call_detector:
+            remaining = self._call_detector.flush()
+            if remaining:
+                call_events.append(self._make_call_bf_event(remaining))
+        if call_events:
+            stats.calls_detected += len(call_events)
+            all_events.extend(call_events)
+
+        # Send events, then advance checkpoints per-bucket.
+        self._send_and_advance_checkpoints(all_events, pending_checkpoints, stats)
+
+        # Process offline queue if we're online
+        if self.bf.is_reachable() and not self.queue.is_empty():
+            self._process_queue(stats)
+
+        # Check heartbeat counter — actual HTTP call is deferred to
+        # after sync() returns so _sync_lock is not held during the
+        # blocking network request.
+        with self._state_lock:
+            self._heartbeat_count += 1
+            should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
+            if should_heartbeat:
+                self._heartbeat_count = 0
+        stats._should_heartbeat = should_heartbeat
+
+        return stats
+
+    def _prepare_input_analysis(self, input_buckets: list) -> None:
+        """Fetch recent input events, feed the activity analyzer, and record
+        whether input data exists + the latest real-input timestamp. Extracted
+        from sync() verbatim — behaviour unchanged.
+
+        The lookback must cover both the engagement window and the full AFK
+        grace period so we can cap counted time at last_input + afk_timeout.
+        """
         input_lookback_minutes = max(
             self.config.engagement.window_minutes * 2,
             self.config.aw.afk_timeout_minutes + 2,
@@ -482,8 +538,14 @@ class SyncEngine:
             if self._latest_input_at is None or event_end > self._latest_input_at:
                 self._latest_input_at = event_end
 
-        # Sync window buckets with gap-filling
-        all_events = []
+    def _sync_window_buckets(
+        self, window_buckets: list, stats: "SyncStats"
+    ) -> tuple[list, list, list]:
+        """Sync window buckets with gap-filling, call detection, and per-event
+        transform. Returns (transformed_events, call_events, pending_checkpoints).
+        Extracted from sync() verbatim — behaviour unchanged.
+        """
+        all_events: list = []
         call_events: list[dict] = []
         pending_checkpoints: list[tuple[str, datetime, Optional[int]]] = []
         for bucket in window_buckets:
@@ -524,36 +586,18 @@ class SyncEngine:
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+        return all_events, call_events, pending_checkpoints
 
-        # Clear window-specific AFK context before processing non-window buckets
-        # to prevent AFK events from one window bucket leaking into unrelated buckets.
-        self._current_afk_events = []
-
-        # Sync non-window buckets normally
-        for bucket in web_buckets + afk_buckets + input_buckets:
-            try:
-                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
-                all_events.extend(events)
-                if checkpoint:
-                    pending_checkpoints.append(checkpoint)
-                stats.buckets_synced += 1
-            except AWClientError as e:
-                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
-
-        # Flush any ongoing call at sync boundary
-        if self._call_detector:
-            remaining = self._call_detector.flush()
-            if remaining:
-                call_events.append(self._make_call_bf_event(remaining))
-        if call_events:
-            stats.calls_detected += len(call_events)
-            all_events.extend(call_events)
-
-        # Send events, then advance checkpoints per-bucket. Only hold back
-        # checkpoints for buckets that had events queued (partial failure).
-        # Previously this was all-or-nothing: if ANY event was queued, NO
-        # checkpoint advanced, causing indefinite re-fetch of already-sent
-        # events that slowly filled the dedup LRU cache.
+    def _send_and_advance_checkpoints(
+        self, all_events: list, pending_checkpoints: list, stats: "SyncStats"
+    ) -> None:
+        """Send the cycle's events, then advance checkpoints per-bucket. Only
+        hold back checkpoints for buckets that had events queued (partial
+        failure). Previously this was all-or-nothing: if ANY event was queued,
+        NO checkpoint advanced, causing indefinite re-fetch of already-sent
+        events that slowly filled the dedup LRU cache. Extracted from sync()
+        verbatim — behaviour unchanged.
+        """
         if all_events:
             pre_queued = stats.events_queued
             self._send_events(all_events, stats)
@@ -571,22 +615,6 @@ class SyncEngine:
             # All events were dedup-filtered (already sent); safe to advance.
             for bucket_id, ts, event_id in pending_checkpoints:
                 self.queue.set_checkpoint(bucket_id, ts, event_id)
-
-        # Process offline queue if we're online
-        if self.bf.is_reachable() and not self.queue.is_empty():
-            self._process_queue(stats)
-
-        # Check heartbeat counter — actual HTTP call is deferred to
-        # after sync() returns so _sync_lock is not held during the
-        # blocking network request.
-        with self._state_lock:
-            self._heartbeat_count += 1
-            should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
-            if should_heartbeat:
-                self._heartbeat_count = 0
-        stats._should_heartbeat = should_heartbeat
-
-        return stats
 
     @staticmethod
     def _local_day_iso() -> str:
