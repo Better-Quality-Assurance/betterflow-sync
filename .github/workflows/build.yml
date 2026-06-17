@@ -26,7 +26,7 @@ jobs:
             package_type: dmg
           - os: windows-latest
             target_arch: ''
-            artifact_name: BetterFlow.exe
+            artifact_name: BetterFlow
             asset_name: BetterFlow-Windows
             package_type: zip
           - os: ubuntu-latest
@@ -173,9 +173,12 @@ jobs:
 
       - name: Create Windows ZIP
         if: matrix.os == 'windows-latest'
+        # One-dir build: zip the *contents* of dist\BetterFlow (BetterFlow.exe +
+        # _internal\...) at the archive root so the self-updater's
+        # `xcopy extract_dir\* app_path\` drops them straight into the install dir.
         run: |
-          cd dist
-          Compress-Archive -Path "BetterFlow.exe" -DestinationPath "${{ matrix.asset_name }}.zip"
+          cd dist/BetterFlow
+          Compress-Archive -Path "*" -DestinationPath "../${{ matrix.asset_name }}.zip"
 
       # Build a real installer so the app registers in Windows "Installed apps"
       # (with an uninstaller) and gets a Start Menu shortcut — a zipped bare exe

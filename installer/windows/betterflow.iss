@@ -1,7 +1,7 @@
 ; Inno Setup script for BetterFlow Sync (Windows).
 ;
 ; Produces a per-user installer (no admin/UAC) that:
-;   - installs the PyInstaller one-file BetterFlow.exe to %LOCALAPPDATA%\Programs\BetterFlow,
+;   - installs the PyInstaller one-dir BetterFlow build to %LOCALAPPDATA%\Programs\BetterFlow,
 ;   - registers an entry in "Installed apps" with a working uninstaller
 ;     (the missing-from-Installed-apps fix — a bare zipped .exe never does this),
 ;   - creates a Start Menu shortcut (and an optional desktop shortcut),
@@ -51,7 +51,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; One-dir build: ship the whole dist\BetterFlow folder (exe + _internal\...).
+Source: "dist\BetterFlow\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

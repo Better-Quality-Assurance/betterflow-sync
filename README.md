@@ -32,7 +32,7 @@ BetterFlow reads activity data from your local [ActivityWatch](https://activityw
 
 Download the latest release for your platform:
 - **macOS**: `BetterFlow.dmg`
-- **Windows**: `BetterFlow.exe`
+- **Windows**: `BetterFlow-Windows-Setup.exe` (installer) or `BetterFlow-Windows.zip`
 
 ### From Source
 
@@ -177,7 +177,7 @@ python scripts\generate_icons.py
 pyinstaller build.spec --clean
 ```
 
-Creates: `dist\BetterFlow.exe`
+Creates: `dist\BetterFlow\` (one-dir bundle; run `BetterFlow.exe` inside it)
 
 **Option 3: Create installer**
 

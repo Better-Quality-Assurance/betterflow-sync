@@ -220,28 +220,43 @@ if is_mac:
     )
 
 elif is_windows:
+    # One-dir build (matches macOS/Linux). A one-file exe unpacks the whole app
+    # into %TEMP%\_MEIxxxxx on every launch and must delete it on exit; when any
+    # handle into that dir is still open at shutdown the windowed bootloader
+    # pops a blocking "Failed to remove temporary directory" dialog (reported
+    # on Windows 2026-06-17). One-dir runs in place and never creates _MEItemp,
+    # so that failure mode is structurally impossible. It also starts faster and
+    # avoids the per-launch unpack that AV heuristics dislike. The Inno Setup
+    # installer ships the folder; the self-updater already replaces a directory.
     exe = EXE(
         pyz,
         a.scripts,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
-        [],
+        exclude_binaries=True,
         name="BetterFlow",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
         # UPX OFF on Windows: UPX-packed binaries are the #1 antivirus heuristic
         # trigger (Avast/Defender flag them on sight). An unsigned + UPX-packed
-        # one-file exe was getting quarantined ("Suspicious file detected",
-        # Claudia 2026-06-16). Dropping UPX trades a slightly larger exe for far
-        # fewer false positives. The durable fix is Authenticode code-signing.
+        # exe was getting quarantined ("Suspicious file detected", Claudia
+        # 2026-06-16). Dropping UPX trades a slightly larger exe for far fewer
+        # false positives. The durable fix is Authenticode code-signing.
         upx=False,
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=TARGET_ARCH,
         icon=str(resources_dir / "icon.ico") if (resources_dir / "icon.ico").exists() else None,
+    )
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="BetterFlow",
     )
 
 elif is_linux:

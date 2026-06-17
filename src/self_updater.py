@@ -64,9 +64,14 @@ def _get_app_bundle_path() -> Optional[Path]:
         return None
 
     elif sys.platform == "win32":
-        # PyInstaller: dist/BetterFlow/BetterFlow.exe - the folder is the app
+        # PyInstaller one-dir: <install>\BetterFlow\BetterFlow.exe — the folder
+        # holding the exe IS the app. exe.parent is correct regardless of the
+        # PyInstaller layout (one-dir puts binaries under _internal\, so
+        # sys._MEIPASS points there, not at the install root). For the now-retired
+        # one-file build sys._MEIPASS was the %TEMP%\_MEI dir, which made the old
+        # _MEIPASS.parent resolution silently target %TEMP% instead of the app.
         if getattr(sys, "frozen", False):
-            return Path(sys._MEIPASS).parent if hasattr(sys, "_MEIPASS") else exe.parent
+            return exe.parent
         return None
 
     elif sys.platform.startswith("linux"):
