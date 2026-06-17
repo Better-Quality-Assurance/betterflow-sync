@@ -102,14 +102,11 @@ class IdleManager:
             afk_duration = 0.0
             idle_start: Optional[datetime] = None
 
-            afk_buckets = self.aw.get_afk_buckets()
-            if afk_buckets:
-                events = self.aw.get_events(afk_buckets[0].id, limit=1)
-                if events:
-                    latest = events[0]
-                    is_afk = latest.status == "afk"
-                    afk_duration = latest.duration
-                    idle_start = latest.timestamp
+            latest = self.aw.get_latest_afk_event()
+            if latest is not None:
+                is_afk = latest.status == "afk"
+                afk_duration = latest.duration
+                idle_start = latest.timestamp
             else:
                 system_idle = self._get_system_idle_seconds()
                 if system_idle is not None:

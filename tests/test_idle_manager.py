@@ -57,6 +57,7 @@ def _make(idle_in_call: bool):
     aw = Mock()
     aw.get_afk_buckets.return_value = [types.SimpleNamespace(id="afk-bucket")]
     aw.get_events.return_value = [afk_event]
+    aw.get_latest_afk_event.return_value = afk_event
 
     sync_engine = Mock()
     sync_engine.is_paused = False
@@ -130,3 +131,33 @@ def test_resumes_when_a_call_starts_during_an_existing_idle_pause():
     from src.ui.tray import TrayState
 
     tray.set_state.assert_called_once_with(TrayState.SYNCING)
+
+
+def test_stale_afk_bucket_does_not_pause_when_latest_betterflow_bucket_is_active():
+    """The live idle check must not pick a stale vanilla AFK bucket first."""
+    config = Config()
+    active_event = types.SimpleNamespace(
+        status="not-afk",
+        duration=60.0,
+        timestamp=datetime.now(timezone.utc) - timedelta(seconds=60),
+    )
+    aw = Mock()
+    aw.get_latest_afk_event.return_value = active_event
+
+    sync_engine = Mock()
+    sync_engine.is_paused = False
+    sync_engine.is_private = False
+    sync_engine.is_in_call.return_value = False
+
+    tray = Mock()
+    idle_mgr = IdleManager(sync_engine, tray, aw, config)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=Mock(),
+        trigger_sync=Mock(),
+    )
+
+    assert idle_mgr.idle_paused is False
+    tray.set_state.assert_not_called()

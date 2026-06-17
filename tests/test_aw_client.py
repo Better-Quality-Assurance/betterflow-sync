@@ -189,6 +189,50 @@ class TestAWClient:
         assert len(window_buckets) == 1
         assert window_buckets[0].type == "aw-watcher-window"
 
+    @responses.activate
+    def test_get_latest_afk_event_prefers_betterflow_bucket(self):
+        """A stale vanilla AFK bucket must not drive live idle state."""
+        responses.add(
+            responses.GET,
+            "http://localhost:5600/api/0/buckets/",
+            json={
+                "aw-watcher-afk_stale-host": {
+                    "name": "aw-watcher-afk",
+                    "type": "aw-watcher-afk",
+                    "client": "aw-watcher-afk",
+                    "hostname": "host",
+                    "created": "2026-01-01T00:00:00Z",
+                },
+                "aw-watcher-afk_bf-idle-tracker_host": {
+                    "name": "bf-idle-tracker",
+                    "type": "afkstatus",
+                    "client": "bf-idle-tracker",
+                    "hostname": "host",
+                    "created": "2026-01-01T00:00:00Z",
+                },
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            "http://localhost:5600/api/0/buckets/aw-watcher-afk_bf-idle-tracker_host/events",
+            json=[
+                {
+                    "id": 2,
+                    "timestamp": "2026-06-17T09:59:00Z",
+                    "duration": 5,
+                    "data": {"status": "not-afk"},
+                },
+            ],
+            status=200,
+        )
+
+        client = AWClient()
+        event = client.get_latest_afk_event()
+
+        assert event is not None
+        assert event.status == "not-afk"
+
     def test_context_manager(self):
         """Test using client as context manager."""
         with AWClient() as client:

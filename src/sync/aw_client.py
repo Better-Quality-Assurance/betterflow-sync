@@ -295,6 +295,48 @@ class AWClient:
         buckets = self.get_buckets()
         return [b for b in buckets.values() if b.type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)]
 
+    def get_latest_afk_event(self) -> Optional[AWEvent]:
+        """Return the latest AFK event from the active BetterFlow bucket.
+
+        Old installs can have both BetterFlow's ``bf-idle-tracker`` bucket and
+        stale vanilla ActivityWatch AFK buckets. A stale bucket frozen on
+        ``afk`` must never win the live idle decision while the BetterFlow
+        bucket is reporting ``not-afk``. Prefer BetterFlow-owned buckets; if
+        they have no readable events, fall back to the newest event from any
+        AFK bucket.
+        """
+        buckets = self.get_afk_buckets()
+        if not buckets:
+            return None
+
+        preferred = [
+            bucket
+            for bucket in buckets
+            if "bf-idle-tracker" in bucket.id
+            or "bf-idle-tracker" in bucket.name
+            or "bf-idle-tracker" in bucket.client
+        ]
+
+        latest = self._latest_event_from_buckets(preferred)
+        if latest is not None:
+            return latest
+        return self._latest_event_from_buckets(buckets)
+
+    def _latest_event_from_buckets(self, buckets: list[AWBucket]) -> Optional[AWEvent]:
+        latest: Optional[AWEvent] = None
+        for bucket in buckets:
+            try:
+                events = self.get_events(bucket.id, limit=1)
+            except AWClientError as e:
+                logger.debug("AFK bucket %s latest-event fetch failed: %s", bucket.id, e)
+                continue
+            if not events:
+                continue
+            event = events[0]
+            if latest is None or event.timestamp > latest.timestamp:
+                latest = event
+        return latest
+
     def get_web_buckets(self) -> list[AWBucket]:
         """Get all web watcher buckets."""
         buckets = self.get_buckets()
