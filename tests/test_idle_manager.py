@@ -98,6 +98,95 @@ def test_pauses_idle_when_not_in_a_call():
     reschedule.assert_called_once_with(idle_mgr._IDLE_SYNC_INTERVAL)
 
 
+def _fake_input_watcher(last_input_secs_ago):
+    """An input watcher whose last observed input was N seconds ago (or None)."""
+    w = Mock()
+    if last_input_secs_ago is None:
+        w.get_last_input_at.return_value = None
+    else:
+        w.get_last_input_at.return_value = (
+            datetime.now(timezone.utc) - timedelta(seconds=last_input_secs_ago)
+        )
+    return w
+
+
+def test_blind_afk_tracker_does_not_pause_while_input_is_live():
+    """Phantom-idle regression: AFK bucket says 'afk' (blind/stuck tracker) but
+    the in-process input watcher saw a keystroke 5s ago. The user is typing —
+    must NOT pause as idle even though the AFK event is well over threshold."""
+    idle_mgr, reschedule, trigger_sync, tray = _make(idle_in_call=False)
+    idle_mgr.input_watcher = _fake_input_watcher(last_input_secs_ago=5)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is False, "live input must override a blind AFK bucket"
+    reschedule.assert_not_called()
+    tray.set_state.assert_not_called()
+    # Short-circuited before even reading the AFK bucket.
+    idle_mgr.aw.get_events.assert_not_called()
+
+
+def test_recent_input_clears_an_existing_phantom_idle_pause():
+    """If we somehow already entered idle and then the input watcher sees real
+    input within the threshold, resume immediately (don't wait for the
+    blind-tracker restart to flip the AFK bucket)."""
+    idle_mgr, reschedule, trigger_sync, tray = _make(idle_in_call=False)
+    idle_mgr.input_watcher = _fake_input_watcher(last_input_secs_ago=2)
+    idle_start = datetime.now(timezone.utc) - timedelta(minutes=30)
+    idle_mgr._idle_paused = True
+    idle_mgr._idle_start = idle_start
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is False, "recent input must clear the idle pause"
+    reschedule.assert_called_once_with(idle_mgr.config.sync.interval_seconds)
+    trigger_sync.assert_called_once_with("idle_resume_sync")
+
+
+def test_genuine_idle_still_pauses_when_input_is_old():
+    """Control: no recent input (last keystroke older than the threshold) — the
+    override must NOT fire, so a real idle stretch still pauses as before."""
+    idle_mgr, reschedule, trigger_sync, tray = _make(idle_in_call=False)
+    # idle_pause_minutes defaults to 20 (1200s); last input 2h ago is well past it.
+    idle_mgr.input_watcher = _fake_input_watcher(last_input_secs_ago=2 * 3600)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True, "old input must not suppress genuine idle"
+    reschedule.assert_called_once_with(idle_mgr._IDLE_SYNC_INTERVAL)
+
+
+def test_no_input_watcher_falls_back_to_afk_path():
+    """Windows/Linux have no in-process watcher (input_watcher is None) — the
+    override is a no-op and idle detection works exactly as before."""
+    idle_mgr, reschedule, trigger_sync, tray = _make(idle_in_call=False)
+    assert idle_mgr.input_watcher is None  # default
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True, "no watcher -> unchanged AFK-based idle"
+
+
 def test_resumes_when_a_call_starts_during_an_existing_idle_pause():
     """A call that begins AFTER the idle pause must resume tracking.
 
