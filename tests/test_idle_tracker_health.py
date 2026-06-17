@@ -46,6 +46,7 @@ def _make_coordinator(
     if latest_afk_event is None and not extra_buckets:
         aw.get_afk_buckets.return_value = []
         aw.get_events.return_value = []
+        aw.get_latest_afk_event.return_value = None
     else:
         primary_bucket = _make_bucket("aw-watcher-afk_bf-idle-tracker_test")
         all_buckets = [primary_bucket]
@@ -56,6 +57,18 @@ def _make_coordinator(
             per_bucket_events[extra_bucket.id] = [extra_event] if extra_event else []
         aw.get_afk_buckets.return_value = all_buckets
         aw.get_events.side_effect = lambda bucket_id, **kwargs: per_bucket_events.get(bucket_id, [])
+
+        bf_buckets = [b for b in all_buckets if "bf-idle-tracker" in b.id]
+        candidate_buckets = bf_buckets or all_buckets
+        latest = None
+        for bucket in candidate_buckets:
+            events = per_bucket_events.get(bucket.id, [])
+            if not events:
+                continue
+            event = events[0]
+            if latest is None or event.timestamp > latest.timestamp:
+                latest = event
+        aw.get_latest_afk_event.return_value = latest
 
     coord = SyncCoordinator(
         config=MagicMock(),

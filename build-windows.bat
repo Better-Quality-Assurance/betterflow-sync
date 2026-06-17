@@ -41,13 +41,13 @@ REM Build with PyInstaller
 echo Building executable...
 pyinstaller build.spec --clean
 
-REM Check result
-if exist "dist\BetterFlow.exe" (
+REM Check result (one-dir build: exe lives inside dist\BetterFlow\)
+if exist "dist\BetterFlow\BetterFlow.exe" (
     echo.
     echo === BUILD SUCCESSFUL ===
-    echo Executable created: dist\BetterFlow.exe
+    echo App folder created: dist\BetterFlow\
     echo.
-    echo To run: dist\BetterFlow.exe
+    echo To run: dist\BetterFlow\BetterFlow.exe
 ) else (
     echo.
     echo === BUILD FAILED ===

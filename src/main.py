@@ -575,39 +575,15 @@ class SyncCoordinator:
 
         # Query the AFK bucket for the latest event. Best-effort; AW being
         # transiently unreachable is a different failure mode handled
-        # elsewhere.
+        # elsewhere. AWClient prefers the BetterFlow-owned idle bucket over
+        # stale vanilla ActivityWatch buckets.
         try:
-            buckets = self.aw.get_afk_buckets()
+            latest = self.aw.get_latest_afk_event()
         except Exception as e:
             logger.debug("idle_tracker_health: AW unreachable, skipping: %s", e)
             return
-        if not buckets:
-            return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
-
-        # A user who migrated from vanilla ActivityWatch can have BOTH a
-        # `bf-idle-tracker` bucket and a stale `aw-watcher-afk` bucket. The
-        # stale one's last event is frozen at "afk" forever, so picking the
-        # wrong one fires a false-positive notification every time the user
-        # types. Prefer the bf-idle-tracker bucket; fall back to picking the
-        # one with the most recent event if neither name matches.
-        bf_buckets = [b for b in buckets if "bf-idle-tracker" in b.id]
-        candidate_buckets = bf_buckets or buckets
-
-        latest = None
-        for bucket in candidate_buckets:
-            try:
-                events = self.aw.get_events(bucket.id, limit=1)
-            except Exception as e:
-                logger.debug("idle_tracker_health: AFK fetch failed for %s: %s", bucket.id, e)
-                continue
-            if not events:
-                continue
-            event = events[0]
-            if latest is None or event.timestamp > latest.timestamp:
-                latest = event
-
         if latest is None:
-            return  # No AFK events anywhere — tracker hasn't reported yet.
+            return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
 
         status = (latest.data or {}).get("status")
         if status != "afk":
@@ -1376,11 +1352,47 @@ class BetterFlowApp:
         )
         self._startup_thread.start()
 
+        # Windows 11: lift our tray icon out of the overflow flyout onto the
+        # taskbar, with no user action. Best-effort; no-op off Windows, in dev,
+        # and on Windows 10. Runs async because Explorer only creates our
+        # NotifyIconSettings entry once the icon has been shown, which races
+        # startup — the worker retries until the entry appears.
+        self._promote_windows_tray_async()
+
         logger.info("BetterFlow tray starting")
         try:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _promote_windows_tray_async(self) -> None:
+        """Best-effort: promote our Windows 11 tray icon onto the taskbar.
+
+        Spawns a short-lived daemon that retries until Explorer has registered
+        our NotifyIconSettings entry, then stops. No-op off Windows / in dev."""
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            return
+        try:
+            try:
+                from .windows_tray import promote_tray_icon
+            except ImportError:
+                from windows_tray import promote_tray_icon
+        except ImportError as e:
+            logger.debug("windows_tray unavailable, skipping promotion: %s", e)
+            return
+
+        def _worker() -> None:
+            # Bounded retry: the entry appears only after the icon is shown.
+            for _ in range(10):
+                try:
+                    if promote_tray_icon():
+                        return
+                except Exception as e:
+                    logger.debug("Tray promotion attempt failed (non-fatal): %s", e)
+                    return
+                time.sleep(1.0)
+
+        threading.Thread(target=_worker, daemon=True, name="win-tray-promote").start()
 
     def _ensure_macos_permissions(self) -> bool:
         """Block on the permission gate until Input Monitoring is granted.

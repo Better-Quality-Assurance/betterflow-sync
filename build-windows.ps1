@@ -42,22 +42,22 @@ python scripts\download_aw.py
 Write-Host "Building executable..." -ForegroundColor Yellow
 pyinstaller build.spec --clean
 
-# Check result
-if (Test-Path "dist\BetterFlow.exe") {
+# Check result (one-dir build: exe lives inside dist\BetterFlow\)
+if (Test-Path "dist\BetterFlow\BetterFlow.exe") {
     Write-Host ""
     Write-Host "=== BUILD SUCCESSFUL ===" -ForegroundColor Green
-    Write-Host "Executable created: dist\BetterFlow.exe"
+    Write-Host "App folder created: dist\BetterFlow\ (run BetterFlow.exe inside it)"
     Write-Host ""
 
     # Get file info
-    $exe = Get-Item "dist\BetterFlow.exe"
-    Write-Host "Size: $([math]::Round($exe.Length / 1MB, 2)) MB"
+    $exe = Get-Item "dist\BetterFlow\BetterFlow.exe"
+    Write-Host "Launcher size: $([math]::Round($exe.Length / 1MB, 2)) MB"
     Write-Host ""
 
     # Offer to run
     $run = Read-Host "Run the app now? (y/n)"
     if ($run -eq "y") {
-        Start-Process "dist\BetterFlow.exe"
+        Start-Process "dist\BetterFlow\BetterFlow.exe"
     }
 } else {
     Write-Host ""

@@ -96,7 +96,7 @@ staple-mac:
 # Build for Windows (run on Windows)
 build-windows: download-aw
 	pyinstaller build.spec --clean
-	@echo "Built: dist/BetterFlow.exe"
+	@echo "Built: dist/BetterFlow/ (one-dir bundle; run BetterFlow.exe inside it)"
 
 # Build for Linux (run on Linux) — produces dist/BetterFlow/ one-dir bundle
 build-linux: download-aw

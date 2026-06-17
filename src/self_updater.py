@@ -64,9 +64,14 @@ def _get_app_bundle_path() -> Optional[Path]:
         return None
 
     elif sys.platform == "win32":
-        # PyInstaller: dist/BetterFlow/BetterFlow.exe - the folder is the app
+        # PyInstaller one-dir: <install>\BetterFlow\BetterFlow.exe — the folder
+        # holding the exe IS the app. exe.parent is correct regardless of the
+        # PyInstaller layout (one-dir puts binaries under _internal\, so
+        # sys._MEIPASS points there, not at the install root). For the now-retired
+        # one-file build sys._MEIPASS was the %TEMP%\_MEI dir, which made the old
+        # _MEIPASS.parent resolution silently target %TEMP% instead of the app.
         if getattr(sys, "frozen", False):
-            return Path(sys._MEIPASS).parent if hasattr(sys, "_MEIPASS") else exe.parent
+            return exe.parent
         return None
 
     elif sys.platform.startswith("linux"):
@@ -129,11 +134,17 @@ def apply_update(
         if on_progress:
             on_progress(msg)
 
-    # Reject non-HTTPS download URLs to prevent MITM attacks
-    parsed_url = urlparse(download_url)
-    if parsed_url.scheme != "https":
+    # Reject download URLs that aren't HTTPS from a known GitHub host (MITM /
+    # spoofed-asset defense). The asset URL comes from the GitHub releases API,
+    # so a tampered response can't redirect the download off-GitHub.
+    try:
+        from .url_safety import is_safe_fetch_url
+    except ImportError:
+        from url_safety import is_safe_fetch_url
+    if not is_safe_fetch_url(download_url):
+        parsed_url = urlparse(download_url)
         safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        _status(f"Refusing non-HTTPS download URL: {safe_url}")
+        _status(f"Refusing unsafe download URL (must be HTTPS from GitHub): {safe_url}")
         return False
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-update-"))

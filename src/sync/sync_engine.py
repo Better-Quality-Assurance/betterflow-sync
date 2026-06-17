@@ -454,8 +454,64 @@ class SyncEngine:
             self._backlog_reconciled = True
 
         # Fetch input events for activity analysis before processing window events.
-        # The lookback must cover both the engagement window and the full AFK
-        # grace period so we can cap counted time at last_input + afk_timeout.
+        self._prepare_input_analysis(input_buckets)
+
+        # Sync window buckets with gap-filling
+        all_events, call_events, pending_checkpoints = self._sync_window_buckets(
+            window_buckets, stats
+        )
+
+        # Clear window-specific AFK context before processing non-window buckets
+        # to prevent AFK events from one window bucket leaking into unrelated buckets.
+        self._current_afk_events = []
+
+        # Sync non-window buckets normally
+        for bucket in web_buckets + afk_buckets + input_buckets:
+            try:
+                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
+                all_events.extend(events)
+                if checkpoint:
+                    pending_checkpoints.append(checkpoint)
+                stats.buckets_synced += 1
+            except AWClientError as e:
+                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+
+        # Flush any ongoing call at sync boundary
+        if self._call_detector:
+            remaining = self._call_detector.flush()
+            if remaining:
+                call_events.append(self._make_call_bf_event(remaining))
+        if call_events:
+            stats.calls_detected += len(call_events)
+            all_events.extend(call_events)
+
+        # Send events, then advance checkpoints per-bucket.
+        self._send_and_advance_checkpoints(all_events, pending_checkpoints, stats)
+
+        # Process offline queue if we're online
+        if self.bf.is_reachable() and not self.queue.is_empty():
+            self._process_queue(stats)
+
+        # Check heartbeat counter — actual HTTP call is deferred to
+        # after sync() returns so _sync_lock is not held during the
+        # blocking network request.
+        with self._state_lock:
+            self._heartbeat_count += 1
+            should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
+            if should_heartbeat:
+                self._heartbeat_count = 0
+        stats._should_heartbeat = should_heartbeat
+
+        return stats
+
+    def _prepare_input_analysis(self, input_buckets: list) -> None:
+        """Fetch recent input events, feed the activity analyzer, and record
+        whether input data exists + the latest real-input timestamp. Extracted
+        from sync() verbatim — behaviour unchanged.
+
+        The lookback must cover both the engagement window and the full AFK
+        grace period so we can cap counted time at last_input + afk_timeout.
+        """
         input_lookback_minutes = max(
             self.config.engagement.window_minutes * 2,
             self.config.aw.afk_timeout_minutes + 2,
@@ -482,8 +538,14 @@ class SyncEngine:
             if self._latest_input_at is None or event_end > self._latest_input_at:
                 self._latest_input_at = event_end
 
-        # Sync window buckets with gap-filling
-        all_events = []
+    def _sync_window_buckets(
+        self, window_buckets: list, stats: "SyncStats"
+    ) -> tuple[list, list, list]:
+        """Sync window buckets with gap-filling, call detection, and per-event
+        transform. Returns (transformed_events, call_events, pending_checkpoints).
+        Extracted from sync() verbatim — behaviour unchanged.
+        """
+        all_events: list = []
         call_events: list[dict] = []
         pending_checkpoints: list[tuple[str, datetime, Optional[int]]] = []
         for bucket in window_buckets:
@@ -524,36 +586,18 @@ class SyncEngine:
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+        return all_events, call_events, pending_checkpoints
 
-        # Clear window-specific AFK context before processing non-window buckets
-        # to prevent AFK events from one window bucket leaking into unrelated buckets.
-        self._current_afk_events = []
-
-        # Sync non-window buckets normally
-        for bucket in web_buckets + afk_buckets + input_buckets:
-            try:
-                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
-                all_events.extend(events)
-                if checkpoint:
-                    pending_checkpoints.append(checkpoint)
-                stats.buckets_synced += 1
-            except AWClientError as e:
-                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
-
-        # Flush any ongoing call at sync boundary
-        if self._call_detector:
-            remaining = self._call_detector.flush()
-            if remaining:
-                call_events.append(self._make_call_bf_event(remaining))
-        if call_events:
-            stats.calls_detected += len(call_events)
-            all_events.extend(call_events)
-
-        # Send events, then advance checkpoints per-bucket. Only hold back
-        # checkpoints for buckets that had events queued (partial failure).
-        # Previously this was all-or-nothing: if ANY event was queued, NO
-        # checkpoint advanced, causing indefinite re-fetch of already-sent
-        # events that slowly filled the dedup LRU cache.
+    def _send_and_advance_checkpoints(
+        self, all_events: list, pending_checkpoints: list, stats: "SyncStats"
+    ) -> None:
+        """Send the cycle's events, then advance checkpoints per-bucket. Only
+        hold back checkpoints for buckets that had events queued (partial
+        failure). Previously this was all-or-nothing: if ANY event was queued,
+        NO checkpoint advanced, causing indefinite re-fetch of already-sent
+        events that slowly filled the dedup LRU cache. Extracted from sync()
+        verbatim — behaviour unchanged.
+        """
         if all_events:
             pre_queued = stats.events_queued
             self._send_events(all_events, stats)
@@ -571,22 +615,6 @@ class SyncEngine:
             # All events were dedup-filtered (already sent); safe to advance.
             for bucket_id, ts, event_id in pending_checkpoints:
                 self.queue.set_checkpoint(bucket_id, ts, event_id)
-
-        # Process offline queue if we're online
-        if self.bf.is_reachable() and not self.queue.is_empty():
-            self._process_queue(stats)
-
-        # Check heartbeat counter — actual HTTP call is deferred to
-        # after sync() returns so _sync_lock is not held during the
-        # blocking network request.
-        with self._state_lock:
-            self._heartbeat_count += 1
-            should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
-            if should_heartbeat:
-                self._heartbeat_count = 0
-        stats._should_heartbeat = should_heartbeat
-
-        return stats
 
     @staticmethod
     def _local_day_iso() -> str:
@@ -1304,66 +1332,7 @@ class SyncEngine:
         data = {}
 
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            data["app"] = app[:MAX_APP_LENGTH] if app else app
-            title = event.title
-            data["title"] = title[:MAX_TITLE_LENGTH] if title else title
-            # The bundled window watcher carries no URL. On macOS, enrich browser
-            # events with the active-tab URL captured around the event's time by
-            # the browser tracker. Raw URL here; the privacy block below applies
-            # domain-only / full-URL rules exactly as it does for extension URLs.
-            raw_url = event.url
-            if (
-                not raw_url
-                and self._browser_tracker is not None
-                and is_browser_app(app)
-            ):
-                event_end = event.timestamp + timedelta(seconds=event.duration)
-                raw_url = self._browser_tracker.url_at(event_end.timestamp())
-            if raw_url:
-                url = raw_url
-                # When the full URL exceeds MAX_URL_LENGTH we deliberately
-                # fall back to the domain rather than silent mid-string
-                # truncation — truncation can change semantics (e.g. turn a
-                # safe redirect target into an attacker-controlled one).
-                if privacy.collect_full_urls and len(url) <= MAX_URL_LENGTH:
-                    data["url"] = url
-                elif privacy.collect_full_urls or privacy.domain_only_urls:
-                    domain = self._extract_domain(url)
-                    if domain and len(domain) <= MAX_URL_LENGTH:
-                        data["url"] = domain
-
-                if privacy.collect_page_category:
-                    data["page_category"] = self._infer_page_category(raw_url, event.title)
-
-            if app and privacy.auto_categorize:
-                category = self._get_category(app)
-                should_persist = False
-                if category is None:
-                    # DB miss - try fallback map
-                    category = privacy.default_categories.get(app)
-                    if category:
-                        with self._category_cache_lock:
-                            if app not in self._persisted_fallbacks:
-                                self._persisted_fallbacks.add(app)
-                                should_persist = True
-                if should_persist:
-                    try:
-                        self.queue.set_category(app, category, source='fallback')
-                    except Exception as exc:
-                        logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
-                if category:
-                    data["app_category"] = category
-
-            if self._display_tracker is not None and privacy.track_display_info:
-                ds = self._display_tracker.state
-                if ds.monitor_name is not None:
-                    data["monitor_name"] = ds.monitor_name
-                if ds.monitor_index is not None:
-                    data["monitor_index"] = ds.monitor_index
-                if ds.desktop_id is not None:
-                    data["desktop_id"] = ds.desktop_id
-                if ds.desktop_index is not None:
-                    data["desktop_index"] = ds.desktop_index
+            self._populate_window_data(event, app, data)
         elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
             data["status"] = event.status
             # AFK periods are sent with their real AFK bucket_type — NOT relabeled
@@ -1411,92 +1380,173 @@ class SyncEngine:
         if project:
             result["project_id"] = project["id"]
 
-        # Add activity classification for window events
+        # Add activity classification + counted time for window events
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
-        activity_state: str | None = None
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
-            if forced_activity_state is not None:
-                activity_state = forced_activity_state
-                result["activity_state"] = activity_state
-            elif self._has_input_data:
-                activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
-                activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
+            self._classify_and_count_window(
+                event, bucket_id, result, forced_activity_state, skip_time_tracking
+            )
 
-                result["activity_state"] = activity_state
-                result["activity_metrics"] = activity_metrics.to_dict()
-            else:
-                # No input watcher - use AFK data to determine activity.
-                event_end = event.timestamp + timedelta(seconds=event.duration)
-                has_afk = bool(self._current_afk_events)
+        return result
 
-                with self._state_lock:
-                    afk_watcher_available = self._afk_watcher_available
-                if not afk_watcher_available:
-                    # AFK watcher is completely down - can't classify.
-                    # Default to "active" since window events prove the user
-                    # was at the computer.
-                    activity_state = "active"
-                    logger.debug(
-                        f"AFK watcher unavailable; classifying window event as active: "
-                        f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+    def _classify_and_count_window(
+        self,
+        event: AWEvent,
+        bucket_id: str,
+        result: dict,
+        forced_activity_state: Optional[str],
+        skip_time_tracking: bool,
+    ) -> None:
+        """Set ``result['activity_state']`` (+ metrics) for a window/web event and
+        accumulate counted active time. Extracted from _transform_event verbatim —
+        behaviour unchanged."""
+        activity_state: str | None = None
+        if forced_activity_state is not None:
+            activity_state = forced_activity_state
+            result["activity_state"] = activity_state
+        elif self._has_input_data:
+            activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
+            activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
+
+            result["activity_state"] = activity_state
+            result["activity_metrics"] = activity_metrics.to_dict()
+        else:
+            # No input watcher - use AFK data to determine activity.
+            event_end = event.timestamp + timedelta(seconds=event.duration)
+            has_afk = bool(self._current_afk_events)
+
+            with self._state_lock:
+                afk_watcher_available = self._afk_watcher_available
+            if not afk_watcher_available:
+                # AFK watcher is completely down - can't classify.
+                # Default to "active" since window events prove the user
+                # was at the computer.
+                activity_state = "active"
+                logger.debug(
+                    f"AFK watcher unavailable; classifying window event as active: "
+                    f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+                )
+            elif has_afk:
+                is_active = self._is_active_during(
+                    event.timestamp, event_end, self._current_afk_events
+                )
+                # Fallback: treat as active when event end falls inside
+                # a not-afk span, even if AFK doesn't fully cover start.
+                if not is_active:
+                    probe_time = event_end - timedelta(milliseconds=1)
+                    is_active = (
+                        self._status_at(probe_time, self._current_afk_events)
+                        == "not-afk"
                     )
-                elif has_afk:
-                    is_active = self._is_active_during(
-                        event.timestamp, event_end, self._current_afk_events
-                    )
-                    # Fallback: treat as active when event end falls inside
-                    # a not-afk span, even if AFK doesn't fully cover start.
-                    if not is_active:
-                        probe_time = event_end - timedelta(milliseconds=1)
-                        is_active = (
-                            self._status_at(probe_time, self._current_afk_events)
-                            == "not-afk"
-                        )
-                    activity_state = "active" if is_active else "inactive"
-                    if not is_active:
-                        logger.debug(
-                            f"Window event classified inactive: "
-                            f"afk_count={len(self._current_afk_events)}, "
-                            f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
-                        )
-                else:
-                    # AFK watcher is running and confirms user was idle
-                    activity_state = "inactive"
+                activity_state = "active" if is_active else "inactive"
+                if not is_active:
                     logger.debug(
                         f"Window event classified inactive: "
                         f"afk_count={len(self._current_afk_events)}, "
                         f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
                     )
-                result["activity_state"] = activity_state
+            else:
+                # AFK watcher is running and confirms user was idle
+                activity_state = "inactive"
+                logger.debug(
+                    f"Window event classified inactive: "
+                    f"afk_count={len(self._current_afk_events)}, "
+                    f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
+                )
+            result["activity_state"] = activity_state
 
-            # Track counted time for any event that is not explicitly inactive.
-            # This keeps live hours aligned with "time on the machine" while
-            # still stopping the counter after prolonged no-input periods.
-            if (
-                not skip_time_tracking
-                and activity_state is not None
-                and activity_state != "inactive"
-            ):
-                event_date = event.timestamp.astimezone().date()
-                event_key = str(result["id"])
-                time_key = (bucket_id, event_key)
-                time_delta = 0.0
-                with self._cache_lock:
-                    prev_counted = self._time_cache.get(time_key, 0.0)
-                    delta = event.duration - prev_counted
-                    if delta > 0:
-                        time_delta = delta
-                        self._time_cache[time_key] = event.duration
-                # Persist outside the cache lock to avoid blocking
-                # dedup checks with SQLite I/O
-                if time_delta > 0:
-                    self._time_tracker.add_active_time(time_delta, event_date)
-                    # Persist cumulative so a restart/reconcile doesn't re-count.
-                    self._persist_counted_time(
-                        bucket_id, event_key, event.duration, event_date.isoformat()
-                    )
+        # Track counted time for any event that is not explicitly inactive.
+        # This keeps live hours aligned with "time on the machine" while
+        # still stopping the counter after prolonged no-input periods.
+        if (
+            not skip_time_tracking
+            and activity_state is not None
+            and activity_state != "inactive"
+        ):
+            event_date = event.timestamp.astimezone().date()
+            event_key = str(result["id"])
+            time_key = (bucket_id, event_key)
+            time_delta = 0.0
+            with self._cache_lock:
+                prev_counted = self._time_cache.get(time_key, 0.0)
+                delta = event.duration - prev_counted
+                if delta > 0:
+                    time_delta = delta
+                    self._time_cache[time_key] = event.duration
+            # Persist outside the cache lock to avoid blocking
+            # dedup checks with SQLite I/O
+            if time_delta > 0:
+                self._time_tracker.add_active_time(time_delta, event_date)
+                # Persist cumulative so a restart/reconcile doesn't re-count.
+                self._persist_counted_time(
+                    bucket_id, event_key, event.duration, event_date.isoformat()
+                )
 
-        return result
+    def _populate_window_data(self, event: AWEvent, app: Optional[str], data: dict) -> None:
+        """Fill ``data`` for a window/web event: app, title, URL (with privacy
+        rules), page/app category, and display info. Extracted from
+        _transform_event verbatim — behaviour unchanged."""
+        privacy = self.config.privacy
+        data["app"] = app[:MAX_APP_LENGTH] if app else app
+        title = event.title
+        data["title"] = title[:MAX_TITLE_LENGTH] if title else title
+        # The bundled window watcher carries no URL. On macOS, enrich browser
+        # events with the active-tab URL captured around the event's time by
+        # the browser tracker. Raw URL here; the privacy block below applies
+        # domain-only / full-URL rules exactly as it does for extension URLs.
+        raw_url = event.url
+        if (
+            not raw_url
+            and self._browser_tracker is not None
+            and is_browser_app(app)
+        ):
+            event_end = event.timestamp + timedelta(seconds=event.duration)
+            raw_url = self._browser_tracker.url_at(event_end.timestamp())
+        if raw_url:
+            url = raw_url
+            # When the full URL exceeds MAX_URL_LENGTH we deliberately
+            # fall back to the domain rather than silent mid-string
+            # truncation — truncation can change semantics (e.g. turn a
+            # safe redirect target into an attacker-controlled one).
+            if privacy.collect_full_urls and len(url) <= MAX_URL_LENGTH:
+                data["url"] = url
+            elif privacy.collect_full_urls or privacy.domain_only_urls:
+                domain = self._extract_domain(url)
+                if domain and len(domain) <= MAX_URL_LENGTH:
+                    data["url"] = domain
+
+            if privacy.collect_page_category:
+                data["page_category"] = self._infer_page_category(raw_url, event.title)
+
+        if app and privacy.auto_categorize:
+            category = self._get_category(app)
+            should_persist = False
+            if category is None:
+                # DB miss - try fallback map
+                category = privacy.default_categories.get(app)
+                if category:
+                    with self._category_cache_lock:
+                        if app not in self._persisted_fallbacks:
+                            self._persisted_fallbacks.add(app)
+                            should_persist = True
+            if should_persist:
+                try:
+                    self.queue.set_category(app, category, source='fallback')
+                except Exception as exc:
+                    logger.warning(f"Failed to persist fallback category for {app!r}: {exc}")
+            if category:
+                data["app_category"] = category
+
+        if self._display_tracker is not None and privacy.track_display_info:
+            ds = self._display_tracker.state
+            if ds.monitor_name is not None:
+                data["monitor_name"] = ds.monitor_name
+            if ds.monitor_index is not None:
+                data["monitor_index"] = ds.monitor_index
+            if ds.desktop_id is not None:
+                data["desktop_id"] = ds.desktop_id
+            if ds.desktop_index is not None:
+                data["desktop_index"] = ds.desktop_index
 
     @staticmethod
     def _extract_domain(url: str) -> Optional[str]:

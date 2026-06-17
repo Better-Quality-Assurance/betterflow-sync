@@ -146,8 +146,9 @@ class DailyTimeTracker:
     def add_active_time(self, seconds: float, event_date: date) -> None:
         """Add active time for a given date.
 
-        If the date is different from the currently tracked day, resets
-        and starts tracking the new day.
+        Only the current local date is kept as the in-memory "today" counter.
+        Replayed historical events are persisted to their own date without
+        moving the live counter backward.
 
         Args:
             seconds: Duration in seconds to add.
@@ -164,16 +165,24 @@ class DailyTimeTracker:
             if self._closed:
                 return
 
+        current_date = self._get_local_date()
+        if event_date != current_date:
+            try:
+                self._increment_date(event_date, seconds)
+            except sqlite3.ProgrammingError:
+                logger.debug("DailyTimeTracker closed mid-write — skipping persist")
+            return
+
         rollover_date = None
         rollover_seconds = 0.0
         with self._lock:
             # Check for day rollover
-            if self._today != event_date:
+            if self._today != current_date:
                 # Capture old day's data for out-of-lock persist
                 rollover_date = self._today
                 rollover_seconds = self._today_seconds
                 # Swap in-memory state immediately
-                self._today = event_date
+                self._today = current_date
                 self._today_seconds = 0.0
 
             self._today_seconds += seconds
@@ -182,7 +191,7 @@ class DailyTimeTracker:
         try:
             if rollover_date is not None:
                 self._persist_date(rollover_date, rollover_seconds)
-                self._load_new_day(event_date)
+                self._load_new_day(current_date)
             self._persist()
         except sqlite3.ProgrammingError:
             # close() raced with us between the _closed check above and the
@@ -261,6 +270,21 @@ class DailyTimeTracker:
                 VALUES (?, ?, ?)
                 ON CONFLICT(date) DO UPDATE SET
                     active_seconds = MAX(excluded.active_seconds, daily_active_time.active_seconds),
+                    updated_at = excluded.updated_at
+                """,
+                (target_date.isoformat(), seconds, now),
+            )
+
+    def _increment_date(self, target_date: date, seconds: float) -> None:
+        """Add seconds to a non-live date without changing today's counter."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO daily_active_time (date, active_seconds, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    active_seconds = daily_active_time.active_seconds + excluded.active_seconds,
                     updated_at = excluded.updated_at
                 """,
                 (target_date.isoformat(), seconds, now),

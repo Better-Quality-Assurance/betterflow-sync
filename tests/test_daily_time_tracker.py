@@ -119,6 +119,22 @@ class TestDailyTimeTracker:
         assert self.tracker.get_active_time_for_date(day2) == timedelta(seconds=200)
         assert self.tracker.get_active_time_for_date(day3) == timedelta(seconds=300)
 
+    def test_historical_replay_does_not_move_today_counter_backward(self):
+        """Backlog reconcile can replay older events after today's total loaded.
+
+        Those events belong in their original date, but the tray's live "today"
+        counter must keep pointing at the current local day. Emin's 2026-06-17
+        logs showed startup reconcile processing 2026-06-16 events after
+        loading 2026-06-17, which moved the in-memory counter backward.
+        """
+        yesterday = self.today - timedelta(days=1)
+
+        self.tracker.add_active_time(900.0, self.today)
+        self.tracker.add_active_time(120.0, yesterday)
+
+        assert self.tracker.get_today_active_time() == timedelta(seconds=900)
+        assert self.tracker.get_active_time_for_date(yesterday) == timedelta(seconds=120)
+
     @patch.object(DailyTimeTracker, "_get_local_date")
     def test_midnight_rollover(self, mock_get_date):
         """Midnight rollover should reset today's counter."""

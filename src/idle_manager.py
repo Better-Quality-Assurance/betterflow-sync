@@ -158,21 +158,16 @@ class IdleManager:
             afk_duration = 0.0
             idle_start: Optional[datetime] = None
 
-            afk_buckets = self.aw.get_afk_buckets()
-            if afk_buckets:
-                # Prefer the bf-idle-tracker bucket. A user migrated from
-                # vanilla ActivityWatch can also carry a stale aw-watcher-afk
-                # bucket frozen at 'afk' forever; taking buckets[0] blindly
-                # could pick it and paint permanent false idle. Mirrors
-                # SyncCoordinator._check_idle_tracker_health's selection.
-                bf_buckets = [b for b in afk_buckets if "bf-idle-tracker" in b.id]
-                bucket = (bf_buckets or afk_buckets)[0]
-                events = self.aw.get_events(bucket.id, limit=1)
-                if events:
-                    latest = events[0]
-                    is_afk = latest.status == "afk"
-                    afk_duration = latest.duration
-                    idle_start = latest.timestamp
+            # Canonical AFK read: prefers BetterFlow's bf-idle-tracker bucket
+            # over a stale vanilla aw-watcher-afk bucket frozen at 'afk', and
+            # falls back to the newest event across all AFK buckets. (Supersedes
+            # the inline bucket-preference from #46 — same intent, centralized in
+            # AWClient.get_latest_afk_event.)
+            latest = self.aw.get_latest_afk_event()
+            if latest is not None:
+                is_afk = latest.status == "afk"
+                afk_duration = latest.duration
+                idle_start = latest.timestamp
             else:
                 system_idle = self._get_system_idle_seconds()
                 if system_idle is not None:
