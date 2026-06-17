@@ -132,7 +132,14 @@ class BaseApiClient:
         with self._throttle_lock:
             until = self._throttle_until
         remaining = until - time.monotonic()
-        return remaining if remaining > 0 else 0.0
+        if remaining <= 0:
+            return 0.0
+        # Clamp to the cap: _enter_throttle never sets a deadline more than
+        # _MAX_THROTTLE_SECONDS out, but float rounding of (t + CAP) - t can land
+        # a hair above CAP when the monotonic clock is coarse (Windows returns the
+        # same value for both reads), which would otherwise violate the documented
+        # "never longer than _MAX_THROTTLE_SECONDS" invariant.
+        return min(remaining, self._MAX_THROTTLE_SECONDS)
 
     def _enter_throttle(self, retry_after: float) -> None:
         """Open/extend the global backoff window (thread-safe).
