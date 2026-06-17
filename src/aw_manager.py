@@ -5,6 +5,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -115,6 +116,54 @@ def _resolve_binary_path(directory: str, name: str) -> Optional[str]:
         return bundled
 
     return None
+
+
+def _find_pids_by_path(binary_path: str) -> list[int]:
+    """PIDs whose command line contains the exact bundled ``binary_path``.
+
+    Path-scoped on purpose: matching the full install path (not the bare name)
+    means we never touch an unrelated process that merely shares a name. Unix
+    only — the Windows updater replaces files via a batch script rather than an
+    orphaning ``os._exit``, so there is no orphan to reap there.
+    """
+    if platform.system() not in ("Darwin", "Linux"):
+        return []
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", binary_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+        logger.debug("pgrep for %s failed: %s", binary_path, e)
+        return []
+    pids: list[int] = []
+    for token in result.stdout.split():
+        try:
+            pids.append(int(token))
+        except ValueError:
+            continue
+    return pids
+
+
+def _terminate_pid(pid: int, grace: float = SHUTDOWN_TIMEOUT) -> None:
+    """SIGTERM a pid, then SIGKILL if it outlives the grace period."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)  # liveness probe
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def _download_aw_binaries(install_dir: str) -> bool:
@@ -262,9 +311,18 @@ class AWManager:
 
     @property
     def is_managing(self) -> bool:
-        """True if we started tracker processes (not using external)."""
+        """True when we own at least one tracker process to supervise.
+
+        The watchers are ALWAYS ours, even when we attached to an external
+        server — so this must be true in external mode too. It gates whether
+        the watchdog (restart_if_needed) runs; the old ``not _using_external``
+        clause silently disabled the watchdog on every post-first launch, so a
+        blind/orphaned bf-idle-tracker was never auto-recovered (it took a
+        manual app restart). Only ``_processes`` membership matters; the
+        external server is never stored there.
+        """
         with self._lifecycle_lock:
-            return bool(self._processes) and not self._using_external
+            return bool(self._processes)
 
     def start(self) -> bool:
         """Start tracker components. Returns True if tracker is available."""
@@ -311,10 +369,41 @@ class AWManager:
                 continue
             existing = self._processes.get(watcher)
             if not existing or existing.poll() is not None:
+                # Reap any orphan of this watcher left by a prior instance that
+                # exited uncleanly (crash, force-quit, or a pre-fix self-update)
+                # BEFORE starting a fresh one — otherwise two instances post to
+                # the same bucket and the day's data is corrupted on launch.
+                self._reap_orphan_watchers(watcher, binaries_dir)
                 self._start_component(watcher, binaries_dir)
 
         logger.info("Tracker components started")
         return True
+
+    def _reap_orphan_watchers(self, name: str, binaries_dir: str) -> None:
+        """Kill stray processes of watcher ``name`` not owned by this instance.
+
+        Orphans accumulate when a previous instance exited without a clean
+        ``stop()`` (the self-update ``os._exit`` path before this fix, or a
+        crash/force-quit). Two bf-idle-trackers posting to the same AFK bucket
+        produce overlapping/duplicate events and apparent staleness a normal
+        restart can't clear. Best-effort and path-scoped — never touches our
+        currently-managed PID or any unrelated process.
+        """
+        binary_path = _resolve_binary_path(binaries_dir, name)
+        if not binary_path:
+            return
+        keep = {os.getpid()}
+        managed = self._processes.get(name)
+        if managed is not None and managed.poll() is None:
+            keep.add(managed.pid)
+        try:
+            for pid in _find_pids_by_path(binary_path):
+                if pid in keep:
+                    continue
+                logger.warning("Reaping orphan %s (PID %d)", name, pid)
+                _terminate_pid(pid)
+        except Exception:
+            logger.debug("orphan reap for %s failed", name, exc_info=True)
 
     def stop(self) -> None:
         """Stop the tracker processes WE started.
@@ -383,11 +472,13 @@ class AWManager:
             return self._restart_if_needed_locked()
 
     def _restart_if_needed_locked(self) -> bool:
-        if self._using_external:
-            if self._port_in_use():
-                return True
-            # External tracker disappeared — try to start our own
-            logger.warning("External tracker no longer running")
+        # The SERVER may be external (a shared instance we didn't start); the
+        # WATCHERS are always ours. Only the "external server vanished" case is
+        # special — otherwise fall through to watcher health/stale recovery,
+        # which MUST run in external mode too. Returning early there was why a
+        # blind/orphaned bf-idle-tracker never self-healed after an update.
+        if self._using_external and not self._port_in_use():
+            logger.warning("External tracker server no longer running — starting our own")
             self._using_external = False
             return self._start_locked()
 
@@ -469,6 +560,10 @@ class AWManager:
                     proc.wait(timeout=SHUTDOWN_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                # Kill any orphan too — staleness that survives repeated restarts
+                # is the signature of a second tracker fighting over the bucket;
+                # restarting only our PID can never win against it.
+                self._reap_orphan_watchers(idle_watcher, binaries_dir)
                 self._start_component(idle_watcher, binaries_dir)
 
         # Only block waiting for the server when the server itself was
