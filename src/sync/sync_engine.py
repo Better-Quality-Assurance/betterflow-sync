@@ -110,6 +110,9 @@ class BoundedLRU:
     def __len__(self) -> int:
         return len(self._od)
 
+    def clear(self) -> None:
+        self._od.clear()
+
 
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow."""
@@ -205,6 +208,10 @@ class SyncEngine:
             if config.call_detection.enabled
             else None
         )
+
+        # The local day the counted-time cache is scoped to; a change across a
+        # sync cycle triggers daily housekeeping (prune) without a restart.
+        self._counted_cache_day = self._local_day_iso()
 
         # Restore per-event counted-time from the previous process so a restart
         # (or the start-of-day backlog reconcile that re-fetches the whole day)
@@ -360,6 +367,12 @@ class SyncEngine:
         6. Send heartbeat periodically
         """
         stats = SyncStats()
+
+        # Daily housekeeping before anything else, so it still runs while paused:
+        # a long-running agent that never restarts across midnight would
+        # otherwise never prune persisted counted-time (prune_counted_time only
+        # ran at startup), leaking a day's rows every day it stays up.
+        self._maybe_rollover_counted_day()
 
         with self._state_lock:
             if self._paused or self._private_mode:
@@ -557,6 +570,26 @@ class SyncEngine:
         """Local calendar date as ISO ``YYYY-MM-DD`` — the key the daily time
         counter and counted-time persistence are scoped by."""
         return datetime.now().astimezone().date().isoformat()
+
+    def _maybe_rollover_counted_day(self) -> None:
+        """On a local-day rollover, reset the per-day dedup cache and reload
+        (which prunes persisted counted-time for days we will never replay).
+
+        Without this the prune only happened at process start, so an agent left
+        running across midnight accumulated a day's counted-time rows in the
+        persistent store every day it stayed up. Cheap when the day is unchanged
+        (a single string compare), so safe to call every sync cycle.
+        """
+        today = self._local_day_iso()
+        with self._cache_lock:
+            if today == self._counted_cache_day:
+                return
+            self._counted_cache_day = today
+            # Yesterday's (bucket_id, event_id) dedup entries are dead — the
+            # daily total resets at midnight, so drop them before reloading.
+            self._time_cache.clear()
+        logger.info("Local day rolled over to %s — pruning counted-time cache", today)
+        self._load_counted_time_cache()
 
     def _load_counted_time_cache(self) -> None:
         """Repopulate ``_time_cache`` from persisted per-event counted-seconds

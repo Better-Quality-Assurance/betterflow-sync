@@ -96,3 +96,27 @@ def test_pauses_idle_when_not_in_a_call():
 
     assert idle_mgr.idle_paused is True, "long AFK outside a call should pause"
     reschedule.assert_called_once_with(idle_mgr._IDLE_SYNC_INTERVAL)
+
+
+def test_resumes_when_a_call_starts_during_an_existing_idle_pause():
+    """A call that begins AFTER the idle pause must resume tracking.
+
+    The is_in_call guard only blocks ENTERING idle. If the user was already
+    idle-paused (stepped away, no call) and then joins a meeting but stays AFK
+    (listening, no keyboard), nothing cleared the pause — the whole call span
+    was painted Idle. This is the symmetric exit: still AFK, but now in a call.
+    """
+    idle_mgr, reschedule, trigger_sync, tray = _make(idle_in_call=True)
+    # Simulate "already idle-paused before the call started".
+    idle_mgr._idle_paused = True
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is False, "a call starting mid-idle must resume"
+    reschedule.assert_called_once_with(idle_mgr.config.sync.interval_seconds)
+    trigger_sync.assert_called_once_with("call_resume_sync")
