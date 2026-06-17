@@ -385,6 +385,17 @@ class SyncEngine:
         # Check ActivityWatch
         if not self.aw.is_running():
             stats.errors.append("ActivityWatch is not running")
+            # Finalize any in-progress call before bailing. Otherwise is_in_call()
+            # stays True for the whole outage (sync returns here every cycle, so
+            # the end-of-sync flush at line ~522 never runs), and the idle guard
+            # in IdleManager keeps suppressing idle long after the call ended —
+            # painting the post-call AFK stretch as worked time. The observed call
+            # portion is still recorded if the backend is reachable; if AW comes
+            # back mid-call a fresh call starts cleanly.
+            if self._call_detector:
+                remaining = self._call_detector.flush()
+                if remaining and self.bf.is_reachable():
+                    self._send_events([self._make_call_bf_event(remaining)], stats)
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)

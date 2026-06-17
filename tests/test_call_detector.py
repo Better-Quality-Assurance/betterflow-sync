@@ -82,6 +82,12 @@ class TestPatternMatching:
     def test_facetime_any_window(self):
         assert _match_native("FaceTime", "anything here") == "FaceTime"
 
+    def test_facetime_alias_matches_on_word_boundary(self):
+        # FaceTime has NO title gate (any window counts), so its alias must match
+        # on a word boundary — a helper process like "FaceTimeHelper" must not be
+        # read as an active call.
+        assert _match_native("FaceTimeHelper", "anything here") is None
+
     def test_webex_meeting(self):
         assert _match_native("Webex", "Meeting - Sprint Review") == "Webex"
 

@@ -62,12 +62,17 @@ _BROWSER_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
 _DEFAULT_GRACE_PERIOD = 30.0
 
 
-# Bare aliases short/common enough to bleed into an unrelated app name — matched
-# on a WORD BOUNDARY rather than as a substring: "teams" must not match
-# "teamspeak"/"teamviewer", "zoom" must not match "zoomtext". Every other alias
-# stays plain containment — notably "webex", which must still match the compound
-# Windows process name "CiscoWebexStart"; a \b boundary would break that.
-_WORD_BOUNDARY_ALIASES = frozenset({"teams", "zoom"})
+# Bare aliases matched on a WORD BOUNDARY rather than as a substring, so they
+# can't bleed into an unrelated app name:
+#   - "teams" must not match "teamspeak"/"teamviewer", "zoom" not "zoomtext".
+#   - "facetime" must not match "FaceTimeHelper" / other facetime-prefixed
+#     helper processes — and unlike the others it has NO title gate (any window
+#     counts), so a loose substring there would be the easiest to false-trigger.
+# Aliases kept as plain containment are EITHER title-gated ("slack"/"discord"/
+# "msteams" need an in-call title too, so a stray substring match can't bill on
+# its own) OR must match a compound process name — notably "webex", which has to
+# match the Windows process "CiscoWebexStart" where a \b boundary would break it.
+_WORD_BOUNDARY_ALIASES = frozenset({"teams", "zoom", "facetime"})
 
 
 def _app_contains(app_lower: str, sub: str) -> bool:
