@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 # even on a fresh install with no prior team-ID context to compare against.
 EXPECTED_TEAM_ID = "87NVC57J44"  # Better Quality Assurance SRL
 
+# Hard cap on a downloaded release artifact. Our installers are ~60-80 MB;
+# 500 MB leaves generous headroom while stopping a runaway/poisoned response
+# from filling the disk.
+_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+
 
 def _get_app_bundle_path() -> Optional[Path]:
     """Return the path to the running app: .app bundle (macOS), .exe dir
@@ -101,15 +106,31 @@ def _download_to_file(
     dest: Path,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Stream a download to ``dest``, reporting percent progress."""
+    """Stream a download to ``dest``, reporting percent progress.
+
+    Caps the body at ``_MAX_DOWNLOAD_BYTES`` so a misconfigured redirect or a
+    malicious release asset can't fill the disk (our installers are ~60-80 MB).
+    """
     with requests.get(download_url, stream=True, timeout=120) as resp:
         resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
+        try:
+            # `or 0` guards an empty-string header; the except guards garbage.
+            total = int(resp.headers.get("content-length", 0) or 0)
+        except (ValueError, TypeError):
+            total = 0
+        if total > _MAX_DOWNLOAD_BYTES:
+            raise ValueError(
+                f"Refusing to download {total} bytes (cap {_MAX_DOWNLOAD_BYTES})"
+            )
         downloaded = 0
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=256 * 1024):
                 f.write(chunk)
                 downloaded += len(chunk)
+                if downloaded > _MAX_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"Download exceeded {_MAX_DOWNLOAD_BYTES} bytes; aborting"
+                    )
                 if total > 0 and on_progress:
                     on_progress(f"Downloading... {int(downloaded / total * 100)}%")
 
@@ -330,12 +351,16 @@ def _apply_local_artifact(
                     _status("Update aborted: install path contains unsupported characters")
                     return False
             bat_content = '@echo off\r\n'
+            # Switch the console to UTF-8 so non-ASCII install paths (e.g.
+            # C:\Users\André\...) survive. Paired with a utf-8 byte write below;
+            # write_text's locale default (cp1252) would mangle or crash on them.
+            bat_content += 'chcp 65001 >nul\r\n'
             bat_content += 'timeout /t 2 /nobreak >nul\r\n'
             bat_content += f'xcopy /E /Y /Q "{extract_dir}\\*" "{app_path}\\"\r\n'
             bat_content += f'start "" "{exe_path}"\r\n'
             bat_content += f'rd /s /q "{tmp_dir}"\r\n'
             bat_content += 'del "%~f0"\r\n'
-            bat_path.write_text(bat_content)
+            bat_path.write_bytes(bat_content.encode("utf-8"))
             if on_pre_exit:
                 try:
                     on_pre_exit()
@@ -410,7 +435,10 @@ def _install_appimage(
             logger.warning("Pre-exit flush failed: %s", e)
 
     status("Restarting...")
-    subprocess.Popen([str(app_path)])
+    # start_new_session detaches the relaunched AppImage from our process
+    # group so the session manager's SIGHUP (after os._exit below) can't kill
+    # it before it initializes — same reason the macOS relaunch helper does it.
+    subprocess.Popen([str(app_path)], start_new_session=True)
     # os._exit works from any thread, unlike sys.exit.
     os._exit(0)
 
@@ -683,9 +711,13 @@ def stage_update(
 
     Returns True if the artifact was downloaded and recorded.
     """
-    parsed_url = urlparse(download_url)
-    if parsed_url.scheme != "https":
-        logger.warning("Refusing to stage non-HTTPS update URL")
+    try:
+        from .url_safety import is_safe_fetch_url
+    except ImportError:
+        from url_safety import is_safe_fetch_url
+    if not is_safe_fetch_url(download_url):
+        # Match apply_update: HTTPS + GitHub-host allowlist, not just HTTPS.
+        logger.warning("Refusing to stage update from disallowed URL host")
         return False
 
     clear_staged_update()

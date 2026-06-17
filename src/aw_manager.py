@@ -189,10 +189,26 @@ def _download_aw_binaries(install_dir: str) -> bool:
     try:
         fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
+        _MAX_AW_DOWNLOAD_BYTES = 500 * 1024 * 1024
         req = urllib.request.Request(url, headers={"User-Agent": "BetterFlow-Sync"})
         with urllib.request.urlopen(req, timeout=120) as response:
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except (ValueError, TypeError):
+                total = 0
+            if total > _MAX_AW_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"Refusing to download {total} bytes (cap {_MAX_AW_DOWNLOAD_BYTES})"
+                )
+            downloaded = 0
             with open(tmp_zip, "wb") as f:
-                shutil.copyfileobj(response, f)
+                for chunk in iter(lambda: response.read(256 * 1024), b""):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > _MAX_AW_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Download exceeded {_MAX_AW_DOWNLOAD_BYTES} bytes; aborting"
+                        )
 
         size_mb = os.path.getsize(tmp_zip) / (1024 * 1024)
         logger.info(f"Downloaded {size_mb:.1f} MB, extracting binaries...")
@@ -800,7 +816,16 @@ class AWManager:
         return self._get_latest_event_age("aw-watcher-window")
 
     def _get_latest_afk_event_age(self) -> Optional[float]:
-        """Return seconds since the most recent AFK event, or None on error."""
+        """Return seconds since the most recent AFK event, or None on error.
+
+        The branded idle tracker registers a ``bf-idle-tracker_<host>`` bucket
+        while vanilla installs use ``aw-watcher-afk_<host>``. Try the branded id
+        first so the staleness watchdog isn't silently disabled on branded-only
+        installs, then fall back to the vanilla prefix.
+        """
+        age = self._get_latest_event_age("bf-idle-tracker")
+        if age is not None:
+            return age
         return self._get_latest_event_age("aw-watcher-afk")
 
     def _get_binaries_dir(self) -> Optional[str]:

@@ -1388,8 +1388,9 @@ class BetterFlowApp:
                     if promote_tray_icon():
                         return
                 except Exception as e:
+                    # One unexpected error shouldn't abandon the remaining
+                    # retries — the entry may still appear once Explorer settles.
                     logger.debug("Tray promotion attempt failed (non-fatal): %s", e)
-                    return
                 time.sleep(1.0)
 
         threading.Thread(target=_worker, daemon=True, name="win-tray-promote").start()

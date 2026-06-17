@@ -44,6 +44,22 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _is_window_like(bucket_type: str) -> bool:
+    """Window/web buckets whose events carry per-event activity + time tracking.
+
+    Single source of truth so a new window-class bucket type is a one-line edit
+    here rather than a scattered tuple-membership change. NOTE: this includes
+    WEB; the activity-analyzer's window-change feed deliberately excludes WEB and
+    keeps its own (WINDOW, WINDOW_ALT) check.
+    """
+    return bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
+
+
+def _is_afk_like(bucket_type: str) -> bool:
+    """AFK/idle buckets that drive the active-vs-idle decision."""
+    return bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)
+
+
 @dataclass
 class SyncStats:
     """Statistics from a sync cycle."""
@@ -545,7 +561,7 @@ class SyncEngine:
         transform. Returns (transformed_events, call_events, pending_checkpoints).
         Extracted from sync() verbatim — behaviour unchanged.
         """
-        all_events: list = []
+        all_events: list[dict] = []
         call_events: list[dict] = []
         pending_checkpoints: list[tuple[str, datetime, Optional[int]]] = []
         for bucket in window_buckets:
@@ -711,8 +727,21 @@ class SyncEngine:
         id, so re-enqueuing already-synced events is deduped — safe. The queue's
         size() now reflects the true backlog and ticks down to 0 as
         _process_queue drains it, so "0 queued" finally means "everything reached
-        prod". skip_time_tracking keeps the replay from touching the local daily
-        total (the persisted counted-time cache also makes it a no-op).
+        prod".
+
+        Time tracking during replay: non-window buckets pass skip_time_tracking
+        so the replay never touches the daily total. Window/web buckets go
+        through _transform_window_event_with_timeout, which dedups per
+        (bucket_id, event_id) against the persisted counted-time cache — so an
+        already-counted event is a no-op, while a genuinely-stranded event (the
+        whole reason reconcile exists) is counted once, here, correctly. There
+        is no double-count: both the live sync and this replay share that cache.
+
+        Ordering: sync() calls this BEFORE _prepare_input_analysis, so during
+        replay _has_input_data is still False and window events are classified
+        "active" (we can't penalize activity without input data — and the
+        server-side billing metric is tracked_seconds, not active_seconds). That
+        is the intended fallback; do not reorder without revisiting it.
         """
         # Don't pile the whole day on top of a backlog that's already queued and
         # draining. Re-enqueuing would duplicate events (a batch carrying the same
@@ -757,7 +786,7 @@ class SyncEngine:
                 events.sort(key=lambda e: e.timestamp)  # AW is newest-first
                 batch: list[dict] = []
                 for event in events:
-                    if bucket.type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+                    if _is_window_like(bucket.type):
                         batch.extend(
                             self._transform_window_event_with_timeout(event, bucket.id, bucket.type)
                         )
@@ -903,7 +932,7 @@ class SyncEngine:
                 stats.events_filtered += 1
                 continue
 
-            if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+            if _is_window_like(bucket_type):
                 transformed_events = self._transform_window_event_with_timeout(
                     event, bucket_id, bucket_type
                 )
@@ -923,7 +952,7 @@ class SyncEngine:
         # call (guarded by sequence counter), so assessing once is equivalent.
         if (
             transformed
-            and bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
+            and _is_window_like(bucket_type)
             and self._has_input_data
         ):
             last_event = events[-1]  # sorted oldest-first, use newest for assessment
@@ -1073,13 +1102,17 @@ class SyncEngine:
         if transformed and total_active_duration > 0:
             event_date = event.timestamp.astimezone().date()
             time_key = (bucket_id, str(event.id))
+            time_delta = 0.0
             with self._cache_lock:
                 prev_counted = self._time_cache.get(time_key, 0.0)
                 delta = total_active_duration - prev_counted
                 if delta > 0:
+                    time_delta = delta
                     self._time_cache[time_key] = total_active_duration
-            if delta > 0:
-                self._time_tracker.add_active_time(delta, event_date)
+            # Persist outside the cache lock to avoid blocking dedup with I/O
+            # (matches _classify_and_count_window's time_delta pattern).
+            if time_delta > 0:
+                self._time_tracker.add_active_time(time_delta, event_date)
                 # Persist the new cumulative so a restart/reconcile doesn't
                 # re-count this event (write-through, outside the cache lock).
                 self._persist_counted_time(
@@ -1106,7 +1139,7 @@ class SyncEngine:
         events, _ = self._fetch_bucket_events(bucket_id, stats)
         if not events:
             return [], None
-        if bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
+        if _is_afk_like(bucket_type):
             # Collapse heartbeat-merge corruption before it reaches the backend
             # (see _collapse_afk_duplicates). Without this, a misbehaving idle
             # tracker's duplicate 'afk' rows are synced raw and billed as idle.
@@ -1321,7 +1354,7 @@ class SyncEngine:
         # Window/web events use a configurable minimum (default 5s) to filter
         # sub-second flickers. AFK/input events keep the 0.5s floor since they
         # have legitimately short durations (e.g. input telemetry at 1s).
-        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+        if _is_window_like(bucket_type):
             if event.duration < self.config.sync.min_window_event_seconds:
                 return None
         elif event.duration < 0.5:
@@ -1331,9 +1364,9 @@ class SyncEngine:
         result_bucket_type = bucket_type
         data = {}
 
-        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+        if _is_window_like(bucket_type):
             self._populate_window_data(event, app, data)
-        elif bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
+        elif _is_afk_like(bucket_type):
             data["status"] = event.status
             # AFK periods are sent with their real AFK bucket_type — NOT relabeled
             # as "break". A break is an intentional, user-initiated pause
@@ -1382,7 +1415,7 @@ class SyncEngine:
 
         # Add activity classification + counted time for window events
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
-        if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB):
+        if _is_window_like(bucket_type):
             self._classify_and_count_window(
                 event, bucket_id, result, forced_activity_state, skip_time_tracking
             )
@@ -1399,7 +1432,14 @@ class SyncEngine:
     ) -> None:
         """Set ``result['activity_state']`` (+ metrics) for a window/web event and
         accumulate counted active time. Extracted from _transform_event verbatim —
-        behaviour unchanged."""
+        behaviour unchanged.
+
+        Locking invariant: reads ``_has_input_data`` / ``_latest_input_at`` /
+        ``_current_afk_events`` without a lock. Those fields are mutated only by
+        ``sync()`` (under main.py's ``_sync_lock``), and this method is only
+        reachable from that same call chain — do NOT call it concurrently with
+        sync() or from another thread without first taking ``_sync_lock``.
+        """
         activity_state: str | None = None
         if forced_activity_state is not None:
             activity_state = forced_activity_state
