@@ -62,17 +62,15 @@ def _is_afk_like(bucket_type: str) -> bool:
 
 @dataclass
 class _SyncCycleContext:
-    """Per-cycle activity context, grouped into one value object instead of
-    two loose SyncEngine fields.
+    """Per-cycle activity context, threaded explicitly through the transform
+    path instead of living as SyncEngine instance state.
 
-    ``has_input_data`` is set once per cycle by ``_prepare_input_analysis``;
-    ``afk_events`` is refreshed per window bucket by ``_sync_window_buckets``.
-    A fresh instance is assigned at the top of each ``sync()`` (before
-    reconcile), so a re-armed reconcile can no longer read a previous cycle's
-    leftover state — it sees deterministic defaults.
-
-    Still read without a lock: mutated only by ``sync()`` (under main.py's
-    ``_sync_lock``) and read only from that same call chain.
+    ``has_input_data`` is set once per cycle (in ``_prepare_input_analysis``,
+    which returns the context); ``afk_events`` is refreshed per window bucket
+    by ``_sync_window_buckets``. ``_reconcile_backlog`` builds its own fresh
+    instance. Because it is a stack-local confined to the ``sync()`` /
+    reconcile call chains (never an instance field), there is no cross-cycle
+    leakage and no shared-state locking concern.
     """
 
     has_input_data: bool = False
@@ -903,7 +901,7 @@ class SyncEngine:
         bucket_id: str,
         bucket_type: str,
         stats: SyncStats,
-        cycle: Optional["_SyncCycleContext"] = None,
+        cycle: "_SyncCycleContext",
     ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
         """Transform events to BetterFlow format and compute pending checkpoint.
 
@@ -913,11 +911,10 @@ class SyncEngine:
         Skips events already sent with unchanged duration (dedup).
         Re-sends if duration has grown (heartbeat extension).
         Returns (transformed_events, pending_checkpoint) — caller commits the
-        checkpoint only after a successful send (N5). ``cycle`` defaults to an
-        empty context when omitted (production callers always pass one).
+        checkpoint only after a successful send (N5). ``cycle`` is required so a
+        new bucket-processing path can't silently classify against an empty
+        context (this is the window-classification entry point).
         """
-        if cycle is None:
-            cycle = _SyncCycleContext()
         # Feed window events to activity analyzer for window change detection
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             self._activity_analyzer.add_window_events(events)

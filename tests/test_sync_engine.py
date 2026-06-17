@@ -369,12 +369,13 @@ class TestSyncEngine:
             id=1, timestamp=now - timedelta(minutes=5), duration=120.0,
             data={"app": "Code", "title": "x"},
         )
-        # Return the event once (first window slice), then nothing.
-        seen = {"n": 0}
-
+        # Return the event from the reconcile window that actually covers its
+        # timestamp (match on the real time range, not a call counter — the
+        # latter is fragile near midnight / as the day-length changes).
         def _get_events(bucket_id, start=None, end=None, limit=None):
-            seen["n"] += 1
-            return [win_event] if seen["n"] == 1 else []
+            if start is not None and end is not None and start <= win_event.timestamp < end:
+                return [win_event]
+            return []
 
         self.aw.get_events.side_effect = _get_events
         self.queue.size.return_value = 0
@@ -728,14 +729,14 @@ class TestSyncEngine:
         the user was at the computer. Defaulting to inactive would cause
         silent zero-hour days which is worse than slightly inflated counts.
         """
-        # has_input_data=False, afk_events=[] is the default cycle context.
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[])
         self.engine._afk_watcher_available = False
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
             data={"app": "Firefox", "title": "Test"},
         )
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert result["activity_state"] == "active"
@@ -746,14 +747,14 @@ class TestSyncEngine:
         When the AFK watcher is available but has no events covering this
         window event's time range, the user was genuinely idle.
         """
-        # has_input_data=False, afk_events=[] is the default cycle context.
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[])
         self.engine._afk_watcher_available = True
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
             data={"app": "Firefox", "title": "Test"},
         )
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert result["activity_state"] == "inactive"
