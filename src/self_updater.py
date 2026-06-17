@@ -171,6 +171,12 @@ def _apply_local_artifact(
             on_progress(msg)
 
     app_path = _get_app_bundle_path()
+    # Instrumentation for the 2026-06-17 relaunch-failure investigation: the
+    # update reached "Installing/Restarting" but /Applications was never updated
+    # and the new process never started, and the cause isn't reproducible by
+    # inspection. Log exactly where we resolved the bundle so a canary shows
+    # whether app_path points at the real install or somewhere unexpected.
+    logger.info("self-update: sys.executable=%s resolved app_path=%s", sys.executable, app_path)
     if app_path is None:
         _status("Cannot determine app location - update aborted")
         return False
@@ -226,6 +232,7 @@ def _apply_local_artifact(
                 shutil.rmtree(backup_path)
 
             _status("Installing...")
+            logger.info("self-update: moving %s aside to %s", app_path, backup_path)
             app_path.rename(backup_path)
             try:
                 shutil.move(str(new_app), str(app_path))
@@ -234,6 +241,13 @@ def _apply_local_artifact(
                 if backup_path.exists() and not app_path.exists():
                     backup_path.rename(app_path)
                 raise
+            # Instrumentation: confirm the new bundle actually landed at app_path
+            # (the 06-17 failure left the old app in place with no error logged).
+            logger.info(
+                "self-update: moved new app to %s (exists=%s)",
+                app_path,
+                app_path.exists(),
+            )
             # Best-effort permission fix — app is already in place so
             # don't rollback on a perms error (would leave no app at all).
             try:
@@ -253,21 +267,38 @@ def _apply_local_artifact(
             _status("Restarting...")
             # `open` on a still-running app reactivates the current
             # (about-to-exit) instance instead of launching a new one — so the
-            # app would vanish and never reopen after a self-update. Same bug
-            # the permission-gate Restart path hit (fixed in main.py via
-            # 1cbca58); the self-update path had the same call shape and was
-            # never patched, so v1.5.30 users still saw the symptom. Wait for
-            # THIS process to die, then open a fresh instance. Detached via
+            # app would vanish and never reopen after a self-update. We wait for
+            # THIS process to die, then open a fresh instance, retrying a few
+            # times in case Gatekeeper is still settling. Detached via
             # start_new_session so the helper survives our os._exit below.
-            subprocess.Popen(
-                [
-                    "/bin/sh",
-                    "-c",
-                    f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
-                    f"open {shlex.quote(str(app_path))}",
-                ],
-                start_new_session=True,
+            #
+            # CRITICAL instrumentation: the relaunch runs AFTER os._exit, so the
+            # main log can't capture whether `open` actually worked — which is
+            # exactly the unknown in the 06-17 outage (the new process never
+            # logged a line). The helper therefore writes its own outcome (each
+            # open attempt + exit code) to self-update-relaunch.log, which is the
+            # ground truth a canary needs.
+            quoted_app = shlex.quote(str(app_path))
+            try:
+                relaunch_log = str(Config.get_log_dir() / "self-update-relaunch.log")
+            except Exception:
+                relaunch_log = "/tmp/betterflow-self-update-relaunch.log"
+            quoted_log = shlex.quote(relaunch_log)
+            # Capture rc into a var IMMEDIATELY after open — a $(date) in the same
+            # echo would otherwise reset $? and we'd log rc=0 for every failure.
+            script = (
+                f'L={quoted_log}; A={quoted_app}; '
+                f'echo "$(date -u +%FT%TZ) waiting for pid {os.getpid()}" >> "$L"; '
+                f'while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; '
+                f'echo "$(date -u +%FT%TZ) pid gone; opening $A" >> "$L"; '
+                f'for i in 1 2 3 4 5; do '
+                f'open "$A" >> "$L" 2>&1; rc=$?; '
+                f'if [ "$rc" -eq 0 ]; then echo "$(date -u +%FT%TZ) open OK (try $i)" >> "$L"; exit 0; fi; '
+                f'echo "$(date -u +%FT%TZ) open FAILED rc=$rc (try $i)" >> "$L"; sleep 1; '
+                f'done; '
+                f'echo "$(date -u +%FT%TZ) RELAUNCH FAILED after 5 attempts" >> "$L"'
             )
+            subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
             # os._exit works from any thread, unlike sys.exit which only raises
             # SystemExit in the calling thread.
             os._exit(0)
