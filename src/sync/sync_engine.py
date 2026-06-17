@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -1077,7 +1078,49 @@ class SyncEngine:
         events, _ = self._fetch_bucket_events(bucket_id, stats)
         if not events:
             return [], None
+        if bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT):
+            # Collapse heartbeat-merge corruption before it reaches the backend
+            # (see _collapse_afk_duplicates). Without this, a misbehaving idle
+            # tracker's duplicate 'afk' rows are synced raw and billed as idle.
+            events = self._collapse_afk_duplicates(events)
         return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
+
+    @staticmethod
+    def _collapse_afk_duplicates(events: list[AWEvent]) -> list[AWEvent]:
+        """Merge overlapping same-status AFK events into one span.
+
+        A misbehaving idle tracker — or a server heartbeat-merge failure — can
+        emit many AFK rows that share a start timestamp with growing durations
+        (observed: 29 'afk' rows all starting at the same instant, furdui.iancu
+        2026-06-17). This happens even with a single tracker, so it is distinct
+        from the orphan-tracker bug. Synced raw, the overlapping rows blanket
+        the period with redundant idle and poison both active-time
+        classification and the backend's billing. Collapsing overlapping
+        same-status spans to one (earliest-start, latest-end) event removes the
+        corruption while preserving the real timeline. Source events are not
+        mutated (new events are built via dataclasses.replace).
+        """
+        if len(events) <= 1:
+            return events
+        ordered = sorted(
+            events,
+            key=lambda e: (e.timestamp, e.timestamp + timedelta(seconds=e.duration)),
+        )
+        collapsed: list[AWEvent] = []
+        for ev in ordered:
+            ev_end = ev.timestamp + timedelta(seconds=ev.duration)
+            if collapsed:
+                last = collapsed[-1]
+                last_end = last.timestamp + timedelta(seconds=last.duration)
+                if last.status == ev.status and ev.timestamp <= last_end:
+                    # Overlap with the same status → extend the existing span.
+                    if ev_end > last_end:
+                        collapsed[-1] = dataclasses.replace(
+                            last, duration=(ev_end - last.timestamp).total_seconds()
+                        )
+                    continue
+            collapsed.append(ev)
+        return collapsed
 
     def _get_afk_events_for_range(
         self, start: datetime, end: datetime
@@ -1115,7 +1158,9 @@ class SyncEngine:
                 logger.debug("AFK bucket %s fetch failed: %s", bucket.id, e)
 
         all_afk.sort(key=lambda e: e.timestamp)
-        return all_afk
+        # Collapse heartbeat-merge corruption so active-time classification
+        # isn't poisoned by duplicate overlapping 'afk' spans.
+        return self._collapse_afk_duplicates(all_afk)
 
     @staticmethod
     def _is_active_during(
