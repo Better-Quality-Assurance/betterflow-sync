@@ -146,9 +146,9 @@ class TestSyncEngine:
 
     def test_transform_event_uses_not_afk_fallback_without_input(self):
         """Window events should stay active when AFK data says not-afk at event end."""
-        self.engine._has_input_data = False
+        self.engine._cycle.has_input_data = False
         now = datetime.now(timezone.utc)
-        self.engine._current_afk_events = [
+        self.engine._cycle.afk_events = [
             AWEvent(
                 id=11,
                 timestamp=now - timedelta(minutes=1),
@@ -173,11 +173,11 @@ class TestSyncEngine:
         The full event is uploaded every cycle; active-vs-idle (AFK overlap) is
         decided server-side. This prevents the client from stranding real work
         when input detection lags or events arrive zero-duration."""
-        self.engine._has_input_data = False
+        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
-        self.engine._latest_input_at = now
-        self.engine._current_afk_events = [
+        self.engine._cycle.latest_input_at = now
+        self.engine._cycle.afk_events = [
             AWEvent(
                 id=20,
                 timestamp=now + timedelta(seconds=30),
@@ -211,10 +211,10 @@ class TestSyncEngine:
 
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""
-        self.engine._has_input_data = False
+        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
-        self.engine._latest_input_at = datetime.now(timezone.utc)
-        self.engine._current_afk_events = []
+        self.engine._cycle.latest_input_at = datetime.now(timezone.utc)
+        self.engine._cycle.afk_events = []
         now = datetime.now(timezone.utc)
         event = AWEvent(
             id=22,
@@ -240,9 +240,9 @@ class TestSyncEngine:
         """1.5.43: no client-side input-timeout cap. The full event duration is
         uploaded; the server trims idle from the AFK stream. The old cap dropped
         genuinely-active work whenever input detection lagged."""
-        self.engine._has_input_data = True
-        self.engine._latest_input_at = datetime.now(timezone.utc)
-        now = self.engine._latest_input_at - timedelta(minutes=5)
+        self.engine._cycle.has_input_data = True
+        self.engine._cycle.latest_input_at = datetime.now(timezone.utc)
+        now = self.engine._cycle.latest_input_at - timedelta(minutes=5)
         event = AWEvent(
             id=23,
             timestamp=now,
@@ -267,9 +267,9 @@ class TestSyncEngine:
         """1.5.43: a window beyond last_input + afk_timeout is still uploaded —
         the client never drops it. The server decides if it counts as active.
         Previously this returned [] and silently stranded real activity."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.engine._afk_watcher_available = False
-        self.engine._latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+        self.engine._cycle.latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
         event = AWEvent(
             id=24,
             timestamp=datetime.now(timezone.utc),
@@ -318,10 +318,10 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_uses_afk_when_input_is_stale(self):
         """AFK data should remain authoritative when input watcher goes stale."""
         now = datetime.now(timezone.utc)
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.engine._afk_watcher_available = True
-        self.engine._latest_input_at = now - timedelta(minutes=30)
-        self.engine._current_afk_events = [
+        self.engine._cycle.latest_input_at = now - timedelta(minutes=30)
+        self.engine._cycle.afk_events = [
             AWEvent(
                 id=25,
                 timestamp=now - timedelta(minutes=40),
@@ -600,7 +600,7 @@ class TestSyncEngine:
 
     def test_transform_event_adds_activity_state_for_window_events(self):
         """Test that window events include activity state and metrics."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
@@ -617,7 +617,7 @@ class TestSyncEngine:
 
     def test_transform_event_tracks_active_time_for_active_events(self):
         """Test that active events add time to tracker."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -636,7 +636,7 @@ class TestSyncEngine:
 
     def test_transform_event_tracks_idle_active_time(self):
         """Test that idle-active events still add counted time to tracker."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "idle-active"
 
         event = AWEvent(
@@ -652,11 +652,11 @@ class TestSyncEngine:
 
     def test_transform_event_no_input_data_uses_afk_for_active(self):
         """Test that without input data, AFK 'not-afk' events mark window as active."""
-        self.engine._has_input_data = False
+        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is active during this window
-        self.engine._current_afk_events = [
+        self.engine._cycle.afk_events = [
             AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "not-afk"}),
         ]
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
@@ -669,11 +669,11 @@ class TestSyncEngine:
 
     def test_transform_event_no_input_data_uses_afk_for_inactive(self):
         """Test that without input data, AFK 'afk' events mark window as inactive."""
-        self.engine._has_input_data = False
+        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is idle during this window
-        self.engine._current_afk_events = [
+        self.engine._cycle.afk_events = [
             AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "afk"}),
         ]
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
@@ -691,8 +691,8 @@ class TestSyncEngine:
         the user was at the computer. Defaulting to inactive would cause
         silent zero-hour days which is worse than slightly inflated counts.
         """
-        self.engine._has_input_data = False
-        self.engine._current_afk_events = []
+        self.engine._cycle.has_input_data = False
+        self.engine._cycle.afk_events = []
         self.engine._afk_watcher_available = False
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
@@ -710,8 +710,8 @@ class TestSyncEngine:
         When the AFK watcher is available but has no events covering this
         window event's time range, the user was genuinely idle.
         """
-        self.engine._has_input_data = False
-        self.engine._current_afk_events = []
+        self.engine._cycle.has_input_data = False
+        self.engine._cycle.afk_events = []
         self.engine._afk_watcher_available = True
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
@@ -773,7 +773,7 @@ class TestSyncEngine:
 
     def test_transform_event_delta_time_tracking_on_refetch(self):
         """Test that re-fetched events with grown duration only add the delta."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event_v1 = AWEvent(
@@ -803,7 +803,7 @@ class TestSyncEngine:
 
     def test_transform_event_no_double_count_same_duration(self):
         """Test that re-fetched events with same duration don't add time."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -823,7 +823,7 @@ class TestSyncEngine:
 
     def test_transform_event_different_buckets_track_separately(self):
         """Test that same event ID in different buckets tracks time independently."""
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -858,7 +858,7 @@ class TestSyncEngine:
         """Test that _time_cache operations are protected by _cache_lock."""
         import threading
 
-        self.engine._has_input_data = True
+        self.engine._cycle.has_input_data = True
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
