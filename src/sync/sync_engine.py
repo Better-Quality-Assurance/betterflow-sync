@@ -63,20 +63,19 @@ def _is_afk_like(bucket_type: str) -> bool:
 @dataclass
 class _SyncCycleContext:
     """Per-cycle activity context, grouped into one value object instead of
-    three loose SyncEngine fields.
+    two loose SyncEngine fields.
 
-    ``has_input_data`` / ``latest_input_at`` are set once per cycle by
-    ``_prepare_input_analysis``; ``afk_events`` is refreshed per window bucket
-    by ``_sync_window_buckets``. A fresh instance is assigned at the top of each
-    ``sync()`` (before reconcile), so a re-armed reconcile can no longer read a
-    previous cycle's leftover state — it sees deterministic defaults.
+    ``has_input_data`` is set once per cycle by ``_prepare_input_analysis``;
+    ``afk_events`` is refreshed per window bucket by ``_sync_window_buckets``.
+    A fresh instance is assigned at the top of each ``sync()`` (before
+    reconcile), so a re-armed reconcile can no longer read a previous cycle's
+    leftover state — it sees deterministic defaults.
 
     Still read without a lock: mutated only by ``sync()`` (under main.py's
     ``_sync_lock``) and read only from that same call chain.
     """
 
     has_input_data: bool = False
-    latest_input_at: Optional[datetime] = None
     afk_events: list = field(default_factory=list)
 
 
@@ -547,11 +546,10 @@ class SyncEngine:
 
     def _prepare_input_analysis(self, input_buckets: list) -> None:
         """Fetch recent input events, feed the activity analyzer, and record
-        whether input data exists + the latest real-input timestamp. Extracted
-        from sync() verbatim — behaviour unchanged.
+        whether input data exists for this cycle.
 
-        The lookback must cover both the engagement window and the full AFK
-        grace period so we can cap counted time at last_input + afk_timeout.
+        The lookback covers the engagement window and the AFK grace period so
+        the analyzer sees enough history to classify engagement.
         """
         input_lookback_minutes = max(
             self.config.engagement.window_minutes * 2,
@@ -570,14 +568,6 @@ class SyncEngine:
                 logger.debug("input bucket %s fetch failed: %s", bucket.id, e)
         self._activity_analyzer.add_input_events(input_events_for_analysis)
         self._cycle.has_input_data = len(input_events_for_analysis) > 0
-        self._cycle.latest_input_at = None
-        for ev in input_events_for_analysis:
-            if ev.presses <= 0 and ev.clicks <= 0 and ev.scrolls <= 0:
-                continue
-
-            event_end = ev.timestamp + timedelta(seconds=ev.duration)
-            if self._cycle.latest_input_at is None or event_end > self._cycle.latest_input_at:
-                self._cycle.latest_input_at = event_end
 
     def _sync_window_buckets(
         self, window_buckets: list, stats: "SyncStats"
@@ -1000,84 +990,6 @@ class SyncEngine:
 
         return transformed, pending_checkpoint
 
-    @staticmethod
-    def _overlap_range(
-        start: datetime,
-        end: datetime,
-        other_start: datetime,
-        other_end: datetime,
-    ) -> Optional[tuple[datetime, datetime]]:
-        """Return the overlapped range, if any."""
-        overlap_start = max(start, other_start)
-        overlap_end = min(end, other_end)
-        if overlap_end <= overlap_start:
-            return None
-
-        return overlap_start, overlap_end
-
-    def _active_ranges_from_afk(self, event: AWEvent) -> list[tuple[datetime, datetime]]:
-        """Return the non-AFK slices for a window/web event."""
-        event_start = event.timestamp
-        event_end = event.timestamp + timedelta(seconds=event.duration)
-        afk_ranges: list[tuple[datetime, datetime]] = []
-
-        for afk_event in self._cycle.afk_events:
-            if afk_event.status != "afk":
-                continue
-
-            afk_start = afk_event.timestamp
-            afk_end = afk_event.timestamp + timedelta(seconds=afk_event.duration)
-            overlap = self._overlap_range(event_start, event_end, afk_start, afk_end)
-            if overlap is not None:
-                afk_ranges.append(overlap)
-
-        if not afk_ranges:
-            return [(event_start, event_end)]
-
-        afk_ranges.sort(key=lambda item: item[0])
-        merged_afk: list[tuple[datetime, datetime]] = []
-        for start, end in afk_ranges:
-            if not merged_afk or start > merged_afk[-1][1]:
-                merged_afk.append((start, end))
-            else:
-                merged_afk[-1] = (merged_afk[-1][0], max(merged_afk[-1][1], end))
-
-        active_ranges: list[tuple[datetime, datetime]] = []
-        cursor = event_start
-        for afk_start, afk_end in merged_afk:
-            if afk_start > cursor:
-                active_ranges.append((cursor, afk_start))
-            cursor = max(cursor, afk_end)
-            if cursor >= event_end:
-                break
-
-        if cursor < event_end:
-            active_ranges.append((cursor, event_end))
-
-        return active_ranges
-
-    def _cap_ranges_to_input_timeout(
-        self,
-        ranges: list[tuple[datetime, datetime]],
-    ) -> list[tuple[datetime, datetime]]:
-        """Cap counted ranges at last confirmed input + AFK timeout."""
-        if self._cycle.latest_input_at is None:
-            return list(ranges)
-
-        timeout_cutoff = self._cycle.latest_input_at + timedelta(
-            minutes=self.config.aw.afk_timeout_minutes
-        )
-        capped: list[tuple[datetime, datetime]] = []
-        for start, end in ranges:
-            if start >= timeout_cutoff:
-                continue
-
-            capped_end = min(end, timeout_cutoff)
-            if capped_end > start:
-                capped.append((start, capped_end))
-
-        return capped
-
     def _transform_window_event_with_timeout(
         self,
         event: AWEvent,
@@ -1460,8 +1372,8 @@ class SyncEngine:
         accumulate counted active time. Extracted from _transform_event verbatim —
         behaviour unchanged.
 
-        Locking invariant: reads ``self._cycle`` (has_input_data / latest_input_at
-        / afk_events) without a lock. ``self._cycle`` is mutated only by
+        Locking invariant: reads ``self._cycle`` (has_input_data / afk_events)
+        without a lock. ``self._cycle`` is mutated only by
         ``sync()`` (under main.py's ``_sync_lock``), and this method is only
         reachable from that same call chain — do NOT call it concurrently with
         sync() or from another thread without first taking ``_sync_lock``.

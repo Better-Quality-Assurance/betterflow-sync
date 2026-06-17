@@ -176,7 +176,6 @@ class TestSyncEngine:
         self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
-        self.engine._cycle.latest_input_at = now
         self.engine._cycle.afk_events = [
             AWEvent(
                 id=20,
@@ -213,7 +212,6 @@ class TestSyncEngine:
         """Without AFK overlap, no-input windows should still count fully."""
         self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
-        self.engine._cycle.latest_input_at = datetime.now(timezone.utc)
         self.engine._cycle.afk_events = []
         now = datetime.now(timezone.utc)
         event = AWEvent(
@@ -241,8 +239,7 @@ class TestSyncEngine:
         uploaded; the server trims idle from the AFK stream. The old cap dropped
         genuinely-active work whenever input detection lagged."""
         self.engine._cycle.has_input_data = True
-        self.engine._cycle.latest_input_at = datetime.now(timezone.utc)
-        now = self.engine._cycle.latest_input_at - timedelta(minutes=5)
+        now = datetime.now(timezone.utc) - timedelta(minutes=5)
         event = AWEvent(
             id=23,
             timestamp=now,
@@ -269,7 +266,6 @@ class TestSyncEngine:
         Previously this returned [] and silently stranded real activity."""
         self.engine._cycle.has_input_data = True
         self.engine._afk_watcher_available = False
-        self.engine._cycle.latest_input_at = datetime.now(timezone.utc) - timedelta(minutes=11)
         event = AWEvent(
             id=24,
             timestamp=datetime.now(timezone.utc),
@@ -320,7 +316,6 @@ class TestSyncEngine:
         now = datetime.now(timezone.utc)
         self.engine._cycle.has_input_data = True
         self.engine._afk_watcher_available = True
-        self.engine._cycle.latest_input_at = now - timedelta(minutes=30)
         self.engine._cycle.afk_events = [
             AWEvent(
                 id=25,
