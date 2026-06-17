@@ -138,18 +138,21 @@ class TestDownloadSizeCap:
         ctx.__exit__.return_value = False
         return ctx
 
-    def test_rejects_oversized_content_length(self, tmp_path):
+    def test_rejects_oversized_content_length(self, tmp_path, monkeypatch):
+        # Shrink the cap so the test stays tiny (no real 500MB anything).
+        monkeypatch.setattr(su, "_MAX_DOWNLOAD_BYTES", 100)
         dest = tmp_path / "big.bin"
-        ctx = self._fake_get(su._MAX_DOWNLOAD_BYTES + 1, [b"x"])
+        ctx = self._fake_get(101, [b"x"])
         with patch("src.self_updater.requests.get", return_value=ctx):
             with pytest.raises(ValueError):
                 su._download_to_file("https://github.com/x/big.bin", dest)
 
-    def test_aborts_when_stream_exceeds_cap(self, tmp_path):
+    def test_aborts_when_stream_exceeds_cap(self, tmp_path, monkeypatch):
         # content-length lies (0), but the streamed body blows past the cap.
+        # Tiny cap + tiny chunk so we don't allocate hundreds of MB in CI.
+        monkeypatch.setattr(su, "_MAX_DOWNLOAD_BYTES", 100)
         dest = tmp_path / "big.bin"
-        oversized_chunk = b"x" * (su._MAX_DOWNLOAD_BYTES + 1)
-        ctx = self._fake_get(0, [oversized_chunk])
+        ctx = self._fake_get(0, [b"x" * 101])
         with patch("src.self_updater.requests.get", return_value=ctx):
             with pytest.raises(ValueError):
                 su._download_to_file("https://github.com/x/big.bin", dest)
