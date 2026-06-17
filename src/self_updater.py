@@ -241,6 +241,15 @@ def _apply_local_artifact(
             except Exception as e:
                 logger.warning("Permission fix failed, update may not launch: %s", e)
 
+            # CRITICAL: strip the com.apple.quarantine xattr the new bundle
+            # inherited from the downloaded DMG. Left on, Gatekeeper App-
+            # Translocation runs the app from an ephemeral read-only path (or
+            # blocks the headless `open` below entirely), so the post-update
+            # relaunch never starts and the whole fleet goes dark after an update
+            # (the 2026-06-17 1.5.49 outage). The notarization staple already
+            # makes the app trusted, so removing quarantine is safe.
+            _strip_quarantine(app_path)
+
             shutil.rmtree(backup_path, ignore_errors=True)
 
             # 4. Flush pending data + relaunch
@@ -259,12 +268,17 @@ def _apply_local_artifact(
             # never patched, so v1.5.30 users still saw the symptom. Wait for
             # THIS process to die, then open a fresh instance. Detached via
             # start_new_session so the helper survives our os._exit below.
+            # Retry the open: the first launch right after install can still be
+            # raced by Gatekeeper finishing its checks. Quarantine is already
+            # stripped above, so a retry loop (bounded, breaks on success) is
+            # cheap insurance against the app failing to come back at all.
+            quoted_app = shlex.quote(str(app_path))
             subprocess.Popen(
                 [
                     "/bin/sh",
                     "-c",
                     f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; "
-                    f"open {shlex.quote(str(app_path))}",
+                    f"for i in 1 2 3 4 5; do open {quoted_app} && exit 0; sleep 1; done",
                 ],
                 start_new_session=True,
             )
@@ -432,6 +446,36 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         finally:
             # Remove the mount point directory itself
             shutil.rmtree(mount_point, ignore_errors=True)
+
+
+def _strip_quarantine(app_path: Path) -> None:
+    """Recursively remove com.apple.quarantine from a freshly-installed bundle.
+
+    Best-effort: a failure here means the post-update relaunch may not start
+    (the very bug this prevents), so log loudly, but never raise into the update
+    flow — aborting after the new app is already in place would be worse. The
+    `-r` recurses the bundle; `-s` ignores symlink targets; a missing attribute
+    is not an error for `xattr -d`.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        result = subprocess.run(
+            ["xattr", "-dr", "com.apple.quarantine", str(app_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "xattr quarantine strip returned %s: %s",
+                result.returncode,
+                result.stderr.strip(),
+            )
+        else:
+            logger.info("Stripped com.apple.quarantine from updated app")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning("Could not strip quarantine (relaunch may fail): %s", e)
 
 
 def _fix_permissions(app_path: Path) -> None:
