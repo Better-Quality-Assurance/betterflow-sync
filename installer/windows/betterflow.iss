@@ -9,7 +9,10 @@
 ;
 ; The version is injected by CI:
 ;   ISCC.exe /DMyAppVersion=1.5.x installer\windows\betterflow.iss
-; Run from the repo root so the relative Source/SetupIconFile paths resolve.
+; Inno resolves relative paths against SourceDir (the .iss directory by
+; default), NOT the compiler's working directory — so SourceDir below is
+; pinned to the repo root and every relative Source/SetupIconFile/OutputDir
+; path resolves from there regardless of where ISCC is invoked.
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -21,6 +24,9 @@
 #define MyAppExeName "BetterFlow.exe"
 
 [Setup]
+; Resolve all relative paths (SetupIconFile, [Files] Source, OutputDir) from
+; the repo root — two levels up from this script (installer\windows\).
+SourceDir={#SourcePath}\..\..
 ; Stable AppId so future versions upgrade in place instead of stacking up.
 AppId={{8F3B2C7A-1E4D-4B9A-9C2E-BF10D5E28A44}
 AppName={#MyAppName}
