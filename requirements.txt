@@ -1,17 +1,20 @@
 # Core dependencies
-requests>=2.31
-pystray>=0.19
-keyring>=24.0
-apscheduler>=3.10
-platformdirs>=3.0
-Pillow>=10.0
-pyobjc-framework-SystemConfiguration>=10.0; sys_platform == "darwin"
-pyobjc-framework-ApplicationServices>=10.0; sys_platform == "darwin"
+# Upper bounds cap the next major to avoid a surprise breaking upstream release
+# (no lockfile, and the deps span 3 platforms). APScheduler<4 is the important
+# one — 4.0 is a breaking rewrite of the scheduler API this app relies on.
+requests>=2.31,<3
+pystray>=0.19,<0.20
+keyring>=24.0,<26
+apscheduler>=3.10,<4
+platformdirs>=3.0,<5
+Pillow>=10.0,<13
+pyobjc-framework-SystemConfiguration>=10.0,<13; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0,<13; sys_platform == "darwin"
 
 # Windows-only dependencies
 # uiautomation -> read the foreground browser's omnibox URL via UI Automation
 # (opt-in active-tab tracking, privacy.track_browser_urls). Fail-closed if absent.
-uiautomation>=2.0; sys_platform == "win32"
+uiautomation>=2.0,<3; sys_platform == "win32"
 
 # Linux-only dependencies
 # PyGObject -> AppIndicator tray backend; python-xlib -> XOrg fallback backend;
@@ -21,9 +24,9 @@ uiautomation>=2.0; sys_platform == "win32"
 # 3.48 builds against girepository-1.0, which is present on far more distros and
 # keeps the bundled AppImage portable.
 PyGObject>=3.42,<3.50; sys_platform == "linux"
-python-xlib>=0.33; sys_platform == "linux"
-jeepney>=0.8; sys_platform == "linux"
-SecretStorage>=3.3; sys_platform == "linux"
+python-xlib>=0.33,<1; sys_platform == "linux"
+jeepney>=0.8,<1; sys_platform == "linux"
+SecretStorage>=3.3,<4; sys_platform == "linux"
 
 # Development dependencies (install with: pip install -r requirements-dev.txt)
 # pytest>=7.0
