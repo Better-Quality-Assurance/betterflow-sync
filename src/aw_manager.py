@@ -478,6 +478,34 @@ class AWManager:
             self._using_external = False
             return self._start_locked()
 
+    def restart_idle_tracker(self, reason: str = "") -> None:
+        """Restart ONLY the idle tracker, reaping orphans first.
+
+        Used when bf-idle-tracker reports 'afk' while the user is demonstrably
+        typing — a blind/stuck tracker. The window/AFK staleness watchdog can't
+        catch this: a blind tracker still emits 'afk' events, so it never looks
+        stale. (If the cause is genuinely missing Input Monitoring permission a
+        restart won't help — the user is separately notified to grant it — but a
+        hung/stuck tracker recovers, and any orphan is cleared.)
+        """
+        name = "bf-idle-tracker"
+        with self._lifecycle_lock:
+            if name in self._disabled_components:
+                return
+            binaries_dir = self._get_binaries_dir()
+            if not binaries_dir:
+                return
+            logger.warning("Restarting %s (%s)", name, reason or "blind tracker")
+            proc = self._processes.get(name)
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self._reap_orphan_processes(name, binaries_dir)
+            self._start_component(name, binaries_dir)
+
     def check_health(self) -> bool:
         """Check if all managed components are still running."""
         with self._lifecycle_lock:

@@ -648,6 +648,18 @@ class SyncCoordinator:
             "bar icon → Diagnostics → Fix Permissions and grant access to "
             "bf-idle-tracker as well as BetterFlow.",
         )
+        # Don't just warn — try to recover. A tracker that reports 'afk' while
+        # input is flowing is blind/stuck (or an orphan is fighting it); a
+        # restart re-establishes capture and reaps any orphan. Throttled by the
+        # same rewarn interval above, so it won't thrash. If the real cause is a
+        # missing permission a restart won't fix it, but the notification above
+        # tells the user how — and a stuck tracker recovers without a manual
+        # app restart (the recurring "shows idle while I'm working" report).
+        if self.aw_manager.is_managing:
+            try:
+                self.aw_manager.restart_idle_tracker(reason="afk reported while input active")
+            except Exception:
+                logger.warning("restart_idle_tracker failed", exc_info=True)
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.

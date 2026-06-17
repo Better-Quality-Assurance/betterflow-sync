@@ -100,3 +100,38 @@ def test_force_restart_reaps_hung_server_then_starts_fresh(monkeypatch):
     assert "bf-data-service" in reaped, "the hung server is reaped, not just the watchers"
     assert mgr._using_external is False, "drops external attachment so a fresh server can start"
     assert mgr._start_locked.called
+
+
+def test_restart_idle_tracker_terminates_reaps_and_restarts():
+    """Blind tracker (afk-while-input) recovery: kill the tracked proc, reap
+    orphans, start fresh."""
+    mgr = AWManager()
+    idle = MagicMock()
+    idle.poll.return_value = None  # alive
+    mgr._processes = {"bf-idle-tracker": idle}
+    mgr._get_binaries_dir = MagicMock(return_value="/tmp/bin")
+    mgr._reap_orphan_processes = MagicMock()
+    mgr._start_component = MagicMock()
+
+    mgr.restart_idle_tracker(reason="afk while input active")
+
+    assert idle.terminate.called, "stuck tracker is terminated"
+    mgr._reap_orphan_processes.assert_called_once_with("bf-idle-tracker", "/tmp/bin")
+    assert ("bf-idle-tracker",) in [
+        c.args[:1] for c in mgr._start_component.call_args_list
+    ], "a fresh idle tracker is started"
+
+
+def test_restart_idle_tracker_skips_disabled():
+    mgr = AWManager()
+    idle = MagicMock()
+    idle.poll.return_value = None
+    mgr._processes = {"bf-idle-tracker": idle}
+    mgr._disabled_components.add("bf-idle-tracker")
+    mgr._get_binaries_dir = MagicMock(return_value="/tmp/bin")
+    mgr._start_component = MagicMock()
+
+    mgr.restart_idle_tracker()
+
+    assert not idle.terminate.called, "a disabled idle tracker is never restarted"
+    assert not mgr._start_component.called
