@@ -167,6 +167,23 @@ class TestBetterFlowClient:
             self.client._request("GET", "config", retry=False)
 
     @responses.activate
+    def test_upload_logs_posts_multipart_to_logs_endpoint(self):
+        """upload_logs POSTs a multipart body (the log tail) to /logs."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/logs",
+            json={"data": {"received": 1}},
+            status=200,
+        )
+        self.client.upload_logs(b"some-log-tail", None)
+        assert len(responses.calls) == 1
+        body = responses.calls[0].request.body
+        raw = body if isinstance(body, bytes) else body.encode()
+        assert b"betterflow.log" in raw          # multipart field/filename present
+        assert b"some-log-tail" in raw           # the tail content was sent
+        assert b"relaunch_log" not in raw        # omitted when None
+
+    @responses.activate
     def test_is_reachable_true(self):
         """Test is_reachable when server responds."""
         responses.add(

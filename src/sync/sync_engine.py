@@ -1913,6 +1913,12 @@ class SyncEngine:
             if response.get("config_updated"):
                 self.fetch_server_config()
 
+            # Admin requested this device's logs for diagnostics. Upload the
+            # tail; the server clears the flag only on success, so a failed
+            # upload simply retries on the next heartbeat.
+            if response.get("logs_requested"):
+                self._upload_requested_logs()
+
         except BetterFlowAuthError as e:
             # Surface auth errors to the caller so re-login can fire.
             # The generic BetterFlowClientError handler below would otherwise
@@ -1922,6 +1928,44 @@ class SyncEngine:
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
         return None
+
+    def _upload_requested_logs(self) -> None:
+        """Upload this device's log tail(s) on server request (admin
+        diagnostics). betterflow.log is required by the server; the relaunch log
+        is included when present. Never clears anything client-side — the server
+        clears its logs_requested flag only on success, so a failed upload just
+        retries on the next heartbeat.
+        """
+        try:
+            log_dir = self.config.get_log_dir()
+        except Exception as e:
+            logger.debug("logs_requested: could not resolve log dir: %s", e)
+            return
+        log_tail = self._read_log_tail(log_dir / "betterflow.log")
+        if not log_tail:
+            logger.debug("logs_requested but betterflow.log is empty/unreadable — skipping")
+            return
+        relaunch_tail = self._read_log_tail(log_dir / "self-update-relaunch.log")
+        try:
+            self.bf.upload_logs(log_tail, relaunch_tail)
+            logger.info("Uploaded log tail on server request (%d bytes)", len(log_tail))
+        except BetterFlowAuthError:
+            raise  # let _send_heartbeat surface re-login
+        except BetterFlowClientError as e:
+            logger.debug("Log upload failed (will retry next heartbeat): %s", e)
+
+    @staticmethod
+    def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
+        """Return up to the last ``max_bytes`` of a log file (matching the
+        server's per-file tail cap), or None if it can't be read."""
+        try:
+            size = path.stat().st_size
+            with open(path, "rb") as f:
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                return f.read()
+        except OSError:
+            return None
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:

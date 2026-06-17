@@ -388,6 +388,26 @@ class TestSyncEngine:
         assert enqueued, "reconcile should enqueue the replayed window event"
         assert all(e["activity_state"] == "active" for e in enqueued)
 
+    def test_heartbeat_uploads_logs_when_requested(self):
+        """When the heartbeat response sets logs_requested, the agent uploads
+        the betterflow.log tail (relaunch log optional)."""
+        self.bf.heartbeat.return_value = {"logs_requested": True}
+
+        def fake_tail(path, max_bytes=512 * 1024):
+            return b"log-bytes" if path.name == "betterflow.log" else None
+
+        with patch.object(SyncEngine, "_read_log_tail", side_effect=fake_tail):
+            result = self.engine._send_heartbeat()
+
+        assert result is None  # no auth error surfaced
+        self.bf.upload_logs.assert_called_once_with(b"log-bytes", None)
+
+    def test_heartbeat_does_not_upload_logs_when_not_requested(self):
+        """No logs_requested flag -> no upload (the common case)."""
+        self.bf.heartbeat.return_value = {"logs_requested": False}
+        self.engine._send_heartbeat()
+        self.bf.upload_logs.assert_not_called()
+
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}
