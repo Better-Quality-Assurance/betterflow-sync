@@ -373,13 +373,13 @@ class AWManager:
                 # exited uncleanly (crash, force-quit, or a pre-fix self-update)
                 # BEFORE starting a fresh one — otherwise two instances post to
                 # the same bucket and the day's data is corrupted on launch.
-                self._reap_orphan_watchers(watcher, binaries_dir)
+                self._reap_orphan_processes(watcher, binaries_dir)
                 self._start_component(watcher, binaries_dir)
 
         logger.info("Tracker components started")
         return True
 
-    def _reap_orphan_watchers(self, name: str, binaries_dir: str) -> None:
+    def _reap_orphan_processes(self, name: str, binaries_dir: str) -> None:
         """Kill stray processes of watcher ``name`` not owned by this instance.
 
         Orphans accumulate when a previous instance exited without a clean
@@ -420,34 +420,63 @@ class AWManager:
         processes — there is nothing belonging to another instance to spare.
         """
         with self._lifecycle_lock:
-            if not self._processes:
-                return
+            self._stop_locked()
 
-            logger.info("Stopping tracker components...")
+    def _stop_locked(self) -> None:
+        """Terminate every tracked process. Caller must hold _lifecycle_lock."""
+        if not self._processes:
+            return
 
-            # Stop watchers first, then server
-            stop_order = BF_WATCHERS + [BF_SERVER]
+        logger.info("Stopping tracker components...")
 
-            for name in stop_order:
-                proc = self._processes.get(name)
-                if proc and proc.poll() is None:
-                    logger.debug(f"Terminating {name} (PID {proc.pid})")
-                    proc.terminate()
+        # Stop watchers first, then server
+        stop_order = BF_WATCHERS + [BF_SERVER]
 
-            # Wait for graceful shutdown
-            deadline = time.monotonic() + SHUTDOWN_TIMEOUT
-            for name in stop_order:
-                proc = self._processes.get(name)
-                if proc and proc.poll() is None:
-                    remaining = max(0, deadline - time.monotonic())
-                    try:
-                        proc.wait(timeout=remaining)
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"Force-killing {name} (PID {proc.pid})")
-                        proc.kill()
+        for name in stop_order:
+            proc = self._processes.get(name)
+            if proc and proc.poll() is None:
+                logger.debug(f"Terminating {name} (PID {proc.pid})")
+                proc.terminate()
 
-            self._processes.clear()
-            logger.info("Tracker components stopped")
+        # Wait for graceful shutdown
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+        for name in stop_order:
+            proc = self._processes.get(name)
+            if proc and proc.poll() is None:
+                remaining = max(0, deadline - time.monotonic())
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Force-killing {name} (PID {proc.pid})")
+                    proc.kill()
+
+        self._processes.clear()
+        logger.info("Tracker components stopped")
+
+    def force_restart(self, reason: str = "") -> bool:
+        """Tear down the whole tracker stack and rebuild it from scratch.
+
+        Unlike ``stop()`` + ``start()`` (which only cycles the watchers and
+        re-attaches to whatever server holds the port), this also reclaims a
+        **hung-but-listening** server: a ``bf-data-service`` that still holds
+        port 5600 but no longer answers HTTP, so ``_port_in_use()`` reads True
+        and nothing ever restarts it. Path-scoped kill of any stray server +
+        watcher processes, then a clean start. Used by the sync loop after the
+        local server is unreachable for several consecutive cycles.
+        """
+        with self._lifecycle_lock:
+            logger.warning("Force-restarting tracker stack (%s)", reason or "unspecified")
+            self._stop_locked()
+            binaries_dir = self._get_binaries_dir()
+            if binaries_dir:
+                # Reap a hung server too — in external mode it isn't in
+                # _processes, so _stop_locked() can't reach it.
+                for name in (BF_SERVER, *BF_WATCHERS):
+                    self._reap_orphan_processes(name, binaries_dir)
+            # Drop external attachment so _start_locked starts our own server
+            # if the port is now free after the reap.
+            self._using_external = False
+            return self._start_locked()
 
     def check_health(self) -> bool:
         """Check if all managed components are still running."""
@@ -563,7 +592,7 @@ class AWManager:
                 # Kill any orphan too — staleness that survives repeated restarts
                 # is the signature of a second tracker fighting over the bucket;
                 # restarting only our PID can never win against it.
-                self._reap_orphan_watchers(idle_watcher, binaries_dir)
+                self._reap_orphan_processes(idle_watcher, binaries_dir)
                 self._start_component(idle_watcher, binaries_dir)
 
         # Only block waiting for the server when the server itself was

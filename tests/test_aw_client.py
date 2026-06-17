@@ -195,7 +195,7 @@ class TestAWClient:
             assert client is not None
 
     def test_request_resets_session_and_retries_on_connection_error(self):
-        """A stale pooled socket (ConnectionError) must trigger one session
+        """A stale pooled socket (ConnectionError) must trigger a session
         reset + retry — the automatic equivalent of the manual restart that
         always 'fixed' sync stalls (furdui.iancu, 2026-06-17)."""
         import requests
@@ -215,21 +215,54 @@ class TestAWClient:
             resp.json = Mock(return_value={"version": "0.13.2"})
             return resp
 
-        with patch.object(requests.Session, "request", flaky_request):
+        with patch.object(requests.Session, "request", flaky_request), \
+                patch("time.sleep"):
             result = client.get_info()
 
         assert result == {"version": "0.13.2"}
-        assert calls["n"] == 2, "must retry exactly once after resetting the session"
+        assert calls["n"] == 2, "recovers on the first retry after resetting the session"
         assert client._session is not first_session, "session was rebuilt on connection failure"
 
-    def test_request_gives_up_after_one_retry(self):
-        """Two consecutive connection failures still surface as AWClientError —
-        no infinite retry loop."""
+    def test_request_retries_through_a_brief_stall_then_succeeds(self):
+        """Two consecutive failures (e.g. a brief server stall) still recover on
+        the third attempt thanks to the backoff retries — no manual restart."""
         import requests
 
         client = AWClient()
-        with patch.object(
-            requests.Session, "request",
-            side_effect=requests.exceptions.ConnectionError("down"),
-        ), pytest.raises(AWClientError):
-            client.get_info()
+        calls = {"n": 0}
+
+        def flaky_request(self, method, url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise requests.exceptions.ConnectionError("stall")
+            resp = Mock()
+            resp.raise_for_status = Mock()
+            resp.content = b'{"ok": true}'
+            resp.json = Mock(return_value={"ok": True})
+            return resp
+
+        with patch.object(requests.Session, "request", flaky_request), \
+                patch("time.sleep"):
+            result = client.get_info()
+
+        assert result == {"ok": True}
+        assert calls["n"] == 3, "uses all backoff retries before succeeding"
+
+    def test_request_gives_up_after_max_attempts(self):
+        """Persistent connection failure surfaces as AWClientError after exactly
+        _CONNECT_ATTEMPTS tries — bounded, no infinite loop."""
+        import requests
+
+        client = AWClient()
+        calls = {"n": 0}
+
+        def always_down(self, method, url, **kwargs):
+            calls["n"] += 1
+            raise requests.exceptions.ConnectionError("down")
+
+        with patch.object(requests.Session, "request", always_down), \
+                patch("time.sleep"):
+            with pytest.raises(AWClientError):
+                client.get_info()
+
+        assert calls["n"] == AWClient._CONNECT_ATTEMPTS

@@ -73,6 +73,30 @@ def test_reaper_kills_orphans_only(monkeypatch):
     killed = []
     monkeypatch.setattr(awm, "_terminate_pid", lambda pid, **k: killed.append(pid))
 
-    mgr._reap_orphan_watchers("bf-idle-tracker", "/x")
+    mgr._reap_orphan_processes("bf-idle-tracker", "/x")
 
     assert killed == [2222], "kills the orphan only — not our managed PID, not ourselves"
+
+
+def test_force_restart_reaps_hung_server_then_starts_fresh(monkeypatch):
+    """A hung-but-listening server (port held, HTTP dead) must be reclaimed:
+    stop watchers, reap stray server+watcher processes, then start fresh."""
+    mgr = AWManager()
+    mgr._using_external = True  # attached to what we now believe is a dead server
+    mgr._get_binaries_dir = MagicMock(return_value="/tmp/bin")
+
+    reaped = []
+    monkeypatch.setattr(mgr, "_stop_locked", lambda: reaped.append("stopped"))
+    monkeypatch.setattr(
+        mgr, "_reap_orphan_processes",
+        lambda name, d: reaped.append(name),
+    )
+    mgr._start_locked = MagicMock(return_value=True)
+
+    ok = mgr.force_restart(reason="server unreachable")
+
+    assert ok is True
+    assert reaped[0] == "stopped", "watchers stopped first"
+    assert "bf-data-service" in reaped, "the hung server is reaped, not just the watchers"
+    assert mgr._using_external is False, "drops external attachment so a fresh server can start"
+    assert mgr._start_locked.called

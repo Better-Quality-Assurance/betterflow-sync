@@ -155,6 +155,15 @@ class SyncCoordinator:
         self._consecutive_auth_failures = 0
         self._AUTH_FAILURE_LOGOUT_THRESHOLD = 3
 
+        # Consecutive cycles where the LOCAL ActivityWatch server is unreachable.
+        # is_running() already resets+retries the HTTP session internally, so a
+        # single failure here means a real stall — but we still debounce before
+        # alarming the user with an Error state, and only force-restart the
+        # (possibly hung-but-listening) server once it's clearly stuck rather
+        # than on one transient blip. Mutated only inside _do_sync (sync thread).
+        self._aw_unreachable_streak = 0
+        self._AW_UNREACHABLE_ERROR_THRESHOLD = 2
+
         # Flags set by the app layer - protected by _state_lock
         self._logged_in = False
         self._paused_by_network = False
@@ -779,12 +788,32 @@ class SyncCoordinator:
                 self.aw_manager.restart_if_needed()
 
             if not self.aw.is_running():
-                if self.aw_manager.is_managing:
-                    logger.warning("ActivityWatch not responding — attempting restart")
-                    self.aw_manager.stop()
-                    self.aw_manager.start()
-                self.tray.set_state(TrayState.ERROR, "ActivityWatch not running")
+                # is_running() already reset+retried the HTTP session, so this
+                # is a real stall, not a stale-socket blip. Debounce before
+                # escalating: one missed cycle stays silent (it usually
+                # self-heals next cycle); only after consecutive failures do we
+                # force-restart and surface an Error.
+                self._aw_unreachable_streak += 1
+                if self._aw_unreachable_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
+                    if self.aw_manager.is_managing:
+                        logger.warning(
+                            "ActivityWatch unreachable for %d cycles — forcing tracker+server restart",
+                            self._aw_unreachable_streak,
+                        )
+                        # force_restart also reclaims a hung-but-listening server
+                        # (port held, HTTP dead); a plain stop()+start() only
+                        # cycles the watchers and leaves the dead server in place.
+                        self.aw_manager.force_restart(reason="server unreachable")
+                    self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+                else:
+                    logger.info(
+                        "ActivityWatch unreachable (%d/%d) — retrying next cycle before escalating",
+                        self._aw_unreachable_streak, self._AW_UNREACHABLE_ERROR_THRESHOLD,
+                    )
                 return
+
+            # Reachable — clear the streak.
+            self._aw_unreachable_streak = 0
 
             stats = self.sync_engine.sync()
 
