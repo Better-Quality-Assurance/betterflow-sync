@@ -110,6 +110,9 @@ class BoundedLRU:
     def __len__(self) -> int:
         return len(self._od)
 
+    def clear(self) -> None:
+        self._od.clear()
+
 
 class SyncEngine:
     """Core sync engine that orchestrates AW -> BetterFlow data flow."""
@@ -205,6 +208,10 @@ class SyncEngine:
             if config.call_detection.enabled
             else None
         )
+
+        # The local day the counted-time cache is scoped to; a change across a
+        # sync cycle triggers daily housekeeping (prune) without a restart.
+        self._counted_cache_day = self._local_day_iso()
 
         # Restore per-event counted-time from the previous process so a restart
         # (or the start-of-day backlog reconcile that re-fetches the whole day)
@@ -361,6 +368,12 @@ class SyncEngine:
         """
         stats = SyncStats()
 
+        # Daily housekeeping before anything else, so it still runs while paused:
+        # a long-running agent that never restarts across midnight would
+        # otherwise never prune persisted counted-time (prune_counted_time only
+        # ran at startup), leaking a day's rows every day it stays up.
+        self._maybe_rollover_counted_day()
+
         with self._state_lock:
             if self._paused or self._private_mode:
                 return stats
@@ -372,6 +385,28 @@ class SyncEngine:
         # Check ActivityWatch
         if not self.aw.is_running():
             stats.errors.append("ActivityWatch is not running")
+            # Finalize any in-progress call before bailing. Otherwise is_in_call()
+            # stays True for the whole outage (sync returns here every cycle, so
+            # the end-of-sync flush at line ~522 never runs), and the idle guard
+            # in IdleManager keeps suppressing idle long after the call ended —
+            # painting the post-call AFK stretch as worked time. The observed call
+            # portion is still recorded if the backend is reachable; if AW comes
+            # back mid-call a fresh call starts cleanly.
+            #
+            # That recovery can emit a SECOND event for the same meeting (the
+            # continuation is picked up from the un-advanced checkpoint). Both
+            # carry the deterministic id call_<app>_<start_ts> and the backend
+            # upserts call events by id, so the overlapping recovered portion
+            # supersedes this flushed one rather than double-billing.
+            if self._call_detector:
+                remaining = self._call_detector.flush()
+                if remaining and self.bf.is_reachable():
+                    # _send_events may set stats.queued_bucket_ids on failure; we
+                    # return immediately and intentionally don't act on it — call
+                    # events go to the synthetic call bucket, not a checkpointed AW
+                    # bucket, so there is no checkpoint to withhold.
+                    self._send_events([self._make_call_bf_event(remaining)], stats)
+                    stats.calls_detected += 1
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)
@@ -558,7 +593,27 @@ class SyncEngine:
         counter and counted-time persistence are scoped by."""
         return datetime.now().astimezone().date().isoformat()
 
-    def _load_counted_time_cache(self) -> None:
+    def _maybe_rollover_counted_day(self) -> None:
+        """On a local-day rollover, reset the per-day dedup cache and reload
+        (which prunes persisted counted-time for days we will never replay).
+
+        Without this the prune only happened at process start, so an agent left
+        running across midnight accumulated a day's counted-time rows in the
+        persistent store every day it stayed up. Cheap when the day is unchanged
+        (a single string compare), so safe to call every sync cycle.
+        """
+        today = self._local_day_iso()
+        with self._cache_lock:
+            if today == self._counted_cache_day:
+                return
+            self._counted_cache_day = today
+            # Yesterday's (bucket_id, event_id) dedup entries are dead — the
+            # daily total resets at midnight, so drop them before reloading.
+            self._time_cache.clear()
+        logger.info("Local day rolled over to %s — pruning counted-time cache", today)
+        self._load_counted_time_cache(today)
+
+    def _load_counted_time_cache(self, day: Optional[str] = None) -> None:
         """Repopulate ``_time_cache`` from persisted per-event counted-seconds
         for the current local day.
 
@@ -576,7 +631,7 @@ class SyncEngine:
         if not callable(getter):
             return
         try:
-            today = self._local_day_iso()
+            today = day or self._local_day_iso()
             persisted = getter(today)
             if not isinstance(persisted, dict):
                 return

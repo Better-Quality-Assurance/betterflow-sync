@@ -118,14 +118,34 @@ class IdleManager:
                     idle_start = datetime.now(timezone.utc) - timedelta(seconds=system_idle)
 
             if is_afk and afk_duration >= self._idle_pause_threshold:
-                if not was_idle_paused:
+                in_call = self._is_in_call()
+                if was_idle_paused:
+                    # Already idle-paused, but a call has since started while the
+                    # user stays AFK. They're now engaged in the meeting
+                    # (listening/watching), so resume — otherwise the call span
+                    # stays painted Idle for as long as they don't touch the
+                    # keyboard. The _is_in_call() guard below only blocks
+                    # ENTERING idle; this is the symmetric exit when a call
+                    # begins during an existing idle pause (Windows has no
+                    # in-process input watcher, so AFK never clears on its own
+                    # mid-call).
+                    if in_call:
+                        logger.info(
+                            "Call active while idle-paused — resuming to track the call"
+                        )
+                        self.clear_idle_pause(send_event=True)
+                        reschedule(self.config.sync.interval_seconds)
+                        self.tray.set_state(TrayState.SYNCING)
+                        trigger_sync("call_resume_sync")
+                    # else: still idle with no call — stay paused.
+                else:
                     # Don't mark idle while the user is in a call/meeting. In a
                     # meeting they're engaged (listening/watching) even without
                     # keyboard/mouse input. The AFK watcher is the only idle
                     # signal on Windows (no in-process input watcher), so a long
                     # call otherwise trips this pause and paints the whole span
                     # as Idle even though the meeting app was focused throughout.
-                    if self._is_in_call():
+                    if in_call:
                         logger.debug(
                             "AFK for %ds but a call is active — not pausing as idle",
                             int(afk_duration),

@@ -22,8 +22,14 @@ class TestPatternMatching:
     def test_zoom_native_webinar(self):
         assert _match_native("zoom.us", "Zoom Webinar") == "Zoom"
 
-    def test_zoom_native_meeting_id(self):
-        assert _match_native("zoom.us", "123456789") == "Zoom"
+    def test_zoom_native_bare_meeting_id_does_not_match(self):
+        # A bare 9–11 digit number in a Zoom window (ticket / phone / timestamp)
+        # must NOT be read as a meeting ID — the old \d{9,11} fallback
+        # over-credited (dropped, mirrors PHP CallEventDetector E3). Real Zoom
+        # calls match the "Zoom Meeting"/"Zoom Webinar" title or the zoom.us/j/
+        # browser URL instead.
+        assert _match_native("zoom.us", "123456789") is None
+        assert _match_native("Zoom", "Ticket 2024123456") is None
 
     def test_zoom_native_no_match(self):
         assert _match_native("zoom.us", "Zoom - Home") is None
@@ -40,6 +46,27 @@ class TestPatternMatching:
     def test_teams_native_chat_no_match(self):
         assert _match_native("Microsoft Teams", "Chat - General") is None
 
+    def test_teams_bare_app_name_matches_on_word_boundary(self):
+        # The classic-Teams process can report as a standalone "Teams".
+        assert _match_native("Teams", "Meeting with John") == "Microsoft Teams"
+
+    def test_teams_alias_does_not_bleed_into_unrelated_apps(self):
+        # "teams" must match as a whole word, not a substring — TeamSpeak /
+        # TeamViewer contain "teams"/"team" but are not Microsoft Teams. (Even
+        # title-gated, a tighter app match is correct.)
+        assert _match_native("TeamSpeak", "Meeting with John") is None
+        assert _match_native("TeamViewer", "Call with Sarah") is None
+
+    def test_zoom_alias_does_not_bleed_into_unrelated_apps(self):
+        # "zoom" matches "Zoom" but not "ZoomText" (a screen magnifier).
+        assert _match_native("ZoomText", "Zoom Meeting") is None
+
+    def test_webex_still_matches_compound_process_name(self):
+        # "webex" stays a SUBSTRING match (not word-boundary) so the compound
+        # Windows process "CiscoWebexStart" is still caught — the word-boundary
+        # tightening is scoped to teams/zoom only.
+        assert _match_native("CiscoWebexStart", "Meeting - Sprint Review") == "Webex"
+
     def test_slack_huddle(self):
         assert _match_native("Slack", "Huddle in #engineering") == "Slack"
 
@@ -54,6 +81,12 @@ class TestPatternMatching:
 
     def test_facetime_any_window(self):
         assert _match_native("FaceTime", "anything here") == "FaceTime"
+
+    def test_facetime_alias_matches_on_word_boundary(self):
+        # FaceTime has NO title gate (any window counts), so its alias must match
+        # on a word boundary — a helper process like "FaceTimeHelper" must not be
+        # read as an active call.
+        assert _match_native("FaceTimeHelper", "anything here") is None
 
     def test_webex_meeting(self):
         assert _match_native("Webex", "Meeting - Sprint Review") == "Webex"

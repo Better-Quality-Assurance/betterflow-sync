@@ -34,7 +34,12 @@ class CallEvent:
 # undetected on Windows (Sachi, 2026-06-15). Each entry stays title-gated, so
 # widening the app match can never turn "app merely open" into a false call.
 _NATIVE_PATTERNS: list[tuple[tuple[str, ...], Optional[re.Pattern], str]] = [
-    (("zoom.us", "zoom"), re.compile(r"Zoom (Meeting|Webinar)|\d{9,11}", re.IGNORECASE), "Zoom"),
+    # NOTE: dropped the old `\d{9,11}` Zoom fallback — a 9–11 digit ticket /
+    # phone / timestamp in a Zoom window title was mis-read as a meeting ID
+    # (mirrors the PHP CallEventDetector E3 fix; KEEP THE TWO IN SYNC). Real
+    # Zoom meetings still match the "Zoom Meeting"/"Zoom Webinar" native title
+    # or the zoom.us/j/ | zoom.us/wc/ browser URL below.
+    (("zoom.us", "zoom"), re.compile(r"Zoom (Meeting|Webinar)", re.IGNORECASE), "Zoom"),
     (("microsoft teams", "ms-teams", "msteams", "teams"), re.compile(r"(Meeting|Call) with|In a call", re.IGNORECASE), "Microsoft Teams"),
     (("slack",), re.compile(r"Huddle", re.IGNORECASE), "Slack"),
     (("discord",), re.compile(r"Voice Connected|voice channel", re.IGNORECASE), "Discord"),
@@ -57,13 +62,39 @@ _BROWSER_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
 _DEFAULT_GRACE_PERIOD = 30.0
 
 
+# Bare aliases matched on a WORD BOUNDARY rather than as a substring, so they
+# can't bleed into an unrelated app name:
+#   - "teams" must not match "teamspeak"/"teamviewer", "zoom" not "zoomtext".
+#   - "facetime" must not match "FaceTimeHelper" / other facetime-prefixed
+#     helper processes — and unlike the others it has NO title gate (any window
+#     counts), so a loose substring there would be the easiest to false-trigger.
+# Aliases kept as plain containment are EITHER title-gated ("slack"/"discord"/
+# "msteams" need an in-call title too, so a stray substring match can't bill on
+# its own) OR must match a compound process name — notably "webex", which has to
+# match the Windows process "CiscoWebexStart" where a \b boundary would break it.
+_WORD_BOUNDARY_ALIASES = frozenset({"teams", "zoom", "facetime"})
+
+
+def _app_contains(app_lower: str, sub: str) -> bool:
+    """Match an app-name alias against the (lowercased) app name.
+
+    Word-boundary for the ambiguous bare aliases in _WORD_BOUNDARY_ALIASES;
+    plain containment for everything else (separator aliases like "ms-teams"
+    where \\b is wrong, and distinctive substrings like "webex" that must still
+    match compound process names).
+    """
+    if sub in _WORD_BOUNDARY_ALIASES:
+        return re.search(rf"\b{re.escape(sub)}\b", app_lower) is not None
+    return sub in app_lower
+
+
 def _match_native(app: str, title: str) -> Optional[str]:
     """Return display name if (app, title) matches a native call pattern."""
     if not title:
         title = ""
     app_lower = app.lower()
     for app_substrs, title_re, name in _NATIVE_PATTERNS:
-        if any(sub in app_lower for sub in app_substrs) and (
+        if any(_app_contains(app_lower, sub) for sub in app_substrs) and (
             title_re is None or title_re.search(title)
         ):
             return name
