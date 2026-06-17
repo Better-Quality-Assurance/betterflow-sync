@@ -175,6 +175,14 @@ def _download_aw_binaries(install_dir: str) -> bool:
         return False
 
     url = f"{RELEASE_BASE}/{asset}"
+    # Defense-in-depth: only ever fetch tracker binaries over HTTPS from GitHub.
+    try:
+        from .url_safety import is_safe_fetch_url
+    except ImportError:
+        from url_safety import is_safe_fetch_url
+    if not is_safe_fetch_url(url):
+        logger.error(f"Refusing unsafe tracker download URL (must be HTTPS from GitHub): {url}")
+        return False
     logger.info(f"Downloading tracker components {AW_VERSION} from {url} ...")
 
     tmp_zip = None

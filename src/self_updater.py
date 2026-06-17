@@ -129,11 +129,17 @@ def apply_update(
         if on_progress:
             on_progress(msg)
 
-    # Reject non-HTTPS download URLs to prevent MITM attacks
-    parsed_url = urlparse(download_url)
-    if parsed_url.scheme != "https":
+    # Reject download URLs that aren't HTTPS from a known GitHub host (MITM /
+    # spoofed-asset defense). The asset URL comes from the GitHub releases API,
+    # so a tampered response can't redirect the download off-GitHub.
+    try:
+        from .url_safety import is_safe_fetch_url
+    except ImportError:
+        from url_safety import is_safe_fetch_url
+    if not is_safe_fetch_url(download_url):
+        parsed_url = urlparse(download_url)
         safe_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        _status(f"Refusing non-HTTPS download URL: {safe_url}")
+        _status(f"Refusing unsafe download URL (must be HTTPS from GitHub): {safe_url}")
         return False
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="betterflow-update-"))
