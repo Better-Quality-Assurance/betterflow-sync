@@ -4,9 +4,7 @@ import sys
 
 import pytest
 
-sys.path.insert(0, "src")
-
-from windows_tray import select_entries_to_promote  # noqa: E402
+from src.windows_tray import select_entries_to_promote
 
 EXE = r"C:\Users\sachi\AppData\Local\Programs\BetterFlow\BetterFlow.exe"
 
@@ -50,6 +48,6 @@ def test_missing_is_promoted_value_is_treated_as_unpromoted():
 def test_promote_tray_icon_is_noop_off_windows(monkeypatch):
     if sys.platform == "win32":
         pytest.skip("covers the non-Windows guard")
-    from windows_tray import promote_tray_icon
+    from src.windows_tray import promote_tray_icon
 
     assert promote_tray_icon(EXE) is False
