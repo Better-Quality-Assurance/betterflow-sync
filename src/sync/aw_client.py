@@ -132,26 +132,50 @@ class AWClient:
         self._buckets_cache_ttl: float = 30.0
 
     def _request(self, method: str, endpoint: str, timeout: Optional[int] = None, **kwargs) -> dict:
-        """Make request to ActivityWatch API."""
+        """Make request to ActivityWatch API.
+
+        On a connection failure the pooled session is reset once and the request
+        retried. A stale keep-alive socket to the LOCAL server raises
+        ConnectionError even though the server is up (the socket rots after the
+        server has been alive a long time). This is why a manual app restart
+        always "fixed" sync stalls — a fresh process builds a fresh session.
+        Doing it here lets the agent self-heal automatically instead of silently
+        dropping syncs until the user notices missing hours (furdui.iancu,
+        2026-06-17).
+        """
         url = urljoin(self.base_url, endpoint)
         kwargs["timeout"] = timeout if timeout is not None else self.timeout
 
-        with self._session_lock:
-            session = self._session
-        if session is None:
-            raise AWClientError("AWClient has been closed")
-        try:
-            response = session.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response.json() if response.content else {}
-        except requests.exceptions.ConnectionError as e:
-            raise AWClientError(f"Cannot connect to ActivityWatch at {self.base_url}") from e
-        except requests.exceptions.Timeout as e:
-            raise AWClientError(f"ActivityWatch request timed out") from e
-        except requests.exceptions.HTTPError as e:
-            raise AWClientError(f"ActivityWatch API error: {e}") from e
-        except Exception as e:
-            raise AWClientError(f"Unexpected error: {e}") from e
+        for attempt in range(2):
+            with self._session_lock:
+                session = self._session
+            if session is None:
+                raise AWClientError("AWClient has been closed")
+            try:
+                response = session.request(method, url, **kwargs)
+                response.raise_for_status()
+                return response.json() if response.content else {}
+            except requests.exceptions.ConnectionError as e:
+                # First failure: drop the (possibly stale) pooled connections
+                # and retry once with a fresh session.
+                if attempt == 0:
+                    with self._session_lock:
+                        still_open = self._session is not None
+                    if still_open:
+                        logger.info(
+                            "AW connection failed (%s) — resetting session and retrying", e
+                        )
+                        self.reset_session()
+                        continue
+                raise AWClientError(f"Cannot connect to ActivityWatch at {self.base_url}") from e
+            except requests.exceptions.Timeout as e:
+                raise AWClientError("ActivityWatch request timed out") from e
+            except requests.exceptions.HTTPError as e:
+                raise AWClientError(f"ActivityWatch API error: {e}") from e
+            except Exception as e:
+                raise AWClientError(f"Unexpected error: {e}") from e
+        # Unreachable: the loop either returns or raises on every path.
+        raise AWClientError(f"Cannot connect to ActivityWatch at {self.base_url}")
 
     def reset_session(self) -> None:
         """Drop pooled connections and create a fresh session.

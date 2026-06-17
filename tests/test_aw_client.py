@@ -193,3 +193,43 @@ class TestAWClient:
         """Test using client as context manager."""
         with AWClient() as client:
             assert client is not None
+
+    def test_request_resets_session_and_retries_on_connection_error(self):
+        """A stale pooled socket (ConnectionError) must trigger one session
+        reset + retry — the automatic equivalent of the manual restart that
+        always 'fixed' sync stalls (furdui.iancu, 2026-06-17)."""
+        import requests
+
+        client = AWClient()
+        first_session = client._session
+
+        calls = {"n": 0}
+
+        def flaky_request(self, method, url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise requests.exceptions.ConnectionError("stale socket")
+            resp = Mock()
+            resp.raise_for_status = Mock()
+            resp.content = b'{"version": "0.13.2"}'
+            resp.json = Mock(return_value={"version": "0.13.2"})
+            return resp
+
+        with patch.object(requests.Session, "request", flaky_request):
+            result = client.get_info()
+
+        assert result == {"version": "0.13.2"}
+        assert calls["n"] == 2, "must retry exactly once after resetting the session"
+        assert client._session is not first_session, "session was rebuilt on connection failure"
+
+    def test_request_gives_up_after_one_retry(self):
+        """Two consecutive connection failures still surface as AWClientError —
+        no infinite retry loop."""
+        import requests
+
+        client = AWClient()
+        with patch.object(
+            requests.Session, "request",
+            side_effect=requests.exceptions.ConnectionError("down"),
+        ), pytest.raises(AWClientError):
+            client.get_info()
