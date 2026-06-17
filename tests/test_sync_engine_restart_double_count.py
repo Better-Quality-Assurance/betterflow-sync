@@ -25,7 +25,7 @@ from src.config import Config
 from src.sync.aw_client import BUCKET_TYPE_WINDOW, AWEvent
 from src.sync.daily_time_tracker import DailyTimeTracker
 from src.sync.queue import OfflineQueue
-from src.sync.sync_engine import SyncEngine
+from src.sync.sync_engine import SyncEngine, _SyncCycleContext
 
 WINDOW_BUCKET = "aw-watcher-window_testhost"
 
@@ -61,7 +61,7 @@ def test_restart_does_not_double_count_replayed_event():
     # --- process 1: count the event once ---
     engine1 = _build_engine(queue_db, time_db)
     out1 = engine1._transform_window_event_with_timeout(
-        event, WINDOW_BUCKET, BUCKET_TYPE_WINDOW
+        event, WINDOW_BUCKET, BUCKET_TYPE_WINDOW, _SyncCycleContext()
     )
     assert out1, "window event should have been transformed and counted"
     total1 = engine1._time_tracker.get_today_active_time().total_seconds()
@@ -74,7 +74,7 @@ def test_restart_does_not_double_count_replayed_event():
     # The new process starts from the persisted daily total (600s already).
     assert abs(engine2._time_tracker.get_today_active_time().total_seconds() - 600.0) < 1.0
     engine2._transform_window_event_with_timeout(
-        event, WINDOW_BUCKET, BUCKET_TYPE_WINDOW
+        event, WINDOW_BUCKET, BUCKET_TYPE_WINDOW, _SyncCycleContext()
     )
     total2 = engine2._time_tracker.get_today_active_time().total_seconds()
 
@@ -97,7 +97,7 @@ def test_heartbeat_extension_counts_only_growth_across_restart():
     short = AWEvent(id=7, timestamp=ts, duration=300.0, data={"app": "Code", "title": "x"})
 
     engine1 = _build_engine(queue_db, time_db)
-    engine1._transform_window_event_with_timeout(short, WINDOW_BUCKET, BUCKET_TYPE_WINDOW)
+    engine1._transform_window_event_with_timeout(short, WINDOW_BUCKET, BUCKET_TYPE_WINDOW, _SyncCycleContext())
     assert abs(engine1._time_tracker.get_today_active_time().total_seconds() - 300.0) < 1.0
     engine1.queue.close()
     engine1._time_tracker.close()
@@ -105,7 +105,7 @@ def test_heartbeat_extension_counts_only_growth_across_restart():
     # Restart; the same event id now reports a grown duration (heartbeat).
     grown = AWEvent(id=7, timestamp=ts, duration=500.0, data={"app": "Code", "title": "x"})
     engine2 = _build_engine(queue_db, time_db)
-    engine2._transform_window_event_with_timeout(grown, WINDOW_BUCKET, BUCKET_TYPE_WINDOW)
+    engine2._transform_window_event_with_timeout(grown, WINDOW_BUCKET, BUCKET_TYPE_WINDOW, _SyncCycleContext())
     total = engine2._time_tracker.get_today_active_time().total_seconds()
     # 300 (already) + 200 (growth) = 500, not 300 + 500 = 800.
     assert abs(total - 500.0) < 1.0, f"expected ~500s, got {total}"
