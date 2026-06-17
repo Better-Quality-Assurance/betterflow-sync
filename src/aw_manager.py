@@ -317,12 +317,20 @@ class AWManager:
         return True
 
     def stop(self) -> None:
-        """Stop all managed tracker processes."""
-        with self._lifecycle_lock:
-            if self._using_external:
-                logger.debug("Using external tracker — nothing to stop")
-                return
+        """Stop the tracker processes WE started.
 
+        The watchers (bf-window-tracker, bf-idle-tracker) are always launched by
+        this instance, so they must always be terminated here — even when we
+        attached to an external/shared server. The previous early-return on
+        ``_using_external`` skipped them entirely, so an app quit or self-update
+        relaunch left bf-idle-tracker running as an orphan. Two trackers then
+        post to the same AFK bucket → overlapping/duplicate events and apparent
+        staleness a normal restart can't clear (furdui.iancu, 2026-06-17:
+        88 watcher starts vs 2 stops across the log). The shared external server
+        is never in ``_processes``, so iterating it only ever touches our own
+        processes — there is nothing belonging to another instance to spare.
+        """
+        with self._lifecycle_lock:
             if not self._processes:
                 return
 

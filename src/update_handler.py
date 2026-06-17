@@ -51,6 +51,15 @@ class UpdateHandler:
         except Exception:
             pass
         self.coordinator.stop()
+        # Terminate the bundled trackers BEFORE the updater's hard os._exit(0).
+        # coordinator.stop() only stops the scheduler; without this the
+        # self-update relaunch left bf-idle-tracker orphaned, so the new
+        # instance started a second one and the two fought over the AFK bucket
+        # (recurring "idle frozen / hours undercounted after update").
+        try:
+            self.coordinator.aw_manager.stop()
+        except Exception:
+            logger.warning("aw_manager.stop() during update exit failed", exc_info=True)
 
     def ensure_update_checks_started(self) -> None:
         """Kick off update checks once after the tray is already visible."""
