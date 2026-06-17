@@ -229,9 +229,6 @@ class SyncEngine:
             fraud_config=self.config.fraud_detection,
         )
         self._time_tracker = time_tracker or DailyTimeTracker()
-        # Per-cycle activity context (input presence + AFK events for the
-        # bucket being transformed). Reset fresh at the top of each sync().
-        self._cycle = _SyncCycleContext()
         self._afk_watcher_available = False  # True when AFK buckets exist this cycle
         # One-time-per-process flag: on first sync we rewind checkpoints to the
         # start of the local day so any locally-stored events the server never
@@ -477,38 +474,36 @@ class SyncEngine:
         with self._state_lock:
             self._afk_watcher_available = bool(afk_buckets)
 
-        # Fresh per-cycle context. Assigned BEFORE reconcile so a re-armed
-        # reconcile reads deterministic defaults (has_input_data=False, no AFK)
-        # rather than whatever the previous cycle left on the instance.
-        self._cycle = _SyncCycleContext()
-
         # One-time backlog reconcile (this process): rewind checkpoints to the
         # start of the local day so events that never reached the server are
         # re-fetched and re-sent. The backend upserts by AW event id, so
         # replaying already-stored events is deduped — safe. This is what makes
-        # a simple quit+restart recover a stuck day's data.
+        # a simple quit+restart recover a stuck day's data. It builds its own
+        # default context (input analysis hasn't run yet).
         if not self._backlog_reconciled:
             self._reconcile_backlog(
                 window_buckets + web_buckets + afk_buckets + input_buckets
             )
             self._backlog_reconciled = True
 
-        # Fetch input events for activity analysis before processing window events.
-        self._prepare_input_analysis(input_buckets)
+        # Fetch input events for activity analysis before processing window
+        # events. The returned context is threaded explicitly through the
+        # transform path — no per-cycle state lives on the instance.
+        cycle = self._prepare_input_analysis(input_buckets)
 
         # Sync window buckets with gap-filling
         all_events, call_events, pending_checkpoints = self._sync_window_buckets(
-            window_buckets, stats
+            window_buckets, stats, cycle
         )
 
         # Clear window-specific AFK context before processing non-window buckets
-        # to prevent AFK events from one window bucket leaking into unrelated buckets.
-        self._cycle.afk_events = []
+        # so AFK events from one window bucket don't leak into unrelated buckets.
+        cycle.afk_events = []
 
         # Sync non-window buckets normally
         for bucket in web_buckets + afk_buckets + input_buckets:
             try:
-                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats)
+                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats, cycle)
                 all_events.extend(events)
                 if checkpoint:
                     pending_checkpoints.append(checkpoint)
@@ -544,9 +539,9 @@ class SyncEngine:
 
         return stats
 
-    def _prepare_input_analysis(self, input_buckets: list) -> None:
-        """Fetch recent input events, feed the activity analyzer, and record
-        whether input data exists for this cycle.
+    def _prepare_input_analysis(self, input_buckets: list) -> _SyncCycleContext:
+        """Fetch recent input events, feed the activity analyzer, and return a
+        fresh cycle context recording whether input data exists.
 
         The lookback covers the engagement window and the AFK grace period so
         the analyzer sees enough history to classify engagement.
@@ -567,14 +562,16 @@ class SyncEngine:
             except AWClientError as e:
                 logger.debug("input bucket %s fetch failed: %s", bucket.id, e)
         self._activity_analyzer.add_input_events(input_events_for_analysis)
-        self._cycle.has_input_data = len(input_events_for_analysis) > 0
+        return _SyncCycleContext(has_input_data=len(input_events_for_analysis) > 0)
 
     def _sync_window_buckets(
-        self, window_buckets: list, stats: "SyncStats"
+        self, window_buckets: list, stats: "SyncStats", cycle: "_SyncCycleContext"
     ) -> tuple[list, list, list]:
         """Sync window buckets with gap-filling, call detection, and per-event
         transform. Returns (transformed_events, call_events, pending_checkpoints).
-        Extracted from sync() verbatim — behaviour unchanged.
+
+        ``cycle`` carries the per-cycle activity context; ``cycle.afk_events`` is
+        refreshed per bucket below and read downstream in the transform path.
         """
         all_events: list[dict] = []
         call_events: list[dict] = []
@@ -590,7 +587,7 @@ class SyncEngine:
                     afk_events = self._get_afk_events_for_range(earliest, latest_end)
 
                     # Store AFK events so _transform_event can check idle status
-                    self._cycle.afk_events = afk_events
+                    cycle.afk_events = afk_events
 
                     filled = self._fill_window_gaps(raw_events, afk_events, bucket_id=bucket.id)
                     stats.gaps_filled += filled
@@ -609,7 +606,7 @@ class SyncEngine:
                                 call_events.append(self._make_call_bf_event(ce))
 
                     transformed, checkpoint = self._transform_and_checkpoint(
-                        raw_events, bucket.id, bucket.type, stats
+                        raw_events, bucket.id, bucket.type, stats, cycle
                     )
                     all_events.extend(transformed)
                     if checkpoint:
@@ -752,12 +749,11 @@ class SyncEngine:
         whole reason reconcile exists) is counted once, here, correctly. There
         is no double-count: both the live sync and this replay share that cache.
 
-        Ordering: sync() resets self._cycle then calls this BEFORE
-        _prepare_input_analysis, so during replay self._cycle.has_input_data is
-        False and window events are classified "active" (we can't penalize
-        activity without input data — and the server-side billing metric is
-        tracked_seconds, not active_seconds). That is the intended fallback; do
-        not reorder without revisiting it.
+        Context: this runs BEFORE _prepare_input_analysis, so it builds its own
+        fresh _SyncCycleContext (has_input_data=False, no AFK). Replay window
+        events are therefore classified "active" (we can't penalize activity
+        without input data — and the server-side billing metric is
+        tracked_seconds, not active_seconds). That is the intended fallback.
         """
         # Don't pile the whole day on top of a backlog that's already queued and
         # draining. Re-enqueuing would duplicate events (a batch carrying the same
@@ -781,6 +777,10 @@ class SyncEngine:
             .astimezone(timezone.utc)
         )
         now = datetime.now(timezone.utc)
+        # Fresh, empty context: replay runs before input analysis, so window
+        # events are classified "active" (see docstring). Deterministic — never
+        # inherits a prior cycle's state.
+        cycle = _SyncCycleContext()
         enqueued = 0
         for bucket in buckets:
             cursor = day_start
@@ -804,11 +804,13 @@ class SyncEngine:
                 for event in events:
                     if _is_window_like(bucket.type):
                         batch.extend(
-                            self._transform_window_event_with_timeout(event, bucket.id, bucket.type)
+                            self._transform_window_event_with_timeout(
+                                event, bucket.id, bucket.type, cycle
+                            )
                         )
                     else:
                         transformed = self._transform_event(
-                            event, bucket.id, bucket.type, skip_time_tracking=True
+                            event, bucket.id, bucket.type, skip_time_tracking=True, cycle=cycle
                         )
                         if transformed:
                             batch.append(transformed)
@@ -901,6 +903,7 @@ class SyncEngine:
         bucket_id: str,
         bucket_type: str,
         stats: SyncStats,
+        cycle: Optional["_SyncCycleContext"] = None,
     ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
         """Transform events to BetterFlow format and compute pending checkpoint.
 
@@ -910,8 +913,11 @@ class SyncEngine:
         Skips events already sent with unchanged duration (dedup).
         Re-sends if duration has grown (heartbeat extension).
         Returns (transformed_events, pending_checkpoint) — caller commits the
-        checkpoint only after a successful send (N5).
+        checkpoint only after a successful send (N5). ``cycle`` defaults to an
+        empty context when omitted (production callers always pass one).
         """
+        if cycle is None:
+            cycle = _SyncCycleContext()
         # Feed window events to activity analyzer for window change detection
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             self._activity_analyzer.add_window_events(events)
@@ -950,10 +956,12 @@ class SyncEngine:
 
             if _is_window_like(bucket_type):
                 transformed_events = self._transform_window_event_with_timeout(
-                    event, bucket_id, bucket_type
+                    event, bucket_id, bucket_type, cycle
                 )
             else:
-                transformed_event = self._transform_event(event, bucket_id, bucket_type)
+                transformed_event = self._transform_event(
+                    event, bucket_id, bucket_type, cycle=cycle
+                )
                 transformed_events = [transformed_event] if transformed_event else []
 
             if transformed_events:
@@ -969,7 +977,7 @@ class SyncEngine:
         if (
             transformed
             and _is_window_like(bucket_type)
-            and self._cycle.has_input_data
+            and cycle.has_input_data
         ):
             last_event = events[-1]  # sorted oldest-first, use newest for assessment
             total_active = sum(ev.get("duration", 0) for ev in transformed)
@@ -995,6 +1003,7 @@ class SyncEngine:
         event: AWEvent,
         bucket_id: str,
         bucket_type: str,
+        cycle: "_SyncCycleContext",
     ) -> list[dict]:
         """Transform only the countable slices of a long window/web event."""
         event_start = event.timestamp
@@ -1027,9 +1036,10 @@ class SyncEngine:
                 segment_event,
                 bucket_id,
                 bucket_type,
-                forced_activity_state=None if self._cycle.has_input_data else "active",
+                forced_activity_state=None if cycle.has_input_data else "active",
                 custom_event_id=f"{event.id}:{idx}",
                 skip_time_tracking=True,  # tracked per-event below
+                cycle=cycle,
             )
             if transformed_event:
                 transformed.append(transformed_event)
@@ -1061,7 +1071,7 @@ class SyncEngine:
         return transformed
 
     def _sync_bucket(
-        self, bucket_id: str, bucket_type: str, stats: SyncStats
+        self, bucket_id: str, bucket_type: str, stats: SyncStats, cycle: "_SyncCycleContext"
     ) -> tuple[list[dict], Optional[tuple[str, datetime, Optional[int]]]]:
         """Sync events from a single bucket.
 
@@ -1082,7 +1092,7 @@ class SyncEngine:
             # (see _collapse_afk_duplicates). Without this, a misbehaving idle
             # tracker's duplicate 'afk' rows are synced raw and billed as idle.
             events = self._collapse_afk_duplicates(events)
-        return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats)
+        return self._transform_and_checkpoint(events, bucket_id, bucket_type, stats, cycle)
 
     @staticmethod
     def _collapse_afk_duplicates(events: list[AWEvent]) -> list[AWEvent]:
@@ -1270,12 +1280,21 @@ class SyncEngine:
         forced_activity_state: Optional[str] = None,
         custom_event_id: Optional[str] = None,
         skip_time_tracking: bool = False,
+        *,
+        cycle: Optional["_SyncCycleContext"] = None,
     ) -> Optional[dict]:
         """Transform an ActivityWatch event to BetterFlow format.
+
+        ``cycle`` (keyword-only) carries the per-cycle activity context read
+        during window classification. Production callers always pass it; when
+        omitted it defaults to an empty context (no input, no AFK) — a safe,
+        deterministic default, never stale cross-cycle state.
 
         Sends raw data to the server — the backend handles privacy
         (title hashing, URL domain extraction) based on device settings.
         """
+        if cycle is None:
+            cycle = _SyncCycleContext()
         privacy = self.config.privacy
 
         # Skip excluded apps (client-side — sensitive apps never leave the machine)
@@ -1355,7 +1374,7 @@ class SyncEngine:
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
         if _is_window_like(bucket_type):
             self._classify_and_count_window(
-                event, bucket_id, result, forced_activity_state, skip_time_tracking
+                event, bucket_id, result, forced_activity_state, skip_time_tracking, cycle
             )
 
         return result
@@ -1367,22 +1386,20 @@ class SyncEngine:
         result: dict,
         forced_activity_state: Optional[str],
         skip_time_tracking: bool,
+        cycle: "_SyncCycleContext",
     ) -> None:
         """Set ``result['activity_state']`` (+ metrics) for a window/web event and
-        accumulate counted active time. Extracted from _transform_event verbatim —
-        behaviour unchanged.
+        accumulate counted active time.
 
-        Locking invariant: reads ``self._cycle`` (has_input_data / afk_events)
-        without a lock. ``self._cycle`` is mutated only by
-        ``sync()`` (under main.py's ``_sync_lock``), and this method is only
-        reachable from that same call chain — do NOT call it concurrently with
-        sync() or from another thread without first taking ``_sync_lock``.
+        ``cycle`` (has_input_data / afk_events) is passed in explicitly — no
+        per-cycle state lives on the instance, so this method is safe to call
+        from anywhere as long as the caller supplies the right context.
         """
         activity_state: str | None = None
         if forced_activity_state is not None:
             activity_state = forced_activity_state
             result["activity_state"] = activity_state
-        elif self._cycle.has_input_data:
+        elif cycle.has_input_data:
             activity_state = self._activity_analyzer.get_activity_state(event.timestamp)
             activity_metrics = self._activity_analyzer.get_raw_metrics(event.timestamp)
 
@@ -1391,7 +1408,7 @@ class SyncEngine:
         else:
             # No input watcher - use AFK data to determine activity.
             event_end = event.timestamp + timedelta(seconds=event.duration)
-            has_afk = bool(self._cycle.afk_events)
+            has_afk = bool(cycle.afk_events)
 
             with self._state_lock:
                 afk_watcher_available = self._afk_watcher_available
@@ -1406,21 +1423,21 @@ class SyncEngine:
                 )
             elif has_afk:
                 is_active = self._is_active_during(
-                    event.timestamp, event_end, self._cycle.afk_events
+                    event.timestamp, event_end, cycle.afk_events
                 )
                 # Fallback: treat as active when event end falls inside
                 # a not-afk span, even if AFK doesn't fully cover start.
                 if not is_active:
                     probe_time = event_end - timedelta(milliseconds=1)
                     is_active = (
-                        self._status_at(probe_time, self._cycle.afk_events)
+                        self._status_at(probe_time, cycle.afk_events)
                         == "not-afk"
                     )
                 activity_state = "active" if is_active else "inactive"
                 if not is_active:
                     logger.debug(
                         f"Window event classified inactive: "
-                        f"afk_count={len(self._cycle.afk_events)}, "
+                        f"afk_count={len(cycle.afk_events)}, "
                         f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
                     )
             else:
@@ -1428,7 +1445,7 @@ class SyncEngine:
                 activity_state = "inactive"
                 logger.debug(
                     f"Window event classified inactive: "
-                    f"afk_count={len(self._cycle.afk_events)}, "
+                    f"afk_count={len(cycle.afk_events)}, "
                     f"event={event.timestamp.isoformat()}->{event_end.isoformat()}"
                 )
             result["activity_state"] = activity_state

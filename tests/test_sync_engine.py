@@ -7,7 +7,7 @@ from unittest.mock import Mock, MagicMock, patch
 
 from src.config import Config, PrivacySettings
 from src.sync.aw_client import AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT
-from src.sync.sync_engine import SyncEngine
+from src.sync.sync_engine import SyncEngine, _SyncCycleContext
 from src.sync.activity_analyzer import ActivityAnalyzer
 from src.sync.daily_time_tracker import DailyTimeTracker
 from src.main import SyncCoordinator
@@ -146,16 +146,15 @@ class TestSyncEngine:
 
     def test_transform_event_uses_not_afk_fallback_without_input(self):
         """Window events should stay active when AFK data says not-afk at event end."""
-        self.engine._cycle.has_input_data = False
         now = datetime.now(timezone.utc)
-        self.engine._cycle.afk_events = [
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[
             AWEvent(
                 id=11,
                 timestamp=now - timedelta(minutes=1),
                 duration=120,
                 data={"status": "not-afk"},
             ),
-        ]
+        ])
         event = AWEvent(
             id=12,
             timestamp=now,
@@ -163,7 +162,7 @@ class TestSyncEngine:
             data={"app": "Terminal", "title": "Work"},
         )
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert result["activity_state"] == "active"
@@ -173,17 +172,16 @@ class TestSyncEngine:
         The full event is uploaded every cycle; active-vs-idle (AFK overlap) is
         decided server-side. This prevents the client from stranding real work
         when input detection lags or events arrive zero-duration."""
-        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
-        self.engine._cycle.afk_events = [
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[
             AWEvent(
                 id=20,
                 timestamp=now + timedelta(seconds=30),
                 duration=30,
                 data={"status": "afk"},
             ),
-        ]
+        ])
         event = AWEvent(
             id=21,
             timestamp=now,
@@ -197,6 +195,7 @@ class TestSyncEngine:
             "bucket-123",
             BUCKET_TYPE_WINDOW,
             stats,
+            cycle,
         )
 
         assert checkpoint == ("bucket-123", now, 21)
@@ -210,9 +209,8 @@ class TestSyncEngine:
 
     def test_transform_and_checkpoint_counts_full_window_without_afk(self):
         """Without AFK overlap, no-input windows should still count fully."""
-        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
-        self.engine._cycle.afk_events = []
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[])
         now = datetime.now(timezone.utc)
         event = AWEvent(
             id=22,
@@ -227,6 +225,7 @@ class TestSyncEngine:
             "bucket-123",
             BUCKET_TYPE_WINDOW,
             stats,
+            cycle,
         )
 
         assert len(transformed) == 1
@@ -238,7 +237,7 @@ class TestSyncEngine:
         """1.5.43: no client-side input-timeout cap. The full event duration is
         uploaded; the server trims idle from the AFK stream. The old cap dropped
         genuinely-active work whenever input detection lagged."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         now = datetime.now(timezone.utc) - timedelta(minutes=5)
         event = AWEvent(
             id=23,
@@ -253,6 +252,7 @@ class TestSyncEngine:
             "bucket-123",
             BUCKET_TYPE_WINDOW,
             stats,
+            cycle,
         )
 
         assert len(transformed) == 1
@@ -264,7 +264,7 @@ class TestSyncEngine:
         """1.5.43: a window beyond last_input + afk_timeout is still uploaded —
         the client never drops it. The server decides if it counts as active.
         Previously this returned [] and silently stranded real activity."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.engine._afk_watcher_available = False
         event = AWEvent(
             id=24,
@@ -279,6 +279,7 @@ class TestSyncEngine:
             "bucket-123",
             BUCKET_TYPE_WINDOW,
             stats,
+            cycle,
         )
 
         assert len(transformed) == 1
@@ -314,16 +315,15 @@ class TestSyncEngine:
     def test_transform_and_checkpoint_uses_afk_when_input_is_stale(self):
         """AFK data should remain authoritative when input watcher goes stale."""
         now = datetime.now(timezone.utc)
-        self.engine._cycle.has_input_data = True
         self.engine._afk_watcher_available = True
-        self.engine._cycle.afk_events = [
+        cycle = _SyncCycleContext(has_input_data=True, afk_events=[
             AWEvent(
                 id=25,
                 timestamp=now - timedelta(minutes=40),
                 duration=40 * 60.0,
                 data={"status": "not-afk"},
             ),
-        ]
+        ])
         event = AWEvent(
             id=26,
             timestamp=now - timedelta(minutes=5),
@@ -337,11 +337,55 @@ class TestSyncEngine:
             "bucket-123",
             BUCKET_TYPE_WINDOW,
             stats,
+            cycle,
         )
 
         assert len(transformed) == 1
         assert transformed[0]["duration"] == 300.0
         self.time_tracker.add_active_time.assert_called_once()
+
+    def test_transform_window_forces_active_without_input_data(self):
+        """A window event with no input data is forced 'active' (we never drop
+        real activity when input detection is unavailable). This is the contract
+        the backlog reconcile relies on for its fresh, empty context."""
+        cycle = _SyncCycleContext(has_input_data=False)
+        event = AWEvent(
+            id=1, timestamp=datetime.now(timezone.utc), duration=120.0,
+            data={"app": "Code", "title": "x"},
+        )
+        out = self.engine._transform_window_event_with_timeout(
+            event, "bucket-1", BUCKET_TYPE_WINDOW, cycle
+        )
+        assert len(out) == 1
+        assert out[0]["activity_state"] == "active"
+
+    def test_reconcile_backlog_replays_window_events_as_active(self):
+        """Reconcile builds its OWN fresh _SyncCycleContext (input analysis has
+        not run yet), so replayed window events are deterministically classified
+        'active' — never inheriting a prior cycle's state. With the per-cycle
+        context now threaded explicitly there is no instance field to leak."""
+        now = datetime.now(timezone.utc)
+        win_event = AWEvent(
+            id=1, timestamp=now - timedelta(minutes=5), duration=120.0,
+            data={"app": "Code", "title": "x"},
+        )
+        # Return the event once (first window slice), then nothing.
+        seen = {"n": 0}
+
+        def _get_events(bucket_id, start=None, end=None, limit=None):
+            seen["n"] += 1
+            return [win_event] if seen["n"] == 1 else []
+
+        self.aw.get_events.side_effect = _get_events
+        self.queue.size.return_value = 0
+        enqueued: list[dict] = []
+        self.queue.enqueue.side_effect = lambda batch: (enqueued.extend(batch), len(batch))[1]
+
+        bucket = Mock(id="win-bucket", type=BUCKET_TYPE_WINDOW)
+        self.engine._reconcile_backlog([bucket])
+
+        assert enqueued, "reconcile should enqueue the replayed window event"
+        assert all(e["activity_state"] == "active" for e in enqueued)
 
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
@@ -595,7 +639,7 @@ class TestSyncEngine:
 
     def test_transform_event_adds_activity_state_for_window_events(self):
         """Test that window events include activity state and metrics."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         event = AWEvent(
             id=1,
             timestamp=datetime.now(timezone.utc),
@@ -603,7 +647,7 @@ class TestSyncEngine:
             data={"app": "Firefox", "title": "Test"},
         )
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert "activity_state" in result
@@ -612,7 +656,7 @@ class TestSyncEngine:
 
     def test_transform_event_tracks_active_time_for_active_events(self):
         """Test that active events add time to tracker."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -622,7 +666,7 @@ class TestSyncEngine:
             data={"app": "Firefox", "title": "Test"},
         )
 
-        self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         # Should call add_active_time with duration and date
         self.time_tracker.add_active_time.assert_called_once()
@@ -631,7 +675,7 @@ class TestSyncEngine:
 
     def test_transform_event_tracks_idle_active_time(self):
         """Test that idle-active events still add counted time to tracker."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "idle-active"
 
         event = AWEvent(
@@ -641,22 +685,21 @@ class TestSyncEngine:
             data={"app": "Firefox", "title": "Test"},
         )
 
-        self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         self.time_tracker.add_active_time.assert_called_once()
 
     def test_transform_event_no_input_data_uses_afk_for_active(self):
         """Test that without input data, AFK 'not-afk' events mark window as active."""
-        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is active during this window
-        self.engine._cycle.afk_events = [
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[
             AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "not-afk"}),
-        ]
+        ])
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert result["activity_state"] == "active"
@@ -664,16 +707,15 @@ class TestSyncEngine:
 
     def test_transform_event_no_input_data_uses_afk_for_inactive(self):
         """Test that without input data, AFK 'afk' events mark window as inactive."""
-        self.engine._cycle.has_input_data = False
         self.engine._afk_watcher_available = True
         now = datetime.now(timezone.utc)
         # AFK says user is idle during this window
-        self.engine._cycle.afk_events = [
+        cycle = _SyncCycleContext(has_input_data=False, afk_events=[
             AWEvent(id=10, timestamp=now - timedelta(seconds=10), duration=120, data={"status": "afk"}),
-        ]
+        ])
         event = AWEvent(id=1, timestamp=now, duration=60, data={"app": "Firefox", "title": "Test"})
 
-        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW)
+        result = self.engine._transform_event(event, "bucket-123", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert result is not None
         assert result["activity_state"] == "inactive"
@@ -686,8 +728,7 @@ class TestSyncEngine:
         the user was at the computer. Defaulting to inactive would cause
         silent zero-hour days which is worse than slightly inflated counts.
         """
-        self.engine._cycle.has_input_data = False
-        self.engine._cycle.afk_events = []
+        # has_input_data=False, afk_events=[] is the default cycle context.
         self.engine._afk_watcher_available = False
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
@@ -705,8 +746,7 @@ class TestSyncEngine:
         When the AFK watcher is available but has no events covering this
         window event's time range, the user was genuinely idle.
         """
-        self.engine._cycle.has_input_data = False
-        self.engine._cycle.afk_events = []
+        # has_input_data=False, afk_events=[] is the default cycle context.
         self.engine._afk_watcher_available = True
         event = AWEvent(
             id=1, timestamp=datetime.now(timezone.utc), duration=60,
@@ -768,7 +808,7 @@ class TestSyncEngine:
 
     def test_transform_event_delta_time_tracking_on_refetch(self):
         """Test that re-fetched events with grown duration only add the delta."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event_v1 = AWEvent(
@@ -779,7 +819,7 @@ class TestSyncEngine:
         )
 
         # First fetch — full 60s should be added
-        self.engine._transform_event(event_v1, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event_v1, "bucket-1", BUCKET_TYPE_WINDOW, cycle=cycle)
         self.time_tracker.add_active_time.assert_called_once()
         assert self.time_tracker.add_active_time.call_args[0][0] == 60
 
@@ -792,13 +832,13 @@ class TestSyncEngine:
             duration=90,
             data={"app": "VSCode", "title": "editor"},
         )
-        self.engine._transform_event(event_v2, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event_v2, "bucket-1", BUCKET_TYPE_WINDOW, cycle=cycle)
         self.time_tracker.add_active_time.assert_called_once()
         assert self.time_tracker.add_active_time.call_args[0][0] == 30  # delta only
 
     def test_transform_event_no_double_count_same_duration(self):
         """Test that re-fetched events with same duration don't add time."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -809,16 +849,16 @@ class TestSyncEngine:
         )
 
         # First fetch
-        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW, cycle=cycle)
         self.time_tracker.add_active_time.reset_mock()
 
         # Re-fetch with identical duration — delta is 0, should not call
-        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW, cycle=cycle)
         self.time_tracker.add_active_time.assert_not_called()
 
     def test_transform_event_different_buckets_track_separately(self):
         """Test that same event ID in different buckets tracks time independently."""
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -829,8 +869,8 @@ class TestSyncEngine:
         )
 
         # Same event ID, different bucket — both should add full duration
-        self.engine._transform_event(event, "bucket-A", BUCKET_TYPE_WINDOW)
-        self.engine._transform_event(event, "bucket-B", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-A", BUCKET_TYPE_WINDOW, cycle=cycle)
+        self.engine._transform_event(event, "bucket-B", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         assert self.time_tracker.add_active_time.call_count == 2
         for call in self.time_tracker.add_active_time.call_args_list:
@@ -853,7 +893,7 @@ class TestSyncEngine:
         """Test that _time_cache operations are protected by _cache_lock."""
         import threading
 
-        self.engine._cycle.has_input_data = True
+        cycle = _SyncCycleContext(has_input_data=True)
         self.activity_analyzer.get_activity_state.return_value = "active"
 
         event = AWEvent(
@@ -885,7 +925,7 @@ class TestSyncEngine:
 
         self.engine._cache_lock = CountingLock()
 
-        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW)
+        self.engine._transform_event(event, "bucket-1", BUCKET_TYPE_WINDOW, cycle=cycle)
 
         # _cache_lock should have been acquired for _time_cache operations
         # _transform_event accesses _time_cache when activity_state is "active"
