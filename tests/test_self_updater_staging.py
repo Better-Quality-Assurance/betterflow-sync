@@ -101,12 +101,68 @@ class TestStageUpdate:
         assert meta["artifact"] == "BetterFlow-linux-x86_64.AppImage"
 
     def test_rejects_non_https(self, staging):
-        assert su.stage_update("http://example.com/a.AppImage", "1.5.23") is False
+        # Allowlisted host but http:// — must be rejected on the scheme alone.
+        assert su.stage_update("http://github.com/x/a.AppImage", "1.5.23") is False
+
+    def test_rejects_off_allowlist_host(self, staging):
+        # HTTPS but a non-GitHub host: stage_update must refuse it at the gate,
+        # matching apply_update's is_safe_fetch_url check (not just https). The
+        # download must never be attempted (pre-fix it was — the gate only
+        # checked the scheme), so assert _download_to_file is never called.
+        with patch("src.self_updater._download_to_file") as dl:
+            assert su.stage_update("https://evil.example.com/a.AppImage", "1.5.23") is False
+        dl.assert_not_called()
 
     def test_failed_download_clears_staging(self, staging):
+        # Use an allowlisted URL so we actually reach (and fail) the download —
+        # otherwise the host gate would short-circuit before _download_to_file.
+        url = "https://github.com/Better-Quality-Assurance/betterflow-sync/releases/download/v1.5.23/a.AppImage"
         with patch("src.self_updater._download_to_file", side_effect=OSError("boom")):
-            assert su.stage_update("https://x/a.AppImage", "1.5.23") is False
+            assert su.stage_update(url, "1.5.23") is False
         assert not su._staging_meta_path().exists()
+
+
+class TestDownloadSizeCap:
+    """The download must refuse oversized bodies so a poisoned/misconfigured
+    response can't fill the disk (installers are ~60-80 MB; cap is 500 MB)."""
+
+    def _fake_get(self, content_length, chunks):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.headers = {"content-length": str(content_length)}
+        resp.raise_for_status.return_value = None
+        resp.iter_content.return_value = iter(chunks)
+        ctx = MagicMock()
+        ctx.__enter__.return_value = resp
+        ctx.__exit__.return_value = False
+        return ctx
+
+    def test_rejects_oversized_content_length(self, tmp_path, monkeypatch):
+        # Shrink the cap so the test stays tiny (no real 500MB anything).
+        monkeypatch.setattr(su, "_MAX_DOWNLOAD_BYTES", 100)
+        dest = tmp_path / "big.bin"
+        ctx = self._fake_get(101, [b"x"])
+        with patch("src.self_updater.requests.get", return_value=ctx):
+            with pytest.raises(ValueError):
+                su._download_to_file("https://github.com/x/big.bin", dest)
+
+    def test_aborts_when_stream_exceeds_cap(self, tmp_path, monkeypatch):
+        # content-length lies (0), but the streamed body blows past the cap.
+        # Tiny cap + tiny chunk so we don't allocate hundreds of MB in CI.
+        monkeypatch.setattr(su, "_MAX_DOWNLOAD_BYTES", 100)
+        dest = tmp_path / "big.bin"
+        ctx = self._fake_get(0, [b"x" * 101])
+        with patch("src.self_updater.requests.get", return_value=ctx):
+            with pytest.raises(ValueError):
+                su._download_to_file("https://github.com/x/big.bin", dest)
+
+    def test_allows_normal_size(self, tmp_path):
+        dest = tmp_path / "ok.bin"
+        ctx = self._fake_get(7, [b"payload"])
+        with patch("src.self_updater.requests.get", return_value=ctx):
+            su._download_to_file("https://github.com/x/ok.bin", dest)
+        assert dest.read_bytes() == b"payload"
 
 
 class TestArtifactFilename:

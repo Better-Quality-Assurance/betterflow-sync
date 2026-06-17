@@ -153,6 +153,20 @@ class TestBetterFlowClient:
             client.close()
 
     @responses.activate
+    def test_malformed_json_body_wrapped_as_client_error(self):
+        """A 2xx with a malformed body must surface as BetterFlowClientError,
+        not leak a raw JSONDecodeError to callers."""
+        responses.add(
+            responses.GET,
+            "https://betterflow.eu/api/agent/config",
+            body="{not valid json",
+            status=200,
+            content_type="application/json",
+        )
+        with pytest.raises(BetterFlowClientError):
+            self.client._request("GET", "config", retry=False)
+
+    @responses.activate
     def test_is_reachable_true(self):
         """Test is_reachable when server responds."""
         responses.add(

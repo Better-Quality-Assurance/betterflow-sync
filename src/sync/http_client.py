@@ -296,7 +296,15 @@ class BaseApiClient:
                     raise _TransientError(f"Server error: {response.status_code}")
 
                 response.raise_for_status()
-                return response.json() if response.content else {}
+                if not response.content:
+                    return {}
+                try:
+                    return response.json()
+                except ValueError as e:
+                    # Malformed body on a 2xx (requests raises JSONDecodeError,
+                    # a ValueError subclass) — surface as our error type, not a
+                    # raw decode error leaking to callers.
+                    raise BetterFlowClientError("Invalid JSON in API response") from e
 
             except requests.exceptions.ConnectionError as e:
                 # DNS resolution failures are not retryable (N8)

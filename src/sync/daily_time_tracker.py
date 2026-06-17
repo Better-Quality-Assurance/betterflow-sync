@@ -165,6 +165,11 @@ class DailyTimeTracker:
             if self._closed:
                 return
 
+        # Read the date BEFORE taking _lock: it drives the non-today early-exit
+        # below, and the in-lock `self._today != current_date` check re-validates
+        # it so a midnight crossing still triggers rollover. Do NOT move this
+        # inside the `with self._lock` block — _load_new_day (reached via the
+        # rollover path) acquires _lock itself and would deadlock.
         current_date = self._get_local_date()
         if event_date != current_date:
             try:
@@ -293,9 +298,10 @@ class DailyTimeTracker:
     def _load_new_day(self, new_date: date) -> None:
         """Load existing data for a new day and merge it into memory.
 
-        Must hold _lock for the SQLite read so concurrent add_active_time
-        calls can't slip additions between the DB read and the in-memory
-        merge (previously a ``max()`` there silently discarded those).
+        Acquires _lock internally for the SQLite read so concurrent
+        add_active_time calls can't slip additions between the DB read and the
+        in-memory merge (previously a ``max()`` there silently discarded those).
+        Callers must NOT already hold _lock (it is not reentrant).
 
         The merge rule is ADD, not MAX: ``loaded`` is the baseline the DB
         already persisted, and any ``_today_seconds`` accumulated between
