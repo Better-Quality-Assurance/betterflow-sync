@@ -392,6 +392,26 @@ class BetterFlowClient(BaseApiClient):
         """Get weekly/monthly trend summaries (non-critical, short timeout)."""
         return self._request("GET", "events/trends", retry=False, timeout_override=10)
 
+    def upload_logs(self, log_tail: bytes, relaunch_tail: Optional[bytes] = None) -> dict:
+        """Upload the agent's log tail(s) in response to a server logs_requested
+        flag (admin diagnostics). POST /api/agent/logs (multipart).
+
+        ``log`` (betterflow.log) is required by the server; ``relaunch_log`` is
+        sent only when present (``None`` or empty ``b""`` are both omitted). The
+        server keeps the last 512 KB per file and clears logs_requested_at on
+        success. Not retried here — if it fails the flag stays set and the next
+        heartbeat re-attempts.
+
+        Privacy note: this is an admin-initiated diagnostic pull. The log can
+        contain app names, the device hostname (in bucket ids), and OS usernames
+        in stack-trace paths — but NOT window titles, URLs, or auth tokens
+        (those are never logged). Acceptable within the tenant-admin trust model.
+        """
+        files: dict = {"log": ("betterflow.log", log_tail, "text/plain")}
+        if relaunch_tail:
+            files["relaunch_log"] = ("self-update-relaunch.log", relaunch_tail, "text/plain")
+        return self._request("POST", "logs", files=files, retry=False)
+
     # =========================================================================
     # Web login passthrough
     # =========================================================================
