@@ -575,15 +575,39 @@ class SyncCoordinator:
 
         # Query the AFK bucket for the latest event. Best-effort; AW being
         # transiently unreachable is a different failure mode handled
-        # elsewhere. AWClient prefers the BetterFlow-owned idle bucket over
-        # stale vanilla ActivityWatch buckets.
+        # elsewhere.
         try:
-            latest = self.aw.get_latest_afk_event()
+            buckets = self.aw.get_afk_buckets()
         except Exception as e:
             logger.debug("idle_tracker_health: AW unreachable, skipping: %s", e)
             return
-        if latest is None:
+        if not buckets:
             return  # No AFK bucket yet — tracker hasn't started or hasn't reported.
+
+        # A user who migrated from vanilla ActivityWatch can have BOTH a
+        # `bf-idle-tracker` bucket and a stale `aw-watcher-afk` bucket. The
+        # stale one's last event is frozen at "afk" forever, so picking the
+        # wrong one fires a false-positive notification every time the user
+        # types. Prefer the bf-idle-tracker bucket; fall back to picking the
+        # one with the most recent event if neither name matches.
+        bf_buckets = [b for b in buckets if "bf-idle-tracker" in b.id]
+        candidate_buckets = bf_buckets or buckets
+
+        latest = None
+        for bucket in candidate_buckets:
+            try:
+                events = self.aw.get_events(bucket.id, limit=1)
+            except Exception as e:
+                logger.debug("idle_tracker_health: AFK fetch failed for %s: %s", bucket.id, e)
+                continue
+            if not events:
+                continue
+            event = events[0]
+            if latest is None or event.timestamp > latest.timestamp:
+                latest = event
+
+        if latest is None:
+            return  # No AFK events anywhere — tracker hasn't reported yet.
 
         status = (latest.data or {}).get("status")
         if status != "afk":
