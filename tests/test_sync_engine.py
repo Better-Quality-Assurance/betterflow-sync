@@ -408,6 +408,17 @@ class TestSyncEngine:
         self.engine._send_heartbeat()
         self.bf.upload_logs.assert_not_called()
 
+    def test_heartbeat_log_upload_auth_error_propagates(self):
+        """A BetterFlowAuthError during the log upload must surface from
+        _send_heartbeat (the re-login signal), not be swallowed by the generic
+        client-error handler."""
+        from src.sync.bf_client import BetterFlowAuthError
+        self.bf.heartbeat.return_value = {"logs_requested": True}
+        self.bf.upload_logs.side_effect = BetterFlowAuthError("expired")
+        with patch.object(SyncEngine, "_read_log_tail", return_value=b"log-bytes"):
+            result = self.engine._send_heartbeat()
+        assert isinstance(result, BetterFlowAuthError)
+
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}

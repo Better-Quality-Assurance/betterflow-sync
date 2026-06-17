@@ -397,9 +397,15 @@ class BetterFlowClient(BaseApiClient):
         flag (admin diagnostics). POST /api/agent/logs (multipart).
 
         ``log`` (betterflow.log) is required by the server; ``relaunch_log`` is
-        sent only when present. The server keeps the last 512 KB per file and
-        clears logs_requested_at on success. Not retried here — if it fails the
-        flag stays set and the next heartbeat re-attempts.
+        sent only when present (``None`` or empty ``b""`` are both omitted). The
+        server keeps the last 512 KB per file and clears logs_requested_at on
+        success. Not retried here — if it fails the flag stays set and the next
+        heartbeat re-attempts.
+
+        Privacy note: this is an admin-initiated diagnostic pull. The log can
+        contain app names, the device hostname (in bucket ids), and OS usernames
+        in stack-trace paths — but NOT window titles, URLs, or auth tokens
+        (those are never logged). Acceptable within the tenant-admin trust model.
         """
         files: dict = {"log": ("betterflow.log", log_tail, "text/plain")}
         if relaunch_tail:

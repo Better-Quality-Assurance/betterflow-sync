@@ -1943,13 +1943,23 @@ class SyncEngine:
             return
         log_tail = self._read_log_tail(log_dir / "betterflow.log")
         if not log_tail:
-            logger.debug("logs_requested but betterflow.log is empty/unreadable — skipping")
+            # WARNING (not debug) so the next successful upload carries a record
+            # of why earlier ones were skipped — the admin's flag stays set and
+            # we retry every heartbeat, which is correct for the normal cause
+            # (a transient log-rotation window).
+            logger.warning(
+                "logs_requested but betterflow.log is empty/unreadable — "
+                "skipping this cycle (will retry next heartbeat)"
+            )
             return
         relaunch_tail = self._read_log_tail(log_dir / "self-update-relaunch.log")
         try:
             self.bf.upload_logs(log_tail, relaunch_tail)
             logger.info("Uploaded log tail on server request (%d bytes)", len(log_tail))
         except BetterFlowAuthError:
+            # Make the source explicit — _send_heartbeat's shared handler would
+            # otherwise log this as a plain "Heartbeat auth error".
+            logger.warning("Log-upload auth error — session likely expired")
             raise  # let _send_heartbeat surface re-login
         except BetterFlowClientError as e:
             logger.debug("Log upload failed (will retry next heartbeat): %s", e)
