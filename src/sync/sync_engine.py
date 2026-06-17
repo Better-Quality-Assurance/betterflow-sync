@@ -392,10 +392,21 @@ class SyncEngine:
             # painting the post-call AFK stretch as worked time. The observed call
             # portion is still recorded if the backend is reachable; if AW comes
             # back mid-call a fresh call starts cleanly.
+            #
+            # That recovery can emit a SECOND event for the same meeting (the
+            # continuation is picked up from the un-advanced checkpoint). Both
+            # carry the deterministic id call_<app>_<start_ts> and the backend
+            # upserts call events by id, so the overlapping recovered portion
+            # supersedes this flushed one rather than double-billing.
             if self._call_detector:
                 remaining = self._call_detector.flush()
                 if remaining and self.bf.is_reachable():
+                    # _send_events may set stats.queued_bucket_ids on failure; we
+                    # return immediately and intentionally don't act on it — call
+                    # events go to the synthetic call bucket, not a checkpointed AW
+                    # bucket, so there is no checkpoint to withhold.
                     self._send_events([self._make_call_bf_event(remaining)], stats)
+                    stats.calls_detected += 1
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)

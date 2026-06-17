@@ -71,8 +71,9 @@ def test_aw_outage_clears_stuck_call_state_and_records_when_reachable():
     engine.aw.is_running.return_value = False
     engine.bf.is_reachable.return_value = True  # online → the observed call is sent
 
-    engine.sync()
+    stats = engine.sync()
 
     assert engine.is_in_call() is False, "stale call state cleared on AW outage"
     # The observed 2-minute call portion is recorded (>= min_call_duration).
     assert engine.bf.send_events.called, "the call up to the outage should be sent"
+    assert stats.calls_detected == 1, "the flushed call must be counted in stats"
