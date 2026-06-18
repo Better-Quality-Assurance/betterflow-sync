@@ -1870,8 +1870,19 @@ class SyncEngine:
         try:
             response = self.bf.heartbeat()
 
+            # The server wraps the heartbeat payload in an envelope: the real
+            # fields live under response["data"], NOT at the top level — the same
+            # convention send_events already accounts for (it had this exact bug
+            # and unwraps with response.get("data", response)). Reading top-level
+            # here made EVERY heartbeat-driven feature a silent no-op: remote
+            # pause/deregister commands, the minimum-version check, clock-skew
+            # detection, config-change refetch, and the admin logs_requested
+            # upload all never fired. Unwrap once, with a fallback so a future
+            # un-enveloped response still works.
+            payload = response.get("data", response) if isinstance(response, dict) else {}
+
             # Handle server commands
-            commands = response.get("commands", [])
+            commands = payload.get("commands", [])
             for cmd in commands:
                 cmd_type = cmd.get("type")
                 if cmd_type == "pause":
@@ -1884,14 +1895,14 @@ class SyncEngine:
                         self._paused = True
 
             # Version compatibility check
-            min_version = response.get("minimum_agent_version")
+            min_version = payload.get("minimum_agent_version")
             if min_version and self._version_below(AGENT_VERSION, min_version):
                 logger.warning(
                     f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
                 )
 
             # Clock skew detection: compare server time with local time
-            server_time_str = response.get("server_time")
+            server_time_str = payload.get("server_time")
             if server_time_str:
                 try:
                     server_time = datetime.fromisoformat(
@@ -1910,13 +1921,13 @@ class SyncEngine:
                     logger.debug("server_time parse failed: %s", e)
 
             # Re-fetch config if server says it changed
-            if response.get("config_updated"):
+            if payload.get("config_updated"):
                 self.fetch_server_config()
 
             # Admin requested this device's logs for diagnostics. Upload the
             # tail; the server clears the flag only on success, so a failed
             # upload simply retries on the next heartbeat.
-            if response.get("logs_requested"):
+            if payload.get("logs_requested"):
                 self._upload_requested_logs()
 
         except BetterFlowAuthError as e:

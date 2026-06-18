@@ -390,8 +390,14 @@ class TestSyncEngine:
 
     def test_heartbeat_uploads_logs_when_requested(self):
         """When the heartbeat response sets logs_requested, the agent uploads
-        the betterflow.log tail (relaunch log optional)."""
-        self.bf.heartbeat.return_value = {"logs_requested": True}
+        the betterflow.log tail (relaunch log optional).
+
+        The response MUST be the real server envelope ({"success", "data": {...}}),
+        not a top-level flag — _send_heartbeat reads response["data"]. An earlier
+        version of this test mocked {"logs_requested": True} at the top level,
+        which matched the buggy reader and so passed against code that never
+        actually uploaded (live repro: Emilian's 1.5.57 agent, 2026-06-18)."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": True}}
 
         def fake_tail(path, max_bytes=512 * 1024):
             return b"log-bytes" if path.name == "betterflow.log" else None
@@ -404,7 +410,7 @@ class TestSyncEngine:
 
     def test_heartbeat_does_not_upload_logs_when_not_requested(self):
         """No logs_requested flag -> no upload (the common case)."""
-        self.bf.heartbeat.return_value = {"logs_requested": False}
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": False}}
         self.engine._send_heartbeat()
         self.bf.upload_logs.assert_not_called()
 
@@ -413,11 +419,33 @@ class TestSyncEngine:
         _send_heartbeat (the re-login signal), not be swallowed by the generic
         client-error handler."""
         from src.sync.bf_client import BetterFlowAuthError
-        self.bf.heartbeat.return_value = {"logs_requested": True}
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": True}}
         self.bf.upload_logs.side_effect = BetterFlowAuthError("expired")
         with patch.object(SyncEngine, "_read_log_tail", return_value=b"log-bytes"):
             result = self.engine._send_heartbeat()
         assert isinstance(result, BetterFlowAuthError)
+
+    def test_heartbeat_unwraps_envelope_for_commands(self):
+        """Not just logs: every heartbeat-driven field lives under response["data"].
+        A 'pause' command in the enveloped response must reach pause() — proving
+        the unwrap covers remote commands (silently no-op'd before the fix), not
+        only the log upload."""
+        self.bf.heartbeat.return_value = {
+            "success": True,
+            "data": {"commands": [{"type": "pause", "reason": "admin"}]},
+        }
+        with patch.object(self.engine, "pause") as mock_pause:
+            self.engine._send_heartbeat()
+        mock_pause.assert_called_once()
+
+    def test_heartbeat_tolerates_unenveloped_response(self):
+        """Defensive: the response.get("data", response) fallback means a future
+        un-enveloped (top-level) response still works rather than silently
+        no-op'ing again."""
+        self.bf.heartbeat.return_value = {"logs_requested": True}
+        with patch.object(SyncEngine, "_read_log_tail", return_value=b"x"):
+            self.engine._send_heartbeat()
+        self.bf.upload_logs.assert_called_once()
 
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
