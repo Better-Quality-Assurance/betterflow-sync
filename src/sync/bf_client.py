@@ -341,19 +341,40 @@ class BetterFlowClient(BaseApiClient):
     # Lightweight retry for heartbeat (N14): 1 retry, 5s timeout
     _HEARTBEAT_RETRY = RetryConfig(max_retries=1, base_delay=1.0, max_delay=5.0)
 
-    def heartbeat(self, agent_version: str = AGENT_VERSION) -> dict:
+    def heartbeat(
+        self,
+        agent_version: str = AGENT_VERSION,
+        health: Optional[dict] = None,
+    ) -> dict:
         """Send heartbeat to server.
 
         Uses a shorter timeout (5s) and fewer retries (1) to avoid
         blocking the sync loop when the server is slow (N14).
 
+        ``health`` carries optional agent-health telemetry (idle-tracker
+        restart count, AFK/window event ages, consecutive sync failures) so the
+        backend can mark a device tracking_degraded even while it reports
+        "Active". Only known keys are forwarded; everything else is ignored.
+
         Returns server commands (pause/deregister) and config update flag.
         """
+        data = {
+            "agent_version": agent_version,
+            "timezone": self._detect_timezone(),
+        }
+        if health:
+            for key in (
+                "idle_tracker_stale_restarts",
+                "afk_event_age_seconds",
+                "window_event_age_seconds",
+                "consecutive_sync_failures",
+                "idle_while_active_detections",
+            ):
+                if key in health:
+                    data[key] = health[key]
+
         return self._request(
-            "POST", "heartbeat", data={
-                "agent_version": agent_version,
-                "timezone": self._detect_timezone(),
-            },
+            "POST", "heartbeat", data=data,
             timeout_override=5,
             retry_config_override=self._HEARTBEAT_RETRY,
         )

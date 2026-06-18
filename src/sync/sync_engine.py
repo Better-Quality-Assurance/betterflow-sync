@@ -187,6 +187,10 @@ class SyncEngine:
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
+        # Optional callable returning agent-health telemetry to ride along with
+        # each heartbeat (set by the SyncCoordinator, which owns the AwManager
+        # and the sync-failure counter). Returning None / raising is tolerated.
+        self.health_provider: Optional[Callable[[], dict]] = None
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -1868,7 +1872,14 @@ class SyncEngine:
         a transient heartbeat failure should not surface as a user error.
         """
         try:
-            response = self.bf.heartbeat()
+            health = None
+            if self.health_provider is not None:
+                try:
+                    health = self.health_provider()
+                except Exception as e:  # noqa: BLE001
+                    # Telemetry is best-effort; never let it block the heartbeat.
+                    logger.debug("health_provider failed: %s", e)
+            response = self.bf.heartbeat(health=health)
 
             # The server wraps the heartbeat payload in an envelope: the real
             # fields live under response["data"], NOT at the top level — the same
