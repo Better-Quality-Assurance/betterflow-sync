@@ -35,13 +35,21 @@ def test_reconcile_enqueues_a_stranded_mid_day_gap():
 
     # A stranded gap: ~400 input events spread across the MIDDLE of today, well
     # before "now". Under the old newest-first+limit fetch these were skipped.
+    #
+    # The events must straddle (day_start, now) regardless of when this runs: the
+    # reconcile only pages start-of-day -> now, so any event past "now" can't be
+    # reached. A fixed day_start+5h offset breaks on UTC-timezone CI runners in
+    # the early morning (now < gap_end -> only the first few events enqueue).
+    # Distribute the 400 events evenly across the open interval (day_start, now)
+    # so every one is in the past and after start-of-day on any machine/hour.
     now = datetime.now(timezone.utc)
     day_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    gap_start = day_start + timedelta(hours=5)
+    span = (now - day_start).total_seconds()
+    step = span / 401  # event i at day_start + step*(i+1); last = step*400 < span
     gap_events = [
         AWEvent(
             id=1000 + i,
-            timestamp=gap_start + timedelta(seconds=10 * i),
+            timestamp=day_start + timedelta(seconds=step * (i + 1)),
             duration=10.0,
             data={"app": "Terminal", "bundle": "com.apple.Terminal", "presses": 5},
         )
