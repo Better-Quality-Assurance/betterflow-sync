@@ -142,6 +142,9 @@ class SyncCoordinator:
         # sync-failure counter, which the SyncEngine does not — so the provider
         # lives here and is handed to the engine.
         self.sync_engine.health_provider = self._build_health_telemetry
+        # So a failed logs_requested upload surfaces to the ops ingest (it can't
+        # surface via the log itself — that's the file we couldn't fetch).
+        self.sync_engine.error_reporter = self.error_reporter
 
         self.scheduler = BackgroundScheduler()
         self._last_tick: Optional[datetime] = None
