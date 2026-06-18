@@ -362,7 +362,7 @@ class BetterFlowClient(BaseApiClient):
             "agent_version": agent_version,
             "timezone": self._detect_timezone(),
         }
-        if health:
+        if health is not None:
             for key in (
                 "idle_tracker_stale_restarts",
                 "afk_event_age_seconds",

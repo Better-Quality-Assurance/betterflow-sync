@@ -40,6 +40,30 @@ class TestDisabled:
         assert from_env(release="1.0.0").enabled is False
 
 
+class TestEndpointScheme:
+    """The DSN rides in `Authorization: Bearer ...` on every report, so a
+    non-HTTPS endpoint must be refused (it would send the token in clear).
+    Loopback is exempt for local dev. Pre-fix, _post sent over any scheme."""
+
+    def test_http_endpoint_is_refused(self) -> None:
+        r = _reporter(endpoint="http://bot.example/notify/error")
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", block=True)
+            post.assert_not_called()
+
+    def test_loopback_http_is_allowed_for_dev(self) -> None:
+        r = _reporter(endpoint="http://127.0.0.1:8080/notify/error")
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", block=True)
+            post.assert_called_once()
+
+    def test_https_endpoint_posts(self) -> None:
+        r = _reporter(endpoint="https://bot.example/notify/error")
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", block=True)
+            post.assert_called_once()
+
+
 class TestPayload:
     def test_builds_expected_payload_and_auth(self) -> None:
         r = _reporter(
