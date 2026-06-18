@@ -447,6 +447,41 @@ class TestSyncEngine:
             self.engine._send_heartbeat()
         self.bf.upload_logs.assert_called_once()
 
+    def test_unreadable_log_reports_upload_failure_to_ops(self):
+        """The remote log fetch exists to diagnose a sick agent — so if the
+        upload fails (here: the log is unreadable, the suspected Windows wedge
+        case), the failure must surface via the error_reporter (a channel that
+        works when the log fetch doesn't). Otherwise the failure is only in the
+        local log we couldn't fetch — circular blindness."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": True}}
+        self.engine.error_reporter = MagicMock()
+        with patch.object(SyncEngine, "_read_log_tail", return_value=None):
+            self.engine._send_heartbeat()
+        self.bf.upload_logs.assert_not_called()
+        self.engine.error_reporter.capture.assert_called_once()
+        assert "unreadable" in self.engine.error_reporter.capture.call_args[0][0]
+
+    def test_failed_upload_post_reports_to_ops(self):
+        """A POST failure on the upload is likewise surfaced to ops, not just
+        logged locally where we can't reach it."""
+        from src.sync.bf_client import BetterFlowClientError
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": True}}
+        self.bf.upload_logs.side_effect = BetterFlowClientError("500")
+        self.engine.error_reporter = MagicMock()
+        with patch.object(SyncEngine, "_read_log_tail", return_value=b"log-bytes"):
+            self.engine._send_heartbeat()
+        self.engine.error_reporter.capture.assert_called_once()
+        assert "POST failed" in self.engine.error_reporter.capture.call_args[0][0]
+
+    def test_successful_upload_does_not_report_failure(self):
+        """The happy path must NOT fire a failure report."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {"logs_requested": True}}
+        self.engine.error_reporter = MagicMock()
+        with patch.object(SyncEngine, "_read_log_tail", return_value=b"log-bytes"):
+            self.engine._send_heartbeat()
+        self.bf.upload_logs.assert_called_once()
+        self.engine.error_reporter.capture.assert_not_called()
+
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}

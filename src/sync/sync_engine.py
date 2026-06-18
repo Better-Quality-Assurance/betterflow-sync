@@ -191,6 +191,14 @@ class SyncEngine:
         # each heartbeat (set by the SyncCoordinator, which owns the AwManager
         # and the sync-failure counter). Returning None / raising is tolerated.
         self.health_provider: Optional[Callable[[], dict]] = None
+        # Optional error reporter (set by the SyncCoordinator) so a FAILED
+        # logs_requested upload is visible remotely. The whole point of the
+        # remote log fetch is to diagnose a sick agent — but if the upload
+        # itself fails (unreadable log, POST error) the only record is the local
+        # log we can't fetch. Reporting the failure here (a separate ops-ingest
+        # channel) breaks that circular blindness. This is exactly why Windows
+        # wedges were undiagnosable. None / errors tolerated.
+        self.error_reporter = None
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -1973,6 +1981,7 @@ class SyncEngine:
                 "logs_requested but betterflow.log is empty/unreadable — "
                 "skipping this cycle (will retry next heartbeat)"
             )
+            self._report_upload_failure("betterflow.log empty/unreadable")
             return
         relaunch_tail = self._read_log_tail(log_dir / "self-update-relaunch.log")
         try:
@@ -1985,6 +1994,26 @@ class SyncEngine:
             raise  # let _send_heartbeat surface re-login
         except BetterFlowClientError as e:
             logger.debug("Log upload failed (will retry next heartbeat): %s", e)
+            self._report_upload_failure(f"upload POST failed: {e}")
+
+    def _report_upload_failure(self, reason: str) -> None:
+        """Surface a logs_requested upload failure to the ops ingest. We can't
+        rely on the local log to carry this — it IS the file we failed to send,
+        and the admin requested it precisely because the agent is sick. The
+        error_reporter is a separate channel that keeps working when the log
+        fetch doesn't, so a wedged/failing agent stays diagnosable. The
+        reporter's own dedup window keeps this from flooding on each retry."""
+        if self.error_reporter is None:
+            return
+        try:
+            self.error_reporter.capture(
+                f"Agent log upload failed: {reason}",
+                level="warning",
+                tags={"component": "log-upload"},
+                fingerprint="log-upload-failed",
+            )
+        except Exception:
+            logger.debug("log-upload-failure report failed", exc_info=True)
 
     @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
