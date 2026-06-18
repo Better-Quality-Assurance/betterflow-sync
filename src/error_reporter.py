@@ -31,6 +31,7 @@ import threading
 import time
 import traceback
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -187,6 +188,18 @@ class ErrorReporter:
 
     def _post(self, payload: dict) -> None:
         """POST the report. Swallows all transport errors (logged, never raised)."""
+        # The DSN rides in `Authorization: Bearer ...` on every report, so refuse
+        # to send it over plaintext. The default endpoint is HTTPS, but
+        # BETTERFLOW_ERROR_ENDPOINT (env or baked) could point elsewhere; mirror
+        # bf_client's token-exchange guard (HTTPS, or loopback for dev).
+        parsed = urlparse(self._endpoint)
+        if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1"):
+            logger.warning(
+                "Error report skipped — endpoint is not HTTPS (won't send the DSN "
+                "in clear): %s",
+                self._endpoint,
+            )
+            return
         try:
             resp = requests.post(
                 self._endpoint,

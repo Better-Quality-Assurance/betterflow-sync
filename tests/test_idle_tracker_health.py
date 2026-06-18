@@ -117,6 +117,28 @@ def test_warns_when_input_recent_but_afk_bucket_says_afk(mock_send):
 
 
 @patch("src.main.send_notification")
+def test_blind_capture_uses_coarse_input_age_not_timestamp(mock_send):
+    """The blind-tracker error report (sent to ops ingest) must NOT carry a
+    precise last-input wall-clock timestamp — that anchors a high-resolution
+    activity timeline for the end user. It should send a coarse age in seconds."""
+    input_watcher = MagicMock()
+    input_watcher.get_last_input_at.return_value = datetime.now(timezone.utc) - timedelta(seconds=30)
+
+    coord = _make_coordinator(
+        input_watcher=input_watcher,
+        latest_afk_event=_afk_event("afk", age_seconds=3600, duration=300),
+    )
+    coord.error_reporter = MagicMock()
+
+    coord._check_idle_tracker_health()
+
+    coord.error_reporter.capture.assert_called_once()
+    ctx = coord.error_reporter.capture.call_args.kwargs["context"]
+    assert "last_input" not in ctx, "must not leak the precise wall-clock timestamp"
+    assert isinstance(ctx.get("last_input_age_seconds"), int)
+
+
+@patch("src.main.send_notification")
 def test_silent_when_afk_bucket_says_not_afk(mock_send):
     """The tracker agrees with the input watcher — no warning."""
     input_watcher = MagicMock()

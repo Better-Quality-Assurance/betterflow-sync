@@ -21,7 +21,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 try:
     from .__init__ import __version__
     from .auth import KeychainManager, LoginManager
-    from .aw_manager import AWManager
+    from .aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from .config import Config, setup_logging
     from . import error_reporter
     from .browser_tracker import start_browser_tracker
@@ -46,7 +46,7 @@ try:
 except ImportError:
     from src import __version__
     from auth import KeychainManager, LoginManager
-    from aw_manager import AWManager
+    from aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from config import Config, setup_logging
     import error_reporter
     from browser_tracker import start_browser_tracker
@@ -207,8 +207,13 @@ class SyncCoordinator:
         self._blind_tracker_window = 0
         # Forced tracker restarts past this (in one session) means the restart
         # isn't converging (orphan tracker / missing Input Monitoring perm) —
-        # escalate via a captured report instead of looping silently.
-        self._RESTART_LOOP_ALERT_THRESHOLD = 5
+        # escalate via a captured report instead of looping silently. Reuse the
+        # aw_manager threshold (the same point at which it flags the tracker
+        # blind) so the two can't drift out of sync.
+        self._RESTART_LOOP_ALERT_THRESHOLD = IDLE_BLIND_RESTART_THRESHOLD
+        # Latch so the escalation captures once per session, not on every sync
+        # cycle once the (monotonic) restart count crosses the threshold.
+        self._restart_loop_escalated = False
 
         # macOS permission-warning throttle. Input Monitoring can be revoked
         # silently (e.g. a new build changes the code signature and macOS drops
@@ -669,7 +674,12 @@ class SyncCoordinator:
                 tags={"component": "idle-tracker"},
                 context={
                     "detections": self._blind_tracker_detections,
-                    "last_input": last_input.isoformat(),
+                    # Age, not the wall-clock timestamp: a precise "last typed at
+                    # HH:MM:SS" anchors a high-resolution activity timeline for the
+                    # end user in the ops error-ingest, which the privacy model
+                    # (hashed titles, domain-only URLs) is meant to avoid. Age
+                    # conveys "input was N seconds ago" without that anchor.
+                    "last_input_age_seconds": int((now - last_input).total_seconds()),
                 },
                 fingerprint="idle-tracker-blind",
             )
@@ -903,6 +913,7 @@ class SyncCoordinator:
                     restarts = self.aw_manager.stale_restart_count()
                     if (
                         restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
+                        and not self._restart_loop_escalated
                         and self.error_reporter is not None
                     ):
                         self.error_reporter.capture(
@@ -912,8 +923,15 @@ class SyncCoordinator:
                             context={"stale_restarts": restarts},
                             fingerprint="idle-tracker-restart-loop",
                         )
+                        # Once per session — the restart count is monotonic, so
+                        # without this latch the capture would re-fire every cycle
+                        # (only the reporter's dedup window kept it from flooding).
+                        self._restart_loop_escalated = True
                 except Exception:
-                    logger.debug("restart-loop escalation check failed", exc_info=True)
+                    # WARNING, not debug: if the reporter itself is broken (bad
+                    # DSN, etc.) the escalation we built to surface this loop must
+                    # not fail silently every cycle.
+                    logger.warning("restart-loop escalation check failed", exc_info=True)
 
             if not self.aw.is_running():
                 # is_running() already reset+retried the HTTP session, so this
