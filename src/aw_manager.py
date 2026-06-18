@@ -789,11 +789,15 @@ class AWManager:
         window and AFK watchers heartbeat their current event, so a healthy
         watcher keeps the end near now; a hung one freezes it.
         """
+        hostname = urllib.parse.quote(platform.node(), safe="")
+        return self._get_latest_event_age_for_bucket(f"{bucket_prefix}_{hostname}")
+
+    def _get_latest_event_age_for_bucket(self, bucket_id: str) -> Optional[float]:
+        """Seconds since the latest event in an exact bucket id."""
         try:
-            hostname = urllib.parse.quote(platform.node(), safe="")
             url = (
                 f"http://localhost:{self.aw_port}/api/0/buckets/"
-                f"{bucket_prefix}_{hostname}/events?limit=1"
+                f"{urllib.parse.quote(bucket_id, safe='')}/events?limit=1"
             )
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=3) as resp:
@@ -808,8 +812,29 @@ class AWManager:
             age = time.time() - event_end
             return max(0, age)
         except Exception as e:
-            logger.debug("_get_latest_event_age(%s) failed: %s", bucket_prefix, e)
+            logger.debug("_get_latest_event_age_for_bucket(%s) failed: %s", bucket_id, e)
             return None
+
+    def _get_buckets(self) -> dict:
+        """Return AW bucket metadata, or an empty dict on error."""
+        try:
+            url = f"http://localhost:{self.aw_port}/api/0/buckets/"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                buckets = json.loads(resp.read())
+            return buckets if isinstance(buckets, dict) else {}
+        except Exception as e:
+            logger.debug("_get_buckets failed: %s", e)
+            return {}
+
+    def _get_latest_event_age_from_buckets(self, bucket_ids: list[str]) -> Optional[float]:
+        """Return the freshest/latest event age among exact bucket ids."""
+        ages = [
+            age
+            for bucket_id in bucket_ids
+            if (age := self._get_latest_event_age_for_bucket(bucket_id)) is not None
+        ]
+        return min(ages) if ages else None
 
     def _get_latest_window_event_age(self) -> Optional[float]:
         """Return seconds since the most recent window event, or None on error."""
@@ -818,11 +843,35 @@ class AWManager:
     def _get_latest_afk_event_age(self) -> Optional[float]:
         """Return seconds since the most recent AFK event, or None on error.
 
-        The branded idle tracker registers a ``bf-idle-tracker_<host>`` bucket
-        while vanilla installs use ``aw-watcher-afk_<host>``. Try the branded id
-        first so the staleness watchdog isn't silently disabled on branded-only
-        installs, then fall back to the vanilla prefix.
+        The branded idle tracker can register under ActivityWatch's historical
+        prefix with BetterFlow identity in the id/name/client (for example
+        ``aw-watcher-afk_bf-idle-tracker_<host>``). Discover buckets first and
+        prefer that live BetterFlow-owned bucket so a stale legacy
+        ``aw-watcher-afk_<host>`` bucket cannot drive restart decisions forever.
+        Fall back to older exact-id guesses for older installs.
         """
+        buckets = self._get_buckets()
+        afk_bucket_ids = [
+            bucket_id
+            for bucket_id, meta in buckets.items()
+            if isinstance(meta, dict)
+            and meta.get("type") in {"afkstatus", "aw-watcher-afk"}
+        ]
+        preferred = [
+            bucket_id
+            for bucket_id in afk_bucket_ids
+            if "bf-idle-tracker" in bucket_id
+            or "bf-idle-tracker" in str(buckets[bucket_id].get("name", ""))
+            or "bf-idle-tracker" in str(buckets[bucket_id].get("client", ""))
+        ]
+
+        age = self._get_latest_event_age_from_buckets(preferred)
+        if age is not None:
+            return age
+        age = self._get_latest_event_age_from_buckets(afk_bucket_ids)
+        if age is not None:
+            return age
+
         age = self._get_latest_event_age("bf-idle-tracker")
         if age is not None:
             return age

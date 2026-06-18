@@ -8,7 +8,10 @@ pin that a hung idle tracker is detected (AFK stale while window fresh) and
 restarted, and that we DON'T churn-restart it during legitimate idle/sleep.
 """
 
+import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from urllib.error import HTTPError
 
 from src.aw_manager import STALE_THRESHOLD, AWManager
 
@@ -88,3 +91,69 @@ def test_boundary_just_over_threshold_restarts():
     mgr.restart_if_needed()
 
     assert _restarted(mgr, idle), "AFK age just over threshold while window at/under it → restart"
+
+
+def test_afk_age_prefers_discovered_betterflow_bucket_over_stale_legacy(monkeypatch):
+    """The branded bucket id can be aw-watcher-afk_bf-idle-tracker_<host>.
+
+    The watchdog used to probe only bf-idle-tracker_<host>, then fall back to
+    aw-watcher-afk_<host>. On machines with both a fresh BetterFlow bucket and a
+    stale legacy ActivityWatch bucket, that made the watchdog think AFK was
+    stale forever and restart bf-idle-tracker every 30s.
+    """
+    now = datetime.now(timezone.utc)
+    fresh_ts = (now - timedelta(seconds=5)).isoformat()
+    stale_ts = (now - timedelta(minutes=30)).isoformat()
+
+    buckets = {
+        "aw-watcher-afk_host": {
+            "name": "aw-watcher-afk",
+            "type": "aw-watcher-afk",
+            "client": "aw-watcher-afk",
+        },
+        "aw-watcher-afk_bf-idle-tracker_host": {
+            "name": "bf-idle-tracker",
+            "type": "afkstatus",
+            "client": "bf-idle-tracker",
+        },
+    }
+    events = {
+        "aw-watcher-afk_host": [
+            {"timestamp": stale_ts, "duration": 0, "data": {"status": "afk"}}
+        ],
+        "aw-watcher-afk_bf-idle-tracker_host": [
+            {"timestamp": fresh_ts, "duration": 0, "data": {"status": "not-afk"}}
+        ],
+    }
+
+    class _Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(req, timeout=3):
+        url = req.full_url
+        if url.endswith("/api/0/buckets/"):
+            return _Response(buckets)
+        marker = "/api/0/buckets/"
+        if marker in url and url.endswith("/events?limit=1"):
+            bucket_id = url.split(marker, 1)[1].split("/events", 1)[0]
+            if bucket_id in events:
+                return _Response(events[bucket_id])
+        raise HTTPError(url, 404, "not found", hdrs=None, fp=None)
+
+    monkeypatch.setattr("src.aw_manager.urllib.request.urlopen", fake_urlopen)
+
+    mgr = AWManager()
+    age = mgr._get_latest_afk_event_age()
+
+    assert age is not None
+    assert age < STALE_THRESHOLD
