@@ -8,7 +8,7 @@ keeps seeing keystrokes. These tests pin the disagreement detection.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from src.main import SyncCoordinator
 from src.sync.aw_client import AWBucket, AWEvent
@@ -284,25 +284,47 @@ def test_aw_unreachable_falls_through_silently(mock_send):
 
 
 @patch("src.main.send_notification")
-def test_reprompts_for_permission_when_idle_tracker_blind(mock_send):
-    """When the watchdog has flagged bf-idle-tracker as chronically blind
-    (stale across repeated restarts = missing Input Monitoring grant, which a
-    restart can't fix), the health check re-prompts the user for permission:
-    re-requests the grant, opens the Settings pane, and notifies. No
-    input_watcher is needed — the blind flag alone drives the re-prompt."""
+def test_reprompt_when_app_lacks_grant_requests_permission(mock_send):
+    """The watchdog flagged the tracker blind AND the main app itself lacks
+    Input Monitoring — the honest ask is "grant Input Monitoring", with a real
+    system prompt. The blind flag alone drives this; no input_watcher needed."""
     coord = _make_coordinator(input_watcher=None)
     coord.aw_manager.idle_tracker_blind = True
 
-    with patch("src.ui.permissions.input_monitoring_active") as req, patch(
-        "src.ui.permissions.open_input_monitoring_settings"
-    ) as open_settings:
+    with patch(
+        "src.ui.permissions.input_monitoring_active", return_value=False
+    ) as im, patch("src.ui.permissions.open_input_monitoring_settings") as open_settings:
         coord._check_idle_tracker_health()
 
-    req.assert_called_once_with(prompt=True)
+    # One status check (no prompt), then one grant request (prompt=True).
+    assert im.call_args_list == [call(), call(prompt=True)]
     open_settings.assert_called_once()
     mock_send.assert_called_once()
-    title = mock_send.call_args[0][0]
-    assert title == "BetterFlow needs Input Monitoring"
+    assert mock_send.call_args[0][0] == "BetterFlow needs Input Monitoring"
+
+
+@patch("src.main.send_notification")
+def test_reprompt_when_app_has_grant_says_refresh_not_missing(mock_send):
+    """The blind tracker's own grant is stale, but the MAIN app already holds
+    Input Monitoring. Telling the user to grant what they already granted reads
+    as broken — and live testing (2026-06-18) showed this is the common case
+    (an ad-hoc tracker whose TCC grant macOS silently denies). So: say
+    "refresh", lead with the OS-idle-clock fallback, and do NOT fire a
+    redundant system prompt for a grant the app already holds."""
+    coord = _make_coordinator(input_watcher=None)
+    coord.aw_manager.idle_tracker_blind = True
+
+    with patch(
+        "src.ui.permissions.input_monitoring_active", return_value=True
+    ) as im, patch("src.ui.permissions.open_input_monitoring_settings") as open_settings:
+        coord._check_idle_tracker_health()
+
+    # Only the status check — never a prompt=True for a grant we already have.
+    assert im.call_args_list == [call()]
+    open_settings.assert_called_once()
+    mock_send.assert_called_once()
+    assert mock_send.call_args[0][0] == "BetterFlow idle tracker needs a refresh"
+    assert "system idle clock" in mock_send.call_args[0][1]
 
 
 @patch("src.main.send_notification")
@@ -326,17 +348,19 @@ def test_no_reprompt_when_idle_tracker_not_blind(mock_send):
 @patch("src.main.send_notification")
 def test_reprompt_throttled_within_window(mock_send):
     """Repeated blind ticks collapse into a single re-prompt within the rewarn
-    window — the Settings pane must not pop on every 60s tick."""
+    window — the Settings pane must not pop on every 60s tick. Ticks 2 and 3
+    return before touching permissions at all, so even the status check runs
+    only once."""
     coord = _make_coordinator(input_watcher=None)
     coord.aw_manager.idle_tracker_blind = True
 
-    with patch("src.ui.permissions.input_monitoring_active") as req, patch(
-        "src.ui.permissions.open_input_monitoring_settings"
-    ) as open_settings:
+    with patch(
+        "src.ui.permissions.input_monitoring_active", return_value=True
+    ) as im, patch("src.ui.permissions.open_input_monitoring_settings") as open_settings:
         coord._check_idle_tracker_health()
         coord._check_idle_tracker_health()
         coord._check_idle_tracker_health()
 
-    assert req.call_count == 1
+    assert im.call_count == 1
     assert open_settings.call_count == 1
     assert mock_send.call_count == 1
