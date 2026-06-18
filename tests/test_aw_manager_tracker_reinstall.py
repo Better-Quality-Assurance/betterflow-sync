@@ -17,12 +17,17 @@ from src.aw_manager import BETTERQA_TEAM_ID, AWManager
 
 def _teams(install, bundle):
     """Patch the codesign reader so the install/bundle binaries report fixed
-    team identifiers (None = ad-hoc / unsigned)."""
+    team identifiers (None = ad-hoc / unsigned).
+
+    Match on a substring rather than a leading slash so this is independent of
+    the path separator — os.path.join uses backslashes on Windows CI, which a
+    `startswith("/install/")` check would miss.
+    """
 
     def fake(binary_path):
-        if binary_path.startswith("/install/"):
+        if "install" in binary_path:
             return install
-        if binary_path.startswith("/bundle/"):
+        if "bundle" in binary_path:
             return bundle
         return None
 
