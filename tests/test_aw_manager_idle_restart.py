@@ -157,3 +157,43 @@ def test_afk_age_prefers_discovered_betterflow_bucket_over_stale_legacy(monkeypa
 
     assert age is not None
     assert age < STALE_THRESHOLD
+
+
+def test_blind_idle_tracker_stops_churning_and_flags_for_reprompt():
+    """A tracker that stays stale across repeated restarts is blind (missing
+    Input Monitoring), not crashed — restarting can't fix it. After the blind
+    threshold we stop churning a restart every tick and flag idle_tracker_blind
+    so the app re-prompts for permission (Brad, 2026-06-18: ~200 futile restarts)."""
+    from src.aw_manager import IDLE_BLIND_RESTART_THRESHOLD
+
+    mgr, idle = _make_manager(afk_age=1800, window_age=5)  # permanently stale
+    for _ in range(IDLE_BLIND_RESTART_THRESHOLD + 5):
+        idle.poll.return_value = None  # process re-mocked as alive each tick
+        mgr.restart_if_needed()
+
+    assert mgr.idle_tracker_blind is True, "stale-across-restarts must flag blind"
+    # Stopped churning: restarted at most THRESHOLD times, not once per tick.
+    assert mgr._start_component.call_count == IDLE_BLIND_RESTART_THRESHOLD, (
+        f"expected backoff after {IDLE_BLIND_RESTART_THRESHOLD} restarts, "
+        f"got {mgr._start_component.call_count}"
+    )
+
+
+def test_blind_clears_when_tracker_recovers():
+    """If the tracker starts emitting fresh AFK events again (e.g. permission
+    granted), the blind flag and the consecutive counter reset so a future
+    genuine stall restarts promptly."""
+    from src.aw_manager import IDLE_BLIND_RESTART_THRESHOLD
+
+    mgr, idle = _make_manager(afk_age=1800, window_age=5)
+    for _ in range(IDLE_BLIND_RESTART_THRESHOLD):
+        idle.poll.return_value = None
+        mgr.restart_if_needed()
+    assert mgr.idle_tracker_blind is True
+
+    # Tracker recovers — fresh AFK events.
+    mgr._get_latest_afk_event_age = MagicMock(return_value=5)
+    mgr.restart_if_needed()
+
+    assert mgr.idle_tracker_blind is False
+    assert mgr._idle_consecutive_stale == 0
