@@ -2017,19 +2017,29 @@ class SyncEngine:
 
     @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
-        """Return up to the last ``max_bytes`` of a log file (matching the
-        server's per-file tail cap). Returns ``None`` if it can't be read
-        (OSError) and ``b""`` for an empty file — callers treat both as "no
-        content" (``if not tail``), so don't rely on None-vs-b"" to distinguish
-        unreadable from empty."""
+        """Return up to the last ``max_bytes`` of a log file as VALID UTF-8
+        (matching the server's per-file tail cap). Returns ``None`` if it can't
+        be read (OSError) and ``b""`` for an empty file — callers treat both as
+        "no content" (``if not tail``), so don't rely on None-vs-b"" to
+        distinguish unreadable from empty.
+
+        The bytes are normalized to valid UTF-8 (invalid sequences replaced)
+        before returning. Older Windows logs were written in cp1252, so a tail
+        could carry bytes like \\x97 that make the server's INSERT into the utf8
+        `content` column fail with MySQL 1366 — silently dropping the upload.
+        New logs are UTF-8 (handler `encoding`), but logs already on disk and
+        any stray bytes still need this guard so the upload always stores.
+        """
         try:
             size = path.stat().st_size
             with open(path, "rb") as f:
                 if size > max_bytes:
                     f.seek(size - max_bytes)
-                return f.read()
+                raw = f.read()
         except OSError:
             return None
+        # Re-encode so the result is always valid UTF-8 the server can store.
+        return raw.decode("utf-8", errors="replace").encode("utf-8")
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:

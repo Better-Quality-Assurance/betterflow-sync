@@ -482,6 +482,28 @@ class TestSyncEngine:
         self.bf.upload_logs.assert_called_once()
         self.engine.error_reporter.capture.assert_not_called()
 
+    def test_read_log_tail_normalizes_invalid_utf8(self):
+        """A cp1252 byte from a Windows log (e.g. \\x97) must come back as VALID
+        UTF-8. Otherwise the server's INSERT into the utf8 content column fails
+        with MySQL 1366 'Incorrect string value' and the upload is silently
+        dropped — the real reason Windows logs never landed (Sachi, 2026-06-18)."""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        fd, p = tempfile.mkstemp()
+        os.write(fd, b"hello \x97 world")  # \x97 is not valid UTF-8
+        os.close(fd)
+        try:
+            tail = SyncEngine._read_log_tail(Path(p))
+        finally:
+            os.unlink(p)
+
+        assert tail is not None
+        tail.decode("utf-8")  # must not raise — the whole point of the fix
+        assert b"\x97" not in tail
+        assert b"hello" in tail and b"world" in tail
+
     def test_get_category_db_only_returns_none_for_unmapped(self):
         """Test that _get_category only checks DB, returns None for unmapped apps."""
         self.queue.get_all_categories.return_value = {}

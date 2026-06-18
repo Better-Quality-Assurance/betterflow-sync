@@ -697,8 +697,13 @@ def setup_logging(debug: bool = False) -> None:
         root.removeHandler(h)
         h.close()
 
+    # encoding="utf-8" is REQUIRED, not cosmetic: without it the handler writes
+    # in the platform locale encoding, which on Windows is cp1252. A cp1252 byte
+    # like \x97 then breaks the remote log upload — the server's INSERT into the
+    # utf8 agent_log_uploads.content column fails with MySQL 1366 "Incorrect
+    # string value", so Windows logs silently never landed (Sachi, 2026-06-18).
     file_handler = RotatingFileHandler(
-        log_file, maxBytes=5 * 1024 * 1024, backupCount=3,
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
     )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
