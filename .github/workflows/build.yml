@@ -74,6 +74,10 @@ jobs:
         run: pyinstaller build.spec --clean
         env:
           TARGET_ARCH: ${{ matrix.target_arch }}
+          # Baked into _build_secrets.py by build.spec so the shipped app reports
+          # in-app errors/crashes. Without this the error reporter is a no-op.
+          BETTERFLOW_ERROR_DSN: ${{ secrets.BETTERFLOW_ERROR_DSN }}
+          BETTERFLOW_ERROR_ENDPOINT: ${{ secrets.BETTERFLOW_ERROR_ENDPOINT }}
 
       - name: List dist contents (macOS)
         if: runner.os == 'macOS'

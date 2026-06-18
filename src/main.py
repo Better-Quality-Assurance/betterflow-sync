@@ -137,6 +137,12 @@ class SyncCoordinator:
         self.reminder_manager = reminder_manager
         self.error_reporter = error_reporter
 
+        # Let the heartbeat carry agent-health telemetry. We own the AwManager
+        # (idle-tracker restart count + AFK/window event ages) and the
+        # sync-failure counter, which the SyncEngine does not — so the provider
+        # lives here and is handed to the engine.
+        self.sync_engine.health_provider = self._build_health_telemetry
+
         self.scheduler = BackgroundScheduler()
         self._last_tick: Optional[datetime] = None
 
@@ -190,6 +196,19 @@ class SyncCoordinator:
         # _PERM_REWARN_INTERVAL while the disagreement persists.
         self._idle_tracker_warn_lock = threading.Lock()
         self._last_idle_tracker_warn_at: Optional[datetime] = None
+        # Count of "afk reported while input active" (blind-tracker) detections
+        # this session — the literal "idle but the bucket has events" case.
+        # Reported via heartbeat telemetry so the backend can flag the device.
+        # Mutated under _idle_tracker_warn_lock. _detections is cumulative (for
+        # the captured report's context); _window resets each heartbeat so the
+        # reported telemetry is "detected since last heartbeat" — a recovered
+        # tracker clears, instead of a cumulative count flagging it all session.
+        self._blind_tracker_detections = 0
+        self._blind_tracker_window = 0
+        # Forced tracker restarts past this (in one session) means the restart
+        # isn't converging (orphan tracker / missing Input Monitoring perm) —
+        # escalate via a captured report instead of looping silently.
+        self._RESTART_LOOP_ALERT_THRESHOLD = 5
 
         # macOS permission-warning throttle. Input Monitoring can be revoked
         # silently (e.g. a new build changes the code signature and macOS drops
@@ -315,10 +334,15 @@ class SyncCoordinator:
             replace_existing=True,
         )
 
-    def stop(self) -> None:
-        """Shut down the scheduler if running."""
+    def stop(self, wait: bool = False) -> None:
+        """Shut down the scheduler if running.
+
+        wait=True blocks until any in-flight _do_sync finishes — used by the
+        final app shutdown so a scheduled sync can't keep running after the
+        offline queue is closed (the 'OfflineQueue has been closed' race,
+        2026-06-17). The watchdog/30s drain cap in _do_sync bounds the wait."""
         if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
+            self.scheduler.shutdown(wait=wait)
 
     def reschedule(self, interval_seconds: int) -> None:
         """Change the sync interval on the fly."""
@@ -609,8 +633,12 @@ class SyncCoordinator:
         if afk_end > last_input - timedelta(seconds=30):
             return
 
-        # Disagreement detected. Throttled warn.
+        # Disagreement detected: the tracker submits 'afk' while the bucket has
+        # fresh input — the literal "idle but bucket has events". Count every
+        # detection (reported via telemetry) but throttle the warn+capture.
         with self._idle_tracker_warn_lock:
+            self._blind_tracker_detections += 1
+            self._blind_tracker_window += 1
             recently_warned = (
                 self._last_idle_tracker_warn_at is not None
                 and (now - self._last_idle_tracker_warn_at) < self._PERM_REWARN_INTERVAL
@@ -632,6 +660,20 @@ class SyncCoordinator:
             "bar icon → Diagnostics → Fix Permissions and grant access to "
             "bf-idle-tracker as well as BetterFlow.",
         )
+        # Surface as a (non-exception) captured report so it shows up in error
+        # tracking, not just local logs. error_reporter has its own dedup window.
+        if self.error_reporter is not None:
+            self.error_reporter.capture(
+                "Idle tracker reporting AFK while input is active (blind tracker)",
+                level="warning",
+                tags={"component": "idle-tracker"},
+                context={
+                    "detections": self._blind_tracker_detections,
+                    "last_input": last_input.isoformat(),
+                },
+                fingerprint="idle-tracker-blind",
+            )
+
         # Don't just warn — try to recover. A tracker that reports 'afk' while
         # input is flowing is blind/stuck (or an orphan is fighting it); a
         # restart re-establishes capture and reaps any orphan. Throttled by the
@@ -853,6 +895,25 @@ class SyncCoordinator:
 
             if self.aw_manager.is_managing:
                 self.aw_manager.restart_if_needed()
+                # Escalate a non-converging restart loop: repeated forced
+                # restarts mean the restart isn't fixing it (orphan tracker /
+                # missing Input Monitoring permission). Capture so it surfaces
+                # instead of looping silently; error_reporter dedup throttles.
+                try:
+                    restarts = self.aw_manager.stale_restart_count()
+                    if (
+                        restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
+                        and self.error_reporter is not None
+                    ):
+                        self.error_reporter.capture(
+                            f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
+                            level="warning",
+                            tags={"component": "idle-tracker"},
+                            context={"stale_restarts": restarts},
+                            fingerprint="idle-tracker-restart-loop",
+                        )
+                except Exception:
+                    logger.debug("restart-loop escalation check failed", exc_info=True)
 
             if not self.aw.is_running():
                 # is_running() already reset+retried the HTTP session, so this
@@ -973,6 +1034,31 @@ class SyncCoordinator:
             self.tray.set_state(TrayState.QUEUED, "Offline")
         else:
             self.tray.set_state(TrayState.ERROR, error_message)
+
+    def _build_health_telemetry(self) -> dict:
+        """Assemble agent-health telemetry for the heartbeat.
+
+        Combines the AwManager's tracker view (idle-tracker restart count, AFK
+        and window event ages) with our own consecutive-sync-failure counter.
+        Best-effort: any failure here is swallowed by the caller so it can never
+        block the heartbeat. Reading the int counter without a lock is fine — a
+        torn read of a single int can't happen in CPython, and a slightly stale
+        value is harmless for a telemetry signal.
+        """
+        # Read-and-reset the per-heartbeat blind-tracker window so the reported
+        # value reflects "detected since the last heartbeat" (clears on recovery).
+        with self._idle_tracker_warn_lock:
+            blind_window = self._blind_tracker_window
+            self._blind_tracker_window = 0
+        telemetry: dict = {
+            "consecutive_sync_failures": self._consecutive_sync_failures,
+            "idle_while_active_detections": blind_window,
+        }
+        try:
+            telemetry.update(self.aw_manager.health_snapshot())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("aw_manager.health_snapshot failed: %s", e)
+        return telemetry
 
     def _note_sync_failure(self, reason: str, *, exc: Optional[BaseException] = None) -> None:
         """Track a hard sync failure and report once it becomes a streak.
@@ -2098,7 +2184,9 @@ class BetterFlowApp:
         # Flush idle event before stopping (otherwise idle period is lost)
         self.coordinator.flush_idle_event()
         clear_notifications()
-        self.coordinator.stop()
+        # wait=True so an in-flight scheduled sync completes BEFORE we close the
+        # offline queue below — otherwise it dies on a closed SQLite handle.
+        self.coordinator.stop(wait=True)
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()

@@ -578,6 +578,39 @@ class AWManager:
                     return False
             return True
 
+    def stale_restart_count(self) -> int:
+        """Idle/window tracker force-restart count this session (lock-safe).
+
+        Cheap counterpart to health_snapshot() — no tracker-server I/O — for the
+        restart-loop escalation check that runs every sync cycle."""
+        with self._lifecycle_lock:
+            return self._stale_restart_count
+
+    def health_snapshot(self) -> dict:
+        """Public read-only view of tracker health for telemetry/heartbeat.
+
+        Returns the idle-tracker force-restart count plus the age (seconds) of
+        the most recent AFK and window events. A high AFK age while the window
+        age stays low is the "active but idle tracker frozen" signature the
+        backend uses to mark a device tracking_degraded.
+
+        The restart count is read under the lifecycle lock; the event ages are
+        fetched from the local tracker server (no shared mutable state) so they
+        sit outside the lock to avoid holding it across network I/O.
+        """
+        with self._lifecycle_lock:
+            stale_restarts = self._stale_restart_count
+
+        afk_age = self._get_latest_afk_event_age()
+        window_age = self._get_latest_window_event_age()
+        return {
+            "idle_tracker_stale_restarts": stale_restarts,
+            # Ints are friendlier to JSON / the backend's unsigned columns; the
+            # sub-second precision is irrelevant for a staleness signal.
+            "afk_event_age_seconds": int(afk_age) if afk_age is not None else None,
+            "window_event_age_seconds": int(window_age) if window_age is not None else None,
+        }
+
     def restart_if_needed(self) -> bool:
         """Restart crashed or stalled components. Returns True if tracker is healthy."""
         with self._lifecycle_lock:
