@@ -646,11 +646,19 @@ class SyncCoordinator:
                 logger.warning("restart_idle_tracker failed", exc_info=True)
 
     def _reprompt_idle_tracker_permission(self) -> None:
-        """bf-idle-tracker is blind across repeated restarts → re-prompt the user
-        for Input Monitoring. Requests the grant (re-registers the app + shows the
-        system prompt), opens the Input Monitoring pane so the user can also add
-        the separate `bf-idle-tracker` binary, and notifies. Throttled to the
-        same rewarn window as the disagreement warning so the two never spam."""
+        """bf-idle-tracker has stayed unresponsive across repeated restarts. A
+        restart can't fix that — the usual cause is a stale or denied Input
+        Monitoring grant on the tracker (a separate TCC subject from the main
+        app, e.g. after the tracker's signing identity changed). Surface an
+        honest, actionable nudge and open the Input Monitoring pane.
+
+        We deliberately do NOT assert "missing permission" as fact: the main app
+        often already has the grant, and tracking keeps working via the OS idle
+        clock regardless (idle_manager's freshness fallback). So the message
+        leads with "still being tracked" and points at the real remedy
+        (enable / re-toggle bf-idle-tracker). Throttled to the same rewarn
+        window as the disagreement warning so the two never spam.
+        """
         now = datetime.now(timezone.utc)
         with self._idle_tracker_warn_lock:
             recently_warned = (
@@ -661,27 +669,52 @@ class SyncCoordinator:
                 return
             self._last_idle_tracker_warn_at = now
 
-        logger.warning(
-            "bf-idle-tracker blind across repeated restarts — re-prompting for "
-            "Input Monitoring (separate TCC subject from the main app)"
-        )
         try:
             from .ui import permissions
         except ImportError:
             from ui import permissions
+
+        # Whether the MAIN app holds Input Monitoring tells us how to phrase this.
+        # If the app itself lacks it, "grant Input Monitoring" is the honest ask.
+        # If the app HAS it, the tracker is a distinct subject whose grant is
+        # stale/denied — telling the user to "grant Input Monitoring" they already
+        # granted reads as broken; "re-toggle bf-idle-tracker" is the real fix.
         try:
-            # Re-request for the main app (re-registers it + system prompt), then
-            # open the pane so the user can enable bf-idle-tracker too.
-            permissions.input_monitoring_active(prompt=True)
+            app_has_grant = permissions.input_monitoring_active()
+        except Exception:
+            logger.debug("Input Monitoring status check failed", exc_info=True)
+            app_has_grant = False
+
+        logger.warning(
+            "bf-idle-tracker unresponsive across repeated restarts (app Input "
+            "Monitoring grant=%s) — opening Input Monitoring so the user can "
+            "enable/refresh the tracker; tracking continues via the OS idle clock",
+            app_has_grant,
+        )
+        try:
+            if not app_has_grant:
+                # The app itself needs the grant — request it (system prompt).
+                permissions.input_monitoring_active(prompt=True)
             permissions.open_input_monitoring_settings()
         except Exception:
             logger.debug("Input Monitoring re-prompt failed", exc_info=True)
-        send_notification(
-            "BetterFlow needs Input Monitoring",
-            "BetterFlow's idle tracker can't see your activity — it needs Input "
-            "Monitoring permission. Opening Settings: please enable BetterFlow "
-            "AND bf-idle-tracker under Input Monitoring.",
-        )
+
+        if app_has_grant:
+            send_notification(
+                "BetterFlow idle tracker needs a refresh",
+                "The idle tracker stopped responding. Your work time is still "
+                "being recorded via the system idle clock. To fix it, open Input "
+                "Monitoring and enable bf-idle-tracker — if it already looks "
+                "enabled, toggle it off and back on to refresh the permission.",
+            )
+        else:
+            send_notification(
+                "BetterFlow needs Input Monitoring",
+                "BetterFlow's idle tracker can't see your activity. Tracking "
+                "continues via the system idle clock for now. Opening Settings: "
+                "please enable BetterFlow and bf-idle-tracker under Input "
+                "Monitoring.",
+            )
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.

@@ -34,6 +34,13 @@ BF_SERVER = "bf-data-service"
 BF_WATCHERS = ["bf-window-tracker", "bf-idle-tracker"]
 ALL_COMPONENTS = [BF_SERVER] + BF_WATCHERS
 
+# Our Apple Developer Team. The build signs the bundled trackers with this
+# (Developer ID, hardened runtime, stable identifier). A persistent tracker that
+# is NOT signed with this team is a stale ad-hoc copy from a pre-signing build:
+# its TCC (Input Monitoring) grant is fragile and gets silently denied, so the
+# tracker runs but stays blind. See _should_reinstall_trackers.
+BETTERQA_TEAM_ID = "87NVC57J44"
+
 AW_VERSION = "v0.13.2"
 RELEASE_BASE = (
     f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
@@ -702,10 +709,12 @@ class AWManager:
                     ):
                         self._idle_tracker_blind = True
                         logger.warning(
-                            "%s has stayed stale across %d restarts — it is almost "
-                            "certainly missing Input Monitoring permission (a separate "
-                            "TCC subject from the main app). Backing off restarts and "
-                            "flagging for a permission re-prompt.",
+                            "%s has stayed stale across %d restarts — a restart "
+                            "can't fix it. Likely a stale or denied Input Monitoring "
+                            "grant on the tracker (a separate TCC subject from the "
+                            "main app). Backing off restarts and flagging for a "
+                            "permission re-prompt; tracking continues via the OS "
+                            "idle clock meanwhile.",
                             idle_watcher,
                             self._idle_consecutive_stale,
                         )
@@ -957,6 +966,29 @@ class AWManager:
         # Persistent install directory (auto-downloaded, permissions survive updates)
         install_dir = _get_install_dir()
         if os.path.isdir(install_dir) and _binaries_present(install_dir):
+            # Heal a stale ad-hoc tracker left by a pre-signing build. Such a
+            # copy keeps its fragile ad-hoc TCC grant, which macOS silently
+            # denies → the tracker runs but never sees input (blind, no AFK
+            # heartbeat → false idle). If the bundle ships a properly
+            # Developer-ID-signed tracker, reinstall it so the grant becomes
+            # stable across updates. The user must re-grant Input Monitoring
+            # once (the new signing identity is a fresh TCC subject), but it
+            # then survives every future update instead of breaking on each one.
+            if getattr(sys, "frozen", False):
+                base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
+                if (
+                    os.path.isdir(base)
+                    and _binaries_present(base)
+                    and self._should_reinstall_trackers(install_dir, base)
+                ):
+                    logger.warning(
+                        "Persistent bf-idle-tracker is ad-hoc/mis-signed while the "
+                        "bundled copy is Developer-ID signed (Team %s) — reinstalling "
+                        "so its Input Monitoring grant is stable. Re-grant Input "
+                        "Monitoring for bf-idle-tracker once after this update.",
+                        BETTERQA_TEAM_ID,
+                    )
+                    self._install_to_persistent(base, install_dir)
             return install_dir
 
         # Development: relative to project root (already has permissions)
@@ -976,6 +1008,57 @@ class AWManager:
                 return base
 
         return None
+
+    @staticmethod
+    def _tracker_team_identifier(binary_path: str) -> Optional[str]:
+        """Return the Apple Developer Team Identifier the binary is signed with,
+        or None if it is ad-hoc / unsigned / unreadable.
+
+        macOS only — codesign does not exist elsewhere, so other platforms
+        always return None (the caller treats that as "can't tell", which never
+        triggers a reinstall). codesign writes its details to stderr.
+        """
+        if platform.system() != "Darwin":
+            return None
+        try:
+            result = subprocess.run(
+                ["codesign", "-dv", "--verbose=2", binary_path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as e:
+            logger.debug("codesign check failed for %s: %s", binary_path, e)
+            return None
+        for line in (result.stderr or "").splitlines():
+            if line.startswith("TeamIdentifier="):
+                team = line.split("=", 1)[1].strip()
+                return None if team in ("", "not set") else team
+        return None
+
+    @classmethod
+    def _should_reinstall_trackers(cls, install_dir: str, bundle_dir: str) -> bool:
+        """True when the installed bf-idle-tracker is NOT signed with our
+        Developer ID team but the bundled one IS.
+
+        That's the stale-ad-hoc case: a tracker copied to the persistent dir by
+        a pre-signing build keeps its ad-hoc signature, whose Input Monitoring
+        grant macOS silently denies (the tracker is alive but blind — no AFK
+        heartbeat). Replacing it with the Developer-ID-signed bundle copy fixes
+        it for good. We deliberately do NOT reinstall when the bundle is also
+        un-teamed (an old build): swapping ad-hoc for ad-hoc would only churn
+        the binary and force a needless re-grant. Returns False off macOS.
+        """
+        idle = "bf-idle-tracker"
+        bundle_team = cls._tracker_team_identifier(
+            os.path.join(bundle_dir, idle, idle)
+        )
+        if bundle_team != BETTERQA_TEAM_ID:
+            return False
+        installed_team = cls._tracker_team_identifier(
+            os.path.join(install_dir, idle, idle)
+        )
+        return installed_team != BETTERQA_TEAM_ID
 
     @staticmethod
     def _install_to_persistent(source_dir: str, install_dir: str) -> bool:
