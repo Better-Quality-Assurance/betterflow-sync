@@ -54,6 +54,14 @@ AW_TO_BF_NAMES = {
 STARTUP_TIMEOUT = 10  # seconds to wait for server to be ready
 SHUTDOWN_TIMEOUT = 5  # seconds before force-killing
 STALE_THRESHOLD = 120  # seconds with no new events before force-restarting watcher
+# After this many consecutive stale-restarts that DON'T take (the tracker emits
+# nothing again right after we restart it), bf-idle-tracker is blind — almost
+# always a missing Input Monitoring grant, which a restart can't fix (#46). Stop
+# churning a process every cycle and flag it so the app re-prompts for permission.
+IDLE_BLIND_RESTART_THRESHOLD = 5
+# Once blind, probe-restart at most this often (so a later permission grant still
+# auto-recovers) instead of restarting on every health-check tick.
+IDLE_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
 
 
 def _get_platform_key() -> str:
@@ -327,6 +335,22 @@ class AWManager:
         # Components intentionally disabled for this app session.
         self._disabled_components: set[str] = set()
         self._stale_restart_count: int = 0
+        # Consecutive bf-idle-tracker stale-restarts that didn't take; once it
+        # crosses IDLE_BLIND_RESTART_THRESHOLD the tracker is treated as blind
+        # (missing Input Monitoring) — restarts back off and the app re-prompts.
+        # Reset to 0 when the tracker starts emitting fresh AFK events again.
+        self._idle_consecutive_stale: int = 0
+        self._idle_tracker_blind: bool = False
+        self._idle_last_restart_mono: float = 0.0
+
+    @property
+    def idle_tracker_blind(self) -> bool:
+        """True when bf-idle-tracker has stayed stale across repeated restarts —
+        the signature of a missing Input Monitoring grant (a restart can't fix
+        it). The app reads this to re-prompt for permission and to stop churning
+        restarts. Clears automatically once the tracker emits fresh events."""
+        with self._lifecycle_lock:
+            return self._idle_tracker_blind
 
     def disable_component(self, name: str) -> None:
         """Prevent a component from being started/restarted."""
@@ -622,30 +646,69 @@ class AWManager:
         ):
             afk_age = self._get_latest_afk_event_age()
             window_age = self._get_latest_window_event_age()
-            if (
+            is_stale = (
                 afk_age is not None
                 and afk_age > STALE_THRESHOLD
                 and window_age is not None
                 and window_age <= STALE_THRESHOLD
-            ):
-                self._stale_restart_count += 1
-                logger.warning(
-                    f"{idle_watcher} stale: no AFK events for {afk_age:.0f}s "
-                    f"while the window tracker is fresh ({window_age:.0f}s) "
-                    f"(threshold {STALE_THRESHOLD}s, "
-                    f"restart #{self._stale_restart_count})"
-                )
-                proc = self._processes[idle_watcher]
-                proc.terminate()
-                try:
-                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                # Kill any orphan too — staleness that survives repeated restarts
-                # is the signature of a second tracker fighting over the bucket;
-                # restarting only our PID can never win against it.
-                self._reap_orphan_processes(idle_watcher, binaries_dir)
-                self._start_component(idle_watcher, binaries_dir)
+            )
+            if not is_stale:
+                # Recovery: the tracker is emitting fresh AFK events again, so
+                # clear any blind state — a future genuine stall restarts
+                # promptly and the permission re-prompt resolves.
+                if afk_age is not None and afk_age <= STALE_THRESHOLD:
+                    self._idle_consecutive_stale = 0
+                    self._idle_tracker_blind = False
+            else:
+                # If the tracker has already stayed stale across several restarts
+                # it is blind (missing Input Monitoring / TCC), not crashed (#46)
+                # — restarting can't fix it. Back off to one probe-restart per
+                # retry interval instead of churning a process every tick, and
+                # flag it so the app re-prompts for permission.
+                now_mono = time.monotonic()
+                blind = self._idle_consecutive_stale >= IDLE_BLIND_RESTART_THRESHOLD
+                if blind and (now_mono - self._idle_last_restart_mono) < IDLE_BLIND_RETRY_INTERVAL:
+                    logger.debug(
+                        "%s still stale but blind (%d restarts didn't take) — backing "
+                        "off; next probe in %.0fs",
+                        idle_watcher,
+                        self._idle_consecutive_stale,
+                        IDLE_BLIND_RETRY_INTERVAL - (now_mono - self._idle_last_restart_mono),
+                    )
+                else:
+                    self._stale_restart_count += 1
+                    self._idle_consecutive_stale += 1
+                    self._idle_last_restart_mono = now_mono
+                    logger.warning(
+                        f"{idle_watcher} stale: no AFK events for {afk_age:.0f}s "
+                        f"while the window tracker is fresh ({window_age:.0f}s) "
+                        f"(threshold {STALE_THRESHOLD}s, restart #{self._stale_restart_count}, "
+                        f"consecutive {self._idle_consecutive_stale})"
+                    )
+                    proc = self._processes[idle_watcher]
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    # Kill any orphan too — staleness that survives repeated restarts
+                    # is the signature of a second tracker fighting over the bucket;
+                    # restarting only our PID can never win against it.
+                    self._reap_orphan_processes(idle_watcher, binaries_dir)
+                    self._start_component(idle_watcher, binaries_dir)
+                    if (
+                        self._idle_consecutive_stale >= IDLE_BLIND_RESTART_THRESHOLD
+                        and not self._idle_tracker_blind
+                    ):
+                        self._idle_tracker_blind = True
+                        logger.warning(
+                            "%s has stayed stale across %d restarts — it is almost "
+                            "certainly missing Input Monitoring permission (a separate "
+                            "TCC subject from the main app). Backing off restarts and "
+                            "flagging for a permission re-prompt.",
+                            idle_watcher,
+                            self._idle_consecutive_stale,
+                        )
 
         # Only block waiting for the server when the server itself was
         # restarted. The previous check (`BF_SERVER in <currently-running>`)

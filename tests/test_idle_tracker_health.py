@@ -70,6 +70,8 @@ def _make_coordinator(
                 latest = event
         aw.get_latest_afk_event.return_value = latest
 
+    aw_manager = MagicMock()
+    aw_manager.idle_tracker_blind = False  # default; a test flips it on
     coord = SyncCoordinator(
         config=MagicMock(),
         aw=aw,
@@ -77,7 +79,7 @@ def _make_coordinator(
         queue=MagicMock(),
         sync_engine=MagicMock(),
         tray=tray,
-        aw_manager=MagicMock(),
+        aw_manager=aw_manager,
     )
     coord.logged_in = True
     coord._input_watcher = input_watcher
@@ -279,3 +281,62 @@ def test_aw_unreachable_falls_through_silently(mock_send):
     coord._check_idle_tracker_health()
 
     mock_send.assert_not_called()
+
+
+@patch("src.main.send_notification")
+def test_reprompts_for_permission_when_idle_tracker_blind(mock_send):
+    """When the watchdog has flagged bf-idle-tracker as chronically blind
+    (stale across repeated restarts = missing Input Monitoring grant, which a
+    restart can't fix), the health check re-prompts the user for permission:
+    re-requests the grant, opens the Settings pane, and notifies. No
+    input_watcher is needed — the blind flag alone drives the re-prompt."""
+    coord = _make_coordinator(input_watcher=None)
+    coord.aw_manager.idle_tracker_blind = True
+
+    with patch("src.ui.permissions.input_monitoring_active") as req, patch(
+        "src.ui.permissions.open_input_monitoring_settings"
+    ) as open_settings:
+        coord._check_idle_tracker_health()
+
+    req.assert_called_once_with(prompt=True)
+    open_settings.assert_called_once()
+    mock_send.assert_called_once()
+    title = mock_send.call_args[0][0]
+    assert title == "BetterFlow needs Input Monitoring"
+
+
+@patch("src.main.send_notification")
+def test_no_reprompt_when_idle_tracker_not_blind(mock_send):
+    """The healthy default: the watchdog hasn't flagged the tracker blind, so
+    the re-prompt path is skipped entirely (no Settings pane, no notification)
+    unless the disagreement check below fires on its own."""
+    coord = _make_coordinator(input_watcher=None)
+    coord.aw_manager.idle_tracker_blind = False
+
+    with patch("src.ui.permissions.input_monitoring_active") as req, patch(
+        "src.ui.permissions.open_input_monitoring_settings"
+    ) as open_settings:
+        coord._check_idle_tracker_health()
+
+    req.assert_not_called()
+    open_settings.assert_not_called()
+    mock_send.assert_not_called()
+
+
+@patch("src.main.send_notification")
+def test_reprompt_throttled_within_window(mock_send):
+    """Repeated blind ticks collapse into a single re-prompt within the rewarn
+    window — the Settings pane must not pop on every 60s tick."""
+    coord = _make_coordinator(input_watcher=None)
+    coord.aw_manager.idle_tracker_blind = True
+
+    with patch("src.ui.permissions.input_monitoring_active") as req, patch(
+        "src.ui.permissions.open_input_monitoring_settings"
+    ) as open_settings:
+        coord._check_idle_tracker_health()
+        coord._check_idle_tracker_health()
+        coord._check_idle_tracker_health()
+
+    assert req.call_count == 1
+    assert open_settings.call_count == 1
+    assert mock_send.call_count == 1

@@ -561,6 +561,14 @@ class SyncCoordinator:
         """
         if not self.logged_in:
             return
+
+        # Chronic-blind path: the watchdog gave up frequent restarts because
+        # bf-idle-tracker stays stale across them — that's a missing Input
+        # Monitoring grant (separate TCC subject), not a crash a restart fixes.
+        # Re-prompt for permission (throttled) instead of churning forever.
+        if getattr(self.aw_manager, "idle_tracker_blind", False):
+            self._reprompt_idle_tracker_permission()
+
         if self._input_watcher is None:
             return
 
@@ -636,6 +644,44 @@ class SyncCoordinator:
                 self.aw_manager.restart_idle_tracker(reason="afk reported while input active")
             except Exception:
                 logger.warning("restart_idle_tracker failed", exc_info=True)
+
+    def _reprompt_idle_tracker_permission(self) -> None:
+        """bf-idle-tracker is blind across repeated restarts → re-prompt the user
+        for Input Monitoring. Requests the grant (re-registers the app + shows the
+        system prompt), opens the Input Monitoring pane so the user can also add
+        the separate `bf-idle-tracker` binary, and notifies. Throttled to the
+        same rewarn window as the disagreement warning so the two never spam."""
+        now = datetime.now(timezone.utc)
+        with self._idle_tracker_warn_lock:
+            recently_warned = (
+                self._last_idle_tracker_warn_at is not None
+                and (now - self._last_idle_tracker_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_idle_tracker_warn_at = now
+
+        logger.warning(
+            "bf-idle-tracker blind across repeated restarts — re-prompting for "
+            "Input Monitoring (separate TCC subject from the main app)"
+        )
+        try:
+            from .ui import permissions
+        except ImportError:
+            from ui import permissions
+        try:
+            # Re-request for the main app (re-registers it + system prompt), then
+            # open the pane so the user can enable bf-idle-tracker too.
+            permissions.input_monitoring_active(prompt=True)
+            permissions.open_input_monitoring_settings()
+        except Exception:
+            logger.debug("Input Monitoring re-prompt failed", exc_info=True)
+        send_notification(
+            "BetterFlow needs Input Monitoring",
+            "BetterFlow's idle tracker can't see your activity — it needs Input "
+            "Monitoring permission. Opening Settings: please enable BetterFlow "
+            "AND bf-idle-tracker under Input Monitoring.",
+        )
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.
