@@ -41,6 +41,7 @@ def test_heartbeat_forwards_health_telemetry():
         client.heartbeat(health={
             "idle_tracker_stale_restarts": 12,
             "idle_tracker_blind": True,
+            "inproc_afk": True,
             "afk_event_age_seconds": 300,
             "window_event_age_seconds": 5,
             "consecutive_sync_failures": 0,
@@ -52,6 +53,7 @@ def test_heartbeat_forwards_health_telemetry():
     assert body["agent_version"]  # base field still present
     assert body["idle_tracker_stale_restarts"] == 12
     assert body["idle_tracker_blind"] is True
+    assert body["inproc_afk"] is True
     assert body["afk_event_age_seconds"] == 300
     assert body["window_event_age_seconds"] == 5
     assert body["consecutive_sync_failures"] == 0
