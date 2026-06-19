@@ -32,7 +32,7 @@ BetterFlow reads activity data from your local [ActivityWatch](https://activityw
 
 Download the latest release for your platform:
 - **macOS**: `BetterFlow.dmg`
-- **Windows**: `BetterFlow-Windows-Setup.exe` (installer) or `BetterFlow-Windows.zip`
+- **Windows**: `BetterFlow-Windows-Setup.exe` (run the installer — per-user, no admin). The `BetterFlow-Windows-Update.zip` asset is for the in-app auto-updater only; don't run it by hand.
 
 ### From Source
 
@@ -182,13 +182,15 @@ Creates: `dist\BetterFlow\` (one-dir bundle; run `BetterFlow.exe` inside it)
 **Option 3: Create installer**
 
 1. Install [Inno Setup](https://jrsoftware.org/isinfo.php)
-2. Build the exe first (Option 1 or 2)
-3. Compile the installer:
+2. Build the exe first (Option 1 or 2) so `dist\BetterFlow\` exists
+3. Compile the installer (inject the version, same as CI):
 ```cmd
-iscc installer\windows-installer.iss
+iscc /DMyAppVersion=1.5.63 installer\windows\betterflow.iss
 ```
 
-Creates: `dist\BetterFlow-Setup-1.0.0.exe`
+Creates: `dist\BetterFlow-Windows-Setup.exe` — the per-user installer CI also
+publishes on every release. This is the file Windows users should download; the
+`BetterFlow-Windows-Update.zip` asset is consumed only by the in-app auto-updater.
 
 #### GitHub Actions (CI/CD)
 
