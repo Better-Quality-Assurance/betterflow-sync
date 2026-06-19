@@ -220,3 +220,14 @@ def test_blind_clears_when_tracker_recovers():
 
     assert mgr.idle_tracker_blind is False
     assert mgr._idle_consecutive_stale == 0
+
+
+def test_inproc_afk_suppresses_idle_tracker_restart():
+    mgr, idle = _make_manager(afk_age=1800, window_age=5)  # would normally restart
+    mgr.set_inproc_afk_active(True)
+
+    mgr.restart_if_needed()
+
+    assert not idle.terminate.called, "ignored tracker must not be restarted"
+    assert mgr._idle_stale_restart_count == 0
+    assert mgr.idle_tracker_blind is False
