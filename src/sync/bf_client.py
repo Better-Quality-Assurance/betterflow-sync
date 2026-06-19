@@ -366,6 +366,7 @@ class BetterFlowClient(BaseApiClient):
             for key in (
                 "idle_tracker_stale_restarts",
                 "idle_tracker_blind",
+                "inproc_afk",
                 "afk_event_age_seconds",
                 "window_event_age_seconds",
                 "consecutive_sync_failures",

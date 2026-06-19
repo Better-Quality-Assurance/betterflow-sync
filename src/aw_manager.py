@@ -625,14 +625,24 @@ class AWManager:
         with self._lifecycle_lock:
             idle_restarts = self._idle_stale_restart_count
             blind = self._idle_tracker_blind
+            inproc = self._inproc_afk_active
 
-        afk_age = self._get_latest_afk_event_age()
         window_age = self._get_latest_window_event_age()
+        # When the agent owns the AFK stream in-process, the external
+        # bf-idle-tracker bucket is ignored — do NOT report its (likely stale)
+        # event age. Reporting it makes the backend fire false "Active time not
+        # advancing" alerts for an agent that is billing correctly (the external
+        # tracker is still running but irrelevant). The restart count + blind flag
+        # are already 0/False on this path (the restart loop is suppressed).
+        afk_age = None if inproc else self._get_latest_afk_event_age()
         return {
             # idle-tracker-only — window-tracker restarts are excluded so this
             # figure isn't inflated by an unrelated flapping window watcher.
             "idle_tracker_stale_restarts": idle_restarts,
             "idle_tracker_blind": blind,
+            # True => agent generates its own AFK stream; backend should ignore
+            # external-tracker staleness for this device.
+            "inproc_afk": inproc,
             # Ints are friendlier to JSON / the backend's unsigned columns; the
             # sub-second precision is irrelevant for a staleness signal.
             "afk_event_age_seconds": int(afk_age) if afk_age is not None else None,

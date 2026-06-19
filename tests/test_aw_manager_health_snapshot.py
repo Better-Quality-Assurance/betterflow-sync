@@ -65,3 +65,22 @@ def test_snapshot_exposes_blind_flag(monkeypatch):
 def test_snapshot_blind_defaults_false(monkeypatch):
     mgr = _manager_with(monkeypatch, afk_age=5.0, window_age=5.0, restarts=0)
     assert mgr.health_snapshot()["idle_tracker_blind"] is False
+
+
+def test_snapshot_suppresses_external_afk_age_when_inproc_active(monkeypatch):
+    """When the agent owns the AFK stream in-process, the external bf-idle-tracker
+    bucket is ignored — its staleness must NOT be reported, or the server fires a
+    false "Active time not advancing" alert for an agent that is billing fine."""
+    mgr = _manager_with(monkeypatch, afk_age=3000.0, window_age=2.0, restarts=0)
+    mgr.set_inproc_afk_active(True)
+    snap = mgr.health_snapshot()
+    assert snap["inproc_afk"] is True
+    assert snap["afk_event_age_seconds"] is None  # not the stale external age
+    assert snap["window_event_age_seconds"] == 2
+
+
+def test_snapshot_reports_external_afk_age_when_inproc_inactive(monkeypatch):
+    mgr = _manager_with(monkeypatch, afk_age=3000.0, window_age=2.0, restarts=0)
+    snap = mgr.health_snapshot()
+    assert snap["inproc_afk"] is False
+    assert snap["afk_event_age_seconds"] == 3000
