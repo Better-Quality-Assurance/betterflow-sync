@@ -341,7 +341,15 @@ class AWManager:
         self._using_external = False
         # Components intentionally disabled for this app session.
         self._disabled_components: set[str] = set()
+        # Any-tracker force-restart count (window OR idle) — drives the
+        # cross-tracker restart-loop escalation check. NOT a per-tracker figure;
+        # use _idle_stale_restart_count for the idle-specific telemetry.
         self._stale_restart_count: int = 0
+        # bf-idle-tracker-only force-restart count this session. Reported as
+        # idle_tracker_stale_restarts so the "Active time not advancing (N
+        # restarts)" fleet alert reflects idle-tracker churn alone, not a flapping
+        # window tracker bleeding into the figure.
+        self._idle_stale_restart_count: int = 0
         # Consecutive bf-idle-tracker stale-restarts that didn't take; once it
         # crosses IDLE_BLIND_RESTART_THRESHOLD the tracker is treated as blind
         # (missing Input Monitoring) — restarts back off and the app re-prompts.
@@ -594,17 +602,26 @@ class AWManager:
         age stays low is the "active but idle tracker frozen" signature the
         backend uses to mark a device tracking_degraded.
 
-        The restart count is read under the lifecycle lock; the event ages are
+        ``idle_tracker_blind`` lets the backend distinguish a transient restart
+        from a chronically blind tracker (a denied Input Monitoring grant a
+        restart can't fix) so the alert can tell the user to grant permission
+        rather than wait it out.
+
+        The counters/flag are read under the lifecycle lock; the event ages are
         fetched from the local tracker server (no shared mutable state) so they
         sit outside the lock to avoid holding it across network I/O.
         """
         with self._lifecycle_lock:
-            stale_restarts = self._stale_restart_count
+            idle_restarts = self._idle_stale_restart_count
+            blind = self._idle_tracker_blind
 
         afk_age = self._get_latest_afk_event_age()
         window_age = self._get_latest_window_event_age()
         return {
-            "idle_tracker_stale_restarts": stale_restarts,
+            # idle-tracker-only — window-tracker restarts are excluded so this
+            # figure isn't inflated by an unrelated flapping window watcher.
+            "idle_tracker_stale_restarts": idle_restarts,
+            "idle_tracker_blind": blind,
             # Ints are friendlier to JSON / the backend's unsigned columns; the
             # sub-second precision is irrelevant for a staleness signal.
             "afk_event_age_seconds": int(afk_age) if afk_age is not None else None,
@@ -717,6 +734,7 @@ class AWManager:
                     )
                 else:
                     self._stale_restart_count += 1
+                    self._idle_stale_restart_count += 1
                     self._idle_consecutive_stale += 1
                     self._idle_last_restart_mono = now_mono
                     logger.warning(

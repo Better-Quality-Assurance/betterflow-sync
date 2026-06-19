@@ -179,6 +179,29 @@ def test_blind_idle_tracker_stops_churning_and_flags_for_reprompt():
     )
 
 
+def test_idle_stale_restart_bumps_idle_only_counter():
+    """A real idle-tracker stale restart increments the idle-specific counter
+    that feeds idle_tracker_stale_restarts."""
+    mgr, idle = _make_manager(afk_age=1800, window_age=5)  # AFK stale, window fresh
+
+    mgr.restart_if_needed()
+
+    assert _restarted(mgr, idle)
+    assert mgr._idle_stale_restart_count == 1
+
+
+def test_window_stale_restart_leaves_idle_counter_untouched():
+    """A flapping window tracker must NOT inflate the idle figure — only the
+    shared any-tracker counter moves."""
+    mgr, idle = _make_manager(afk_age=5, window_age=1800)  # window stale, AFK fresh
+
+    mgr.restart_if_needed()
+
+    assert not idle.terminate.called, "idle tracker is healthy here"
+    assert mgr._idle_stale_restart_count == 0, "window churn must not touch idle count"
+    assert mgr._stale_restart_count == 1, "shared any-tracker counter still moves"
+
+
 def test_blind_clears_when_tracker_recovers():
     """If the tracker starts emitting fresh AFK events again (e.g. permission
     granted), the blind flag and the consecutive counter reset so a future
