@@ -64,21 +64,37 @@ def test_continuous_activity_is_one_notafk_span():
     assert _spans(ev) == [("not-afk", T0.isoformat(), 30)]
 
 
-def test_idle_past_timeout_flips_at_last_input_plus_timeout():
+def test_idle_past_timeout_is_all_afk_no_grace():
+    # NO GRACE (verified on live aw-watcher-afk 2026-06-19): last input at T0,
+    # idle through T0+700 -> the WHOLE gap is afk, backdated to last input. There
+    # is no 600s of leading not-afk.
     src = _src(700.0)
     _seed(src, (T0, T0), (T0 + timedelta(seconds=700), T0))
     ev = src.build_afk_events(T0, T0 + timedelta(seconds=700))
-    assert _spans(ev) == [
-        ("not-afk", T0.isoformat(), 600),
-        ("afk", (T0 + timedelta(seconds=600)).isoformat(), 100),
-    ]
+    assert _spans(ev) == [("afk", T0.isoformat(), 700)]
 
 
 def test_pause_shorter_than_timeout_stays_active():
+    # A gap <= afk_timeout never transitioned to afk in real time, so it stays
+    # not-afk (this is the same under grace or no-grace).
     src = _src(599.0)
     _seed(src, (T0, T0), (T0 + timedelta(seconds=599), T0))
     ev = src.build_afk_events(T0, T0 + timedelta(seconds=599))
     assert _spans(ev) == [("not-afk", T0.isoformat(), 599)]
+
+
+def test_gap_exactly_timeout_is_notafk_boundary():
+    src = _src(0.0)
+    _seed(src, (T0, T0), (T0 + timedelta(seconds=600), T0 + timedelta(seconds=600)))
+    ev = src.build_afk_events(T0, T0 + timedelta(seconds=600))
+    assert _spans(ev) == [("not-afk", T0.isoformat(), 600)]  # gap == timeout -> active
+
+
+def test_gap_just_over_timeout_is_all_afk():
+    src = _src(0.0)
+    _seed(src, (T0, T0), (T0 + timedelta(seconds=601), T0 + timedelta(seconds=601)))
+    ev = src.build_afk_events(T0, T0 + timedelta(seconds=601))
+    assert _spans(ev) == [("afk", T0.isoformat(), 601)]  # gap > timeout -> all idle
 
 
 def test_no_samples_in_range_is_afk():
@@ -91,10 +107,7 @@ def test_gap_with_no_samples_billed_afk_not_active():
     src = _src(0.0)
     _seed(src, (T0, T0), (T0 + timedelta(seconds=3600), T0 + timedelta(seconds=3600)))
     ev = src.build_afk_events(T0, T0 + timedelta(seconds=3600))
-    statuses = [e["data"]["status"] for e in ev]
-    assert "not-afk" in statuses and "afk" in statuses
-    notafk = sum(e["duration"] for e in ev if e["data"]["status"] == "not-afk")
-    assert notafk <= 1200
+    assert _spans(ev) == [("afk", T0.isoformat(), 3600)]  # whole 1h gap is idle
 
 
 def test_empty_range_returns_nothing():
@@ -119,3 +132,27 @@ def test_consecutive_cycles_are_contiguous_and_non_overlapping():
     b_start = datetime.fromisoformat(b[0]["timestamp"])
     assert a_end == b_start
     assert a[-1]["id"] != b[0]["id"]
+
+
+def test_finalize_point_is_last_input_while_within_timeout():
+    # User active 5s ago (idle < timeout): the trailing region isn't final yet
+    # (they might return -> not-afk, or go idle -> afk), so finalize only up to
+    # the last confirmed input.
+    src = _src(5.0)
+    now = T0 + timedelta(seconds=100)
+    src.record_sample(now)  # last_input = now - 5
+    assert src.finalize_point(now) == now - timedelta(seconds=5)
+
+
+def test_finalize_point_is_now_once_idle_past_timeout():
+    # Idle >= timeout: the whole trailing region is definitively afk, so it's
+    # safe to finalize all the way to now.
+    src = _src(700.0)
+    now = T0 + timedelta(seconds=1000)
+    src.record_sample(now)  # last_input = now - 700
+    assert src.finalize_point(now) == now
+
+
+def test_finalize_point_is_now_with_no_samples():
+    src = _src(5.0)
+    assert src.finalize_point(T0) == T0

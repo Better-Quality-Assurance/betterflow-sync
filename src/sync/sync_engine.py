@@ -1872,13 +1872,21 @@ class SyncEngine:
         if self._afk_inproc_checkpoint is None:
             self._afk_inproc_checkpoint = now
             return []
+        # Only finalize up to the point whose afk classification is settled. While
+        # the user is within the timeout of their last input, the trailing region
+        # is still pending (could go not-afk or afk), so it waits for a later cycle
+        # — otherwise we'd commit it not-afk and be unable to flip it to afk if they
+        # stay idle past the timeout.
+        finalize_to = self.afk_source.finalize_point(now)
+        if finalize_to <= self._afk_inproc_checkpoint:
+            return []
         with self._state_lock:
             project = self._current_project
         events = self.afk_source.build_afk_events(
-            self._afk_inproc_checkpoint, now,
+            self._afk_inproc_checkpoint, finalize_to,
             project_id=project["id"] if project else None,
         )
-        self._afk_inproc_checkpoint = now
+        self._afk_inproc_checkpoint = finalize_to
         return events
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:

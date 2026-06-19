@@ -66,13 +66,13 @@ most recent input as of that sample). Reconstruct active/idle over
 1. Collect the distinct `last_input_at` values (activity instants) within or
    bordering the range, sorted ascending. Prepend the newest activity instant at
    or before `range_start` so the leading edge is anchored.
-2. Walk consecutive activity instants `a_i -> a_{i+1}`:
-   - The user is **not-afk** from `a_i` until `min(a_{i+1}, a_i + afk_timeout)`.
-   - If `a_{i+1} - a_i > afk_timeout`, an **afk** span covers
-     `[a_i + afk_timeout, a_{i+1}]`.
-3. For the tail after the last activity instant `a_n` up to `range_end`:
-   - not-afk `[a_n, min(range_end, a_n + afk_timeout)]`;
-   - afk `[a_n + afk_timeout, range_end]` if it exceeds the timeout.
+2. Walk consecutive activity instants `a_i -> a_{i+1}` (NO grace):
+   - if `a_{i+1} - a_i <= afk_timeout`: **not-afk** for the whole `[a_i, a_{i+1}]`
+     (a pause that never reached the timeout never went afk);
+   - else: **afk** for the whole `[a_i, a_{i+1}]` (backdated to the last input).
+3. Tail after the last activity instant `a_n` up to `range_end`: **not-afk** if
+   `range_end - a_n <= afk_timeout`, else **afk** (whole tail). The caller passes
+   `range_end = finalize_point(now)` so this tail is only ever the settled region.
 4. Clip every emitted span to `[range_start, range_end]`; drop zero/negative spans.
 5. **No samples covering a sub-range → emit afk** for it. Never invent activity
    (the conservative, never-over-bill rule).
@@ -85,22 +85,29 @@ Each emitted event:
   "data": {"status": "not-afk"|"afk", "synthetic": True},
   "project_id": <if set> }
 ```
-**Billing parity (critical).** The afk transition at `last_input + afk_timeout`
-(steps 2–3) is deliberate: it matches `aw-watcher-afk` (the binary we replace),
-which heartbeats `not-afk` through pauses shorter than the timeout and only flips
-to `afk` once the timeout elapses. So the first `afk_timeout` seconds of any idle
-gap stay billed active, exactly as today — **steady-state billing for normal users
-does not change.** Marking afk from `last_input` instead (no grace) would silently
-under-bill every reading/thinking pause across the fleet. A pre-flip verification
-step (see Risks) confirms this against a real `aw-watcher-afk` bucket before
-default-ON.
+**Billing parity (critical — corrected after live measurement 2026-06-19).**
+`aw-watcher-afk` **backdates `afk` to the last input — there is NO grace.**
+Verified on a live machine: across 8 clean idle transitions, the gap from the
+last real keystroke/click to the start of the stored `afk` span was a **median of
+9 seconds**, not 600s. (Had a grace existed, every gap would cluster near 600s; a
+9s gap is only possible if `afk` starts at the last input.) So the rule is:
 
-**Ids & no overlap.** Because `_afk_inproc_checkpoint` advances to `now` every
-cycle, `build_afk_events` only ever emits spans for the *new* `[checkpoint, now]`
-slice — consecutive cycles produce **non-overlapping** segments, each uploaded once.
-There is no growing-span / re-emit, so no server-side patching is relied on; the
-`span_start`-keyed id is simply a stable unique key (and lets a re-queued offline
-event dedupe on retry). This is simpler and safer than #67's re-emit model.
+- consecutive activity instants `a -> b`: `not-afk [a, b]` iff `b - a <=
+  afk_timeout`; otherwise **`afk` for the entire `[a, b]`** (no 600s of leading
+  not-afk).
+
+The earlier draft assumed a grace and would have credited ~`afk_timeout` of extra
+active time per break across the fleet — an over-bill. The `afk_timeout` only
+governs how long real-time detection waits before *declaring* afk; the stored/
+billed span is backdated to the last input.
+
+**Ids & no overlap.** Each cycle finalizes only up to `finalize_point(now)` (the
+last instant whose afk status is settled — see integration), and the checkpoint
+advances to that point. `build_afk_events` emits spans only for the new
+`[checkpoint, finalize_point]` slice, so consecutive cycles produce
+**non-overlapping** segments uploaded once. No growing-span / re-emit and no
+server-side status-flip patching is relied on; the `span_start`-keyed id is a
+stable unique key (and lets a re-queued offline event dedupe on retry).
 
 ### SyncEngine integration
 
@@ -109,8 +116,11 @@ A single flag-gated branch in `sync()`:
 - If `config.sync.in_process_afk and afk_source.available()`:
   - **exclude `afk_buckets`** from the non-window upload loop (don't upload the
     external tracker's bucket);
-  - `events = afk_source.build_afk_events(self._afk_inproc_checkpoint, now)`;
-    append to `all_events`; advance `_afk_inproc_checkpoint` to `now`;
+  - `finalize_to = afk_source.finalize_point(now)`; if `finalize_to >
+    checkpoint`, `events = afk_source.build_afk_events(checkpoint, finalize_to)`,
+    append to `all_events`, and advance `_afk_inproc_checkpoint` to `finalize_to`
+    (the trailing region within the timeout of the last input stays pending for a
+    later cycle, so it can resolve not-afk OR afk without re-emit);
   - **skip** `_synthesize_for_stale_afk` (#67 — subsumed).
 - Else (flag off, or Linux): today's behavior verbatim (external bucket + #67).
 
@@ -174,13 +184,11 @@ Proof-of-failure per fixture discipline: each behavior test fails on pre-change 
 ## Risks
 - **Billing correctness of the timeline builder** — mitigated by the conservative
   never-over-bill rule (unknown → afk) and exhaustive pure-function tests.
-- **afk-transition semantics assumption** — the design assumes the server bills the
-  first `afk_timeout` seconds of a pause as active (aw-watcher-afk parity).
-  **Pre-flip verification (do before merging the default-ON):** on one machine, run
-  the in-process source side-by-side with the live `aw-watcher-afk` bucket for a
-  session and diff the resulting active-seconds; they must match within sampling
-  noise. If the server actually bills from `last_input` (no grace), drop the grace
-  in step 2/3 instead. This check is cheap and removes the only unproven assumption.
+- **afk-transition semantics** — VERIFIED on a live macOS machine 2026-06-19:
+  `aw-watcher-afk` backdates afk to the last input (median 9s gap from last
+  keystroke/click to afk-span start across 8 transitions; a grace would show
+  ~600s). The design uses the no-grace rule accordingly. An earlier grace draft
+  would have over-billed ~`afk_timeout` per break fleet-wide; caught by this check.
 - **Default ON, no beta** — any timeline bug bills wrong fleet-wide before it's
   caught; the kill-switch flag is the rollback. (Accepted: Brad, 2026-06-19.)
 - **Coarse Windows granularity** — sampling at sync cadence (~30s) vs the 600s

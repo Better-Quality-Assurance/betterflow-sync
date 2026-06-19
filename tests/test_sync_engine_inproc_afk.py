@@ -22,7 +22,10 @@ def test_inproc_afk_events_built_for_uploaded_range():
     now = datetime(2026, 6, 19, 12, 0, 0, tzinfo=timezone.utc)
     eng.afk_source.record_sample(now - timedelta(seconds=30))
     eng.afk_source.record_sample(now)
-    eng._build_inproc_afk(now)  # first call seeds the checkpoint, returns []
+    eng._build_inproc_afk(now)  # first call seeds the checkpoint at now, returns []
+    # User stays active — a fresh input pushes the finalize point past the
+    # checkpoint so the settled slice uploads.
+    eng.afk_source.record_sample(now + timedelta(seconds=30))
     events = eng._build_inproc_afk(now + timedelta(seconds=30))
     assert events and all(e["bucket_id"] == "bf-afk-inproc_host" for e in events)
 

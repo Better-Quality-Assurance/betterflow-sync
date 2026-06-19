@@ -79,6 +79,23 @@ class AfkSource:
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
 
+    def finalize_point(self, now: datetime) -> datetime:
+        """The latest instant whose afk classification is FINAL.
+
+        While the user is within the timeout of their last input, the trailing
+        region [last_input, now] could still resolve either way — they may return
+        (making it not-afk) or stay idle past the timeout (making the whole region
+        afk, backdated). So we finalize only up to the last confirmed input. Once
+        idle >= timeout, the trailing region is definitively afk and we finalize
+        all the way to `now`. With no samples there is nothing to defer."""
+        with self._lock:
+            last_input = max((li for (_, li) in self._samples), default=None)
+        if last_input is None:
+            return now
+        if (now - last_input).total_seconds() >= self._afk_timeout:
+            return now
+        return last_input
+
     def build_afk_events(
         self, range_start: datetime, range_end: datetime,
         project_id: Optional[int] = None,
@@ -102,6 +119,11 @@ class AfkSource:
         in_range = [li for li in instants if range_start < li < range_end]
         activity = ([anchor] if anchor is not None else []) + in_range
 
+        # NO GRACE (verified against live aw-watcher-afk 2026-06-19): afk is
+        # backdated to the last input. A gap between two inputs is not-afk only if
+        # it never reached the timeout; otherwise the ENTIRE gap is afk. The
+        # afk_timeout governs only how long real-time detection waits before
+        # declaring afk, not how the billed span is classified.
         spans: list = []
         if not activity:
             spans.append((range_start, range_end, "afk"))
@@ -110,13 +132,11 @@ class AfkSource:
             if first > range_start:
                 spans.append((range_start, first, "afk"))  # leading unknown
             for a, b in zip(activity, activity[1:], strict=False):
-                spans.append((a, min(b, a + timeout), "not-afk"))
-                if b - a > timeout:
-                    spans.append((a + timeout, b, "afk"))
+                spans.append((a, b, "not-afk" if (b - a) <= timeout else "afk"))
             last = activity[-1]
-            spans.append((last, min(range_end, last + timeout), "not-afk"))
-            if range_end - last > timeout:
-                spans.append((last + timeout, range_end, "afk"))
+            spans.append(
+                (last, range_end, "not-afk" if (range_end - last) <= timeout else "afk")
+            )
 
         events: list = []
         for start, end, status in sorted(spans, key=lambda s: s[0]):
