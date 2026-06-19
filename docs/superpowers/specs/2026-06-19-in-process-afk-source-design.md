@@ -85,9 +85,22 @@ Each emitted event:
   "data": {"status": "not-afk"|"afk", "synthetic": True},
   "project_id": <if set> }
 ```
-The id is keyed on `span_start`, so the current (growing) span re-sends the same id
-each cycle and the server upserts (patches) — same heartbeat-extend contract real
-AW events and #67 rely on. Closed past spans keep their id permanently.
+**Billing parity (critical).** The afk transition at `last_input + afk_timeout`
+(steps 2–3) is deliberate: it matches `aw-watcher-afk` (the binary we replace),
+which heartbeats `not-afk` through pauses shorter than the timeout and only flips
+to `afk` once the timeout elapses. So the first `afk_timeout` seconds of any idle
+gap stay billed active, exactly as today — **steady-state billing for normal users
+does not change.** Marking afk from `last_input` instead (no grace) would silently
+under-bill every reading/thinking pause across the fleet. A pre-flip verification
+step (see Risks) confirms this against a real `aw-watcher-afk` bucket before
+default-ON.
+
+**Ids & no overlap.** Because `_afk_inproc_checkpoint` advances to `now` every
+cycle, `build_afk_events` only ever emits spans for the *new* `[checkpoint, now]`
+slice — consecutive cycles produce **non-overlapping** segments, each uploaded once.
+There is no growing-span / re-emit, so no server-side patching is relied on; the
+`span_start`-keyed id is simply a stable unique key (and lets a re-queued offline
+event dedupe on retry). This is simpler and safer than #67's re-emit model.
 
 ### SyncEngine integration
 
@@ -101,10 +114,18 @@ A single flag-gated branch in `sync()`:
   - **skip** `_synthesize_for_stale_afk` (#67 — subsumed).
 - Else (flag off, or Linux): today's behavior verbatim (external bucket + #67).
 
-Checkpoint: a single `_afk_inproc_checkpoint: datetime` (last covered instant). On
-first cycle, initialize to a short lookback (e.g. `now - afk_timeout`) so a restart
-doesn't claim a huge active span. The server upserts by event id, so re-emitting an
-overlapping current span is safe.
+Checkpoint: a single `_afk_inproc_checkpoint: datetime` (last covered instant),
+**initialized to `now` on the first cycle** — we only account for time while the
+agent is running and sampling, and emit nothing for the unknown pre-start period.
+Failed uploads ride the existing offline queue (events are appended to `all_events`
+→ `_send_and_advance_checkpoints`, which queues on failure), so advancing the
+checkpoint after a failed send never loses data.
+
+**Backlog reconcile does NOT touch `_afk_inproc_checkpoint`.** The day-start
+checkpoint rewind exists to re-fetch stranded events from real AW buckets; the
+in-process AFK stream has no AW bucket and the sample log only retains ~2h, so
+rewinding it would re-emit `afk` over a morning we already billed correctly.
+In-process AFK relies solely on the offline queue for delivery, never on rewind.
 
 The local pause decision (`idle_manager`) already uses the in-process input watcher
 + OS idle clock (`_has_recent_input`, `_get_system_idle_seconds`), so it needs no
@@ -129,7 +150,12 @@ untouched.
 - interleaved active/idle/active → correct alternating spans, no fabricated
   activity over the idle middle;
 - empty log → afk for the whole range;
-- stable id across cycles for the growing current span (server patches in place).
+- **billing-parity boundary**: a pause of `afk_timeout − 1s` is entirely not-afk
+  (grace), a pause of `afk_timeout + 1s` flips to afk exactly at
+  `last_input + afk_timeout` — pins that short pauses stay billed active like
+  aw-watcher-afk;
+- consecutive cycles produce non-overlapping, contiguous segments (no gaps, no
+  double-cover) for a steadily-active user.
 
 `tests/test_sync_engine_inproc_afk.py` — integration on the real sync path:
 - flag ON + readable clock → external afk bucket NOT uploaded; in-process afk
@@ -148,6 +174,13 @@ Proof-of-failure per fixture discipline: each behavior test fails on pre-change 
 ## Risks
 - **Billing correctness of the timeline builder** — mitigated by the conservative
   never-over-bill rule (unknown → afk) and exhaustive pure-function tests.
+- **afk-transition semantics assumption** — the design assumes the server bills the
+  first `afk_timeout` seconds of a pause as active (aw-watcher-afk parity).
+  **Pre-flip verification (do before merging the default-ON):** on one machine, run
+  the in-process source side-by-side with the live `aw-watcher-afk` bucket for a
+  session and diff the resulting active-seconds; they must match within sampling
+  noise. If the server actually bills from `last_input` (no grace), drop the grace
+  in step 2/3 instead. This check is cheap and removes the only unproven assumption.
 - **Default ON, no beta** — any timeline bug bills wrong fleet-wide before it's
   caught; the kill-switch flag is the rollback. (Accepted: Brad, 2026-06-19.)
 - **Coarse Windows granularity** — sampling at sync cadence (~30s) vs the 600s
