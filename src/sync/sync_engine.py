@@ -209,6 +209,16 @@ class SyncEngine:
         # channel) breaks that circular blindness. This is exactly why Windows
         # wedges were undiagnosable. None / errors tolerated.
         self.error_reporter = None
+        # Optional in-process AFK source (set by the SyncCoordinator). When
+        # present, enabled by config, and the OS idle clock is readable, the
+        # agent uploads its own AFK stream and ignores the external bf-idle-tracker
+        # bucket. The checkpoint is the last instant covered by an upload; it is
+        # initialized to `now` on the first cycle (account only while running) and
+        # is NEVER touched by the backlog reconcile (no AW bucket to re-fetch; the
+        # sample log only retains ~2h, so a day-start rewind would re-emit afk over
+        # a morning already billed correctly).
+        self.afk_source = None
+        self._afk_inproc_checkpoint: Optional[datetime] = None
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -479,6 +489,15 @@ class SyncEngine:
                     else:
                         logger.warning(f"Failed to start session after retry: {e}")
 
+        # Record an activity sample for the in-process AFK timeline (no-op when
+        # no source is wired or the OS idle clock is unavailable). Done every
+        # cycle so the sample log stays dense regardless of bucket-fetch outcome.
+        if self.afk_source is not None:
+            try:
+                self.afk_source.record_sample(datetime.now(timezone.utc))
+            except Exception as e:
+                logger.debug("afk_source.record_sample failed: %s", e)
+
         # Get buckets to sync
         try:
             window_buckets = self.aw.get_window_buckets()
@@ -520,8 +539,14 @@ class SyncEngine:
         # so AFK events from one window bucket don't leak into unrelated buckets.
         cycle.afk_events = []
 
-        # Sync non-window buckets normally
+        # Sync non-window buckets normally. When the agent is the sole AFK source
+        # (in-process), drop the external bf-idle-tracker bucket entirely — we
+        # upload our own stream below instead, so its (possibly frozen/blind)
+        # events never reach the server.
+        skip_external_afk = self._should_skip_external_afk()
         for bucket in web_buckets + afk_buckets + input_buckets:
+            if skip_external_afk and _is_afk_like(bucket.type):
+                continue
             try:
                 events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats, cycle)
                 all_events.extend(events)
@@ -531,15 +556,18 @@ class SyncEngine:
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
 
-        # If bf-idle-tracker has frozen but the OS idle clock shows the user kept
-        # working, upload a synthetic not-afk span. The server bills active-vs-idle
-        # from the AFK stream, so without this a frozen tracker's worked span is
-        # billed idle ("Active time not advancing" fleet alert) — the gap #53/#56
-        # left open on the upload side (their OS-idle fallback only governs the
-        # LOCAL pause decision, never the uploaded stream).
-        synth_afk = self._synthesize_for_stale_afk(afk_buckets)
-        if synth_afk:
-            all_events.append(synth_afk)
+        if skip_external_afk:
+            # Sole-source path: upload the in-process AFK stream for the slice
+            # since the last covered instant. Subsumes _synthesize_for_stale_afk.
+            all_events.extend(self._build_inproc_afk(datetime.now(timezone.utc)))
+        else:
+            # External-bucket path: if bf-idle-tracker has frozen but the OS idle
+            # clock shows the user kept working, upload a synthetic not-afk span so
+            # the frozen tracker's worked span isn't billed idle ("Active time not
+            # advancing" alert) — the gap #53/#56 left open on the upload side.
+            synth_afk = self._synthesize_for_stale_afk(afk_buckets)
+            if synth_afk:
+                all_events.append(synth_afk)
 
         # Flush any ongoing call at sync boundary
         if self._call_detector:
@@ -1819,6 +1847,39 @@ class SyncEngine:
             afk_buckets[0].id,
         )
         return self._synthesize_active_afk_event(latest, bucket_id, now=now)
+
+    def _inproc_afk_active(self) -> bool:
+        """True when the in-process AFK source should be the sole AFK source —
+        config flag on, a source is wired, and the OS idle clock is readable
+        (macOS/Windows; False on Linux)."""
+        return (
+            bool(self.config.sync.in_process_afk)
+            and self.afk_source is not None
+            and self.afk_source.available()
+        )
+
+    def _should_skip_external_afk(self) -> bool:
+        """Whether to drop the external bf-idle-tracker bucket from this cycle's
+        upload (because the agent uploads its own AFK stream instead)."""
+        return self._inproc_afk_active()
+
+    def _build_inproc_afk(self, now: datetime) -> list[dict]:
+        """Build in-process AFK events for [checkpoint, now] and advance the
+        checkpoint. First cycle just seeds the checkpoint at `now` (we only
+        account for time while running). Returns [] when not active."""
+        if not self._inproc_afk_active():
+            return []
+        if self._afk_inproc_checkpoint is None:
+            self._afk_inproc_checkpoint = now
+            return []
+        with self._state_lock:
+            project = self._current_project
+        events = self.afk_source.build_afk_events(
+            self._afk_inproc_checkpoint, now,
+            project_id=project["id"] if project else None,
+        )
+        self._afk_inproc_checkpoint = now
+        return events
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""
