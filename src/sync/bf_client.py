@@ -365,6 +365,7 @@ class BetterFlowClient(BaseApiClient):
         if health is not None:
             for key in (
                 "idle_tracker_stale_restarts",
+                "idle_tracker_blind",
                 "afk_event_age_seconds",
                 "window_event_age_seconds",
                 "consecutive_sync_failures",
