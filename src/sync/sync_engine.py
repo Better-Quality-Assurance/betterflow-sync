@@ -31,6 +31,7 @@ try:
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
+    from .os_idle import get_system_idle_seconds
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -40,6 +41,7 @@ except ImportError:
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from sync.daily_time_tracker import DailyTimeTracker
     from sync.call_detector import CallDetector, CallEvent
+    from sync.os_idle import get_system_idle_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,14 @@ def _is_window_like(bucket_type: str) -> bool:
 def _is_afk_like(bucket_type: str) -> bool:
     """AFK/idle buckets that drive the active-vs-idle decision."""
     return bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)
+
+
+# Seconds the latest AFK event may lag "now" before the tracker is presumed
+# frozen. A healthy bf-idle-tracker heartbeats its current event continuously,
+# so its end-time tracks now; a larger gap means it hung/went blind and its last
+# event must not be trusted as the live idle state. Mirrors IdleManager's
+# _afk_staleness_grace and aw_manager's STALE_THRESHOLD (all 120s).
+_AFK_STALENESS_GRACE = 120.0
 
 
 @dataclass
@@ -520,6 +530,16 @@ class SyncEngine:
                 stats.buckets_synced += 1
             except AWClientError as e:
                 stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+
+        # If bf-idle-tracker has frozen but the OS idle clock shows the user kept
+        # working, upload a synthetic not-afk span. The server bills active-vs-idle
+        # from the AFK stream, so without this a frozen tracker's worked span is
+        # billed idle ("Active time not advancing" fleet alert) — the gap #53/#56
+        # left open on the upload side (their OS-idle fallback only governs the
+        # LOCAL pause decision, never the uploaded stream).
+        synth_afk = self._synthesize_for_stale_afk(afk_buckets)
+        if synth_afk:
+            all_events.append(synth_afk)
 
         # Flush any ongoing call at sync boundary
         if self._call_detector:
@@ -1706,6 +1726,99 @@ class SyncEngine:
         if project:
             result["project_id"] = project["id"]
         return result
+
+    def _synthesize_active_afk_event(
+        self, latest_afk, afk_bucket_id: str, now: Optional[datetime] = None
+    ) -> Optional[dict]:
+        """Emit a synthetic ``not-afk`` span when bf-idle-tracker has frozen but
+        the OS idle clock shows the user kept working.
+
+        The server bills active-vs-idle from the uploaded AFK stream
+        (see ``_transform_window_event_with_timeout``). A frozen tracker stops
+        emitting fresh not-afk events, so the worked span has no AFK coverage and
+        the server counts it as idle — the "Active time not advancing while the
+        user works" fleet alert. #53/#56 added an OS-idle-clock fallback, but only
+        in IdleManager's LOCAL pause decision; it never reaches the uploaded
+        stream, so server-side active time still freezes. This closes that loop:
+        when the latest AFK event is stale AND the OS idle clock proves recent
+        input, we upload a not-afk span covering [freeze point, last input].
+
+        Conservative by construction — returns None and fabricates nothing when:
+          * there is no AFK event to extend from,
+          * the tracker is fresh (latest event still ~covers now),
+          * the OS idle clock is unavailable (Linux / ioreg failure), or
+          * the OS clock says the user is genuinely idle, or the last input
+            predates the freeze point (no active span to claim).
+
+        The id is keyed on the freeze point, so while the tracker stays stuck the
+        same id is re-sent with a growing duration and the server upserts (patches
+        in place) rather than accumulating overlapping spans — the same heartbeat-
+        extend contract real AW events rely on.
+        """
+        if latest_afk is None:
+            return None
+        if now is None:
+            now = datetime.now(timezone.utc)
+        try:
+            freeze_end = latest_afk.timestamp + timedelta(seconds=latest_afk.duration)
+        except (TypeError, AttributeError):
+            return None
+
+        if (now - freeze_end).total_seconds() <= _AFK_STALENESS_GRACE:
+            return None  # tracker still heartbeating — not frozen
+
+        system_idle = self._get_system_idle_seconds()
+        if system_idle is None or system_idle >= _AFK_STALENESS_GRACE:
+            # Can't confirm activity, or the OS clock agrees the user is idle.
+            return None
+
+        last_input = now - timedelta(seconds=system_idle)
+        duration = (last_input - freeze_end).total_seconds()
+        if duration <= 0:
+            return None  # last input predates the freeze — nothing active to claim
+
+        synth_id = f"synth-active_{self._hostname}_{int(freeze_end.timestamp())}"
+        result: dict = {
+            "id": synth_id,
+            "timestamp": freeze_end.isoformat(),
+            "duration": round(duration, 2),
+            "bucket_id": afk_bucket_id,
+            "bucket_type": BUCKET_TYPE_AFK,
+            "data": {"status": "not-afk", "synthetic": True},
+        }
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            result["project_id"] = project["id"]
+        return result
+
+    @staticmethod
+    def _get_system_idle_seconds() -> Optional[float]:
+        """OS idle clock (seconds since last input), or None. Delegates to the
+        shared implementation also used by IdleManager."""
+        return get_system_idle_seconds()
+
+    def _synthesize_for_stale_afk(
+        self, afk_buckets: list, now: Optional[datetime] = None
+    ) -> Optional[dict]:
+        """Cycle-level wrapper around ``_synthesize_active_afk_event``: gathers
+        the latest AFK event and the target bucket, then synthesizes a not-afk
+        span if the tracker is frozen while the user is active. Returns None when
+        there is nothing to synthesize.
+        """
+        if not afk_buckets:
+            return None
+        try:
+            latest = self.aw.get_latest_afk_event()
+        except AWClientError:
+            return None
+        # Attach to the BetterFlow-owned AFK bucket so the server folds the span
+        # into the same AFK stream it bills from; fall back to the first bucket.
+        bucket_id = next(
+            (b.id for b in afk_buckets if "bf-idle-tracker" in b.id),
+            afk_buckets[0].id,
+        )
+        return self._synthesize_active_afk_event(latest, bucket_id, now=now)
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow or queue if offline."""
