@@ -266,7 +266,15 @@ jobs:
             artifacts/BetterFlow-Windows.zip
             artifacts/BetterFlow-Windows-Setup.exe
             artifacts/BetterFlow-linux-x86_64.AppImage
-          draft: true
+          # Channel-aware publishing, keyed off the '-' in the tag name:
+          #   v1.5.62        (stable)  -> draft, NOT prerelease  (manual publish
+          #                              gates the all-users / `stable` rollout)
+          #   v1.5.62-beta.1 (beta/rc) -> published prerelease    (delivered to
+          #                              the in-app `beta`/`canary` channels for
+          #                              the dev team; never seen by `stable`)
+          # See update_checker._matches_channel for the consuming logic.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          draft: ${{ !contains(github.ref_name, '-') }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
