@@ -357,6 +357,10 @@ class AWManager:
         self._idle_consecutive_stale: int = 0
         self._idle_tracker_blind: bool = False
         self._idle_last_restart_mono: float = 0.0
+        # When the agent uploads its own in-process AFK stream, the external
+        # bf-idle-tracker bucket is ignored — don't restart it or raise blind
+        # alerts about a tracker we no longer consume.
+        self._inproc_afk_active: bool = False
 
     @property
     def idle_tracker_blind(self) -> bool:
@@ -366,6 +370,13 @@ class AWManager:
         restarts. Clears automatically once the tracker emits fresh events."""
         with self._lifecycle_lock:
             return self._idle_tracker_blind
+
+    def set_inproc_afk_active(self, active: bool) -> None:
+        """Mark whether the agent is uploading its own in-process AFK stream. When
+        active, the bf-idle-tracker stale/blind detection is suppressed (we no
+        longer consume its bucket, so it must not restart or raise alerts)."""
+        with self._lifecycle_lock:
+            self._inproc_afk_active = bool(active)
 
     def disable_component(self, name: str) -> None:
         """Prevent a component from being started/restarted."""
@@ -697,7 +708,8 @@ class AWManager:
         # full-system idle or a sleep/wake where both watchers are paused.
         idle_watcher = "bf-idle-tracker"
         if (
-            idle_watcher not in self._disabled_components
+            not self._inproc_afk_active
+            and idle_watcher not in self._disabled_components
             and idle_watcher in self._processes
             and self._processes[idle_watcher].poll() is None
         ):

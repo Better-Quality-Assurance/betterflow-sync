@@ -300,6 +300,10 @@ class SyncSettings:
     compress: bool = True  # Use gzip compression
     idle_pause_minutes: int = 20  # Pause sync after this many minutes AFK
     min_window_event_seconds: float = 5.0  # Drop window/web events shorter than this
+    # Generate the AFK/active stream in-process from the OS idle clock + input
+    # watcher instead of the external bf-idle-tracker bucket. Kill-switch: set
+    # False to fall back to the external bucket + stale-synthesis path.
+    in_process_afk: bool = True
 
 
 @dataclass

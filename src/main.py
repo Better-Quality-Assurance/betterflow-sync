@@ -1290,6 +1290,26 @@ class BetterFlowApp:
         self.coordinator.idle_mgr.input_watcher = self.input_watcher
         self.coordinator.idle_mgr._on_idle_pause = self._on_idle_pause
 
+        # In-process AFK source: the agent generates its own active/idle stream
+        # from the OS idle clock (+ the in-process input watcher on macOS) and
+        # uploads it as the sole AFK source, so a frozen/blind bf-idle-tracker
+        # can't lose billed time. Inert unless config enables it AND the OS idle
+        # clock is readable (macOS/Windows; off on Linux). When active, tell the
+        # AwManager to stop restarting/alerting on the now-ignored tracker.
+        try:
+            from .sync.afk_source import AfkSource
+        except ImportError:
+            from sync.afk_source import AfkSource
+        afk_source = AfkSource(
+            afk_timeout_seconds=self.config.aw.afk_timeout_minutes * 60,
+            hostname=self.coordinator.sync_engine._hostname,
+            input_watcher=self.input_watcher,
+        )
+        self.coordinator.sync_engine.afk_source = afk_source
+        self.coordinator.aw_manager.set_inproc_afk_active(
+            self.config.sync.in_process_afk and afk_source.available()
+        )
+
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(self.config.reminders)
         self.coordinator.reminder_manager = self.reminder_manager

@@ -187,3 +187,8 @@ class TestUuidRegex:
 
     def test_rejects_empty(self):
         assert not _UUID_RE.match("")
+
+
+def test_in_process_afk_defaults_on():
+    from src.config import Config
+    assert Config().sync.in_process_afk is True

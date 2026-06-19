@@ -170,3 +170,11 @@ class TestSelfUpdaterLinux:
         monkeypatch.setattr(self_updater.sys, "platform", "linux")
         monkeypatch.delenv("APPIMAGE", raising=False)
         assert self_updater._get_app_bundle_path() is None
+
+
+def test_afk_source_unavailable_on_linux():
+    """Linux has no OS idle clock → AfkSource.available() is False, so the engine
+    keeps the external bf-idle-tracker path regardless of the config flag."""
+    from src.sync.afk_source import AfkSource
+    src = AfkSource(600, "host", idle_clock=lambda: None)
+    assert src.available() is False
