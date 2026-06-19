@@ -34,9 +34,11 @@ import requests
 
 try:
     from .config import Config
+    from .sync.http_client import resolve_ca_bundle
     from .update_checker import _version_tuple
 except ImportError:  # PyInstaller bundle (src/ is import root)
     from config import Config
+    from sync.http_client import resolve_ca_bundle
     from update_checker import _version_tuple
 
 logger = logging.getLogger(__name__)
@@ -111,7 +113,13 @@ def _download_to_file(
     Caps the body at ``_MAX_DOWNLOAD_BYTES`` so a misconfigured redirect or a
     malicious release asset can't fill the disk (our installers are ~60-80 MB).
     """
-    with requests.get(download_url, stream=True, timeout=120) as resp:
+    # Pin TLS verification to a resolved CA bundle: a missing/clipped certifi
+    # copy must not also break the self-updater, or the app can't download its
+    # own fix. resolve_ca_bundle() returns None only when no bundle exists, in
+    # which case verify=None falls back to the requests default (logged loudly).
+    with requests.get(
+        download_url, stream=True, timeout=120, verify=resolve_ca_bundle()
+    ) as resp:
         resp.raise_for_status()
         try:
             # `or 0` guards an empty-string header; the except guards garbage.

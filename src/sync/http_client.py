@@ -5,11 +5,13 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from typing import Optional
 from urllib.parse import urlparse
 
+import certifi
 import requests
 
 try:
@@ -22,9 +24,105 @@ __all__ = [
     "BaseApiClient",
     "BetterFlowClientError",
     "BetterFlowAuthError",
+    "resolve_ca_bundle",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# ---- TLS CA bundle resolution -----------------------------------------------
+#
+# requests verifies HTTPS against certifi.where(), which in a PyInstaller build
+# resolves to _internal/certifi/cacert.pem. If that file is missing — not
+# collected into the bundle, or clipped by antivirus after install — every
+# HTTPS request raises OSError("Could not find a suitable TLS CA certificate
+# bundle, invalid path: ...cacert.pem") and ALL sync silently fails until the
+# app is restarted (reported on Windows 2026-06-18: ~1h40m sync blackout while
+# the user kept working, surfacing as false idle on the dashboard). build.spec
+# now ships a redundant copy under resources/; this resolver picks whichever CA
+# bundle actually exists and logs loudly if none do, instead of letting requests
+# fail the same way on every call.
+_CACHED_CA_BUNDLE: Optional[str] = None
+_CA_BUNDLE_RESOLVED = False
+
+
+def _bundled_cacert_fallback() -> Optional[str]:
+    """Path to the redundant cacert.pem shipped under resources/, if present."""
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return os.path.join(meipass, "resources", "cacert.pem")
+    # Dev run: src/sync/http_client.py -> src/ -> repo root -> resources/
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "resources",
+        "cacert.pem",
+    )
+
+
+def resolve_ca_bundle() -> Optional[str]:
+    """Return a usable CA bundle path for TLS verification, or None.
+
+    Resolution order (first existing file wins):
+      1. REQUESTS_CA_BUNDLE / SSL_CERT_FILE env overrides (operator escape hatch)
+      2. certifi.where() — the bundle requests would use by default
+      3. resources/cacert.pem — the redundant copy build.spec ships
+
+    Cached after the first call. Returns None only when no bundle exists at all,
+    after logging an error — we never silently disable verification (that would
+    trade a sync outage for a MITM risk); callers fall back to the requests
+    default, which now fails loudly with a logged cause instead of silently.
+
+    Called from several threads (sync scheduler, update-checker, error-report
+    daemon). Intentionally lock-free: resolution is idempotent — every caller
+    inspects the same filesystem/env and arrives at the identical result, and
+    the string/bool assignments are atomic under the GIL, so a first-use race
+    only recomputes the same value, never tears or returns a wrong one.
+    """
+    global _CACHED_CA_BUNDLE, _CA_BUNDLE_RESOLVED
+    if _CA_BUNDLE_RESOLVED:
+        return _CACHED_CA_BUNDLE
+
+    candidates = []
+    for env in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        val = os.environ.get(env)
+        if val:
+            candidates.append(val)
+    try:
+        candidates.append(certifi.where())
+    except Exception as e:  # pragma: no cover - certifi.where() is pure pathjoin
+        logger.warning("certifi.where() raised while resolving CA bundle: %s", e)
+    fallback = _bundled_cacert_fallback()
+    if fallback:
+        candidates.append(fallback)
+
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path):
+                _CACHED_CA_BUNDLE = path
+                _CA_BUNDLE_RESOLVED = True
+                return path
+        except OSError:
+            continue
+
+    logger.error(
+        "No TLS CA bundle found (checked: %s). HTTPS verification will fail; "
+        "reinstall the app to restore the certifi bundle.",
+        ", ".join(p for p in candidates if p) or "none",
+    )
+    _CACHED_CA_BUNDLE = None
+    _CA_BUNDLE_RESOLVED = True
+    return None
+
+
+def _new_verified_session() -> requests.Session:
+    """Create a requests.Session with TLS verification pinned to a resolved CA
+    bundle, so a missing/clipped certifi copy can't silently break all sync."""
+    session = requests.Session()
+    ca_bundle = resolve_ca_bundle()
+    if ca_bundle:
+        session.verify = ca_bundle
+    return session
 
 
 class BetterFlowClientError(Exception):
@@ -110,7 +208,7 @@ class BaseApiClient:
         self.compress = compress
         self.timeout = timeout
         self.retry_config = retry_config or self.DEFAULT_RETRY_CONFIG
-        self._session = session or requests.Session()
+        self._session = session or _new_verified_session()
         self._owns_session = session is None  # Track if we created the session
         self._session_lock = threading.Lock()
         # Global rate-limit backoff. When the server returns 429, ALL outbound
@@ -363,7 +461,7 @@ class BaseApiClient:
         with self._session_lock:
             old = self._session
             was_owned = self._owns_session
-            self._session = requests.Session()
+            self._session = _new_verified_session()
             self._owns_session = True
         # Close outside lock to avoid holding it during I/O.
         # Only close the old session if we owned it - don't destroy

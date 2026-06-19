@@ -7,6 +7,11 @@ from typing import Callable, Optional
 
 import requests
 
+try:
+    from .sync.http_client import resolve_ca_bundle
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from sync.http_client import resolve_ca_bundle
+
 logger = logging.getLogger(__name__)
 
 GITHUB_REPO = "Better-Quality-Assurance/betterflow-sync"
@@ -132,6 +137,7 @@ def check_for_update(
                     f"{RELEASES_URL}/latest",
                     headers={"Accept": "application/vnd.github+json"},
                     timeout=10,
+                    verify=resolve_ca_bundle(),
                 )
                 if resp.status_code != 200:
                     logger.debug(f"Update check: GitHub API returned {resp.status_code}")
@@ -148,6 +154,7 @@ def check_for_update(
                     headers={"Accept": "application/vnd.github+json"},
                     params={"per_page": 20},
                     timeout=10,
+                    verify=resolve_ca_bundle(),
                 )
                 if resp.status_code != 200:
                     logger.debug(f"Update check: GitHub API returned {resp.status_code}")

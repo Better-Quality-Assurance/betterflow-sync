@@ -35,6 +35,11 @@ from urllib.parse import urlparse
 
 import requests
 
+try:
+    from .sync.http_client import resolve_ca_bundle
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from sync.http_client import resolve_ca_bundle
+
 logger = logging.getLogger(__name__)
 
 # betterqa-bot error ingest. Overridable for staging/self-host; the production
@@ -206,6 +211,7 @@ class ErrorReporter:
                 json=payload,
                 headers={"Authorization": f"Bearer {self._dsn}"},
                 timeout=self._timeout,
+                verify=resolve_ca_bundle(),
             )
             if resp.status_code >= 400:
                 logger.warning(

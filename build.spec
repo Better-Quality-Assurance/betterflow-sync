@@ -73,6 +73,19 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 tcl_tk_datas = collect_data_files("tkinter")
 tcl_tk_binaries = collect_dynamic_libs("_tkinter")
 
+# Certifi CA bundle. requests verifies TLS against certifi.where(), which in a
+# frozen build resolves to _internal/certifi/cacert.pem. If that file isn't
+# collected (PyInstaller hook didn't run) — or an antivirus clips it from the
+# install — EVERY HTTPS sync dies with "Could not find a suitable TLS CA
+# certificate bundle" and tracking silently stops uploading (reported on
+# Windows 2026-06-18: ~1h40m total sync blackout, recovered only on restart).
+# Collect it explicitly so the canonical copy is deterministic, AND ship a
+# redundant copy under resources/ so a single clipped file doesn't take down
+# all sync — sync/http_client._resolve_ca_bundle() falls back to it at runtime.
+import certifi as _certifi
+certifi_datas = collect_data_files("certifi")
+certifi_fallback = [(str(Path(_certifi.where())), "resources")]
+
 # Platform-specific hidden imports (tray backend, keyring backend, native libs).
 if is_mac:
     platform_hiddenimports = [
@@ -115,6 +128,8 @@ hiddenimports = [
     "PIL._tkinter_finder",
     "apscheduler.triggers.interval",
     "apscheduler.schedulers.background",
+    "certifi",  # TLS CA bundle for requests; data file collected via certifi_datas
+
     # Our modules (absolute imports from src/)
     "config",
     "sync",
@@ -153,7 +168,7 @@ a = Analysis(
     [str(src_dir / "entry_point.py")],
     pathex=[str(root_dir), str(src_dir)],
     binaries=aw_binaries + tcl_tk_binaries,
-    datas=datas + tcl_tk_datas,
+    datas=datas + tcl_tk_datas + certifi_datas + certifi_fallback,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
