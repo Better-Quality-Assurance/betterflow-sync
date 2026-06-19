@@ -54,7 +54,7 @@ jobs:
                 changelog_markdown: (.body // ""),
                 macos_arm64_url: ([.assets[] | select(.name == "BetterFlow-macOS-arm64.dmg") | .browser_download_url] | first // ""),
                 macos_x64_url: ([.assets[] | select(.name == "BetterFlow-macOS-x86_64.dmg") | .browser_download_url] | first // ""),
-                windows_url: ([.assets[] | select(.name == "BetterFlow-Windows.zip") | .browser_download_url] | first // "")
+                windows_url: ([.assets[] | select(.name == "BetterFlow-Windows-Setup.exe") | .browser_download_url] | first // "")
               }
             ' release.json > payload.json
 
