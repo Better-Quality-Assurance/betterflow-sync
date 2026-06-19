@@ -78,3 +78,65 @@ class AfkSource:
             cutoff = now - self._retention
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
+
+    def build_afk_events(
+        self, range_start: datetime, range_end: datetime,
+        project_id: Optional[int] = None,
+    ) -> list:
+        """Reconstruct AFK spans over [range_start, range_end] from samples.
+
+        Activity is known only at each sample's last_input_at. Between two
+        activity instants the user is not-afk until last_input + afk_timeout,
+        then afk (aw-watcher-afk parity). Any sub-range with no covering sample
+        is afk (never invent activity)."""
+        if range_end <= range_start:
+            return []
+        timeout = timedelta(seconds=self._afk_timeout)
+        with self._lock:
+            instants = sorted({li for (_, li) in self._samples})
+
+        anchor = None
+        for li in instants:
+            if li <= range_start:
+                anchor = li  # newest instant at/before range_start
+        in_range = [li for li in instants if range_start < li < range_end]
+        activity = ([anchor] if anchor is not None else []) + in_range
+
+        spans: list = []
+        if not activity:
+            spans.append((range_start, range_end, "afk"))
+        else:
+            first = activity[0]
+            if first > range_start:
+                spans.append((range_start, first, "afk"))  # leading unknown
+            for a, b in zip(activity, activity[1:], strict=False):
+                spans.append((a, min(b, a + timeout), "not-afk"))
+                if b - a > timeout:
+                    spans.append((a + timeout, b, "afk"))
+            last = activity[-1]
+            spans.append((last, min(range_end, last + timeout), "not-afk"))
+            if range_end - last > timeout:
+                spans.append((last + timeout, range_end, "afk"))
+
+        events: list = []
+        for start, end, status in sorted(spans, key=lambda s: s[0]):
+            s = max(start, range_start)
+            e = min(end, range_end)
+            if e <= s:
+                continue
+            events.append(self._event(s, (e - s).total_seconds(), status, project_id))
+        return events
+
+    def _event(self, start: datetime, duration: float, status: str,
+               project_id: Optional[int]) -> dict:
+        ev = {
+            "id": f"afk-inproc_{self._hostname}_{int(start.timestamp())}",
+            "timestamp": start.isoformat(),
+            "duration": round(duration, 2),
+            "bucket_id": f"bf-afk-inproc_{self._hostname}",
+            "bucket_type": BUCKET_TYPE_AFK,
+            "data": {"status": status, "synthetic": True},
+        }
+        if project_id is not None:
+            ev["project_id"] = project_id
+        return ev
