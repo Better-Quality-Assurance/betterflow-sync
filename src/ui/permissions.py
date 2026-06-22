@@ -35,15 +35,56 @@ _ALLOWED_TCC_SERVICES = frozenset({
 _BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,127}$")
 
 
+# AXError code: the Accessibility API is disabled for this process (i.e. NOT
+# granted). Any other result from an AXUIElement query means the AX subsystem
+# is servicing our requests = granted. From <HIServices/AXError.h>.
+_kAXErrorAPIDisabled = -25211
+
+
+def _ax_api_works() -> bool:
+    """Authoritative Accessibility test: exercise the real in-process AX API.
+
+    Asks the system-wide AX element for the focused application — the same
+    Accessibility machinery the window watcher relies on to read titles. If the
+    grant is present the call is serviced (success, or no-value when nothing is
+    focused); if it is absent macOS returns ``kAXErrorAPIDisabled``. This is the
+    only honest practical probe: it tests *this process's own* Accessibility
+    grant, and it succeeds even when ``AXIsProcessTrusted()`` returns a false
+    negative for unsigned x86_64 binaries under Rosetta.
+
+    Crucially it does NOT shell out to AppleScript/System Events — that path
+    only proves *Automation* permission, so after a reinstall dropped the AX
+    grant it reported Accessibility as present and the watcher silently emitted
+    empty titles with no re-prompt.
+    """
+    try:
+        from ApplicationServices import (
+            AXUIElementCopyAttributeValue,
+            AXUIElementCreateSystemWide,
+        )
+
+        system_wide = AXUIElementCreateSystemWide()
+        err, _value = AXUIElementCopyAttributeValue(
+            system_wide, "AXFocusedApplication", None,
+        )
+        return err != _kAXErrorAPIDisabled
+    except Exception as e:
+        logger.debug("AX system-wide probe failed: %s", e)
+        return False
+
+
 def check_accessibility() -> bool:
     """Check if Accessibility permission is granted.
 
-    Tries pyobjc ApplicationServices first (more reliable in PyInstaller
-    bundles), falls back to ctypes, then to a practical AppleScript test.
+    Tries pyobjc ``AXIsProcessTrusted`` first (most reliable in PyInstaller
+    bundles), falls back to ctypes, then confirms a negative with a real
+    in-process AX read (``_ax_api_works``).
 
-    The practical test is needed because AXIsProcessTrusted() can return
-    False for unsigned x86_64 PyInstaller binaries running under Rosetta
-    even when the System Settings toggle is ON.
+    The final AX read is needed because ``AXIsProcessTrusted()`` can return
+    False for unsigned x86_64 PyInstaller binaries running under Rosetta even
+    when the System Settings toggle is ON. It replaces a former AppleScript
+    probe that only exercised Automation permission and so falsely reported
+    Accessibility as granted after a signature change dropped the grant.
 
     Returns True on non-macOS platforms.
     """
@@ -73,21 +114,10 @@ def check_accessibility() -> bool:
     except Exception as e:
         logger.debug("ctypes AXIsProcessTrusted probe failed: %s", e)
 
-    # Practical test: try reading the frontmost app name via AppleScript.
-    # This actually exercises the Accessibility API and works even when
-    # AXIsProcessTrusted() lies (Rosetta/unsigned binary edge case).
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", 'tell application "System Events" to get name of first process whose frontmost is true'],
-            capture_output=True, text=True, timeout=3,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            logger.debug("AXIsProcessTrusted=False but AppleScript works, treating as granted")
-            return True
-    except Exception as e:
-        logger.debug("AppleScript accessibility probe failed: %s", e)
-
-    return False
+    # AXIsProcessTrusted() said False — confirm against the real AX API rather
+    # than trusting it (Rosetta false-negative) or AppleScript (Automation
+    # false-positive). This is the authoritative, watcher-matching test.
+    return _ax_api_works()
 
 
 def check_input_monitoring(prompt: bool = False) -> bool:
