@@ -18,11 +18,29 @@ _version_file = Path(SPECPATH) / "src" / "__init__.py"
 _version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', _version_file.read_text())
 APP_VERSION = _version_match.group(1) if _version_match else "0.0.0"
 
+# Resolve the human-facing release version (carries -beta.N/-rc.N from the tag,
+# so a prerelease build is distinguishable in the tray). APP_VERSION stays
+# numeric for CFBundleVersion; RELEASE_VERSION is display-only.
+import subprocess
+sys.path.insert(0, str(Path(SPECPATH) / "src"))
+from release_version import format_release_version
+try:
+    _git_tag = subprocess.run(
+        ["git", "describe", "--tags", "--exact-match"],
+        capture_output=True, text=True, cwd=str(SPECPATH),
+    ).stdout.strip()
+except Exception:
+    _git_tag = ""
+RELEASE_VERSION = format_release_version(
+    os.environ.get("GITHUB_REF_NAME", ""), _git_tag, APP_VERSION
+)
+
 # Stamp build metadata into _build_info.py
 _build_info = Path(SPECPATH) / "src" / "_build_info.py"
 _build_info.write_text(
     f'"""Build metadata - regenerated at build time."""\n\n'
     f'APP_VERSION = "{APP_VERSION}"\n'
+    f'RELEASE_VERSION = "{RELEASE_VERSION}"\n'
     f'BUILD_DATE = "{date.today().isoformat()}"\n'
 )
 
