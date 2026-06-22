@@ -34,22 +34,53 @@ class AfkSource:
         self._hostname = hostname
         self._input_watcher = input_watcher
         self._idle_clock = idle_clock
+        self._retention_seconds = float(retention_seconds)
         self._retention = timedelta(seconds=retention_seconds)
         self._lock = threading.Lock()
         # (sample_time, last_input_at)
         self._samples: deque = deque()
+        # Sticky platform-capability latch: a transient idle-clock read failure
+        # (e.g. a one-off `ioreg` timeout) must NOT revoke in-process mode for a
+        # cycle — that would hand billing back to the external tracker and flap
+        # the health telemetry. Once a read has ever succeeded the platform HAS
+        # the capability, so we stay latched on (audit finding A).
+        self._available_latched = False
+        # Consecutive idle-clock read failures, for blind-clock detection (audit
+        # finding E). Reset to 0 on any successful read.
+        self._consecutive_clock_failures = 0
 
     @property
     def samples(self) -> list:
         with self._lock:
             return list(self._samples)
 
+    @property
+    def retention_seconds(self) -> float:
+        return self._retention_seconds
+
+    @property
+    def consecutive_clock_failures(self) -> int:
+        return self._consecutive_clock_failures
+
+    @property
+    def bucket_id(self) -> str:
+        """The synthetic AFK bucket id this source uploads under. Single source
+        of truth so the upload (_event) and the checkpoint-commit gate agree."""
+        return f"bf-afk-inproc_{self._hostname}"
+
     def available(self) -> bool:
-        """True when the OS idle clock is readable on this platform."""
+        """True when the OS idle clock is (or has ever been) readable on this
+        platform. Sticky: once a read succeeds it stays True, so a transient
+        failure cannot flap in-process AFK off for a cycle (audit finding A)."""
+        if self._available_latched:
+            return True
         try:
-            return self._idle_clock() is not None
+            ok = self._idle_clock() is not None
         except Exception:
-            return False
+            ok = False
+        if ok:
+            self._available_latched = True
+        return ok
 
     def record_sample(self, now: datetime) -> None:
         """Observe activity at ``now`` and append (now, last_input_at). No-op when
@@ -58,9 +89,12 @@ class AfkSource:
             idle = self._idle_clock()
         except Exception as e:
             logger.debug("AfkSource idle clock failed: %s", e)
+            self._consecutive_clock_failures += 1
             return
         if idle is None:
+            self._consecutive_clock_failures += 1
             return
+        self._consecutive_clock_failures = 0
         last_input_at = now - timedelta(seconds=idle)
         # macOS in-process watcher holds the main app's grant — prefer it when
         # it reports a *more recent* input than the OS idle clock.
@@ -150,10 +184,14 @@ class AfkSource:
     def _event(self, start: datetime, duration: float, status: str,
                project_id: Optional[int]) -> dict:
         ev = {
-            "id": f"afk-inproc_{self._hostname}_{int(start.timestamp())}",
+            # Millisecond precision: two spans can legitimately start within the
+            # same whole second (an activity instant and a last_input+timeout
+            # boundary <1s apart); a second-truncated id would collide and the
+            # server upsert would drop one, under-billing (audit finding F).
+            "id": f"afk-inproc_{self._hostname}_{int(start.timestamp() * 1000)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
-            "bucket_id": f"bf-afk-inproc_{self._hostname}",
+            "bucket_id": self.bucket_id,
             "bucket_type": BUCKET_TYPE_AFK,
             "data": {"status": status, "synthetic": True},
         }

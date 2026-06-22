@@ -218,7 +218,15 @@ class SyncEngine:
         # sample log only retains ~2h, so a day-start rewind would re-emit afk over
         # a morning already billed correctly).
         self.afk_source = None
+        # Mutated only on the sync thread (record_sample / _build_inproc_afk /
+        # _commit_inproc_afk_checkpoint all run inside SyncEngine.sync()).
         self._afk_inproc_checkpoint: Optional[datetime] = None
+        # Proposed next checkpoint for the span built this cycle; committed by
+        # _commit_inproc_afk_checkpoint only after a confirmed send (finding B).
+        self._afk_inproc_pending: Optional[datetime] = None
+        # Blind-clock escalation latch + threshold (finding E).
+        self._inproc_blind_reported = False
+        self._INPROC_BLIND_THRESHOLD = 3
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -580,6 +588,9 @@ class SyncEngine:
 
         # Send events, then advance checkpoints per-bucket.
         self._send_and_advance_checkpoints(all_events, pending_checkpoints, stats)
+        # Commit the in-process AFK checkpoint only if its bucket wasn't queued
+        # (the send was confirmed) — otherwise rebuild it next cycle (finding B).
+        self._commit_inproc_afk_checkpoint(stats)
 
         # Process offline queue if we're online
         if self.bf.is_reachable() and not self.queue.is_empty():
@@ -1858,36 +1869,114 @@ class SyncEngine:
             and self.afk_source.available()
         )
 
+    @property
+    def inproc_afk_active(self) -> bool:
+        """Public view of the per-cycle in-process-AFK decision, so the app can
+        keep aw_manager's flag (which drives the idle-tracker watchdog + health
+        telemetry) reconciled with what the sync engine actually does (A)."""
+        return self._inproc_afk_active()
+
     def _should_skip_external_afk(self) -> bool:
         """Whether to drop the external bf-idle-tracker bucket from this cycle's
         upload (because the agent uploads its own AFK stream instead)."""
         return self._inproc_afk_active()
 
     def _build_inproc_afk(self, now: datetime) -> list[dict]:
-        """Build in-process AFK events for [checkpoint, now] and advance the
-        checkpoint. First cycle just seeds the checkpoint at `now` (we only
-        account for time while running). Returns [] when not active."""
+        """Build in-process AFK events for [checkpoint, now]. First cycle seeds
+        the checkpoint at `now` (we only account for time while running). The
+        checkpoint is NOT advanced here — it is committed by
+        ``_commit_inproc_afk_checkpoint`` only once the send succeeds, so a
+        terminal send failure can't lose a span (audit finding B). Returns []
+        when not active."""
         if not self._inproc_afk_active():
             return []
-        if self._afk_inproc_checkpoint is None:
+        cp = self._afk_inproc_checkpoint
+        if cp is None:
             self._afk_inproc_checkpoint = now
             return []
+
+        # Re-seed rather than reconstruct when the checkpoint can't be trusted:
+        #  - now < cp: the wall clock stepped backward (NTP/manual). Without this
+        #    the finalize guard below would stall the stream forever (D).
+        #  - gap > retention: a pause/sleep froze the checkpoint while samples
+        #    were pruned (2h). Reconstructing over an unsampled multi-hour window
+        #    would mis-bill; the unobserved span is simply left uncovered (C).
+        gap = (now - cp).total_seconds()
+        if now < cp or gap > self.afk_source.retention_seconds:
+            logger.info(
+                "in-process AFK: re-seeding checkpoint (gap %.0fs) — not billing "
+                "the unobserved window", gap,
+            )
+            self._afk_inproc_checkpoint = now
+            self._afk_inproc_pending = None
+            return []
+
+        # Blind clock: the OS idle clock has failed for several consecutive
+        # cycles, so there are no fresh samples. finalize_point would backdate
+        # the whole un-observed span as afk — billing real work as idle. Hold the
+        # checkpoint and surface it to ops instead (audit finding E). When the
+        # clock recovers, fresh samples resume and the held span bills correctly.
+        if self.afk_source.consecutive_clock_failures >= self._INPROC_BLIND_THRESHOLD:
+            if not self._inproc_blind_reported:
+                self._inproc_blind_reported = True
+                self._report_inproc_blind(self.afk_source.consecutive_clock_failures)
+            return []
+        self._inproc_blind_reported = False
+
         # Only finalize up to the point whose afk classification is settled. While
         # the user is within the timeout of their last input, the trailing region
         # is still pending (could go not-afk or afk), so it waits for a later cycle
         # — otherwise we'd commit it not-afk and be unable to flip it to afk if they
         # stay idle past the timeout.
         finalize_to = self.afk_source.finalize_point(now)
-        if finalize_to <= self._afk_inproc_checkpoint:
+        if finalize_to <= cp:
             return []
         with self._state_lock:
             project = self._current_project
         events = self.afk_source.build_afk_events(
-            self._afk_inproc_checkpoint, finalize_to,
+            cp, finalize_to,
             project_id=project["id"] if project else None,
         )
-        self._afk_inproc_checkpoint = finalize_to
+        # Defer the checkpoint advance to _commit_inproc_afk_checkpoint (finding B).
+        self._afk_inproc_pending = finalize_to
         return events
+
+    def _commit_inproc_afk_checkpoint(self, stats: SyncStats) -> None:
+        """Advance the in-process AFK checkpoint past the just-built span, but
+        only if its bucket wasn't queued (the send succeeded). On a queued/failed
+        send we leave the checkpoint where it was so the next cycle rebuilds the
+        same span from samples — the synthetic ids are stable, so a later queue
+        drain + the rebuild upsert idempotently. Unlike AW buckets, the
+        in-process stream has no source to re-fetch from, so advancing before a
+        confirmed send risks permanent loss on terminal queue failure (B)."""
+        pending = self._afk_inproc_pending
+        if pending is None:
+            return
+        inproc_bucket = self.afk_source.bucket_id
+        if inproc_bucket not in stats.queued_bucket_ids:
+            self._afk_inproc_checkpoint = pending
+        self._afk_inproc_pending = None
+
+    def _report_inproc_blind(self, failures: int) -> None:
+        """Surface a blind in-process idle clock to the ops ingest. Logged-only
+        clock failures are invisible until billing is already wrong; the
+        error_reporter is the channel an admin can see (audit finding E)."""
+        logger.warning(
+            "in-process AFK idle clock blind for %d consecutive cycles — holding "
+            "checkpoint; active time may be under-counted until it recovers",
+            failures,
+        )
+        if self.error_reporter is None:
+            return
+        try:
+            self.error_reporter.capture(
+                f"In-process AFK idle clock blind for {failures} consecutive cycles",
+                level="warning",
+                tags={"component": "inproc-afk"},
+                fingerprint="inproc-afk-blind",
+            )
+        except Exception:
+            logger.debug("inproc-afk-blind report failed", exc_info=True)
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow, grouped by bucket (#4 decouple buckets).
