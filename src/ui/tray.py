@@ -20,23 +20,31 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional, TypedDict
 
 try:
-    from .._build_info import APP_VERSION as _APP_VERSION, BUILD_DATE  # module execution
+    from .. import _build_info as _bi  # module execution
+    _APP_VERSION = _bi.APP_VERSION
+    BUILD_DATE = _bi.BUILD_DATE
+    # RELEASE_VERSION carries any -beta.N/-rc.N suffix; getattr keeps us working
+    # against an older bundle stamped before the field existed.
+    _RELEASE_VERSION = getattr(_bi, "RELEASE_VERSION", _APP_VERSION)
 except ImportError:
     try:
         import _build_info as _bi  # PyInstaller bundle (src/ is root, no parent package)
         _APP_VERSION = _bi.APP_VERSION
         BUILD_DATE = _bi.BUILD_DATE
+        _RELEASE_VERSION = getattr(_bi, "RELEASE_VERSION", _APP_VERSION)
     except ImportError:
         try:
             from .. import __version__ as _APP_VERSION
         except ImportError:
             _APP_VERSION = "unknown"
         BUILD_DATE = "dev"
+        _RELEASE_VERSION = _APP_VERSION
 
 # Tray hover tooltip base. Surfaces the running version on hover even when the
 # icon sits in the Windows hidden-icons overflow, where the right-click menu
-# (and its Preferences > version item) isn't reachable.
-_BASE_TOOLTIP = f"BetterFlow v{_APP_VERSION}"
+# (and its Preferences > version item) isn't reachable. Uses the release version
+# so a beta hover reads "BetterFlow v1.5.68-beta.1".
+_BASE_TOOLTIP = f"BetterFlow v{_RELEASE_VERSION}"
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -730,7 +738,7 @@ class TrayIcon:
         else:
             pref_items.append(Item("Check for Update", self._handle_check_update))
 
-        pref_items.append(Item(f"v{_APP_VERSION} ({BUILD_DATE})", None, enabled=False))
+        pref_items.append(Item(f"v{_RELEASE_VERSION} ({BUILD_DATE})", None, enabled=False))
 
         items.append(Item("Preferences", pystray.Menu(*pref_items), enabled=logged_in))
 
