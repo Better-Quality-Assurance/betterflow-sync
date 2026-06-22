@@ -521,7 +521,13 @@ class TestBetterFlowClient:
         assert self.client._throttle_remaining() == 0.0
 
         self.client._enter_throttle(10)
-        assert 8 < self.client._throttle_remaining() <= 10
+        # Upper bound tolerates a float epsilon: _throttle_remaining computes
+        # (monotonic() + 10) - monotonic(), and on a coarse clock (Windows
+        # returns the same value for both reads) float cancellation can land a
+        # hair above 10 (e.g. 10.000000000000028). Only the _MAX_THROTTLE_SECONDS
+        # cap is a hard invariant (clamped in _throttle_remaining); 10 is just
+        # this call's input, so allow the rounding slack.
+        assert 8 < self.client._throttle_remaining() <= 10 + 1e-6
 
         # A shorter backoff must NOT shrink an active longer one.
         self.client._enter_throttle(1)

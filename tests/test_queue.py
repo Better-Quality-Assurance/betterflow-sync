@@ -152,6 +152,57 @@ class TestOfflineQueue:
         loaded = self.queue.get_checkpoint(bucket_id)
         assert loaded.replace(microsecond=0) == new_time.replace(microsecond=0)
 
+    def test_checkpoint_forward_advances_on_newer(self):
+        """set_checkpoint_forward moves the checkpoint forward (#5a)."""
+        bucket_id = "aw-watcher-window_test"
+        old_time = datetime.now(timezone.utc) - timedelta(hours=1)
+        new_time = datetime.now(timezone.utc)
+
+        self.queue.set_checkpoint_forward(bucket_id, old_time)
+        self.queue.set_checkpoint_forward(bucket_id, new_time)
+
+        loaded = self.queue.get_checkpoint(bucket_id)
+        assert loaded.replace(microsecond=0) == new_time.replace(microsecond=0)
+
+    def test_checkpoint_forward_is_noop_on_older(self):
+        """set_checkpoint_forward never rewinds a checkpoint backward (#5a).
+
+        Guards the doc's "silently re-scan from a 2-day-old checkpoint" class:
+        a lookback re-fetch whose last event end predates the stored checkpoint
+        must not drag it back.
+        """
+        bucket_id = "aw-watcher-window_test"
+        new_time = datetime.now(timezone.utc)
+        old_time = new_time - timedelta(days=2)
+
+        self.queue.set_checkpoint_forward(bucket_id, new_time)
+        self.queue.set_checkpoint_forward(bucket_id, old_time)  # must be ignored
+
+        loaded = self.queue.get_checkpoint(bucket_id)
+        assert loaded.replace(microsecond=0) == new_time.replace(microsecond=0)
+
+    def test_checkpoint_forward_seeds_when_absent(self):
+        """First forward write creates the row (no existing checkpoint)."""
+        bucket_id = "aw-watcher-window_test"
+        ts = datetime.now(timezone.utc)
+
+        self.queue.set_checkpoint_forward(bucket_id, ts)
+
+        loaded = self.queue.get_checkpoint(bucket_id)
+        assert loaded is not None
+        assert loaded.replace(microsecond=0) == ts.replace(microsecond=0)
+
+    def test_checkpoint_forward_equal_is_noop(self):
+        """An equal timestamp is not 'forward' — keeps the stored event_id."""
+        bucket_id = "aw-watcher-window_test"
+        ts = datetime(2026, 6, 20, 10, 0, 0, tzinfo=timezone.utc)
+
+        self.queue.set_checkpoint_forward(bucket_id, ts, event_id=1)
+        self.queue.set_checkpoint_forward(bucket_id, ts, event_id=2)
+
+        loaded = self.queue.get_checkpoint(bucket_id)
+        assert loaded.replace(microsecond=0) == ts.replace(microsecond=0)
+
     def test_get_nonexistent_checkpoint(self):
         """Test getting a checkpoint that doesn't exist."""
         loaded = self.queue.get_checkpoint("nonexistent_bucket")

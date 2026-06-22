@@ -506,6 +506,39 @@ class OfflineQueue:
                 (bucket_id, event_id, timestamp.isoformat(), now),
             )
 
+    def set_checkpoint_forward(
+        self, bucket_id: str, timestamp: datetime, event_id: Optional[int] = None
+    ) -> None:
+        """Advance a bucket's checkpoint, but only forward (monotonic).
+
+        Identical to ``set_checkpoint`` except the write is a no-op when the
+        bucket already has a checkpoint at or after ``timestamp``. The guard is
+        a ``WHERE`` on the existing row inside a single statement, so two sync
+        threads can't race a checkpoint backward (no read-then-write). Use this
+        on the normal per-cycle advance path; reserve the raw ``set_checkpoint``
+        for intentional resets (first-sync seed, pause skip-forward).
+
+        The comparison is lexical on the stored ISO-8601 strings. Every writer
+        passes a tz-aware UTC datetime (``isoformat()`` -> ``...+00:00``), so the
+        fixed-width prefix compares chronologically; sub-second format
+        differences only ever bias toward NOT rewinding, which is the safe
+        direction.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO sync_checkpoints (bucket_id, last_event_id, last_timestamp, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(bucket_id) DO UPDATE SET
+                    last_event_id = excluded.last_event_id,
+                    last_timestamp = excluded.last_timestamp,
+                    updated_at = excluded.updated_at
+                WHERE excluded.last_timestamp > sync_checkpoints.last_timestamp
+                """,
+                (bucket_id, event_id, timestamp.isoformat(), now),
+            )
+
     def get_all_checkpoints(self) -> dict[str, datetime]:
         """Get all sync checkpoints."""
         with self._cursor() as cursor:

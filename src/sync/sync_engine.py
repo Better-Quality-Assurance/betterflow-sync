@@ -690,17 +690,17 @@ class SyncEngine:
             if stats.events_queued == pre_queued:
                 # Full success — advance all checkpoints
                 for bucket_id, ts, event_id in pending_checkpoints:
-                    self.queue.set_checkpoint(bucket_id, ts, event_id)
+                    self.queue.set_checkpoint_forward(bucket_id, ts, event_id)
             else:
                 # Partial failure — advance only buckets whose events
                 # were all sent (none queued).
                 for bucket_id, ts, event_id in pending_checkpoints:
                     if bucket_id not in stats.queued_bucket_ids:
-                        self.queue.set_checkpoint(bucket_id, ts, event_id)
+                        self.queue.set_checkpoint_forward(bucket_id, ts, event_id)
         elif pending_checkpoints:
             # All events were dedup-filtered (already sent); safe to advance.
             for bucket_id, ts, event_id in pending_checkpoints:
-                self.queue.set_checkpoint(bucket_id, ts, event_id)
+                self.queue.set_checkpoint_forward(bucket_id, ts, event_id)
 
     @staticmethod
     def _local_day_iso() -> str:
@@ -947,7 +947,7 @@ class SyncEngine:
         # checkpoint): advance past it so we don't re-poll the same empty span
         # forever while a backlog waits beyond it.
         if not events and fetch_end < now:
-            self.queue.set_checkpoint(bucket_id, fetch_end)
+            self.queue.set_checkpoint_forward(bucket_id, fetch_end)
             return [], lookback_start
 
         if len(events) > self.config.sync.batch_size:
@@ -1890,7 +1890,43 @@ class SyncEngine:
         return events
 
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
-        """Send events to BetterFlow or queue if offline."""
+        """Send events to BetterFlow, grouped by bucket (#4 decouple buckets).
+
+        Each bucket's events are batched and sent in their own sequence so a
+        transient failure in one bucket (e.g. a frozen/duplicate AFK stream)
+        re-queues and back-off-marks ONLY that bucket. Previously all buckets
+        shared one batch list, so a single transient failure with no
+        ``accepted_ids`` re-queued the whole mixed batch and tainted every
+        bucket's ``queued_bucket_ids`` — withholding the window checkpoint over
+        an unrelated AFK failure. Grouping confines the blast radius to the
+        failing bucket; ``_send_and_advance_checkpoints`` then advances the
+        healthy buckets normally.
+        """
+        # Preserve insertion order (dict is ordered in 3.7+) so behaviour is
+        # deterministic and single-bucket cycles are unchanged.
+        by_bucket: dict[str, list[dict]] = {}
+        for event in events:
+            by_bucket.setdefault(event.get("bucket_id", ""), []).append(event)
+
+        bucket_groups = list(by_bucket.values())
+        for idx, group in enumerate(bucket_groups):
+            try:
+                self._send_bucket_events(group, stats)
+            except BetterFlowAuthError:
+                # A 401 means the server rejected the request — every bucket not
+                # yet attempted is also unsent. Queue them all before
+                # propagating so nothing is silently dropped (the per-bucket
+                # handler already queued this bucket's remaining batches).
+                for remaining in bucket_groups[idx + 1:]:
+                    self.queue.enqueue(remaining)
+                    stats.events_queued += len(remaining)
+                    stats.queued_bucket_ids.update(
+                        e.get("bucket_id", "") for e in remaining
+                    )
+                raise
+
+    def _send_bucket_events(self, events: list[dict], stats: SyncStats) -> None:
+        """Batch and send a single bucket's events (or queue on failure)."""
         # Batch events
         batch_size = self.config.sync.batch_size
         batches = [events[i : i + batch_size] for i in range(0, len(events), batch_size)]
