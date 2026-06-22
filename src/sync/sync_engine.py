@@ -321,7 +321,13 @@ class SyncEngine:
     def resume(self) -> None:
         """Resume syncing."""
         with self._state_lock:
+            was_paused = self._paused
             self._paused = False
+        # Skip the window AW recorded while paused — otherwise the next sync
+        # re-fetches it (the fetch is "since checkpoint", so the enter-time
+        # advance to pause-START doesn't cover it). See Lucian, 2026-06-22.
+        if was_paused:
+            self._advance_checkpoints_to_now("resume")
 
     @property
     def is_paused(self) -> bool:
@@ -359,6 +365,12 @@ class SyncEngine:
         if entering_private:
             self._advance_checkpoints_to_now("private_time")
         if leaving_private and private_start_snap:
+            # Skip the private window AW recorded (active window + not-afk while
+            # the user kept working). The enter-time advance set checkpoints to
+            # private-START, and the fetch is "since checkpoint", so without this
+            # leave-time advance the whole private hour re-syncs and bills as
+            # ACTIVE — the exact bug Lucian hit on 2026-06-22.
+            self._advance_checkpoints_to_now("private_time_end")
             self._send_private_time_event(private_start_snap)
         if need_end_session:
             try:
@@ -2387,9 +2399,22 @@ class SyncEngine:
         """Fast-forward all known watcher checkpoints to now.
 
         This prevents buffered events collected while paused/private from being
-        uploaded when syncing resumes.
+        uploaded when syncing resumes. Called on BOTH the enter and the leave of
+        a pause/private window — the leave call is the one that skips the window
+        AW just recorded (the enter call only drops pre-window buffered events).
         """
         now = datetime.now(timezone.utc)
+
+        # The in-process AFK stream keeps its own checkpoint (not an AW bucket),
+        # so advance it here too — otherwise the next _build_inproc_afk
+        # reconstructs the paused/private window and bills it (Lucian,
+        # 2026-06-22). Done first + unconditionally (independent of the AW bucket
+        # fetch below). Forward-only: `now` is always >= the checkpoint here, so
+        # this never rewinds the stream.
+        if self._afk_inproc_checkpoint is not None:
+            self._afk_inproc_checkpoint = now
+        self._afk_inproc_pending = None
+
         bucket_ids: set[str] = set()
 
         def _collect(fetcher) -> None:
