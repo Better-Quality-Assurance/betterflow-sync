@@ -784,6 +784,7 @@ class SyncCoordinator:
         Several callees already self-guard but tray.tick_clock() does not.
         """
         for fn, label in (
+            (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
             (self._liveness_heartbeat, "liveness_heartbeat"),
@@ -801,6 +802,16 @@ class SyncCoordinator:
                 self.reminder_manager.check()
             except Exception as e:
                 logger.warning("_tick_60s/reminders failed: %s", e)
+
+    def _reconcile_inproc_afk_flag(self) -> None:
+        """Keep aw_manager's in-process-AFK flag in step with the sync engine's
+        actual per-cycle decision. The flag gates the idle-tracker watchdog and
+        the AFK health telemetry; it was set once at startup, so without this it
+        could diverge from what the engine actually does (audit finding A)."""
+        eng = self.coordinator.sync_engine
+        if eng.afk_source is None:
+            return
+        self.coordinator.aw_manager.set_inproc_afk_active(eng.inproc_afk_active)
 
     def _check_idle_status(self) -> None:
         self.idle_mgr.check_idle_status(
