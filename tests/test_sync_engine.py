@@ -1,17 +1,18 @@
 """Tests for sync engine."""
 
 import threading
-import pytest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
-from src.config import Config, PrivacySettings
-from src.sync.aw_client import AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT
-from src.sync.sync_engine import SyncEngine, _SyncCycleContext
-from src.sync.activity_analyzer import ActivityAnalyzer
-from src.sync.daily_time_tracker import DailyTimeTracker
+import pytest
+
+from src.config import Config
 from src.main import SyncCoordinator
 from src.reminders import ReminderManager
+from src.sync.activity_analyzer import ActivityAnalyzer
+from src.sync.aw_client import BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT, BUCKET_TYPE_WINDOW, AWEvent
+from src.sync.daily_time_tracker import DailyTimeTracker
+from src.sync.sync_engine import SyncEngine, _SyncCycleContext
 from src.ui.tray import TrayState
 
 
@@ -1047,6 +1048,124 @@ class TestSyncEngine:
         # _cache_lock should have been acquired for _time_cache operations
         # _transform_event accesses _time_cache when activity_state is "active"
         assert acquire_count >= 1, f"Expected >= 1 lock acquisition for _time_cache, got {acquire_count}"
+
+
+class TestSendEventsDecoupleBuckets:
+    """#4: a transient failure in one bucket must not taint another."""
+
+    def setup_method(self):
+        self.aw = Mock()
+        self.bf = Mock()
+        self.queue = Mock()
+        self.queue.get_checkpoint.return_value = None
+        self.config = Config()
+        self.engine = SyncEngine(
+            aw=self.aw,
+            bf=self.bf,
+            queue=self.queue,
+            config=self.config,
+            activity_analyzer=Mock(spec=ActivityAnalyzer),
+            time_tracker=Mock(spec=DailyTimeTracker),
+        )
+
+    @staticmethod
+    def _ev(bucket_id, eid):
+        return {"id": f"{bucket_id}_{eid}", "bucket_id": bucket_id, "duration": 60}
+
+    def test_afk_failure_does_not_taint_window(self):
+        """AFK send fails transiently; window send succeeds → only AFK is
+        queued/back-off-marked. Previously the mixed batch re-queued both."""
+        from src.sync.bf_client import SyncResult
+        from src.sync.sync_engine import SyncStats
+
+        def fake_send(batch):
+            if any("afk" in e.get("bucket_id", "") for e in batch):
+                return SyncResult(success=False, error="transient failure")
+            return SyncResult(success=True, events_synced=len(batch))
+
+        self.bf.send_events.side_effect = fake_send
+
+        events = [
+            self._ev("aw-watcher-window_host", 1),
+            self._ev("bf-afk-inproc_host", 2),
+            self._ev("aw-watcher-window_host", 3),
+        ]
+        stats = SyncStats()
+        self.engine._send_events(events, stats)
+
+        # Only the AFK bucket is queued/tainted.
+        assert "bf-afk-inproc_host" in stats.queued_bucket_ids
+        assert "aw-watcher-window_host" not in stats.queued_bucket_ids
+        # Exactly the two AFK events were enqueued, window events were not.
+        enqueued = [e for call in self.queue.enqueue.call_args_list for e in call.args[0]]
+        assert {e["id"] for e in enqueued} == {"bf-afk-inproc_host_2"}
+        assert stats.events_queued == 1
+        assert stats.events_sent == 2
+
+    def test_no_batch_mixes_buckets(self):
+        """Each send_events call carries a single bucket's events only."""
+        from src.sync.bf_client import SyncResult
+        from src.sync.sync_engine import SyncStats
+
+        self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
+        events = [
+            self._ev("aw-watcher-window_host", 1),
+            self._ev("bf-afk-inproc_host", 2),
+            self._ev("aw-watcher-input_host", 3),
+        ]
+        self.engine._send_events(events, SyncStats())
+
+        for call in self.bf.send_events.call_args_list:
+            buckets = {e["bucket_id"] for e in call.args[0]}
+            assert len(buckets) == 1, f"batch mixed buckets: {buckets}"
+
+    def test_single_bucket_transient_failure_unchanged(self):
+        """Regression: a single-bucket cycle still queues that whole bucket."""
+        from src.sync.bf_client import SyncResult
+        from src.sync.sync_engine import SyncStats
+
+        self.bf.send_events.return_value = SyncResult(success=False, error="down")
+        events = [self._ev("aw-watcher-window_host", i) for i in range(3)]
+        stats = SyncStats()
+        self.engine._send_events(events, stats)
+
+        assert stats.queued_bucket_ids == {"aw-watcher-window_host"}
+        assert stats.events_queued == 3
+        assert stats.events_sent == 0
+
+    def test_afk_failure_advances_window_checkpoint(self):
+        """End-to-end goal: with AFK failing and window succeeding, the window
+        checkpoint advances while the AFK checkpoint is withheld. This is the
+        actual decouple win — exercises _send_and_advance_checkpoints, not just
+        _send_events."""
+        from src.sync.bf_client import SyncResult
+        from src.sync.sync_engine import SyncStats
+
+        def fake_send(batch):
+            if any("afk" in e.get("bucket_id", "") for e in batch):
+                return SyncResult(success=False, error="transient failure")
+            return SyncResult(success=True, events_synced=len(batch))
+
+        self.bf.send_events.side_effect = fake_send
+
+        win_ts = datetime(2026, 6, 22, 10, 0, 0, tzinfo=timezone.utc)
+        afk_ts = datetime(2026, 6, 22, 10, 0, 5, tzinfo=timezone.utc)
+        all_events = [
+            self._ev("aw-watcher-window_host", 1),
+            self._ev("bf-afk-inproc_host", 2),
+        ]
+        pending = [
+            ("aw-watcher-window_host", win_ts, 1),
+            ("bf-afk-inproc_host", afk_ts, 2),
+        ]
+        stats = SyncStats()
+        self.engine._send_and_advance_checkpoints(all_events, pending, stats)
+
+        advanced = {
+            call.args[0] for call in self.queue.set_checkpoint_forward.call_args_list
+        }
+        assert "aw-watcher-window_host" in advanced  # healthy bucket advances
+        assert "bf-afk-inproc_host" not in advanced  # failed bucket withheld
 
 
 class TestStatusSpanEvents:
