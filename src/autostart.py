@@ -71,6 +71,27 @@ def _plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHAGENT_LABEL}.plist"
 
 
+def _macos_plist_program_args() -> Optional[list[str]]:
+    """ProgramArguments from the installed plist, or None if missing/unreadable."""
+    import plistlib
+
+    try:
+        with open(_plist_path(), "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None
+    args = data.get("ProgramArguments")
+    return [str(a) for a in args] if isinstance(args, list) else None
+
+
+def _macos_plist_is_current() -> bool:
+    """True only if the installed plist launches the CURRENT app. A plist left
+    over from a rename/move ("BetterFlow Sync.app" -> "BetterFlow.app", or a
+    relocated bundle) is still "loaded" but launches nothing — it must read as
+    not-current so ensure_synced() rewrites it on the next startup."""
+    return _macos_plist_program_args() == _app_launch_args()
+
+
 def _app_launch_args() -> list[str]:
     """Determine the correct launch command for the current execution context."""
     exe = sys.executable
@@ -156,6 +177,11 @@ def _set_macos(enabled: bool) -> bool:
 
 def _get_macos() -> bool:
     if not _plist_path().exists():
+        return False
+    # A stale plist (points at a renamed/moved app) is "loaded" but launches
+    # nothing. Treat it as not-enabled so ensure_synced() rewrites it with the
+    # current app path instead of leaving auto-start silently broken.
+    if not _macos_plist_is_current():
         return False
     # Confirm it's actually loaded with launchd, not just present on disk.
     rc, _ = _launchctl(["print", f"{_launchctl_domain()}/{LAUNCHAGENT_LABEL}"])
