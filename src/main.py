@@ -148,9 +148,10 @@ class SyncCoordinator:
         # Single source of truth for the in-process-AFK flag: the engine publishes
         # its per-cycle decision straight to aw_manager on the path where the
         # decision is made. The 60s _reconcile_inproc_afk_flag below is now only a
-        # backstop for paused periods (when the sync cycle doesn't run). Before
-        # this the timer was the ONLY writer — and it silently died for a whole
-        # release in Bug A (#76/#78), leaving the flag stale.
+        # backstop for cycles that don't reach that decision point (paused/private,
+        # AW down, bucket-fetch error). Before this the timer was the ONLY writer —
+        # and it silently died for a whole release in Bug A (#76/#78), leaving the
+        # flag stale.
         self.sync_engine.inproc_afk_flag_sink = self.aw_manager.set_inproc_afk_active
 
         # _tick_60s sub-tasks each run under a try/except so one failure can't kill
