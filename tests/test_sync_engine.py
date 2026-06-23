@@ -483,6 +483,26 @@ class TestSyncEngine:
         self.bf.upload_logs.assert_called_once()
         self.engine.error_reporter.capture.assert_not_called()
 
+    def test_heartbeat_below_min_version_triggers_update(self):
+        """When the server advertises a minimum_agent_version above ours, the
+        heartbeat fires on_update_required so the handler can stage the build —
+        the fleet-push lever (not just a log line)."""
+        self.bf.heartbeat.return_value = {
+            "success": True, "data": {"minimum_agent_version": "999.0.0"},
+        }
+        self.engine.on_update_required = MagicMock()
+        self.engine._send_heartbeat()
+        self.engine.on_update_required.assert_called_once_with("999.0.0")
+
+    def test_heartbeat_at_or_above_min_version_does_not_trigger(self):
+        """An up-to-date agent must not be told to update."""
+        self.bf.heartbeat.return_value = {
+            "success": True, "data": {"minimum_agent_version": "0.0.1"},
+        }
+        self.engine.on_update_required = MagicMock()
+        self.engine._send_heartbeat()
+        self.engine.on_update_required.assert_not_called()
+
     def test_dropped_queue_events_are_reported_to_ops(self):
         """Events that exhaust their retries and get dropped are permanent data
         loss (captured activity the server never accepted). With the server now

@@ -209,6 +209,12 @@ class SyncEngine:
         # channel) breaks that circular blindness. This is exactly why Windows
         # wedges were undiagnosable. None / errors tolerated.
         self.error_reporter = None
+        # Optional callback (set by BetterFlowApp → UpdateHandler) invoked with
+        # the server's advertised minimum version when this agent is below it.
+        # It stages the latest build and applies on next idle, so an urgent fix
+        # reaches the fleet in minutes instead of waiting for the 6h periodic
+        # check. None / errors tolerated — never let it break the heartbeat.
+        self.on_update_required: Optional[Callable[[str], None]] = None
         # Optional in-process AFK source (set by the SyncCoordinator). When
         # present, enabled by config, and the OS idle clock is readable, the
         # agent uploads its own AFK stream and ignores the external bf-idle-tracker
@@ -2260,6 +2266,15 @@ class SyncEngine:
                 logger.warning(
                     f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
                 )
+                # Act on it, don't just log: stage the latest build now (applied
+                # on next idle) so a server-pushed urgent fix lands in minutes
+                # instead of waiting up to 6h for the periodic check. The handler
+                # throttles itself so the 5-min heartbeat won't re-download.
+                if self.on_update_required is not None:
+                    try:
+                        self.on_update_required(min_version)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("on_update_required failed: %s", e)
 
             # Clock skew detection: compare server time with local time
             server_time_str = payload.get("server_time")

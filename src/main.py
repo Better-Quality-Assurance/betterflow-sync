@@ -1343,6 +1343,9 @@ class BetterFlowApp:
 
         # Sub-handlers
         self.update_handler = UpdateHandler(self.tray, self.config, self.coordinator, _VERSION)
+        # Let a server-advertised minimum version (heartbeat) push an update:
+        # the sync engine sees the floor, the handler stages + applies on idle.
+        self.sync_engine.on_update_required = self.update_handler.trigger_remote_update
         self.sys_events = SystemEventHandler(
             sync_engine=self.sync_engine,
             tray=self.tray,
