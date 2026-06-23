@@ -382,6 +382,43 @@ class OfflineQueue:
                 event_ids,
             )
 
+    def failed_event_summary(self, max_retries: int = 5) -> dict:
+        """Summarize events at/over the retry ceiling that remove_failed() is
+        about to drop. Read-only — does NOT delete.
+
+        Dropping queued events is permanent data loss (activity captured locally
+        that the server never accepted). It used to be a bare log line nobody
+        sees; this lets the caller surface it to the ops error channel instead.
+        Returns {count, bucket_ids, oldest, newest} — empty count 0 when clean.
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT event_data FROM queued_events WHERE retry_count >= ?",
+                (max_retries,),
+            )
+            rows = cursor.fetchall()
+
+        bucket_ids: set[str] = set()
+        timestamps: list[str] = []
+        for row in rows:
+            try:
+                ev = json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            bid = ev.get("bucket_id")
+            if bid:
+                bucket_ids.add(str(bid))
+            ts = ev.get("timestamp")
+            if ts:
+                timestamps.append(str(ts))
+        timestamps.sort()
+        return {
+            "count": len(rows),
+            "bucket_ids": sorted(bucket_ids),
+            "oldest": timestamps[0] if timestamps else None,
+            "newest": timestamps[-1] if timestamps else None,
+        }
+
     def remove_failed(self, max_retries: int = 5) -> int:
         """Remove events that have exceeded max retries.
 

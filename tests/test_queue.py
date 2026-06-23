@@ -99,10 +99,41 @@ class TestOfflineQueue:
         for _ in range(5):
             self.queue.increment_retry([q.id for q in queued])
 
+        # Before removal, the about-to-drop events are summarized for ops
+        # (read-only — must not delete them).
+        summary = self.queue.failed_event_summary(max_retries=5)
+        assert summary["count"] == 1
+        assert self.queue.size() == 1, "failed_event_summary must not delete"
+
         removed = self.queue.remove_failed(max_retries=5)
 
         assert removed == 1
         assert self.queue.is_empty()
+
+    def test_failed_event_summary_reports_buckets_and_span(self):
+        """The drop summary carries enough to diagnose the loss: count, the
+        distinct bucket_ids affected, and the oldest/newest event timestamps."""
+        events = [
+            {"id": "e1", "bucket_id": "aw-watcher-window_h", "timestamp": "2026-06-23T05:00:00Z", "data": {}},
+            {"id": "e2", "bucket_id": "aw-watcher-afk_h", "timestamp": "2026-06-23T05:10:00Z", "data": {}},
+        ]
+        self.queue.enqueue(events)
+        queued = self.queue.dequeue(batch_size=10)
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+
+        summary = self.queue.failed_event_summary(max_retries=5)
+
+        assert summary["count"] == 2
+        assert summary["bucket_ids"] == ["aw-watcher-afk_h", "aw-watcher-window_h"]
+        assert summary["oldest"] == "2026-06-23T05:00:00Z"
+        assert summary["newest"] == "2026-06-23T05:10:00Z"
+
+    def test_failed_event_summary_clean_queue(self):
+        """No events past the ceiling → count 0, empty fields."""
+        self.queue.enqueue([{"id": "fresh", "timestamp": "2026-06-23T05:00:00Z", "data": {}}])
+        summary = self.queue.failed_event_summary(max_retries=5)
+        assert summary == {"count": 0, "bucket_ids": [], "oldest": None, "newest": None}
 
     def test_max_size_enforcement(self):
         """Test that queue enforces max size."""

@@ -483,6 +483,44 @@ class TestSyncEngine:
         self.bf.upload_logs.assert_called_once()
         self.engine.error_reporter.capture.assert_not_called()
 
+    def test_dropped_queue_events_are_reported_to_ops(self):
+        """Events that exhaust their retries and get dropped are permanent data
+        loss (captured activity the server never accepted). With the server now
+        confirming delivery per-event, anything reaching the ceiling is a genuine
+        rejection — it must surface to ops, not vanish behind a local log line."""
+        from src.sync.sync_engine import SyncStats
+        self.queue.failed_event_summary.return_value = {
+            "count": 3,
+            "bucket_ids": ["aw-watcher-window_host"],
+            "oldest": "2026-06-23T05:00:00Z",
+            "newest": "2026-06-23T05:10:00Z",
+        }
+        self.queue.dequeue.return_value = []  # nothing left to drain
+        self.engine.error_reporter = MagicMock()
+
+        self.engine._process_queue(SyncStats())
+
+        self.engine.error_reporter.capture.assert_called_once()
+        msg = self.engine.error_reporter.capture.call_args[0][0]
+        assert "Dropped 3 queued event" in msg
+        assert self.engine.error_reporter.capture.call_args.kwargs["fingerprint"] == (
+            "offline-queue-events-dropped"
+        )
+        self.queue.remove_failed.assert_called_once_with(max_retries=5)
+
+    def test_no_dropped_events_does_not_report(self):
+        """A clean queue (nothing past the retry ceiling) must not fire a report."""
+        from src.sync.sync_engine import SyncStats
+        self.queue.failed_event_summary.return_value = {
+            "count": 0, "bucket_ids": [], "oldest": None, "newest": None,
+        }
+        self.queue.dequeue.return_value = []
+        self.engine.error_reporter = MagicMock()
+
+        self.engine._process_queue(SyncStats())
+
+        self.engine.error_reporter.capture.assert_not_called()
+
     def test_read_log_tail_normalizes_invalid_utf8(self):
         """A cp1252 byte from a Windows log (e.g. \\x97) must come back as VALID
         UTF-8. Otherwise the server's INSERT into the utf8 content column fails
