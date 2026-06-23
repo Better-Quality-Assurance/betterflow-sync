@@ -390,8 +390,15 @@ class AWManager:
         transition into/out of active, also STOP / re-launch the external
         bf-idle-tracker process. Driven via ``_disabled_components`` so the single
         membership flip gates every (re)start path (`_start_locked`, the watchdog,
-        `restart_idle_tracker`). Idempotent — only acts on an actual transition, as
-        the flag is now published every sync cycle."""
+        `restart_idle_tracker`). Idempotent — only acts on an actual TRANSITION, as
+        the flag is now published every sync cycle.
+
+        The transition does subprocess I/O (terminate/wait, orphan reap) under the
+        lock. That's bounded: `_inproc_afk_active()` is config + sticky
+        `available()`, neither of which changes at runtime, so a session flips at
+        most once (typically once at startup) — this is a one-time lock hold, the
+        same pattern `restart_idle_tracker`/`_stop_locked` already use, not a
+        per-cycle cost."""
         active = bool(active)
         with self._lifecycle_lock:
             was_active = self._inproc_afk_active
@@ -432,6 +439,13 @@ class AWManager:
         _lifecycle_lock."""
         if IDLE_TRACKER in self._disabled_components:
             return  # left disabled by someone else — respect it
+        if not self._processes:
+            # The stack hasn't been start()ed yet (this fired from a pre-start
+            # reconcile/cycle). Don't launch a lone tracker against a server that
+            # isn't up — start() will bring it up with the rest now that it's
+            # re-enabled. Without this guard an early False transition could leak
+            # a serverless tracker process.
+            return
         existing = self._processes.get(IDLE_TRACKER)
         if existing is not None and existing.poll() is None:
             return  # already running

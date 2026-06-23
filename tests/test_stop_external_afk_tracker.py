@@ -85,14 +85,30 @@ def test_active_stops_and_disables_the_tracker():
 
 def test_inactive_reenables_and_restarts_the_tracker():
     m = _mgr(stop_external=True)
+    # A running stack: server + window tracker stay up; only the idle tracker is
+    # cycled. _processes is non-empty after the idle tracker is stopped, so the
+    # fallback restart is valid (server is up to receive its events).
+    m._processes["bf-data-service"] = FakeProc()
     m._processes[IDLE] = FakeProc()
-    m.set_inproc_afk_active(True)               # disable + stop
+    m.set_inproc_afk_active(True)               # disable + stop idle tracker
     assert IDLE in m._disabled_components
 
     m.set_inproc_afk_active(False)              # fallback: re-enable + start
 
     assert IDLE not in m._disabled_components
     m._start_component.assert_called_with(IDLE, "/fake/bin")
+
+
+def test_inactive_before_start_does_not_launch_a_serverless_tracker():
+    # Transition fired from a pre-start reconcile/cycle (nothing started yet):
+    # the fallback must NOT launch a lone tracker against a server that isn't up —
+    # start() will bring it up with the rest. (Review finding #2.)
+    m = _mgr(stop_external=True)
+    m.set_inproc_afk_active(True)               # _processes empty → disable only
+    m.set_inproc_afk_active(False)              # re-enable, but defer the start
+
+    assert IDLE not in m._disabled_components
+    m._start_component.assert_not_called()
 
 
 def test_no_transition_is_idempotent():
