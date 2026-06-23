@@ -31,7 +31,8 @@ APP_AUTHOR = "BetterQA"
 # Binaries to manage (start order matters: server first, then watchers)
 # These are renamed from aw-* originals for white-labeling
 BF_SERVER = "bf-data-service"
-BF_WATCHERS = ["bf-window-tracker", "bf-idle-tracker"]
+IDLE_TRACKER = "bf-idle-tracker"
+BF_WATCHERS = ["bf-window-tracker", IDLE_TRACKER]
 ALL_COMPONENTS = [BF_SERVER] + BF_WATCHERS
 
 # Our Apple Developer Team. The build signs the bundled trackers with this
@@ -323,7 +324,8 @@ def _download_aw_binaries(install_dir: str) -> bool:
 class AWManager:
     """Manages lifecycle of bundled tracker processes."""
 
-    def __init__(self, aw_port: int = 5600, afk_timeout: int = 600):
+    def __init__(self, aw_port: int = 5600, afk_timeout: int = 600,
+                 stop_external_when_inproc: bool = False):
         # Clamp to reasonable ranges. These values are baked into argv for
         # the tracker binaries; bounding them prevents future config drift
         # from producing nonsense or huge argv strings.
@@ -333,6 +335,14 @@ class AWManager:
             raise ValueError(f"afk_timeout out of range: {afk_timeout!r}")
         self.aw_port = aw_port
         self.afk_timeout = afk_timeout  # seconds
+        # Stage 2 of tracker-convergence (default OFF, opt-in via
+        # config.sync.stop_external_afk_tracker): when True AND in-process AFK is
+        # the source, STOP the external bf-idle-tracker process entirely rather
+        # than just ignoring its bucket — killing the dual-source surface that
+        # produced Bug A. Default OFF because, with the tracker stopped, recovery
+        # can't fall back to it without flipping the (currently local-only)
+        # kill-switch — so it ships dark until validated/remotely-flippable.
+        self._stop_external_when_inproc = bool(stop_external_when_inproc)
         # Serializes every mutation of _processes, _using_external,
         # _disabled_components, and _stale_restart_count so scheduler
         # callbacks, tray callbacks, and shutdown never race.
@@ -374,9 +384,63 @@ class AWManager:
     def set_inproc_afk_active(self, active: bool) -> None:
         """Mark whether the agent is uploading its own in-process AFK stream. When
         active, the bf-idle-tracker stale/blind detection is suppressed (we no
-        longer consume its bucket, so it must not restart or raise alerts)."""
+        longer consume its bucket, so it must not restart or raise alerts).
+
+        Stage 2 (only when ``stop_external_when_inproc`` is enabled): on the
+        transition into/out of active, also STOP / re-launch the external
+        bf-idle-tracker process. Driven via ``_disabled_components`` so the single
+        membership flip gates every (re)start path (`_start_locked`, the watchdog,
+        `restart_idle_tracker`). Idempotent — only acts on an actual transition, as
+        the flag is now published every sync cycle."""
+        active = bool(active)
         with self._lifecycle_lock:
-            self._inproc_afk_active = bool(active)
+            was_active = self._inproc_afk_active
+            self._inproc_afk_active = active
+            if not self._stop_external_when_inproc or active == was_active:
+                return
+            if active:
+                # In-process is the sole source: disable + stop the external
+                # tracker so two AFK sources can't diverge and we don't run a dead
+                # process whose bucket we ignore anyway.
+                self._disabled_components.add(IDLE_TRACKER)
+                self._stop_idle_tracker_locked()
+            else:
+                # In-process unavailable (config off / no OS idle clock / Linux):
+                # fall back to the external tracker — re-enable and (re)start it.
+                self._disabled_components.discard(IDLE_TRACKER)
+                self._start_idle_tracker_locked()
+
+    def _stop_idle_tracker_locked(self) -> None:
+        """Terminate the bf-idle-tracker process if we're running it, and reap any
+        orphan so it can't keep posting to the AFK bucket. No-op if not running.
+        Caller holds _lifecycle_lock."""
+        proc = self._processes.pop(IDLE_TRACKER, None)
+        if proc is not None and proc.poll() is None:
+            logger.info("Stopping %s (in-process AFK is the sole source)", IDLE_TRACKER)
+            proc.terminate()
+            try:
+                proc.wait(timeout=SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        binaries_dir = self._get_binaries_dir()
+        if binaries_dir:
+            self._reap_orphan_processes(IDLE_TRACKER, binaries_dir)
+
+    def _start_idle_tracker_locked(self) -> None:
+        """(Re)start bf-idle-tracker as the fallback when in-process AFK is no
+        longer the source. No-op if already running or no binaries. Caller holds
+        _lifecycle_lock."""
+        if IDLE_TRACKER in self._disabled_components:
+            return  # left disabled by someone else — respect it
+        existing = self._processes.get(IDLE_TRACKER)
+        if existing is not None and existing.poll() is None:
+            return  # already running
+        binaries_dir = self._get_binaries_dir()
+        if not binaries_dir:
+            return
+        logger.info("(Re)starting %s (in-process AFK no longer the source)", IDLE_TRACKER)
+        self._reap_orphan_processes(IDLE_TRACKER, binaries_dir)
+        self._start_component(IDLE_TRACKER, binaries_dir)
 
     def disable_component(self, name: str) -> None:
         """Prevent a component from being started/restarted."""
