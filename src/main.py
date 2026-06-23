@@ -808,10 +808,15 @@ class SyncCoordinator:
         actual per-cycle decision. The flag gates the idle-tracker watchdog and
         the AFK health telemetry; it was set once at startup, so without this it
         could diverge from what the engine actually does (audit finding A)."""
-        eng = self.coordinator.sync_engine
+        # This runs on SyncCoordinator (via _tick_60s), so the engine/manager are
+        # direct attributes — `self.coordinator` only exists on BetterFlowApp, so
+        # the old `self.coordinator.*` threw AttributeError every 60s and this
+        # reconcile never ran (the flag it maintains gates the idle-tracker
+        # watchdog + AFK telemetry).
+        eng = self.sync_engine
         if eng.afk_source is None:
             return
-        self.coordinator.aw_manager.set_inproc_afk_active(eng.inproc_afk_active)
+        self.aw_manager.set_inproc_afk_active(eng.inproc_afk_active)
 
     def _check_idle_status(self) -> None:
         self.idle_mgr.check_idle_status(
