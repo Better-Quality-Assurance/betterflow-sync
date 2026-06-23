@@ -145,6 +145,21 @@ class SyncCoordinator:
         # So a failed logs_requested upload surfaces to the ops ingest (it can't
         # surface via the log itself — that's the file we couldn't fetch).
         self.sync_engine.error_reporter = self.error_reporter
+        # Single source of truth for the in-process-AFK flag: the engine publishes
+        # its per-cycle decision straight to aw_manager on the path where the
+        # decision is made. The 60s _reconcile_inproc_afk_flag below is now only a
+        # backstop for paused periods (when the sync cycle doesn't run). Before
+        # this the timer was the ONLY writer — and it silently died for a whole
+        # release in Bug A (#76/#78), leaving the flag stale.
+        self.sync_engine.inproc_afk_flag_sink = self.aw_manager.set_inproc_afk_active
+
+        # _tick_60s sub-tasks each run under a try/except so one failure can't kill
+        # the scheduler — but that also HID Bug A (a reconcile that threw every 60s
+        # for a whole release, found only by reading fleet logs). Track consecutive
+        # per-task failures and escalate ONCE past a threshold to the ops ingest so
+        # the same silent-breakage class surfaces in minutes, not on a log dive.
+        self._tick_failure_counts: dict[str, int] = {}
+        self._tick_failure_reported: set[str] = set()
 
         self.scheduler = BackgroundScheduler()
         self._last_tick: Optional[datetime] = None
@@ -793,15 +808,52 @@ class SyncCoordinator:
             (self._check_auth_warn, "auth_warn"),
             (self._check_idle_tracker_health, "idle_tracker_health"),
         ):
-            try:
-                fn()
-            except Exception as e:
-                logger.warning("_tick_60s/%s failed: %s", label, e)
+            self._run_tick_task(fn, label)
         if self.reminder_manager:
-            try:
-                self.reminder_manager.check()
-            except Exception as e:
-                logger.warning("_tick_60s/reminders failed: %s", e)
+            self._run_tick_task(self.reminder_manager.check, "reminders")
+
+    # A _tick_60s sub-task that fails this many cycles in a row is escalated to
+    # the ops ingest (a transient blip is below this; chronic breakage is not).
+    _TICK_FAILURE_ESCALATE_THRESHOLD = 3
+
+    def _run_tick_task(self, fn: Callable[[], None], label: str) -> None:
+        """Run one _tick_60s sub-task. A single failure is logged but never kills
+        the scheduler (one dead sub-task must not freeze idle detection, hours,
+        permissions, etc). A sub-task that fails repeatedly is escalated ONCE to
+        the ops ingest — the missing signal that let Bug A run silently for a
+        release. A later success clears the streak and re-arms escalation."""
+        try:
+            fn()
+        except Exception as e:
+            logger.warning("_tick_60s/%s failed: %s", label, e)
+            self._note_tick_failure(label, e)
+            return
+        self._clear_tick_failure(label)
+
+    def _note_tick_failure(self, label: str, exc: Exception) -> None:
+        n = self._tick_failure_counts.get(label, 0) + 1
+        self._tick_failure_counts[label] = n
+        if n < self._TICK_FAILURE_ESCALATE_THRESHOLD or label in self._tick_failure_reported:
+            return
+        self._tick_failure_reported.add(label)
+        reporter = getattr(self, "error_reporter", None)
+        if reporter is None:
+            return
+        try:
+            reporter.capture(
+                f"_tick_60s sub-task '{label}' failed {n} consecutive times — a "
+                f"background tick is silently broken",
+                level="error",
+                tags={"component": "tick-60s", "task": label},
+                context={"consecutive_failures": n, "last_error": str(exc)},
+                fingerprint=f"tick-60s-{label}",
+            )
+        except Exception:
+            logger.debug("tick-failure escalation report failed", exc_info=True)
+
+    def _clear_tick_failure(self, label: str) -> None:
+        if self._tick_failure_counts.pop(label, None):
+            self._tick_failure_reported.discard(label)
 
     def _reconcile_inproc_afk_flag(self) -> None:
         """Keep aw_manager's in-process-AFK flag in step with the sync engine's

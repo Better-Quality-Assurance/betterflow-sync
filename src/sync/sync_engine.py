@@ -224,6 +224,16 @@ class SyncEngine:
         # sample log only retains ~2h, so a day-start rewind would re-emit afk over
         # a morning already billed correctly).
         self.afk_source = None
+        # Optional callback (set by the SyncCoordinator to aw_manager's
+        # set_inproc_afk_active) invoked every cycle with the in-process-AFK
+        # decision. The flag it sets gates the idle-tracker watchdog + AFK health
+        # telemetry. Publishing it from HERE — the path where the decision is
+        # actually made — makes the engine the single source of truth: the flag
+        # tracks the engine every active cycle independent of the 60s reconcile
+        # timer, which used to be the only writer and silently died in Bug A
+        # (#76/#78), leaving the flag stale for a whole release. None / errors
+        # tolerated — telemetry wiring must never break a sync cycle.
+        self.inproc_afk_flag_sink: Optional[Callable[[bool], None]] = None
         # Mutated only on the sync thread (record_sample / _build_inproc_afk /
         # _commit_inproc_afk_checkpoint all run inside SyncEngine.sync()).
         self._afk_inproc_checkpoint: Optional[datetime] = None
@@ -570,6 +580,11 @@ class SyncEngine:
         # upload our own stream below instead, so its (possibly frozen/blind)
         # events never reach the server.
         skip_external_afk = self._should_skip_external_afk()
+        # Publish the decision to the flag sink on the path where it's made, so
+        # aw_manager's flag (idle-tracker watchdog + AFK telemetry) stays in step
+        # with the engine every active cycle — one source of truth, not a cache a
+        # separate timer keeps in sync (and silently failed to: Bug A, #76/#78).
+        self._publish_inproc_afk_flag(skip_external_afk)
         for bucket in web_buckets + afk_buckets + input_buckets:
             if skip_external_afk and _is_afk_like(bucket.type):
                 continue
@@ -1912,6 +1927,21 @@ class SyncEngine:
         """Whether to drop the external bf-idle-tracker bucket from this cycle's
         upload (because the agent uploads its own AFK stream instead)."""
         return self._inproc_afk_active()
+
+    def _publish_inproc_afk_flag(self, active: bool) -> None:
+        """Push the per-cycle in-process-AFK decision to the flag sink
+        (aw_manager.set_inproc_afk_active). Called from the cycle's decision point
+        so the flag — which gates the idle-tracker watchdog + AFK health
+        telemetry — is a direct consequence of what the engine actually did this
+        cycle, not a cache a separate 60s timer keeps in sync. None / errors are
+        tolerated: telemetry wiring must never break a sync cycle."""
+        sink = self.inproc_afk_flag_sink
+        if sink is None:
+            return
+        try:
+            sink(active)
+        except Exception as e:
+            logger.debug("inproc_afk_flag_sink failed: %s", e)
 
     def _build_inproc_afk(self, now: datetime) -> list[dict]:
         """Build in-process AFK events for [checkpoint, now]. First cycle seeds
