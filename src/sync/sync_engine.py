@@ -2106,7 +2106,15 @@ class SyncEngine:
 
         Capped at 30s wall-clock time to prevent tying up the sync thread.
         """
-        # Remove events that exceeded retry limit
+        # Remove events that exceeded retry limit. Surface the drop to ops FIRST
+        # — with the server now confirming delivery per-event (accepted_ids),
+        # anything that still exhausts its retries is a genuine permanent
+        # rejection (out-of-range timestamp, server validation), i.e. real
+        # activity we are about to lose. Report it instead of dropping silently
+        # (the blindness that hid prior data loss for days).
+        drop_summary = self.queue.failed_event_summary(max_retries=5)
+        if drop_summary.get("count", 0) > 0:
+            self._report_dropped_events(drop_summary)
         self.queue.remove_failed(max_retries=5)
 
         # Skip queue processing if in backoff period
@@ -2328,6 +2336,27 @@ class SyncEngine:
         except BetterFlowClientError as e:
             logger.debug("Log upload failed (will retry next heartbeat): %s", e)
             self._report_upload_failure(f"upload POST failed: {e}")
+
+    def _report_dropped_events(self, summary: dict) -> None:
+        """Surface permanently-dropped queued events to the ops ingest. These
+        are events the server rejected on every retry until they hit the ceiling
+        — real captured activity that will never reach the dashboard. The
+        reporter's dedup window keeps repeated drops from flooding."""
+        if self.error_reporter is None:
+            return
+        try:
+            count = summary.get("count", 0)
+            buckets = ",".join(summary.get("bucket_ids") or []) or "unknown"
+            span = f"{summary.get('oldest')}..{summary.get('newest')}"
+            self.error_reporter.capture(
+                f"Dropped {count} queued event(s) after max retries "
+                f"(buckets={buckets}, span={span})",
+                level="warning",
+                tags={"component": "offline-queue"},
+                fingerprint="offline-queue-events-dropped",
+            )
+        except Exception:
+            logger.debug("dropped-events report failed", exc_info=True)
 
     def _report_upload_failure(self, reason: str) -> None:
         """Surface a logs_requested upload failure to the ops ingest. We can't
