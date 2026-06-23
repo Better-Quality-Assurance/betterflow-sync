@@ -10,7 +10,13 @@ Applying a staged build is loop-safe (see src/self_updater.get_staged_update).
 
 import logging
 import threading
+import time
 from typing import Optional
+
+try:
+    from .update_checker import _version_tuple
+except ImportError:
+    from update_checker import _version_tuple
 
 try:
     from .notifications import send_notification
@@ -37,6 +43,15 @@ class UpdateHandler:
         self._staged_lock = threading.Lock()
         self._update_jobs_started = False
         self._update_jobs_lock = threading.Lock()
+
+        # Throttle for server-pushed update checks (heartbeat-driven). The
+        # heartbeat fires every ~5 min and keeps reporting the floor until the
+        # agent has updated, so without this we'd re-hit GitHub / re-stage every
+        # beat. monotonic so a clock change can't wedge it.
+        self._last_remote_update_check = 0.0
+
+    # Min gap between heartbeat-driven update checks.
+    _REMOTE_UPDATE_THROTTLE = 1800.0  # 30 min
 
     def _flush_before_update_exit(self) -> None:
         """Best-effort flush of pending state right before the process is
@@ -199,6 +214,44 @@ class UpdateHandler:
             )
         except Exception:
             logger.debug("Periodic update check failed", exc_info=True)
+
+    def trigger_remote_update(self, target_version: str) -> None:
+        """Server (via the heartbeat's minimum_agent_version) says the fleet
+        should be at least `target_version` and this agent is below it. Kick an
+        off-cycle update check so the latest build stages now and applies on the
+        next idle/restart — reaching the fleet in minutes instead of waiting up
+        to 6h for the periodic check. Non-disruptive (no mid-session restart).
+
+        Guards: respects check_updates; skips if a build >= target is already
+        staged (it'll apply on idle); and throttles to one check per
+        _REMOTE_UPDATE_THROTTLE so the recurring heartbeat can't re-download.
+        """
+        if not self.config.check_updates:
+            return
+
+        # Already have it (or newer) downloaded — nothing to fetch; it applies
+        # on the next idle/restart via the staged-update path.
+        with self._staged_lock:
+            staged = self._staged_version
+        if staged is not None:
+            try:
+                if _version_tuple(staged) >= _version_tuple(target_version):
+                    return
+            except (ValueError, TypeError):
+                pass
+
+        now = time.monotonic()
+        with self._update_jobs_lock:
+            if now - self._last_remote_update_check < self._REMOTE_UPDATE_THROTTLE:
+                return
+            self._last_remote_update_check = now
+
+        logger.info(
+            "Server pushed update floor %s (agent %s) — staging latest build",
+            target_version,
+            self._version,
+        )
+        self._periodic_update_check()
 
     def on_install_update(self, asset_url: str) -> None:
         """Manual 'Install & Restart': download + apply immediately.
