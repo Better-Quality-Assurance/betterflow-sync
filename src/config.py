@@ -304,6 +304,12 @@ class SyncSettings:
     # watcher instead of the external bf-idle-tracker bucket. Kill-switch: set
     # False to fall back to the external bucket + stale-synthesis path.
     in_process_afk: bool = True
+    # Stage 2 of tracker-convergence: when in_process_afk is the source, STOP the
+    # external bf-idle-tracker process (not just ignore its bucket), eliminating
+    # the dual-source surface that produced Bug A. Default OFF — opt-in, and
+    # independently reversible: with the tracker stopped, recovery can't fall back
+    # to it without flipping a flag, so this ships dark until validated.
+    stop_external_afk_tracker: bool = False
 
 
 @dataclass

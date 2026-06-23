@@ -1252,6 +1252,7 @@ class BetterFlowApp:
         self.aw_manager = AWManager(
             aw_port=self.config.aw.port,
             afk_timeout=self.config.aw.afk_timeout_minutes * 60,
+            stop_external_when_inproc=self.config.sync.stop_external_afk_tracker,
         )
 
         # Initialize components
