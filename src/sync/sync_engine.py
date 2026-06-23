@@ -969,7 +969,21 @@ class SyncEngine:
         # Empty leading window (e.g. an overnight quiet stretch right after the
         # checkpoint): advance past it so we don't re-poll the same empty span
         # forever while a backlog waits beyond it.
-        if not events and fetch_end < now:
+        #
+        # "Empty" must mean "no NEW events past the checkpoint" — NOT a literally
+        # empty slice. The 2-min lookback (above) always re-includes the pre-gap
+        # tail event, so an `if not events` test never fires after an idle gap
+        # longer than _BACKLOG_WINDOW: the checkpoint pins at the last pre-gap
+        # event, the fetch window stays parked ~2h behind it forever, and events
+        # captured after the gap are never read. (PiratesMac / device 14,
+        # 2026-06-23: window+input frozen at the prior evening's last event after
+        # an overnight gap; the morning's events sat captured-but-unsent until a
+        # checkpoint jump skipped them.) Gate the jump on events strictly AFTER
+        # the checkpoint so an idle gap can't pin the cursor. In steady state
+        # (fetch_end == now) the jump never fires, so the lookback's heartbeat-
+        # grown re-send is preserved.
+        new_events = [e for e in events if e.timestamp > checkpoint]
+        if not new_events and fetch_end < now:
             self.queue.set_checkpoint_forward(bucket_id, fetch_end)
             return [], lookback_start
 
