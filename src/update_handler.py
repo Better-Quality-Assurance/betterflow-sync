@@ -47,8 +47,11 @@ class UpdateHandler:
         # Throttle for server-pushed update checks (heartbeat-driven). The
         # heartbeat fires every ~5 min and keeps reporting the floor until the
         # agent has updated, so without this we'd re-hit GitHub / re-stage every
-        # beat. monotonic so a clock change can't wedge it.
-        self._last_remote_update_check = 0.0
+        # beat. monotonic so a clock change can't wedge it. Seeded to -inf (NOT
+        # 0.0) so the FIRST push is never throttled: on a freshly-booted machine
+        # monotonic() is small and `now - 0.0 < THROTTLE` would wrongly suppress
+        # the first check (passes on a long-uptime box, fails on a fresh runner).
+        self._last_remote_update_check = float("-inf")
 
     # Min gap between heartbeat-driven update checks.
     _REMOTE_UPDATE_THROTTLE = 1800.0  # 30 min

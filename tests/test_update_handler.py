@@ -6,7 +6,7 @@ it. The handler must stage the latest build (applied on next idle) WITHOUT
 re-downloading on every 5-min heartbeat.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.update_handler import UpdateHandler
 
@@ -50,6 +50,17 @@ def test_trigger_stages_when_staged_is_older_than_target():
     h = _handler("1.5.68")
     h._staged_version = "1.5.70"
     h.trigger_remote_update("1.5.71")
+    h._periodic_update_check.assert_called_once()
+
+
+def test_first_push_not_throttled_on_fresh_boot():
+    """Regression: on a freshly-booted machine time.monotonic() is small. With
+    the throttle seeded to 0.0, `now - 0.0 < THROTTLE` wrongly suppressed the
+    FIRST push (green on a long-uptime dev box, red on a fresh CI runner). The
+    first check must always fire regardless of the monotonic clock's origin."""
+    h = _handler("1.5.68")
+    with patch("src.update_handler.time.monotonic", return_value=5.0):
+        h.trigger_remote_update("1.5.71")
     h._periodic_update_check.assert_called_once()
 
 
