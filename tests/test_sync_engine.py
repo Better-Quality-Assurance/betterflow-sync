@@ -1007,6 +1007,21 @@ class TestSyncEngine:
         assert kwargs["level"] == "info"
         assert kwargs["fingerprint"] != "offline-queue-events-dropped"
 
+    def test_sync_flags_bucket_fetch_failure(self):
+        """When AW answers /info (is_running True) but get_buckets fails (503 from
+        a half-hung bf-data-service), sync() flags aw_bucket_fetch_failed so the
+        coordinator can force_restart — is_running() alone can't see this."""
+        from src.sync.aw_client import AWClientError
+        self.aw.is_running.return_value = True
+        self.bf.is_reachable.return_value = True
+        self.engine._config_fetched = True
+        self.aw.get_window_buckets.side_effect = AWClientError("ActivityWatch API error: 503")
+
+        stats = self.engine.sync()
+
+        assert stats.aw_bucket_fetch_failed is True
+        assert stats.success is False
+
     def test_transform_event_delta_time_tracking_on_refetch(self):
         """Test that re-fetched events with grown duration only add the delta."""
         cycle = _SyncCycleContext(has_input_data=True)
@@ -1571,3 +1586,36 @@ class TestConfigDefaultCategories:
         config.save()
         loaded = Config.load()
         assert "Claude" in loaded.privacy.default_categories
+
+
+def _coord_for_bucket_watchdog():
+    """A SyncCoordinator with just the attrs _handle_aw_bucket_failure touches."""
+    c = SyncCoordinator.__new__(SyncCoordinator)
+    c._aw_buckets_failed_streak = 0
+    c._AW_UNREACHABLE_ERROR_THRESHOLD = 2
+    c.aw_manager = Mock()
+    c.aw_manager.is_managing = True
+    c.tray = Mock()
+    return c
+
+
+def test_bucket_failure_force_restarts_only_at_threshold():
+    """A single bucket-fetch failure is debounced; force_restart fires once the
+    streak crosses the threshold (the hung-server recovery is_running() missed)."""
+    c = _coord_for_bucket_watchdog()
+
+    c._handle_aw_bucket_failure()  # 1/2 — below threshold
+    c.aw_manager.force_restart.assert_not_called()
+
+    c._handle_aw_bucket_failure()  # 2/2 — escalate
+    c.aw_manager.force_restart.assert_called_once()
+    assert c.tray.set_state.call_args[0][0] == TrayState.ERROR
+
+
+def test_bucket_failure_streak_resets_clear_no_restart():
+    """A reset streak (e.g. after a healthy sync) needs the full threshold again
+    before another force_restart — no carry-over."""
+    c = _coord_for_bucket_watchdog()
+    c._aw_buckets_failed_streak = 0
+    c._handle_aw_bucket_failure()  # 1/2
+    c.aw_manager.force_restart.assert_not_called()

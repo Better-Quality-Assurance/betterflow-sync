@@ -189,6 +189,14 @@ class SyncCoordinator:
         self._aw_unreachable_streak = 0
         self._AW_UNREACHABLE_ERROR_THRESHOLD = 2
 
+        # Consecutive cycles where AW answered is_running() (/info) but the bucket
+        # fetch (/buckets/) failed — a half-hung bf-data-service the is_running()
+        # watchdog can't see (Liviu's 2 AM 503 storm: 133 "Failed to get buckets"
+        # with zero recovery, cleared only by a manual restart). Separate from
+        # _aw_unreachable_streak, which is reset whenever is_running() passes —
+        # and is_running() DOES pass here, so reusing it would never escalate.
+        self._aw_buckets_failed_streak = 0
+
         # Flags set by the app layer - protected by _state_lock
         self._logged_in = False
         self._paused_by_network = False
@@ -856,6 +864,31 @@ class SyncCoordinator:
         if self._tick_failure_counts.pop(label, None):
             self._tick_failure_reported.discard(label)
 
+    def _handle_aw_bucket_failure(self) -> None:
+        """AW answers is_running() (/info) but the bucket fetch (/buckets/) keeps
+        failing — a half-hung bf-data-service. is_running() can't see this, so the
+        normal unreachable watchdog never fires; debounce, then force_restart to
+        reclaim the hung server (force_restart rebuilds the whole stack incl. a
+        port-held-but-HTTP-dead server). Without this the agent loops 'Failed to
+        get buckets' until the user manually restarts — Liviu's 2 AM 503 storm,
+        133 failures, ~75 min of tracking lost."""
+        self._aw_buckets_failed_streak += 1
+        if self._aw_buckets_failed_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
+            if self.aw_manager.is_managing:
+                logger.warning(
+                    "ActivityWatch responding but bucket fetch failing for %d "
+                    "cycles — forcing tracker+server restart (hung bf-data-service)",
+                    self._aw_buckets_failed_streak,
+                )
+                self.aw_manager.force_restart(reason="bucket fetch failing (server hung)")
+            self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+        else:
+            logger.info(
+                "ActivityWatch bucket fetch failing (%d/%d) — retrying next cycle "
+                "before forcing a restart",
+                self._aw_buckets_failed_streak, self._AW_UNREACHABLE_ERROR_THRESHOLD,
+            )
+
     def _reconcile_inproc_afk_flag(self) -> None:
         """Keep aw_manager's in-process-AFK flag in step with the sync engine's
         actual per-cycle decision. The flag gates the idle-tracker watchdog and
@@ -1034,6 +1067,13 @@ class SyncCoordinator:
             self._aw_unreachable_streak = 0
 
             stats = self.sync_engine.sync()
+
+            if stats.aw_bucket_fetch_failed:
+                # AW answers /info but 503s on /buckets/ — is_running() above
+                # passed, so only this path can recover the hung server.
+                self._handle_aw_bucket_failure()
+                return
+            self._aw_buckets_failed_streak = 0
 
             if stats.success or stats.events_sent > 0:
                 # A successful (or partial) sync clears the failure streak.

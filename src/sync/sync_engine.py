@@ -101,6 +101,10 @@ class SyncStats:
     errors: list[str] = field(default_factory=list)
     queued_bucket_ids: set = field(default_factory=set)
     _should_heartbeat: bool = False
+    # True when AW answered is_running() (/info) but the bucket fetch (/buckets/)
+    # failed — a half-hung bf-data-service. The coordinator escalates this to a
+    # force_restart, which is_running() alone can't trigger.
+    aw_bucket_fetch_failed: bool = False
 
     @property
     def success(self) -> bool:
@@ -542,6 +546,11 @@ class SyncEngine:
             input_buckets = self.aw.get_input_buckets()
         except AWClientError as e:
             stats.errors.append(f"Failed to get buckets: {e}")
+            # is_running() (/info) can still pass while /buckets/ 503s on a
+            # half-hung bf-data-service. Flag it so the coordinator force_restarts
+            # the hung server instead of looping this error forever (the 2 AM 503
+            # storm that cost Liviu ~75 min, recovered only by a manual restart).
+            stats.aw_bucket_fetch_failed = True
             return stats
 
         # Track whether AFK watcher is running so _transform_event can
