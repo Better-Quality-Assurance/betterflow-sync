@@ -72,6 +72,16 @@ src/_build_info.py
 # Generated at build time - bakes the error-reporting DSN into the bundle; never commit
 src/_build_secrets.py
 
+# Signing / key material — belt-and-suspenders so a locally-exported Developer ID
+# cert (the project's highest-value secret; lives only in GitHub Actions secrets)
+# can never be staged into this PUBLIC repo by a stray `git add .`.
+*.p12
+*.pem
+*.key
+*.crt
+*.cer
+*.keychain-db
+
 # Plans (local only)
 plans.md
 docs/plans/

@@ -23,10 +23,10 @@ def _make_wizard() -> SetupWizard:
 class TestConsentRouting:
     def test_non_macos_login_routes_to_consent(self):
         w = _make_wizard()
-        state = MagicMock(logged_in=True, user_email="cati@betterqa.co")
+        state = MagicMock(logged_in=True, user_email="x@y.co")
         with patch("src.ui.setup_wizard.sys.platform", "win32"):
             w._on_login_complete(state)
-        w._show_consent.assert_called_once_with("cati@betterqa.co")
+        w._show_consent.assert_called_once_with("x@y.co")
         w._show_success.assert_not_called()
 
     def test_linux_login_routes_to_consent(self):
@@ -63,11 +63,11 @@ class TestConsentRender:
         w._draw_scene = MagicMock(return_value=300)
         w._make_button = MagicMock()
         # Use the real method (un-mock it for this render test).
-        SetupWizard._show_consent(w, "cati@betterqa.co")
+        SetupWizard._show_consent(w, "x@y.co")
         w._draw_scene.assert_called_once()
         w._make_button.assert_called_once()
         # The action button forwards to the success screen on acknowledgement.
         label, action = w._make_button.call_args.args[0], w._make_button.call_args.args[1]
         assert "Agree" in label
         action()
-        w._show_success.assert_called_once_with("cati@betterqa.co")
+        w._show_success.assert_called_once_with("x@y.co")
