@@ -62,6 +62,14 @@ AW_TO_BF_NAMES = {
 STARTUP_TIMEOUT = 10  # seconds to wait for server to be ready
 SHUTDOWN_TIMEOUT = 5  # seconds before force-killing
 STALE_THRESHOLD = 120  # seconds with no new events before force-restarting watcher
+# A window tracker that has emitted ZERO events this long after launch (its bucket
+# is still empty) is blind, not just quiet — aw-watcher-window heartbeats even a
+# static window, so a healthy one emits within seconds. Past this grace, with AW
+# reachable, restart it (Sachi, win32, 2026-06-24: alive but never emitted, so the
+# age-based stale check — which needs an event to measure — never fired). The grace
+# also doubles as restart backoff: _start_component resets the launch clock, so a
+# persistently-blind tracker is re-probed at most once per grace, not every tick.
+WINDOW_BLIND_GRACE = 180  # seconds
 # After this many consecutive stale-restarts that DON'T take (the tracker emits
 # nothing again right after we restart it), bf-idle-tracker is blind — almost
 # always a missing Input Monitoring grant, which a restart can't fix (#46). Stop
@@ -348,6 +356,10 @@ class AWManager:
         # callbacks, tray callbacks, and shutdown never race.
         self._lifecycle_lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen] = {}
+        # monotonic launch time per component, for the window-tracker blind-grace
+        # (a tracker emitting nothing only counts as blind once it's run past the
+        # grace; resetting this on (re)start also backs off blind re-probes).
+        self._component_started_at: dict[str, float] = {}
         self._using_external = False
         # Components intentionally disabled for this app session.
         self._disabled_components: set[str] = set()
@@ -762,7 +774,11 @@ class AWManager:
                 if name == BF_SERVER:
                     server_restarted = True
 
-        # Detect stalled window tracker (process alive but no new events)
+        # Detect stalled window tracker: either it froze (events exist but their
+        # end is old) OR it's blind — alive but emitting nothing at all, so the
+        # age helper has no event to measure and returns None. The blind case used
+        # to slip through (`age is not None` only), leaving window data frozen
+        # while AFK/input flowed (Sachi, win32).
         watcher = "bf-window-tracker"
         if (
             watcher not in self._disabled_components
@@ -770,11 +786,16 @@ class AWManager:
             and self._processes[watcher].poll() is None
         ):
             age = self._get_latest_window_event_age()
-            if age is not None and age > STALE_THRESHOLD:
+            running_for = self._component_running_seconds(watcher)
+            reachable = self._port_in_use()
+            if self._is_window_tracker_stale(age, running_for, reachable):
                 self._stale_restart_count += 1
+                detail = (
+                    f"no new events for {age:.0f}s" if age is not None
+                    else f"no events {running_for:.0f}s after launch (blind)"
+                )
                 logger.warning(
-                    f"{watcher} stale: no new events for {age:.0f}s "
-                    f"(threshold {STALE_THRESHOLD}s, "
+                    f"{watcher} stale: {detail} (threshold {STALE_THRESHOLD}s, "
                     f"restart #{self._stale_restart_count})"
                 )
                 proc = self._processes[watcher]
@@ -958,6 +979,7 @@ class AWManager:
 
             proc = subprocess.Popen(args, **kwargs)
             self._processes[name] = proc
+            self._component_started_at[name] = time.monotonic()
             logger.info(f"Started {name} (PID {proc.pid})")
             return True
 
@@ -1062,6 +1084,29 @@ class AWManager:
     def _get_latest_window_event_age(self) -> Optional[float]:
         """Return seconds since the most recent window event, or None on error."""
         return self._get_latest_event_age("aw-watcher-window")
+
+    def _component_running_seconds(self, name: str) -> Optional[float]:
+        """Seconds since we last (re)started ``name``, or None if we never did."""
+        started = self._component_started_at.get(name)
+        if started is None:
+            return None
+        return time.monotonic() - started
+
+    @staticmethod
+    def _is_window_tracker_stale(
+        age: Optional[float], running_for: Optional[float], reachable: bool
+    ) -> bool:
+        """Whether the window tracker should be restarted.
+
+        - ``age`` is not None: events exist; stale if their end is older than the
+          threshold (the original frozen-tracker case).
+        - ``age`` is None: no events at all. That's a blind tracker ONLY when it's
+          run well past the launch grace AND AW is reachable — otherwise None is
+          just startup lag or an AW outage (handled elsewhere), not a dead tracker.
+        """
+        if age is not None:
+            return age > STALE_THRESHOLD
+        return bool(reachable and running_for is not None and running_for > WINDOW_BLIND_GRACE)
 
     def _get_latest_afk_event_age(self) -> Optional[float]:
         """Return seconds since the most recent AFK event, or None on error.
