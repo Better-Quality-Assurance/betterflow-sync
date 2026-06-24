@@ -133,7 +133,67 @@ class TestOfflineQueue:
         """No events past the ceiling → count 0, empty fields."""
         self.queue.enqueue([{"id": "fresh", "timestamp": "2026-06-23T05:00:00Z", "data": {}}])
         summary = self.queue.failed_event_summary(max_retries=5)
-        assert summary == {"count": 0, "bucket_ids": [], "oldest": None, "newest": None}
+        assert summary == {
+            "count": 0, "bucket_ids": [], "oldest": None, "newest": None,
+            "real_loss_count": 0, "unstorable_count": 0,
+        }
+
+    def _drop_n(self, events):
+        """Enqueue events and push them past the retry ceiling so they count as
+        about-to-drop in failed_event_summary."""
+        self.queue.enqueue(events)
+        queued = self.queue.dequeue(batch_size=len(events))
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+
+    def test_failed_event_summary_classifies_stale_as_unstorable(self):
+        """Events older than the storable window (~7d) are unstorable — the
+        server legitimately rejects them, so dropping is a benign flush, not
+        real loss. (Diana's 06-16/06-17 batches.)"""
+        now = datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc)
+        self._drop_n([
+            {"id": "a", "bucket_id": "aw-watcher-window_h", "timestamp": "2026-06-16T15:56:00+00:00", "duration": 60, "data": {}},
+            {"id": "b", "bucket_id": "aw-watcher-input_h", "timestamp": "2026-06-17T06:04:00+00:00", "duration": 30, "data": {}},
+        ])
+        summary = self.queue.failed_event_summary(max_retries=5, now=now)
+        assert summary["count"] == 2
+        assert summary["real_loss_count"] == 0
+        assert summary["unstorable_count"] == 2
+
+    def test_failed_event_summary_classifies_no_bucket_as_unstorable(self):
+        """A recent event with no bucket_id can't be routed/stored → unstorable
+        (the 2026-06-19 buckets=unknown drop)."""
+        now = datetime(2026, 6, 19, 15, 0, tzinfo=timezone.utc)
+        self._drop_n([
+            {"id": "c", "timestamp": "2026-06-19T14:50:37+00:00", "duration": 60, "data": {}},
+        ])
+        summary = self.queue.failed_event_summary(max_retries=5, now=now)
+        assert summary["count"] == 1
+        assert summary["real_loss_count"] == 0
+        assert summary["unstorable_count"] == 1
+
+    def test_failed_event_summary_counts_recent_bucketed_as_real_loss(self):
+        """Recent + bucketed = genuine lost activity the server should have
+        accepted → real loss (warning-worthy)."""
+        now = datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc)
+        self._drop_n([
+            {"id": "d", "bucket_id": "aw-watcher-window_h", "timestamp": "2026-06-24T07:30:00+00:00", "duration": 60, "data": {}},
+        ])
+        summary = self.queue.failed_event_summary(max_retries=5, now=now)
+        assert summary["real_loss_count"] == 1
+        assert summary["unstorable_count"] == 0
+
+    def test_failed_event_summary_mixed_real_and_unstorable(self):
+        """A mix → counts split; the caller escalates because real loss > 0."""
+        now = datetime(2026, 6, 24, 8, 0, tzinfo=timezone.utc)
+        self._drop_n([
+            {"id": "e", "bucket_id": "aw-watcher-window_h", "timestamp": "2026-06-24T07:30:00+00:00", "duration": 60, "data": {}},
+            {"id": "f", "bucket_id": "aw-watcher-window_h", "timestamp": "2026-06-10T07:30:00+00:00", "duration": 60, "data": {}},
+            {"id": "g", "timestamp": "2026-06-24T07:31:00+00:00", "duration": 60, "data": {}},
+        ])
+        summary = self.queue.failed_event_summary(max_retries=5, now=now)
+        assert summary["real_loss_count"] == 1
+        assert summary["unstorable_count"] == 2
 
     def test_max_size_enforcement(self):
         """Test that queue enforces max size."""

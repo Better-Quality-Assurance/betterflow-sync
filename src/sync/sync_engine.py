@@ -2383,23 +2383,45 @@ class SyncEngine:
             self._report_upload_failure(f"upload POST failed: {e}")
 
     def _report_dropped_events(self, summary: dict) -> None:
-        """Surface permanently-dropped queued events to the ops ingest. These
-        are events the server rejected on every retry until they hit the ceiling
-        — real captured activity that will never reach the dashboard. The
-        reporter's dedup window keeps repeated drops from flooding."""
+        """Surface permanently-dropped queued events to the ops ingest, split by
+        whether the drop is genuine loss or a benign flush.
+
+        Only RECENT, BUCKETED events are real lost activity worth a warning — the
+        server should have accepted them. Events that are stale (>retention) or
+        carry no bucket are unstorable by nature: the server always rejects them,
+        so flushing them after max retries loses nothing. Reporting those at
+        warning level (as it used to) cried wolf — a week-old queue aging out, or
+        a single bucketless event, paged ops the same as real loss. Now the
+        benign flush logs at info under a distinct fingerprint; warning is
+        reserved for actual loss. The reporter's dedup keeps repeats from
+        flooding."""
         if self.error_reporter is None:
             return
         try:
             count = summary.get("count", 0)
+            # Default real=count keeps back-compat if a caller passes the old
+            # shape (treat as loss rather than silently swallow).
+            real = summary.get("real_loss_count", count)
             buckets = ",".join(summary.get("bucket_ids") or []) or "unknown"
             span = f"{summary.get('oldest')}..{summary.get('newest')}"
-            self.error_reporter.capture(
-                f"Dropped {count} queued event(s) after max retries "
-                f"(buckets={buckets}, span={span})",
-                level="warning",
-                tags={"component": "offline-queue"},
-                fingerprint="offline-queue-events-dropped",
-            )
+            if real > 0:
+                other = count - real
+                extra = f"; {other} other unstorable" if other > 0 else ""
+                self.error_reporter.capture(
+                    f"Dropped {real} queued event(s) after max retries — likely "
+                    f"real lost activity (buckets={buckets}, span={span}{extra})",
+                    level="warning",
+                    tags={"component": "offline-queue"},
+                    fingerprint="offline-queue-events-dropped",
+                )
+            else:
+                self.error_reporter.capture(
+                    f"Flushed {count} unstorable queued event(s) — stale or no "
+                    f"bucket, never server-acceptable (buckets={buckets}, span={span})",
+                    level="info",
+                    tags={"component": "offline-queue"},
+                    fingerprint="offline-queue-events-flushed-unstorable",
+                )
         except Exception:
             logger.debug("dropped-events report failed", exc_info=True)
 

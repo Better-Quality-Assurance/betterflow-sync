@@ -982,6 +982,31 @@ class TestSyncEngine:
         assert self.engine._session_active is False
         self.time_tracker.close.assert_called_once()
 
+    def test_report_dropped_events_warns_on_real_loss(self):
+        """A drop with real_loss_count > 0 escalates at warning level."""
+        self.engine.error_reporter = MagicMock()
+        self.engine._report_dropped_events({
+            "count": 2, "real_loss_count": 1, "unstorable_count": 1,
+            "bucket_ids": ["aw-watcher-window_h"],
+            "oldest": "2026-06-24T07:30:00+00:00", "newest": "2026-06-24T07:31:00+00:00",
+        })
+        self.engine.error_reporter.capture.assert_called_once()
+        assert self.engine.error_reporter.capture.call_args.kwargs["level"] == "warning"
+
+    def test_report_dropped_events_info_when_all_unstorable(self):
+        """All-unstorable drops (stale / no-bucket) are a benign flush — reported
+        at info with a distinct fingerprint so they don't page ops as warnings."""
+        self.engine.error_reporter = MagicMock()
+        self.engine._report_dropped_events({
+            "count": 20, "real_loss_count": 0, "unstorable_count": 20,
+            "bucket_ids": ["aw-watcher-input_h"],
+            "oldest": "2026-06-17T06:04:00+00:00", "newest": "2026-06-17T06:07:00+00:00",
+        })
+        self.engine.error_reporter.capture.assert_called_once()
+        kwargs = self.engine.error_reporter.capture.call_args.kwargs
+        assert kwargs["level"] == "info"
+        assert kwargs["fingerprint"] != "offline-queue-events-dropped"
+
     def test_transform_event_delta_time_tracking_on_refetch(self):
         """Test that re-fetched events with grown duration only add the delta."""
         cycle = _SyncCycleContext(has_input_data=True)
