@@ -48,7 +48,7 @@ ActivityWatch (localhost:5600)
         |
         v
     SyncEngine (src/sync/sync_engine.py)
-        |-- Privacy filtering (hash titles, strip URLs to domain)
+        |-- Client-side privacy: drop excluded apps, strip URLs to domain
         |-- Transform events to BetterFlow format
         v
     BetterFlowClient (src/sync/bf_client.py)
@@ -69,11 +69,27 @@ ActivityWatch (localhost:5600)
 
 ### Privacy Model
 
-Privacy settings in `Config.privacy`:
-- `hash_titles` (default: True) - SHA-256 hash window titles, send first 16 hex chars
-- `title_allowlist` - Apps that send raw titles (IDEs, terminals)
-- `domain_only_urls` (default: True) - Strip URLs to domain only
-- `exclude_apps` - Apps never tracked (1Password, System Preferences)
+**Important:** window titles are sent **raw** to the backend, which applies
+privacy server-side (title handling + categorization). The agent does **not**
+hash titles before egress — there is no client-side title hashing today, and
+implementing it would disable server-side categorization (titles are the
+categorization signal). The settings in `Config.privacy`:
+
+- `hash_titles` (default: **False**) - a per-device preference *forwarded to the
+  server*, NOT a client-side transform. The agent never hashes; the server
+  honours this flag. (Despite the name, raw titles still leave the device.)
+- `domain_only_urls` (default: True) - **enforced client-side** — URLs are
+  reduced to their domain before egress. Full URLs require `collect_full_urls`
+  (default False, opt-in, sensitive).
+- `exclude_apps` (default: 1Password, Keychain, System Settings, ...) -
+  **enforced client-side** — these apps' events never leave the device. This is
+  the real "never send this app's titles" control.
+- `title_allowlist` - apps allowed to send raw titles even when `hash_titles` is
+  set (forwarded to the server alongside `hash_titles`).
+
+The OS keychain holds the auth token (never on disk / in config). If raw titles
+must never leave the device, that requires client-side hashing/redaction, which
+is **not implemented** — track it as a feature, not an assumed guarantee.
 
 ### Configuration Storage
 

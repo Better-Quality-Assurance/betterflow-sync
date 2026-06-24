@@ -983,15 +983,24 @@ class TestSyncEngine:
         self.time_tracker.close.assert_called_once()
 
     def test_report_dropped_events_warns_on_real_loss(self):
-        """A drop with real_loss_count > 0 escalates at warning level."""
+        """A drop with real_loss_count > 0 escalates at warning level, and the
+        message carries NO PII to the cross-tenant ops ingest: bucket TYPES only
+        (no hostname suffix) and NO wall-clock activity timestamps (age only)."""
         self.engine.error_reporter = MagicMock()
         self.engine._report_dropped_events({
             "count": 2, "real_loss_count": 1, "unstorable_count": 1,
-            "bucket_ids": ["aw-watcher-window_h"],
+            "bucket_ids": ["aw-watcher-window_Razvan-MacBook-Pro"],
             "oldest": "2026-06-24T07:30:00+00:00", "newest": "2026-06-24T07:31:00+00:00",
         })
         self.engine.error_reporter.capture.assert_called_once()
-        assert self.engine.error_reporter.capture.call_args.kwargs["level"] == "warning"
+        call = self.engine.error_reporter.capture.call_args
+        msg = call.args[0]
+        assert call.kwargs["level"] == "warning"
+        # F4: hostname (often a person's name) must be stripped to the bucket type.
+        assert "aw-watcher-window" in msg
+        assert "Razvan-MacBook-Pro" not in msg
+        # F3: no raw wall-clock activity timestamps in the ops report.
+        assert "2026-06-24T07:30:00" not in msg and "2026-06-24T07:31:00" not in msg
 
     def test_report_dropped_events_info_when_all_unstorable(self):
         """All-unstorable drops (stale / no-bucket) are a benign flush — reported
@@ -1619,3 +1628,24 @@ def test_bucket_failure_streak_resets_clear_no_restart():
     c._aw_buckets_failed_streak = 0
     c._handle_aw_bucket_failure()  # 1/2
     c.aw_manager.force_restart.assert_not_called()
+
+
+def test_error_context_omits_user_email_and_name():
+    """Error reports go to the cross-tenant BetterQA ops ingest, so they must NOT
+    carry the end user's email/name. device_id (maps back server-side) + role are
+    enough for routing."""
+    from src.main import BetterFlowApp
+    app = BetterFlowApp.__new__(BetterFlowApp)
+    app.tray = MagicMock()
+    app.tray.model.user_email = "someone@betterqa.co"
+    app.tray.model.user_name = "Some One"
+    app.tray.model.user_role = "B2E"
+    app.bf = MagicMock()
+    app.bf.device_id = 42
+
+    ctx = app._error_context()
+
+    assert "user_email" not in ctx
+    assert "user_name" not in ctx
+    assert ctx["user_role"] == "B2E"
+    assert ctx["device_id"] == 42

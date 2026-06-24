@@ -117,7 +117,9 @@ class KeychainManager:
         except KeyringError as e:
             logger.error("Keychain write failed — credentials NOT stored: %s", e)
             return False
-        logger.info("Credentials stored for %s", credentials.user_email)
+        # Log device_id, not the email — this log is uploaded on logs_requested,
+        # so keep PII (the email) out of the uploaded tail (privacy F5).
+        logger.info("Credentials stored for device %s", credentials.device_id)
         _purge_legacy_file()
         return True
 
