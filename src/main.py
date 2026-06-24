@@ -2290,14 +2290,15 @@ class BetterFlowApp:
     def _error_context(self) -> dict:
         """Build the who/what context attached to every error report.
 
-        Reads the current user from the tray model under its lock so a report
-        names which user's agent failed.
+        Error reports go to the cross-tenant BetterQA ops ingest (betterqa-bot),
+        NOT the tenant's own server — so we deliberately do NOT attach the end
+        user's email or name. device_id maps back to a user server-side for an
+        admin who needs it, and user_role is enough to route/triage. This keeps
+        PII off a shared sink (privacy audit, 2026-06-24).
         """
         ctx: dict = {"app_version": _VERSION}
         try:
             with self.tray.model.lock:
-                ctx["user_email"] = self.tray.model.user_email
-                ctx["user_name"] = self.tray.model.user_name
                 ctx["user_role"] = self.tray.model.user_role
         except Exception as e:
             logger.debug("Could not read user context for error report: %s", e)

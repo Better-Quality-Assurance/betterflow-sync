@@ -2411,14 +2411,20 @@ class SyncEngine:
             # Default real=count keeps back-compat if a caller passes the old
             # shape (treat as loss rather than silently swallow).
             real = summary.get("real_loss_count", count)
-            buckets = ",".join(summary.get("bucket_ids") or []) or "unknown"
-            span = f"{summary.get('oldest')}..{summary.get('newest')}"
+            # bucket TYPES only — bucket ids embed the hostname (often a person's
+            # name); don't ship that to the cross-tenant ops ingest (privacy F4).
+            types = sorted({str(b).rsplit("_", 1)[0] for b in (summary.get("bucket_ids") or [])})
+            buckets = ",".join(types) or "unknown"
+            # Age, not wall-clock — a precise activity timestamp anchors a
+            # high-resolution timeline in the ops ingest, which the privacy model
+            # avoids (privacy F3; same discipline as the blind-tracker report).
+            window = self._dropped_window_age(summary.get("oldest"), summary.get("newest"))
             if real > 0:
                 other = count - real
                 extra = f"; {other} other unstorable" if other > 0 else ""
                 self.error_reporter.capture(
                     f"Dropped {real} queued event(s) after max retries — likely "
-                    f"real lost activity (buckets={buckets}, span={span}{extra})",
+                    f"real lost activity (buckets={buckets}, {window}{extra})",
                     level="warning",
                     tags={"component": "offline-queue"},
                     fingerprint="offline-queue-events-dropped",
@@ -2426,13 +2432,34 @@ class SyncEngine:
             else:
                 self.error_reporter.capture(
                     f"Flushed {count} unstorable queued event(s) — stale or no "
-                    f"bucket, never server-acceptable (buckets={buckets}, span={span})",
+                    f"bucket, never server-acceptable (buckets={buckets}, {window})",
                     level="info",
                     tags={"component": "offline-queue"},
                     fingerprint="offline-queue-events-flushed-unstorable",
                 )
         except Exception:
             logger.debug("dropped-events report failed", exc_info=True)
+
+    @staticmethod
+    def _dropped_window_age(oldest, newest, now: Optional[datetime] = None) -> str:
+        """Coarse age + duration of a dropped batch for the ops report — NEVER the
+        raw wall-clock event timestamps (those anchor a high-resolution activity
+        timeline in the cross-tenant ingest, which the privacy model avoids)."""
+        now = now or datetime.now(timezone.utc)
+
+        def _parse(s):
+            try:
+                d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                return None
+
+        o, n = _parse(oldest), _parse(newest)
+        if o is None:
+            return "age unknown"
+        age_min = max(0.0, (now - o).total_seconds()) / 60
+        span_min = max(0.0, ((n or o) - o).total_seconds()) / 60
+        return f"oldest ~{age_min:.0f}m old, spans ~{span_min:.0f}m"
 
     def _report_upload_failure(self, reason: str) -> None:
         """Surface a logs_requested upload failure to the ops ingest. We can't

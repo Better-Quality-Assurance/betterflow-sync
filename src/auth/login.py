@@ -100,7 +100,9 @@ class LoginManager:
                     user_role=credentials.user_role,
                     device_id=credentials.device_id,
                 )
-                logger.info(f"Auto-login successful for {credentials.user_email}")
+                # device_id, not email — the log is uploaded on logs_requested;
+                # keep PII out of the uploaded tail (privacy F5).
+                logger.info(f"Auto-login successful for device {credentials.device_id}")
                 if self._on_login_callback:
                     self._on_login_callback(state)
                 return state
