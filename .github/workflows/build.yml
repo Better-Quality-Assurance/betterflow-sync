@@ -8,6 +8,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least-privilege by default: build/test jobs only read. The release job opts up
+# to contents: write below. Pins the token so it never inherits a read-write org
+# default (defense-in-depth, esp. against any future pull_request_target change).
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -242,6 +248,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write  # create the GitHub release + upload assets
 
     steps:
       - name: Download macOS ARM artifact

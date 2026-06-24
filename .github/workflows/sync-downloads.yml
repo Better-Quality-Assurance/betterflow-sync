@@ -10,6 +10,11 @@ on:
         required: false
         type: string
 
+# Read-only token: this workflow only reads release metadata and POSTs to the
+# downloads backend with its own secret; it never needs to write to the repo.
+permissions:
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
