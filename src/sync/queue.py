@@ -382,15 +382,32 @@ class OfflineQueue:
                 event_ids,
             )
 
-    def failed_event_summary(self, max_retries: int = 5) -> dict:
+    def failed_event_summary(
+        self,
+        max_retries: int = 5,
+        *,
+        now: Optional[datetime] = None,
+        stale_after_days: int = 7,
+    ) -> dict:
         """Summarize events at/over the retry ceiling that remove_failed() is
         about to drop. Read-only — does NOT delete.
 
-        Dropping queued events is permanent data loss (activity captured locally
-        that the server never accepted). It used to be a bare log line nobody
-        sees; this lets the caller surface it to the ops error channel instead.
-        Returns {count, bucket_ids, oldest, newest} — empty count 0 when clean.
+        Dropping queued events is normally permanent data loss, but not every
+        drop is real loss: the server legitimately rejects events that are
+        unstorable BY NATURE — older than its retention window (``stale_after_days``,
+        the >7d-stale rule) or carrying no ``bucket_id`` (nowhere to route them).
+        Those exhaust their retries and get flushed, which is benign. We classify
+        each so the caller can warn only on genuine loss (recent + bucketed) and
+        log the benign flushes quietly instead of paging ops.
+
+        Returns {count, bucket_ids, oldest, newest, real_loss_count,
+        unstorable_count} — all zero/empty when clean.
+
+        ``now`` is injectable for deterministic tests (defaults to UTC now).
         """
+        now = now or datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(days=stale_after_days)
+
         with self._cursor() as cursor:
             cursor.execute(
                 "SELECT event_data FROM queued_events WHERE retry_count >= ?",
@@ -400,10 +417,14 @@ class OfflineQueue:
 
         bucket_ids: set[str] = set()
         timestamps: list[str] = []
+        real_loss = 0
+        unstorable = 0
         for row in rows:
             try:
                 ev = json.loads(row[0])
             except (json.JSONDecodeError, TypeError):
+                # Can't even parse it → it could never be stored. Benign flush.
+                unstorable += 1
                 continue
             bid = ev.get("bucket_id")
             if bid:
@@ -411,13 +432,36 @@ class OfflineQueue:
             ts = ev.get("timestamp")
             if ts:
                 timestamps.append(str(ts))
+            # A drop is real loss only if it was actually storable: it has a
+            # bucket to route to AND its timestamp is within the retention window.
+            recent = bid and self._timestamp_within(ts, stale_cutoff)
+            if recent:
+                real_loss += 1
+            else:
+                unstorable += 1
         timestamps.sort()
         return {
             "count": len(rows),
             "bucket_ids": sorted(bucket_ids),
             "oldest": timestamps[0] if timestamps else None,
             "newest": timestamps[-1] if timestamps else None,
+            "real_loss_count": real_loss,
+            "unstorable_count": unstorable,
         }
+
+    @staticmethod
+    def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
+        """True when ``ts`` (ISO-8601) parses and is at/after ``cutoff``. A
+        missing or unparseable timestamp is treated as NOT within (unstorable)."""
+        if not ts:
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed >= cutoff
 
     def remove_failed(self, max_retries: int = 5) -> int:
         """Remove events that have exceeded max retries.
