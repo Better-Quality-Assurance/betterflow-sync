@@ -534,7 +534,13 @@ class SyncEngine:
         # cycle so the sample log stays dense regardless of bucket-fetch outcome.
         if self.afk_source is not None:
             try:
-                self.afk_source.record_sample(datetime.now(timezone.utc))
+                # Protect samples back to the in-process checkpoint so the active
+                # samples taken just before a long pause survive this prune and
+                # can still be billed by the re-seed salvage below.
+                self.afk_source.record_sample(
+                    datetime.now(timezone.utc),
+                    protect_since=self._afk_inproc_checkpoint,
+                )
             except Exception as e:
                 logger.debug("afk_source.record_sample failed: %s", e)
 
@@ -1973,14 +1979,43 @@ class SyncEngine:
         #    were pruned (2h). Reconstructing over an unsampled multi-hour window
         #    would mis-bill; the unobserved span is simply left uncovered (C).
         gap = (now - cp).total_seconds()
-        if now < cp or gap > self.afk_source.retention_seconds:
+        if now < cp:
+            # The wall clock stepped backward (NTP/manual). The window can't be
+            # trusted and the finalize guard below would stall the stream
+            # forever (D) — re-seed and move on.
             logger.info(
-                "in-process AFK: re-seeding checkpoint (gap %.0fs) — not billing "
-                "the unobserved window", gap,
+                "in-process AFK: re-seeding checkpoint (clock stepped back %.0fs)",
+                -gap,
             )
             self._afk_inproc_checkpoint = now
             self._afk_inproc_pending = None
             return []
+        if gap > self.afk_source.retention_seconds:
+            # A pause/sleep froze the checkpoint past the sample-retention
+            # window (2h). We can't reconstruct the whole multi-hour span, but
+            # discarding it outright dropped the genuine active work the agent
+            # had already observed in the final minutes before the machine
+            # slept — surfacing as a ~10-20 min idle/empty gap hugging every
+            # pause (Ecaterina/Matei Cocora, device 44, 2026-06-25). Salvage the
+            # spans the retained samples DO cover (cover_unsampled=False leaves
+            # the unobserved window uncovered, exactly as before) and re-seed
+            # past it. Emitted one-shot: the queue is the durability layer, and
+            # the checkpoint is reset to `now` so nothing is rebuilt.
+            with self._state_lock:
+                project = self._current_project
+            salvaged = self.afk_source.build_afk_events(
+                cp, self.afk_source.finalize_point(now),
+                project_id=project["id"] if project else None,
+                cover_unsampled=False,
+            )
+            logger.info(
+                "in-process AFK: re-seeding checkpoint (gap %.0fs) — salvaged %d "
+                "observed span(s), leaving the unobserved window uncovered",
+                gap, len(salvaged),
+            )
+            self._afk_inproc_checkpoint = now
+            self._afk_inproc_pending = None
+            return salvaged
 
         # Blind clock: the OS idle clock has failed for several consecutive
         # cycles, so there are no fresh samples. finalize_point would backdate
