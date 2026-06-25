@@ -1520,6 +1520,66 @@ class TestSyncCoordinatorBreak:
         self.coordinator.scheduler = Mock()
         self.coordinator.scheduler.running = True
 
+    def test_private_auto_end_fires_callback_past_cap(self):
+        self.config.reminders.private_auto_end_hours = 4.0
+        self.sync_engine.is_private = True
+        self.reminder.private_elapsed_seconds.return_value = 4 * 3600 + 1
+        cb = Mock()
+        self.coordinator.on_private_auto_end = cb
+
+        self.coordinator._check_private_auto_end()
+
+        cb.assert_called_once()
+        assert cb.call_args[0][0] >= 4 * 3600
+
+    def test_private_auto_end_below_cap_does_nothing(self):
+        self.config.reminders.private_auto_end_hours = 4.0
+        self.sync_engine.is_private = True
+        self.reminder.private_elapsed_seconds.return_value = 3 * 3600
+        cb = Mock()
+        self.coordinator.on_private_auto_end = cb
+
+        self.coordinator._check_private_auto_end()
+
+        cb.assert_not_called()
+
+    def test_private_auto_end_disabled_when_cap_zero(self):
+        self.config.reminders.private_auto_end_hours = 0
+        self.sync_engine.is_private = True
+        self.reminder.private_elapsed_seconds.return_value = 99 * 3600
+        cb = Mock()
+        self.coordinator.on_private_auto_end = cb
+
+        self.coordinator._check_private_auto_end()
+
+        cb.assert_not_called()
+
+    def test_private_auto_end_skipped_when_not_private(self):
+        self.config.reminders.private_auto_end_hours = 4.0
+        self.sync_engine.is_private = False
+        cb = Mock()
+        self.coordinator.on_private_auto_end = cb
+
+        self.coordinator._check_private_auto_end()
+
+        cb.assert_not_called()
+        self.reminder.private_elapsed_seconds.assert_not_called()
+
+    @patch("src.main.send_notification")
+    def test_auto_end_private_tears_down_and_notifies(self, mock_notify):
+        """The app-side teardown (wired as on_private_auto_end) ends private the
+        same way the user toggle does, with a 'we turned it off' notice."""
+        from src.main import BetterFlowApp
+        app = Mock()
+        BetterFlowApp._auto_end_private(app, 5 * 3600)
+        app._set_user_paused.assert_called_once_with(False)
+        app.sync_engine.set_private_mode.assert_called_once_with(False)
+        app.sync_engine.resume.assert_called_once()
+        app.reminder_manager.on_private_ended.assert_called_once()
+        app.reminder_manager.on_tracking_started.assert_called_once()
+        mock_notify.assert_called_once()
+        assert "auto-ended" in mock_notify.call_args[0][0].lower()
+
     def test_start_break_sets_flag(self):
         """start_break sets _on_break."""
         self.coordinator.start_break()

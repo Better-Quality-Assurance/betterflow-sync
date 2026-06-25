@@ -210,6 +210,10 @@ class SyncCoordinator:
 
         # Optional callback wired by the app for auth-error re-login
         self._on_auth_error: Optional[Callable] = None
+        # Wired by BetterFlowApp to end Private Time when the auto-end safety cap
+        # is hit (the engine/tray/paused-flag teardown lives on the app). Called
+        # with the elapsed seconds. None until wired (e.g. in tests).
+        self.on_private_auto_end: Optional[Callable[[float], None]] = None
 
         # In-process input watcher reference, wired by the App after
         # construction. Used by `_check_idle_tracker_health` to cross-check
@@ -594,6 +598,25 @@ class SyncCoordinator:
     # short typing pause doesn't trip the warning.
     _IDLE_TRACKER_RECENT_INPUT_S = 180  # 3 min
 
+    def _check_private_auto_end(self) -> None:
+        """Hard safety cap: force-end Private Time after a configured number of
+        continuous hours so a forgotten toggle can't silently zero a whole day's
+        billable time (Raluca, 2026-06-25, ~11h private). v1.5.79 already ends
+        private on sleep; this covers the awake-but-forgotten case. 0 disables.
+        The actual teardown runs via the on_private_auto_end callback (wired by
+        BetterFlowApp, which owns the engine/tray/paused-flag state)."""
+        if self.reminder_manager is None or not self.sync_engine.is_private:
+            return
+        cap_hours = getattr(self.config.reminders, "private_auto_end_hours", 0) or 0
+        if cap_hours <= 0:
+            return
+        elapsed = self.reminder_manager.private_elapsed_seconds()
+        if elapsed is None or elapsed < cap_hours * 3600:
+            return
+        logger.warning("Private Time auto-ended after %.1fh (safety cap)", elapsed / 3600)
+        if self.on_private_auto_end is not None:
+            self.on_private_auto_end(elapsed)
+
     def _check_idle_tracker_health(self) -> None:
         """Detect when bf-idle-tracker is reporting AFK while the in-process
         input watcher is seeing keystrokes — Lucian's 2026-06-11 incident.
@@ -834,6 +857,7 @@ class SyncCoordinator:
             (self._check_permissions, "permissions"),
             (self._check_auth_warn, "auth_warn"),
             (self._check_idle_tracker_health, "idle_tracker_health"),
+            (self._check_private_auto_end, "private_auto_end"),
         ):
             self._run_tick_task(fn, label)
         if self.reminder_manager:
@@ -1409,6 +1433,7 @@ class BetterFlowApp:
             error_reporter=self.error_reporter,
         )
         self.coordinator._on_auth_error = self._on_session_expired
+        self.coordinator.on_private_auto_end = self._auto_end_private
         self.coordinator._input_watcher = self.input_watcher
         # The idle manager uses the same in-process watcher as an authoritative
         # override so a blind/stuck bf-idle-tracker can't paint live work as
@@ -2036,6 +2061,21 @@ class BetterFlowApp:
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
             send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
+
+    def _auto_end_private(self, elapsed_seconds: float) -> None:
+        """End Private Time the same way the user toggle does, with a message
+        making clear WE turned it off (so they re-enable if it was intended)."""
+        self._set_user_paused(False)
+        self.sync_engine.set_private_mode(False)
+        self.sync_engine.resume()
+        self.tray.set_paused(False)
+        self.reminder_manager.on_private_ended()
+        self.reminder_manager.on_tracking_started()
+        send_notification(
+            "Private Time auto-ended",
+            f"Private mode had been on for {elapsed_seconds / 3600:.1f}h, so tracking "
+            "was turned back on. Re-enable Private Time if you still need it.",
+        )
 
     def _on_idle_pause(self, paused: bool) -> None:
         """Handle idle pause/resume — also pause/resume input watcher and slow window polling."""

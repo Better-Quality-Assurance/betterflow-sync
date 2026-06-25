@@ -165,6 +165,35 @@ class TestPrivateReminders:
         self.mgr.check()
         mock_notify.assert_not_called()
 
+    @patch("src.reminders.time.monotonic")
+    def test_private_elapsed_seconds_tracks_active_session(self, mock_mono):
+        mock_mono.return_value = 100.0
+        assert self.mgr.private_elapsed_seconds() is None  # not in private
+
+        self.mgr.on_private_started()
+        mock_mono.return_value = 100.0 + 3600
+        assert self.mgr.private_elapsed_seconds() == 3600
+
+        self.mgr.on_private_ended()
+        assert self.mgr.private_elapsed_seconds() is None
+
+    @patch("src.reminders.send_notification")
+    @patch("src.reminders.time.monotonic")
+    def test_private_nudge_escalates_past_one_hour(self, mock_mono, mock_notify):
+        mock_mono.return_value = 0.0
+        self.mgr.on_private_started()
+
+        # 20m — passive copy.
+        mock_mono.return_value = 20 * 60
+        self.mgr.check()
+        assert "still active" in mock_notify.call_args[0][0].lower()
+
+        # 60m — escalated copy ("is that intended?").
+        mock_notify.reset_mock()
+        mock_mono.return_value = 60 * 60
+        self.mgr.check()
+        assert "intended" in mock_notify.call_args[0][0].lower()
+
 
 class TestBreakState:
     """Tests for break-state suppression and reset behavior."""
