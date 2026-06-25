@@ -318,26 +318,11 @@ def _apply_local_artifact(
             # logged a line). The helper therefore writes its own outcome (each
             # open attempt + exit code) to self-update-relaunch.log, which is the
             # ground truth a canary needs.
-            quoted_app = shlex.quote(str(app_path))
             try:
                 relaunch_log = str(Config.get_log_dir() / "self-update-relaunch.log")
             except Exception:
                 relaunch_log = "/tmp/betterflow-self-update-relaunch.log"
-            quoted_log = shlex.quote(relaunch_log)
-            # Capture rc into a var IMMEDIATELY after open — a $(date) in the same
-            # echo would otherwise reset $? and we'd log rc=0 for every failure.
-            script = (
-                f'L={quoted_log}; A={quoted_app}; '
-                f'echo "$(date -u +%FT%TZ) waiting for pid {os.getpid()}" >> "$L"; '
-                f'while kill -0 {os.getpid()} 2>/dev/null; do sleep 0.2; done; '
-                f'echo "$(date -u +%FT%TZ) pid gone; opening $A" >> "$L"; '
-                f'for i in 1 2 3 4 5; do '
-                f'open "$A" >> "$L" 2>&1; rc=$?; '
-                f'if [ "$rc" -eq 0 ]; then echo "$(date -u +%FT%TZ) open OK (try $i)" >> "$L"; exit 0; fi; '
-                f'echo "$(date -u +%FT%TZ) open FAILED rc=$rc (try $i)" >> "$L"; sleep 1; '
-                f'done; '
-                f'echo "$(date -u +%FT%TZ) RELAUNCH FAILED after 5 attempts" >> "$L"'
-            )
+            script = _build_macos_relaunch_script(str(app_path), os.getpid(), relaunch_log)
             subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
             # os._exit works from any thread, unlike sys.exit which only raises
             # SystemExit in the calling thread.
@@ -603,6 +588,41 @@ def _codesign_verify(app_path: Path) -> bool:
     except subprocess.TimeoutExpired:
         logger.error("codesign verification timed out")
         return False
+
+
+def _build_macos_relaunch_script(app_path: str, pid: int, log_path: str) -> str:
+    """Shell helper run (detached) after os._exit to reopen the app post-update.
+
+    It waits for THIS process to die, opens the new bundle, and — crucially —
+    VERIFIES a real process actually came up before trusting it, retrying the
+    open if not. `open` returning 0 means LaunchServices ACCEPTED the request,
+    NOT that the app started: it can silently no-op (or the new instance can die
+    on startup) leaving NO running process while the helper logs "open OK" and
+    exits. That is the 6.5h black hole Botond hit (2026-06-25): a 09:18 relaunch
+    logged "open OK" but the agent never synced until the next relaunch at 15:35.
+    `open` is idempotent (it just reactivates an already-running app), so the
+    retry is always safe. The helper logs each outcome to its own file (the main
+    log can't capture anything after os._exit) — ground truth for a canary.
+    """
+    quoted_app = shlex.quote(str(app_path))
+    quoted_log = shlex.quote(str(log_path))
+    return (
+        f'L={quoted_log}; A={quoted_app}; '
+        f'echo "$(date -u +%FT%TZ) waiting for pid {pid}" >> "$L"; '
+        f'while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; '
+        f'echo "$(date -u +%FT%TZ) pid gone; opening $A" >> "$L"; '
+        f'for i in 1 2 3 4 5; do '
+        # Capture rc IMMEDIATELY after open — a $(date) in the same echo would
+        # reset $? and we'd log rc=0 for every failure.
+        f'open "$A" >> "$L" 2>&1; rc=$?; '
+        f'if [ "$rc" -ne 0 ]; then echo "$(date -u +%FT%TZ) open FAILED rc=$rc (try $i)" >> "$L"; sleep 2; continue; fi; '
+        f'sleep 3; '
+        f'if pgrep -f "$A/Contents/MacOS/" >/dev/null 2>&1; then '
+        f'echo "$(date -u +%FT%TZ) open OK + process alive (try $i)" >> "$L"; exit 0; fi; '
+        f'echo "$(date -u +%FT%TZ) open returned 0 but NO running process (try $i) — retrying" >> "$L"; sleep 2; '
+        f'done; '
+        f'echo "$(date -u +%FT%TZ) RELAUNCH FAILED after 5 attempts (open accepted but no live process)" >> "$L"'
+    )
 
 
 def _verify_codesign(app_path: Path, current_app_path: Optional[Path] = None) -> bool:
