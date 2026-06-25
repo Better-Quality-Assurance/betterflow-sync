@@ -12,6 +12,7 @@ import logging
 import platform
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -52,6 +53,19 @@ class MacOSWindowWatcher:
     # the user having to restart the app.
     _ACCESSIBILITY_RECHECK_INTERVAL_S = 30.0
 
+    # Warn once when the watcher has posted no window heartbeat for this long
+    # while still running — surfaces a silent window-ingest stall, which was
+    # invisible in the logs during the Cristian Dragota incident (2026-06-25:
+    # window/app data went stale on the server for ~15 min while AFK/input kept
+    # flowing, with nothing in the agent log to say the window watcher had gone
+    # quiet or why).
+    _NO_EMIT_WARN_SECONDS = 90.0
+
+    # Bound each Accessibility messaging round-trip so a hung/unresponsive
+    # frontmost app can't block the poll thread inside AXUIElementCopyAttribute-
+    # Value (which would freeze window tracking with no exception and no log).
+    _AX_MESSAGING_TIMEOUT_S = 2.0
+
     def __init__(self, aw_client, poll_interval: float = 2.0):
         self._aw = aw_client
         self._poll_interval = poll_interval
@@ -73,6 +87,12 @@ class MacOSWindowWatcher:
         self._browser_cache_key: Optional[tuple[str, str]] = None
         self._browser_cache_url: Optional[str] = None
         self._browser_cache_incognito: Optional[bool] = None
+        # No-emit instrumentation: when post_heartbeat stops being called
+        # (frontmost is None, an AX error, or a blocked poll) window/app data
+        # silently goes stale on the server. Track the no-emit streak so a real
+        # gap leaves a one-shot fingerprint in the log instead of silence.
+        self._no_emit_since: Optional[float] = None
+        self._no_emit_warned: bool = False
 
     def start(self) -> bool:
         """Create the AW bucket and start the polling thread.
@@ -140,6 +160,16 @@ class MacOSWindowWatcher:
         # Get window title via Accessibility API
         title = ""
         app_ref = AXUIElementCreateApplication(pid)
+        # Bound the AX round-trips: an unresponsive frontmost app can otherwise
+        # block AXUIElementCopyAttributeValue and freeze this poll thread with no
+        # exception (silent window stall). The symbol is absent on some PyObjC
+        # builds, so guard it and fall back to the system default timeout.
+        try:
+            from ApplicationServices import AXUIElementSetMessagingTimeout
+
+            AXUIElementSetMessagingTimeout(app_ref, self._AX_MESSAGING_TIMEOUT_S)
+        except Exception:
+            pass
         err, focused_window = AXUIElementCopyAttributeValue(
             app_ref, "AXFocusedWindow", None,
         )
@@ -283,6 +313,10 @@ class MacOSWindowWatcher:
                     self._poll_once()
             except Exception as e:
                 logger.warning(f"Window watcher poll error: {e}")
+                # A raising poll also produces no heartbeat — count it toward the
+                # no-emit streak so a persistent failure escalates to the stall
+                # warning instead of just per-poll noise.
+                self._note_no_emit(f"poll error: {e}")
 
     def _maybe_log_accessibility_transition(self) -> None:
         """Re-check AXIsProcessTrusted() occasionally and log when the
@@ -311,10 +345,38 @@ class MacOSWindowWatcher:
             )
         self._last_accessibility = trusted
 
+    def _note_emit(self) -> None:
+        """A window heartbeat was posted — clear any no-emit streak (and log a
+        one-line recovery if we'd previously warned about a stall)."""
+        if self._no_emit_warned and self._no_emit_since is not None:
+            logger.info(
+                "Window watcher resumed posting after %.0fs of no window events",
+                time.monotonic() - self._no_emit_since,
+            )
+        self._no_emit_since = None
+        self._no_emit_warned = False
+
+    def _note_no_emit(self, reason: str) -> None:
+        """A poll produced no window heartbeat. Warn once when the gap crosses
+        the threshold so a silent window-ingest stall is diagnosable on the next
+        occurrence (Cristian Dragota, 2026-06-25)."""
+        now = time.monotonic()
+        if self._no_emit_since is None:
+            self._no_emit_since = now
+        gap = now - self._no_emit_since
+        if not self._no_emit_warned and gap >= self._NO_EMIT_WARN_SECONDS:
+            self._no_emit_warned = True
+            logger.warning(
+                "Window watcher has posted no window event for %.0fs (%s) — "
+                "window/app data is going stale on the server while the agent runs",
+                gap, reason,
+            )
+
     def _poll_once(self) -> None:
         """Single poll iteration: get active window, post heartbeat."""
         data = self._get_active_window()
         if not data or not data.get("app"):
+            self._note_no_emit("no frontmost app")
             return
 
         heartbeat_data = {
@@ -331,3 +393,4 @@ class MacOSWindowWatcher:
             self._bucket_id, timestamp, heartbeat_data,
             pulsetime=self._poll_interval + 1.0,
         )
+        self._note_emit()
