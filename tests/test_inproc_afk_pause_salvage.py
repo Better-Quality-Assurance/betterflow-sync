@@ -69,7 +69,12 @@ def test_long_pause_reseed_salvages_observed_active_tail():
 
 def test_long_pause_with_no_observed_tail_emits_nothing():
     """If nothing was observed before the pause (only the wake sample), the
-    re-seed still emits nothing — we never invent activity over a blank window."""
+    re-seed still emits nothing — we never invent activity over a blank window.
+
+    NOTE: unlike the salvage test above, this one also passes on PRE-fix code
+    (the old re-seed also returned []). It is not a regression test — it guards
+    that the salvage path does not OVER-bill when there is no observed tail.
+    """
     eng = _engine(retention=7200.0)
     eng._afk_inproc_checkpoint = T0 - timedelta(hours=5)
     eng.afk_source.record_sample(T0, protect_since=eng._afk_inproc_checkpoint)
@@ -78,3 +83,14 @@ def test_long_pause_with_no_observed_tail_emits_nothing():
 
     assert events == [], "must not reconstruct an unobserved multi-hour window"
     assert eng._afk_inproc_checkpoint == T0
+
+
+def test_protect_since_respects_maxlen_backstop():
+    """`protect_since` keeps samples past retention, but the deque's maxlen is an
+    absolute memory cap — a frozen checkpoint can't grow it without bound."""
+    src = AfkSource(600, "host", idle_clock=lambda: 5.0,
+                    retention_seconds=7200.0, max_samples=100)
+    frozen_cp = T0  # checkpoint never advances (e.g. continuous send failure)
+    for i in range(500):
+        src.record_sample(T0 + timedelta(seconds=i), protect_since=frozen_cp)
+    assert len(src.samples) <= 100

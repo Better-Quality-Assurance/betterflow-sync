@@ -29,6 +29,7 @@ class AfkSource:
         input_watcher=None,
         idle_clock: Callable[[], Optional[float]] = get_system_idle_seconds,
         retention_seconds: float = 7200.0,
+        max_samples: int = 20000,
     ) -> None:
         self._afk_timeout = float(afk_timeout_seconds)
         self._hostname = hostname
@@ -37,8 +38,14 @@ class AfkSource:
         self._retention_seconds = float(retention_seconds)
         self._retention = timedelta(seconds=retention_seconds)
         self._lock = threading.Lock()
-        # (sample_time, last_input_at)
-        self._samples: deque = deque()
+        # (sample_time, last_input_at). `maxlen` is an absolute memory backstop:
+        # `protect_since` can hold samples past the retention prune (so a long
+        # pause's pre-pause tail survives, and a held checkpoint can rebuild),
+        # but a pathological frozen checkpoint during a multi-day outage must
+        # not grow this without bound. ~20k samples ≈ 2 weeks at one per cycle;
+        # appends auto-evict the oldest beyond that (salvage past that horizon is
+        # moot anyway).
+        self._samples: deque = deque(maxlen=max_samples)
         # Sticky platform-capability latch: a transient idle-clock read failure
         # (e.g. a one-off `ioreg` timeout) must NOT revoke in-process mode for a
         # cycle — that would hand billing back to the external tracker and flap
@@ -183,6 +190,8 @@ class AfkSource:
                 spans.append((range_start, range_end, "afk"))
         else:
             first = activity[0]
+            # `first > range_start` also covers anchor == range_start (checkpoint
+            # set exactly to a last_input): no leading gap, so skip the span.
             if first > range_start and cover_unsampled:
                 spans.append((range_start, first, "afk"))  # leading unknown
             for a, b in zip(activity, activity[1:], strict=False):

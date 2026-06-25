@@ -536,7 +536,13 @@ class SyncEngine:
             try:
                 # Protect samples back to the in-process checkpoint so the active
                 # samples taken just before a long pause survive this prune and
-                # can still be billed by the re-seed salvage below.
+                # can still be billed by the re-seed salvage below (and so a
+                # held checkpoint can rebuild un-acked spans, finding B).
+                # The checkpoint read is lock-free: it's a GIL-atomic reference
+                # read, _advance_checkpoints_to_now only moves it FORWARD to now,
+                # and _build_inproc_afk re-reads it fresh — so a race only ever
+                # over-retains a few samples (bounded by the deque maxlen), never
+                # mis-bills.
                 self.afk_source.record_sample(
                     datetime.now(timezone.utc),
                     protect_since=self._afk_inproc_checkpoint,
@@ -2013,6 +2019,12 @@ class SyncEngine:
                 "observed span(s), leaving the unobserved window uncovered",
                 gap, len(salvaged),
             )
+            # INTENTIONAL deviation from finding B (checkpoint advances only after
+            # a confirmed send): the salvaged spans can't be rebuilt next cycle —
+            # the samples that produced them are about to age out. The offline
+            # queue is the durability layer instead: a queued salvage drains later
+            # and the server upserts idempotently on the stable (ms-precision) ids.
+            # Advancing to `now` prevents re-salvaging the same window every wake.
             self._afk_inproc_checkpoint = now
             self._afk_inproc_pending = None
             return salvaged
