@@ -7,8 +7,8 @@ to start, leaving no running process. The helper must confirm a live process
 (and retry the open otherwise) instead of trusting `open`'s exit code.
 """
 
-import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -30,7 +30,7 @@ def test_relaunch_script_verifies_a_live_process_after_open():
     assert "open \"$A\"" in script
 
 
-@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX sh unavailable (e.g. Windows CI); the relaunch script is macOS-only")
+@pytest.mark.skipif(sys.platform == "win32", reason="/bin/sh is macOS/Linux-only; the relaunch script only ever runs on macOS")
 def test_relaunch_script_is_valid_sh():
     script = _build_macos_relaunch_script("/Applications/BetterFlow 2.app", 4242, "/tmp/r.log")
     # `sh -n` parses without executing — catches quoting/syntax regressions in
