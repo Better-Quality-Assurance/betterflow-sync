@@ -30,6 +30,7 @@ def _make_coordinator(
     input_watcher=None,
     latest_afk_event=None,
     extra_buckets=None,
+    inproc_afk_active=False,
 ) -> SyncCoordinator:
     """Build a coordinator with mock deps and inject the input_watcher +
     a fake AWClient that returns canned AFK buckets/events.
@@ -72,12 +73,17 @@ def _make_coordinator(
 
     aw_manager = MagicMock()
     aw_manager.idle_tracker_blind = False  # default; a test flips it on
+    sync_engine = MagicMock()
+    # Default: external bf-idle-tracker IS the billing source, so its blindness
+    # is billing-relevant and the check should fire. The in-process-AFK case
+    # (where a blind external tracker is cosmetic) sets this True explicitly.
+    sync_engine.inproc_afk_active = inproc_afk_active
     coord = SyncCoordinator(
         config=MagicMock(),
         aw=aw,
         bf=MagicMock(),
         queue=MagicMock(),
-        sync_engine=MagicMock(),
+        sync_engine=sync_engine,
         tray=tray,
         aw_manager=aw_manager,
     )
@@ -136,6 +142,29 @@ def test_blind_capture_uses_coarse_input_age_not_timestamp(mock_send):
     ctx = coord.error_reporter.capture.call_args.kwargs["context"]
     assert "last_input" not in ctx, "must not leak the precise wall-clock timestamp"
     assert isinstance(ctx.get("last_input_age_seconds"), int)
+
+
+@patch("src.main.send_notification")
+def test_silent_when_inproc_afk_active(mock_send):
+    """When the in-process AFK source is the sole billing source (#70), a blind
+    external bf-idle-tracker no longer affects recorded work time — its 'afk'
+    disagreement is cosmetic, so the check must NOT alarm the user or page ops
+    (the "not being recorded as work time" message would be false). This is the
+    fix for the recurring [betterflow-sync] blind-tracker ops-error wave."""
+    input_watcher = MagicMock()
+    input_watcher.get_last_input_at.return_value = datetime.now(timezone.utc) - timedelta(seconds=30)
+
+    coord = _make_coordinator(
+        input_watcher=input_watcher,
+        latest_afk_event=_afk_event("afk", age_seconds=3600, duration=300),
+        inproc_afk_active=True,
+    )
+    coord.error_reporter = MagicMock()
+
+    coord._check_idle_tracker_health()
+
+    mock_send.assert_not_called()
+    coord.error_reporter.capture.assert_not_called()
 
 
 @patch("src.main.send_notification")

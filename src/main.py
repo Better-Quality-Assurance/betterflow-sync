@@ -618,6 +618,24 @@ class SyncCoordinator:
         if not self.logged_in:
             return
 
+        # When the in-process AFK source is active it is the SOLE billing source
+        # (#70): the agent uploads its own AFK stream and the external
+        # bf-idle-tracker bucket is ignored. A blind/stale external tracker then
+        # no longer affects recorded work time, so its disagreement with the
+        # input watcher is cosmetic. Skip the whole check — alarming the user
+        # ("your activity isn't being recorded as work time") would be FALSE, and
+        # paging ops produces the recurring blind-tracker error wave for nothing.
+        # The aw_manager watchdog already suppresses its own blind detection on
+        # the same condition; this closes the remaining un-gated path. When
+        # in-process AFK is unavailable (Linux, or the OS idle clock went blind)
+        # this flips False and the external tracker matters again — so the check
+        # correctly resumes.
+        try:
+            if self.sync_engine.inproc_afk_active:
+                return
+        except Exception as e:  # never let a telemetry guard break the tick
+            logger.debug("idle_tracker_health: inproc_afk_active check failed: %s", e)
+
         # Chronic-blind path: the watchdog gave up frequent restarts because
         # bf-idle-tracker stays stale across them — that's a missing Input
         # Monitoring grant (separate TCC subject), not a crash a restart fixes.
