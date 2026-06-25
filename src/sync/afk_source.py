@@ -29,6 +29,7 @@ class AfkSource:
         input_watcher=None,
         idle_clock: Callable[[], Optional[float]] = get_system_idle_seconds,
         retention_seconds: float = 7200.0,
+        max_samples: int = 20000,
     ) -> None:
         self._afk_timeout = float(afk_timeout_seconds)
         self._hostname = hostname
@@ -37,8 +38,14 @@ class AfkSource:
         self._retention_seconds = float(retention_seconds)
         self._retention = timedelta(seconds=retention_seconds)
         self._lock = threading.Lock()
-        # (sample_time, last_input_at)
-        self._samples: deque = deque()
+        # (sample_time, last_input_at). `maxlen` is an absolute memory backstop:
+        # `protect_since` can hold samples past the retention prune (so a long
+        # pause's pre-pause tail survives, and a held checkpoint can rebuild),
+        # but a pathological frozen checkpoint during a multi-day outage must
+        # not grow this without bound. ~20k samples ≈ 2 weeks at one per cycle;
+        # appends auto-evict the oldest beyond that (salvage past that horizon is
+        # moot anyway).
+        self._samples: deque = deque(maxlen=max_samples)
         # Sticky platform-capability latch: a transient idle-clock read failure
         # (e.g. a one-off `ioreg` timeout) must NOT revoke in-process mode for a
         # cycle — that would hand billing back to the external tracker and flap
@@ -82,9 +89,16 @@ class AfkSource:
             self._available_latched = True
         return ok
 
-    def record_sample(self, now: datetime) -> None:
+    def record_sample(self, now: datetime, protect_since: Optional[datetime] = None) -> None:
         """Observe activity at ``now`` and append (now, last_input_at). No-op when
-        the OS idle clock is unavailable (Linux)."""
+        the OS idle clock is unavailable (Linux).
+
+        ``protect_since`` keeps samples at/after that instant from being pruned
+        even when they age past the retention window. The engine passes its
+        in-process AFK checkpoint so the active samples taken just before a
+        long pause survive the wake-cycle prune and can still be billed —
+        otherwise a sleep longer than retention drops the genuine pre-pause
+        work as an idle gap (Ecaterina/Matei Cocora, 2026-06-25)."""
         try:
             idle = self._idle_clock()
         except Exception as e:
@@ -111,6 +125,10 @@ class AfkSource:
             self._samples.append((now, last_input_at))
             cutoff = now - self._retention
             while self._samples and self._samples[0][0] < cutoff:
+                # Don't prune below a protected floor (the engine's checkpoint):
+                # those samples still cover an un-billed span before a pause.
+                if protect_since is not None and self._samples[0][0] >= protect_since:
+                    break
                 self._samples.popleft()
 
     def finalize_point(self, now: datetime) -> datetime:
@@ -133,13 +151,21 @@ class AfkSource:
     def build_afk_events(
         self, range_start: datetime, range_end: datetime,
         project_id: Optional[int] = None,
+        cover_unsampled: bool = True,
     ) -> list:
         """Reconstruct AFK spans over [range_start, range_end] from samples.
 
         Activity is known only at each sample's last_input_at. Between two
         activity instants the user is not-afk until last_input + afk_timeout,
         then afk (aw-watcher-afk parity). Any sub-range with no covering sample
-        is afk (never invent activity)."""
+        is afk (never invent activity).
+
+        With ``cover_unsampled=False`` the unsampled boundary regions (a leading
+        gap before the first observed instant, and a trailing gap past the last
+        one that already exceeds the timeout) are LEFT OUT instead of filled
+        with afk. Used by the long-pause re-seed path to salvage only the spans
+        the retained samples genuinely cover, leaving the unobserved sleep
+        window uncovered rather than reconstructing it."""
         if range_end <= range_start:
             return []
         timeout = timedelta(seconds=self._afk_timeout)
@@ -160,17 +186,20 @@ class AfkSource:
         # declaring afk, not how the billed span is classified.
         spans: list = []
         if not activity:
-            spans.append((range_start, range_end, "afk"))
+            if cover_unsampled:
+                spans.append((range_start, range_end, "afk"))
         else:
             first = activity[0]
-            if first > range_start:
+            # `first > range_start` also covers anchor == range_start (checkpoint
+            # set exactly to a last_input): no leading gap, so skip the span.
+            if first > range_start and cover_unsampled:
                 spans.append((range_start, first, "afk"))  # leading unknown
             for a, b in zip(activity, activity[1:], strict=False):
                 spans.append((a, b, "not-afk" if (b - a) <= timeout else "afk"))
             last = activity[-1]
-            spans.append(
-                (last, range_end, "not-afk" if (range_end - last) <= timeout else "afk")
-            )
+            trailing = "not-afk" if (range_end - last) <= timeout else "afk"
+            if trailing == "not-afk" or cover_unsampled:
+                spans.append((last, range_end, trailing))
 
         events: list = []
         for start, end, status in sorted(spans, key=lambda s: s[0]):
