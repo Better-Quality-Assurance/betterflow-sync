@@ -80,6 +80,16 @@ class ReminderManager:
                 self._private_active = False
                 logger.debug("Private timer reset")
 
+    def private_elapsed_seconds(self) -> float | None:
+        """Seconds Private Time has been continuously active, or None when not
+        in private mode. Monotonic, so it excludes machine-sleep — paired with
+        the v1.5.79 end-private-on-sleep fix, this is the awake duration. The
+        coordinator uses it for the hard auto-end safety cap."""
+        with self._lock:
+            if not self._private_active or self._private_start is None:
+                return None
+            return time.monotonic() - self._private_start
+
     def on_break_started(self) -> None:
         """Call when auto-break begins (suppresses further break checks)."""
         with self._lock:
@@ -159,9 +169,18 @@ class ReminderManager:
             minutes = int(elapsed // 60)
             self._last_private_notification = now
 
-        # Send notification outside the lock
+        # Send notification outside the lock. Escalate past an hour: a multi-hour
+        # private session is almost always a forgotten toggle silently zeroing
+        # billable time, so the copy gets pointed rather than passive.
         logger.info(f"Private time reminder sent ({minutes}m elapsed)")
-        send_notification(
-            "Private Time Still Active",
-            f"Private mode has been on for {minutes}m - tracking is paused.",
-        )
+        if minutes >= 60:
+            send_notification(
+                "Private Time still on — is that intended?",
+                f"Private mode has been on for {minutes / 60:.1f}h and nothing is "
+                "being tracked. Turn it off if you've finished.",
+            )
+        else:
+            send_notification(
+                "Private Time Still Active",
+                f"Private mode has been on for {minutes}m - tracking is paused.",
+            )

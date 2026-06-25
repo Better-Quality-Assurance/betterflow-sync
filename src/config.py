@@ -376,6 +376,11 @@ class ReminderSettings:
     break_duration_minutes: int = 15  # Auto-break pause duration
     private_reminders_enabled: bool = True
     private_interval_minutes: int = 20  # 10, 20, or 30
+    # Hard safety cap: auto-end Private Time after this many continuous hours so a
+    # forgotten toggle can't silently zero a whole day's billable time (Raluca,
+    # 2026-06-25, ~11h private). 0 disables the cap. v1.5.79 already ends private
+    # on sleep; this covers the awake-but-forgotten case.
+    private_auto_end_hours: float = 4.0
 
 
 @dataclass
