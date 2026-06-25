@@ -1448,6 +1448,43 @@ class TestSystemSleepWakeEmitsSleepSpan:
         handler.on_system_wake()
         sync_engine.resume.assert_called_once()
 
+    def test_private_active_at_sleep_is_ended_and_not_restored_on_wake(self):
+        """A forgotten Private Time toggle must not survive a sleep.
+
+        Private has no auto-timeout, so a user who enables it and whose machine
+        then sleeps would otherwise stay private across the sleep AND into the
+        next awake session — silently marking real post-wake work as private and
+        uncounted (Raluca, 2026-06-24: a ~20-min private toggle stayed on ~11h
+        overnight and swallowed her evening). End it at the sleep boundary (the
+        normal leave path records the true enable→sleep span) and resume NORMAL
+        tracking on wake, never re-entering private.
+        """
+        handler, sync_engine = self._make_handler()
+        sync_engine.is_private = True
+
+        handler.on_system_sleep()
+        sync_engine.set_private_mode.assert_called_once_with(False)
+
+        sync_engine.set_private_mode.reset_mock()
+        handler.on_system_wake()
+
+        assert not any(
+            call.args == (True,)
+            for call in sync_engine.set_private_mode.call_args_list
+        ), "wake must NOT restore private mode"
+        sync_engine.resume.assert_called()
+
+    def test_non_private_sleep_does_not_touch_private_mode(self):
+        """When the user was NOT private at sleep, the flow never calls
+        set_private_mode (no spurious enter/leave)."""
+        handler, sync_engine = self._make_handler()
+        sync_engine.is_private = False
+
+        handler.on_system_sleep()
+        handler.on_system_wake()
+
+        sync_engine.set_private_mode.assert_not_called()
+
 
 class TestSyncCoordinatorBreak:
     """Tests for SyncCoordinator break state management."""
