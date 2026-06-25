@@ -73,6 +73,20 @@ class SystemEventHandler:
                     "on_system_sleep fired while a prior _sleep_start is still pending "
                     "(no wake yet) — keeping the earlier timestamp"
                 )
+        # End Private Time at the sleep boundary. Private has no auto-timeout,
+        # so a user who enables it and forgets — or whose machine sleeps mid-
+        # private — would otherwise stay private across the sleep AND into the
+        # next awake session, silently marking real post-wake work as private
+        # and uncounted (Raluca, 2026-06-24: a ~20-min private toggle stayed on
+        # ~11h overnight and swallowed her evening). Leaving it here records the
+        # true enable→sleep span via the normal leave path (private_time event +
+        # checkpoint advance); on wake we resume NORMAL tracking, never auto-
+        # restoring private.
+        if self._pre_sleep_private:
+            try:
+                self.sync_engine.set_private_mode(False)
+            except Exception as e:
+                logger.warning("ending private mode on sleep failed: %s", e)
         self.coordinator.paused_by_network = False
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
@@ -89,11 +103,6 @@ class SystemEventHandler:
         except ImportError:
             from ui.tray import TrayState
 
-        try:
-            from .main import _day_greeting
-        except ImportError:
-            from main import _day_greeting
-
         self.bf.reset_session()
         self.aw.reset_session()
         # Emit the sleep_time event before any early-return paths so even
@@ -101,7 +110,6 @@ class SystemEventHandler:
         # span. Captured under the lock to avoid racing a second sleep.
         with self._pause_state_lock:
             user_paused = self._user_paused
-            pre_sleep_private = self._pre_sleep_private
             sleep_start = self._sleep_start
             self._sleep_start = None
         if sleep_start is not None:
@@ -115,12 +123,10 @@ class SystemEventHandler:
         if self.coordinator.is_on_break:
             logger.info("System wake - staying on break")
             return
-        if pre_sleep_private:
-            logger.info("System wake - restoring private time")
-            self.sync_engine.resume()
-            self.sync_engine.set_private_mode(True)
-            self.tray.set_state(TrayState.PRIVATE)
-            return
+        # Private Time is intentionally NOT auto-restored: it was ended at the
+        # sleep boundary (on_system_sleep), so a sleep cleanly ends a private
+        # session. The user re-enables it if they still want privacy — a
+        # forgotten toggle can no longer silently swallow post-wake work.
         self.sync_engine.resume()
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
