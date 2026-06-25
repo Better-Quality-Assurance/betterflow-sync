@@ -202,6 +202,19 @@ class SyncCoordinator:
         self._paused_by_network = False
         self._state_lock = threading.Lock()
         self._sync_lock = threading.Lock()
+        # Wedge self-recovery (Cristian Dragota / sync:67a77a43-787, 2026-06-25):
+        # a _do_sync that hangs past the watchdog holds _sync_lock forever, so
+        # every later cycle skips and sync freezes while the heartbeat keeps
+        # last_seen fresh. _sync_takeover_lock guards the acquire/re-arm decision;
+        # a holder stamps _sync_started_at + _sync_holder so a later cycle can
+        # tell a healthy in-flight run from a wedged zombie.
+        self._sync_takeover_lock = threading.Lock()
+        self._sync_started_at: Optional[float] = None
+        self._sync_holder: Optional[threading.Lock] = None
+        # Monotonic clock of the last successful sync round-trip; surfaced on the
+        # heartbeat as sync_stale_seconds so the fleet can flag "alive but not
+        # syncing" directly instead of inferring it from upload gaps.
+        self._last_successful_sync: Optional[float] = None
 
         # Sub-managers (own their locks)
         self.break_mgr = BreakManager(sync_engine, tray, self.scheduler, config, reminder_manager)
@@ -996,10 +1009,64 @@ class SyncCoordinator:
             self._handle_auth_error(auth_err, source="liveness_heartbeat")
 
     _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
+    # A _do_sync holding _sync_lock longer than this is treated as wedged
+    # (deadlock, or a call hung past the watchdog). A new cycle then abandons the
+    # stuck holder and re-arms a fresh lock so syncing resumes instead of skipping
+    # forever. Must exceed _DO_SYNC_DEADLINE so the watchdog's session-reset gets
+    # its chance first.
+    _SYNC_WEDGE_CEILING = 300  # seconds
+
+    def _acquire_sync_slot(self) -> Optional[threading.Lock]:
+        """Take the sync slot, returning the lock to release later, or None to
+        skip this cycle.
+
+        Normally a non-blocking acquire of _sync_lock. But a wedged cycle
+        (lock-ordering deadlock, or a call hung past the watchdog) holds the lock
+        forever — every later cycle would skip and sync would freeze while the
+        heartbeat keeps last_seen fresh (the device looks Active but uploads
+        nothing: Cristian Dragota / sync:67a77a43-787, 2026-06-25). The zombie
+        thread can't be killed, but it must stop blocking every future sync:
+        after _SYNC_WEDGE_CEILING we abandon it and re-arm a fresh lock.
+
+        All bookkeeping runs under _sync_takeover_lock (held briefly, never across
+        IO) so the acquire + re-arm decision is atomic. _sync_holder identifies
+        the current holder so a zombie's finally can't clear a successor's stamp.
+        """
+        with self._sync_takeover_lock:
+            lock = self._sync_lock
+            if lock.acquire(blocking=False):
+                self._sync_started_at = time.monotonic()
+                self._sync_holder = lock
+                return lock
+
+            started = self._sync_started_at
+            if started is None or time.monotonic() - started <= self._SYNC_WEDGE_CEILING:
+                return None  # a healthy in-flight cycle — just skip this tick
+
+            logger.error(
+                "Sync wedged >%ds — abandoning the stuck cycle and re-arming the "
+                "lock so syncing can resume",
+                self._SYNC_WEDGE_CEILING,
+            )
+            if self.error_reporter is not None:
+                self.error_reporter.capture(
+                    f"Sync wedged — held the sync lock >{self._SYNC_WEDGE_CEILING}s; "
+                    "re-armed to resume syncing",
+                    level="error",
+                    tags={"component": "sync-wedge"},
+                    fingerprint="sync-wedged",
+                )
+            fresh = threading.Lock()
+            fresh.acquire()
+            self._sync_lock = fresh
+            self._sync_started_at = time.monotonic()
+            self._sync_holder = fresh
+            return fresh
 
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
-        if not self._sync_lock.acquire(blocking=False):
+        my_lock = self._acquire_sync_slot()
+        if my_lock is None:
             logger.debug("Sync already in progress, skipping")
             return
 
@@ -1120,6 +1187,8 @@ class SyncCoordinator:
             if stats.success or stats.events_sent > 0:
                 # A successful (or partial) sync clears the failure streak.
                 self._consecutive_sync_failures = 0
+                # Stamp the last good round-trip for the staleness telemetry.
+                self._last_successful_sync = time.monotonic()
                 # A successful authenticated round-trip means the token is fine,
                 # so any earlier 401/403 was transient — clear the auth streak.
                 self._consecutive_auth_failures = 0
@@ -1176,9 +1245,15 @@ class SyncCoordinator:
             self._set_sync_failure_state("Sync error")
             self._note_sync_failure("Sync error", exc=e)
         finally:
+            # Clear the wedge stamp only if we're still the current holder — a
+            # taken-over zombie reaching here must not wipe its successor's stamp.
+            with self._sync_takeover_lock:
+                if self._sync_holder is my_lock:
+                    self._sync_started_at = None
+                    self._sync_holder = None
             watchdog_cancelled.set()
             watchdog.cancel()
-            self._sync_lock.release()
+            my_lock.release()
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
         # the lock during a blocking HTTP call that can take 30s on timeout.
@@ -1226,6 +1301,12 @@ class SyncCoordinator:
             "consecutive_sync_failures": self._consecutive_sync_failures,
             "idle_while_active_detections": blind_window,
         }
+        # Seconds since the last successful sync round-trip. Lets the server flag
+        # "alive but sync stale" (heartbeat fresh, uploads frozen) directly rather
+        # than inferring it from upload gaps. Omitted until the first good sync.
+        last_ok = self._last_successful_sync
+        if last_ok is not None:
+            telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
         try:
             telemetry.update(self.aw_manager.health_snapshot())
         except Exception as e:  # noqa: BLE001
