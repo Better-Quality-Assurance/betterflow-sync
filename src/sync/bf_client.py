@@ -371,6 +371,7 @@ class BetterFlowClient(BaseApiClient):
                 "window_event_age_seconds",
                 "consecutive_sync_failures",
                 "idle_while_active_detections",
+                "sync_stale_seconds",
             ):
                 if key in health:
                     data[key] = health[key]
