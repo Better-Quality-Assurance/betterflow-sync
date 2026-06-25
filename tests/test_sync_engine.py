@@ -12,7 +12,7 @@ from src.reminders import ReminderManager
 from src.sync.activity_analyzer import ActivityAnalyzer
 from src.sync.aw_client import BUCKET_TYPE_AFK, BUCKET_TYPE_INPUT, BUCKET_TYPE_WINDOW, AWEvent
 from src.sync.daily_time_tracker import DailyTimeTracker
-from src.sync.sync_engine import SyncEngine, _SyncCycleContext
+from src.sync.sync_engine import SyncEngine, SyncStats, _SyncCycleContext
 from src.ui.tray import TrayState
 
 
@@ -189,7 +189,7 @@ class TestSyncEngine:
             duration=90.0,
             data={"app": "Terminal", "title": "Work"},
         )
-        stats = Mock(events_filtered=0)
+        stats = SyncStats()
 
         transformed, checkpoint = self.engine._transform_and_checkpoint(
             [event],
@@ -219,7 +219,7 @@ class TestSyncEngine:
             duration=60.0,
             data={"app": "Terminal", "title": "Work"},
         )
-        stats = Mock(events_filtered=0)
+        stats = SyncStats()
 
         transformed, _ = self.engine._transform_and_checkpoint(
             [event],
@@ -246,7 +246,7 @@ class TestSyncEngine:
             duration=20 * 60.0,
             data={"app": "Terminal", "title": "Work"},
         )
-        stats = Mock(events_filtered=0)
+        stats = SyncStats()
 
         transformed, _ = self.engine._transform_and_checkpoint(
             [event],
@@ -273,7 +273,7 @@ class TestSyncEngine:
             duration=120.0,
             data={"app": "Terminal", "title": "Work"},
         )
-        stats = Mock(events_filtered=0)
+        stats = SyncStats()
 
         transformed, _ = self.engine._transform_and_checkpoint(
             [event],
@@ -331,7 +331,7 @@ class TestSyncEngine:
             duration=300.0,
             data={"app": "Terminal", "title": "Work"},
         )
-        stats = Mock(events_filtered=0)
+        stats = SyncStats()
 
         transformed, _ = self.engine._transform_and_checkpoint(
             [event],

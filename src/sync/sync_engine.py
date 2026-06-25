@@ -98,6 +98,16 @@ class SyncStats:
     buckets_synced: int = 0
     gaps_filled: int = 0
     calls_detected: int = 0
+    # Window-filter diagnostics: separate "the watcher produced nothing"
+    # (v1.5.83 logs that watcher-side) from "the watcher produced window events
+    # but the privacy filter dropped them all" (this side). window_seen = window
+    # events read from AW this cycle; window_sent = those that survived filtering;
+    # the drop sets/counter name WHY (which excluded app, or how many sub-minimum
+    # flickers) so the next stall classifies itself (Cristian Dragota, 2026-06-25).
+    window_seen: int = 0
+    window_sent: int = 0
+    window_drop_excluded_apps: set = field(default_factory=set)
+    window_drop_short: int = 0
     errors: list[str] = field(default_factory=list)
     queued_bucket_ids: set = field(default_factory=set)
     _should_heartbeat: bool = False
@@ -272,6 +282,14 @@ class SyncEngine:
         # Dedicated lock for all BoundedLRU caches (ops are multi-step and
         # touched from the sync thread plus heartbeat thread).
         self._cache_lock = threading.Lock()
+
+        # Window-filter streak: consecutive sync cycles where the watcher produced
+        # window events but the privacy filter dropped them ALL (window_seen>0,
+        # window_sent==0). Distinguishes "produced-but-filtered" from the
+        # watcher-quiet case (v1.5.83 logs that watcher-side). Single-threaded
+        # (only _do_sync touches it via sync()), so no lock needed.
+        self._window_filter_streak: int = 0
+        self._window_filter_warned: bool = False
 
         # App category cache — avoids SQLite lookups on every event.
         # Populated lazily; invalidated when categories are refreshed.
@@ -660,7 +678,57 @@ class SyncEngine:
                 self._heartbeat_count = 0
         stats._should_heartbeat = should_heartbeat
 
+        self._assess_window_filter(stats)
+
         return stats
+
+    # Warn after this many consecutive cycles where window events were produced
+    # but the filter dropped them all. At a 5-min sync interval this is ~15 min,
+    # matching the server's window-ingest-stall threshold; at 1-min, ~3 min.
+    _WINDOW_FILTER_WARN_CYCLES = 3
+
+    def _assess_window_filter(self, stats: SyncStats) -> None:
+        """Classify a 'no window data on the server' gap as filter-side.
+
+        When the watcher produced window events this cycle (window_seen>0) but
+        the privacy filter dropped them all (window_sent==0), the server sees
+        window/app data go stale even though the watcher is healthy — so the
+        watcher-side warning (v1.5.83) stays silent. After a sustained streak,
+        warn once and NAME the cause (which excluded app, or sub-minimum
+        flickers) so the next occurrence classifies itself instead of being a
+        third indistinguishable silence (Cristian Dragota, 2026-06-25).
+        """
+        produced_but_filtered = stats.window_seen > 0 and stats.window_sent == 0
+        if not produced_but_filtered:
+            if self._window_filter_warned:
+                logger.info(
+                    "Window/app events are reaching the server again "
+                    "(filter no longer dropping them all)"
+                )
+            self._window_filter_streak = 0
+            self._window_filter_warned = False
+            return
+
+        self._window_filter_streak += 1
+        if self._window_filter_warned or self._window_filter_streak < self._WINDOW_FILTER_WARN_CYCLES:
+            return
+        self._window_filter_warned = True
+        if stats.window_drop_excluded_apps:
+            cause = "excluded app(s) frontmost: " + ", ".join(sorted(stats.window_drop_excluded_apps))
+        elif stats.window_drop_short:
+            cause = (
+                f"{stats.window_drop_short} window event(s) under the "
+                f"{self.config.sync.min_window_event_seconds:.0f}s minimum (flicker filter)"
+            )
+        else:
+            cause = "all window events filtered (dedup / zero-duration)"
+        logger.warning(
+            "Window/app data has gone stale on the server across %d cycles — the "
+            "watcher IS producing window events but the filter is dropping them all "
+            "(%s). Billing is unaffected (AFK/input still upload); only per-app "
+            "attribution is lost for this span.",
+            self._window_filter_streak, cause,
+        )
 
     def _prepare_input_analysis(self, input_buckets: list) -> _SyncCycleContext:
         """Fetch recent input events, feed the activity analyzer, and return a
@@ -1090,7 +1158,9 @@ class SyncEngine:
                 stats.events_filtered += 1
                 continue
 
-            if _is_window_like(bucket_type):
+            is_window = _is_window_like(bucket_type)
+            if is_window:
+                stats.window_seen += 1
                 transformed_events = self._transform_window_event_with_timeout(
                     event, bucket_id, bucket_type, cycle
                 )
@@ -1104,8 +1174,19 @@ class SyncEngine:
                 transformed.extend(transformed_events)
                 with self._cache_lock:
                     self._sent_cache[cache_key] = event.duration
+                if is_window:
+                    stats.window_sent += 1
             else:
                 stats.events_filtered += 1
+                # Attribute a dropped WINDOW event so a "no window data" stall can
+                # be classified as filter-side (vs the watcher going quiet). The
+                # reasons mirror _transform_event's drop conditions.
+                if is_window:
+                    app = event.app
+                    if app and app in self.config.privacy.exclude_apps:
+                        stats.window_drop_excluded_apps.add(app)
+                    elif event.duration < self.config.sync.min_window_event_seconds:
+                        stats.window_drop_short += 1
 
         # Batch fraud assessment: one call per cycle instead of per-event.
         # The fraud detector's underlying data changes once per record_window_metrics()
