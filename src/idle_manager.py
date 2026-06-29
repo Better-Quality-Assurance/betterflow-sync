@@ -138,6 +138,19 @@ class IdleManager:
         except Exception:
             return False
 
+    def _is_engaged_without_input(self) -> bool:
+        """Whether a non-input engagement context is active — a call/meeting OR
+        an active foreground-CPU session (Claude Code / build / render in the
+        focused window). Either suppresses the idle pause: the user is engaged
+        even without keyboard/mouse input. Defensive: any error means 'not
+        engaged' so idle detection still works."""
+        if self._is_in_call():
+            return True
+        try:
+            return bool(self.sync_engine.is_active_dev_session())
+        except Exception:
+            return False
+
     def check_idle_status(
         self,
         *,
@@ -221,36 +234,37 @@ class IdleManager:
                     idle_start = datetime.now(timezone.utc) - timedelta(seconds=system_idle)
 
             if is_afk and afk_duration >= self._idle_pause_threshold:
-                in_call = self._is_in_call()
+                engaged = self._is_engaged_without_input()
                 if was_idle_paused:
-                    # Already idle-paused, but a call has since started while the
-                    # user stays AFK. They're now engaged in the meeting
-                    # (listening/watching), so resume — otherwise the call span
-                    # stays painted Idle for as long as they don't touch the
-                    # keyboard. The _is_in_call() guard below only blocks
-                    # ENTERING idle; this is the symmetric exit when a call
+                    # Already idle-paused, but an engagement context (a call, or
+                    # an active foreground-CPU session) has since started while
+                    # the user stays AFK. They're now engaged (listening/watching
+                    # a meeting, or supervising a running session), so resume —
+                    # otherwise the span stays painted Idle for as long as they
+                    # don't touch the keyboard. The guard below only blocks
+                    # ENTERING idle; this is the symmetric exit when engagement
                     # begins during an existing idle pause (Windows has no
-                    # in-process input watcher, so AFK never clears on its own
-                    # mid-call).
-                    if in_call:
+                    # in-process input watcher, so AFK never clears on its own).
+                    if engaged:
                         logger.info(
-                            "Call active while idle-paused — resuming to track the call"
+                            "Engagement active while idle-paused — resuming to track it"
                         )
                         self.clear_idle_pause(send_event=True)
                         reschedule(self.config.sync.interval_seconds)
                         self.tray.set_state(TrayState.SYNCING)
-                        trigger_sync("call_resume_sync")
-                    # else: still idle with no call — stay paused.
+                        trigger_sync("engaged_resume_sync")
+                    # else: still idle with no engagement — stay paused.
                 else:
-                    # Don't mark idle while the user is in a call/meeting. In a
-                    # meeting they're engaged (listening/watching) even without
-                    # keyboard/mouse input. The AFK watcher is the only idle
+                    # Don't mark idle while the user is engaged without input —
+                    # in a call/meeting (listening/watching) or supervising an
+                    # active foreground-CPU session (Claude Code / build / render
+                    # in the focused window). The AFK watcher is the only idle
                     # signal on Windows (no in-process input watcher), so a long
-                    # call otherwise trips this pause and paints the whole span
-                    # as Idle even though the meeting app was focused throughout.
-                    if in_call:
+                    # engaged span otherwise trips this pause and paints the whole
+                    # span Idle even though the user was present throughout.
+                    if engaged:
                         logger.debug(
-                            "AFK for %ds but a call is active — not pausing as idle",
+                            "AFK for %ds but engaged without input — not pausing as idle",
                             int(afk_duration),
                         )
                         return

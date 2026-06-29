@@ -1534,10 +1534,17 @@ class BetterFlowApp:
             from .sync.afk_source import AfkSource
         except ImportError:
             from sync.afk_source import AfkSource
+        # Register the foreground-CPU detector (created by the sync engine) as a
+        # supplementary AFK activity source so an engaged no-input session keeps
+        # the uploaded AFK stream not-afk (macOS/Windows). Inert on Linux, where
+        # the OS idle clock — and thus this whole in-process AFK source — is
+        # unreadable; there the uploaded dev-session span carries the credit.
+        foreground_detector = self.coordinator.sync_engine._foreground_detector
         afk_source = AfkSource(
             afk_timeout_seconds=self.config.aw.afk_timeout_minutes * 60,
             hostname=self.coordinator.sync_engine._hostname,
             input_watcher=self.input_watcher,
+            activity_sources=[foreground_detector] if foreground_detector else None,
         )
         self.coordinator.sync_engine.afk_source = afk_source
         self.coordinator.aw_manager.set_inproc_afk_active(
