@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -501,6 +500,17 @@ class SyncEngine:
         """Set the current project for event tagging."""
         with self._state_lock:
             self._current_project = project
+
+    def set_browser_tracker(self, tracker) -> None:
+        """Swap the active-tab URL tracker (or None to detach it).
+
+        Used by the working-hours capture gate, which stops the browser poller
+        outside enforced hours and starts a fresh one on re-entry. The engine
+        only dereferences this while enriching a window event, which is reached
+        only after the paused-guard early-return — and the gate pauses the engine
+        whenever it detaches the tracker — so a plain attribute swap (atomic under
+        the GIL) is sufficient; a transient None merely yields a URL-less event."""
+        self._browser_tracker = tracker
 
     def invalidate_category_cache(self) -> None:
         """Clear the in-memory category cache so next lookup re-reads from DB."""
@@ -1099,20 +1109,14 @@ class SyncEngine:
     def _within_working_hours(self, event: AWEvent) -> bool:
         """True if the event's start falls inside the server-enforced working-
         hours window. When the schedule is not enforced (B2B / unrestricted)
-        this is always True. Evaluated in the schedule's timezone, falling back
-        to the machine's local timezone when none is provided."""
+        this is always True. The upload-side backstop to the capture gate: even
+        if a stray out-of-hours event reached the local buckets, it is never
+        uploaded. Shares the single window check on WorkingHoursConfig so the
+        gate and this filter can never disagree about the window."""
         wh = self.config.working_hours
-        if not getattr(wh, "enforced", False):
+        if not wh.enforces():
             return True
-        try:
-            tz = ZoneInfo(wh.timezone) if wh.timezone else None
-        except Exception:
-            tz = None
-        local = event.timestamp.astimezone(tz) if tz else event.timestamp.astimezone()
-        if wh.working_days and local.isoweekday() not in wh.working_days:
-            return False
-        hhmm = local.strftime("%H:%M")
-        return wh.work_start <= hhmm <= wh.work_end
+        return wh.is_within_window(event.timestamp)
 
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats
