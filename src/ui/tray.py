@@ -179,6 +179,13 @@ class TrayModel:
         self.on_break: bool = False
         self.break_minutes_left: int = 0
 
+        # Working-hours capture gate. ``schedule_suspended`` is True while the
+        # agent is outside the enforced window (capture paused). ``offer_override``
+        # gates the "Work outside hours" menu item — shown only to a restricted
+        # user who is currently outside their window and hasn't armed the override.
+        self.schedule_suspended: bool = False
+        self.schedule_offer_override: bool = False
+
         # Permissions
         self.needs_permissions: bool = False
         # macOS Input Monitoring (keystroke/click capture). True until a check
@@ -448,6 +455,7 @@ class TrayIcon:
         on_check_update: Optional[Callable[[], None]] = None,
         on_tray_died: Optional[Callable[[], None]] = None,
         on_show_hours: Optional[Callable[[], Optional[str]]] = None,
+        on_work_outside_hours: Optional[Callable[[], None]] = None,
     ):
         """Initialize tray icon.
 
@@ -488,6 +496,7 @@ class TrayIcon:
         self._on_check_update = on_check_update
         self._on_tray_died = on_tray_died
         self._on_show_hours = on_show_hours
+        self._on_work_outside_hours = on_work_outside_hours
 
         self.model = TrayModel()
 
@@ -537,6 +546,8 @@ class TrayIcon:
                 "project_started_at": self.model.project_started_at,
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
+                "schedule_suspended": self.model.schedule_suspended,
+                "schedule_offer_override": self.model.schedule_offer_override,
                 "sync_interval": self.model.sync_interval,
                 "hash_titles": self.model.hash_titles,
                 "domain_only_urls": self.model.domain_only_urls,
@@ -635,6 +646,17 @@ class TrayIcon:
             items.append(Item("End Private Time", self._handle_private_toggle, enabled=logged_in))
         elif not s["on_break"]:
             items.append(Item("Private Time", self._handle_private_toggle, enabled=logged_in))
+
+        # ── Work-outside-hours override ─────────────────────────────────────
+        # Only for a restricted user currently outside their enforced window:
+        # the explicit, single-day opt-in to collect anyway ("unless strictly
+        # requested"). Hidden once armed (offer_override goes False).
+        if s["schedule_offer_override"]:
+            items.append(Item(
+                "Work outside hours (today)",
+                self._handle_work_outside_hours,
+                enabled=logged_in,
+            ))
 
         # ── Private Time Reminder submenu ───────────────────
         items.append(Item("Private Time Reminder", pystray.Menu(
@@ -873,6 +895,12 @@ class TrayIcon:
         """Handle pause menu click."""
         if self._on_pause:
             self._on_pause()
+
+    def _handle_work_outside_hours(self, icon, item) -> None:
+        """Handle the 'Work outside hours' menu click — the explicit opt-in to
+        collect outside the enforced window for the rest of the day."""
+        if self._on_work_outside_hours:
+            self._on_work_outside_hours()
 
     def _handle_resume(self, icon, item) -> None:
         """Handle resume menu click."""
@@ -1152,6 +1180,18 @@ class TrayIcon:
             self.set_state(TrayState.PRIVATE)
         else:
             self.set_state(TrayState.SYNCING)
+
+    def set_schedule_state(self, suspended: bool, offer_override: bool) -> None:
+        """Update the working-hours gate hint shown in the menu. Rebuilds the
+        menu only when something actually changed, so the every-60s gate check
+        doesn't churn the menu on the steady state."""
+        with self.model.lock:
+            if (self.model.schedule_suspended == suspended
+                    and self.model.schedule_offer_override == offer_override):
+                return
+            self.model.schedule_suspended = suspended
+            self.model.schedule_offer_override = offer_override
+        self._update_menu()
 
     def update_stats(
         self,
