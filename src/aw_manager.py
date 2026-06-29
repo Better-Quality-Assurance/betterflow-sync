@@ -473,6 +473,57 @@ class AWManager:
         with self._lifecycle_lock:
             self._disabled_components.add(name)
 
+    def suspend_watcher(self, name: str) -> None:
+        """Stop a managed watcher AND disable it so the watchdog won't revive it.
+
+        Used by the working-hours capture gate to stop the subprocess window
+        tracker (Windows/Linux) outside enforced hours, so no window titles are
+        recorded even locally. Disabling first means restart_if_needed and
+        _start_locked both skip it (they honour _disabled_components), so the
+        terminate below can't race a restart. No-op on macOS where the
+        subprocess tracker is already disabled in favour of the in-process
+        watcher. Mirrors _stop_idle_tracker_locked; reaps orphans so a killed
+        process can't keep posting to the bucket."""
+        with self._lifecycle_lock:
+            self._disabled_components.add(name)
+            proc = self._processes.pop(name, None)
+            if proc is not None and proc.poll() is None:
+                logger.info("Suspending %s (outside working hours)", name)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            binaries_dir = self._get_binaries_dir()
+            if binaries_dir:
+                self._reap_orphan_processes(name, binaries_dir)
+
+    def resume_watcher(self, name: str) -> None:
+        """Re-enable a previously suspended watcher and (re)start it.
+
+        The inverse of suspend_watcher: clears the disabled flag so the watchdog
+        supervises it again, then starts a fresh process if the stack is up. A
+        no-op if the watcher wasn't suspended by us (e.g. macOS, where the
+        subprocess tracker stays disabled by design — clearing it here would be
+        wrong, so we only restart when it had actually been suspended)."""
+        with self._lifecycle_lock:
+            if name not in self._disabled_components:
+                return  # not suspended by us — nothing to resume
+            self._disabled_components.discard(name)
+            if not self._processes:
+                # Stack not started yet (pre-launch reconcile); start() will
+                # bring it up with the rest now that it's re-enabled.
+                return
+            existing = self._processes.get(name)
+            if existing is not None and existing.poll() is None:
+                return  # already running
+            binaries_dir = self._get_binaries_dir()
+            if not binaries_dir:
+                return
+            logger.info("Resuming %s (back inside working hours)", name)
+            self._reap_orphan_processes(name, binaries_dir)
+            self._start_component(name, binaries_dir)
+
     @property
     def is_managing(self) -> bool:
         """True when we own at least one tracker process to supervise.
