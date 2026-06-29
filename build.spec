@@ -147,6 +147,7 @@ hiddenimports = [
     "apscheduler.triggers.interval",
     "apscheduler.schedulers.background",
     "certifi",  # TLS CA bundle for requests; data file collected via certifi_datas
+    "psutil",  # Foreground-process CPU sampling for activity detection
 
     # Our modules (absolute imports from src/)
     "config",
@@ -179,6 +180,7 @@ hiddenimports = [
     "auth.browser_auth",
     "sync.macos_window_watcher",
     "sync.macos_input_watcher",
+    "sync.foreground_activity",  # Foreground-CPU activity detection
     "_build_info",  # Generated at build time by the spec preamble
 ]
 
