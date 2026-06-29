@@ -355,6 +355,23 @@ class CallDetectionSettings:
 
 
 @dataclass
+class ForegroundActivitySettings:
+    """Foreground-CPU activity detection — credits engaged-but-no-input work
+    (e.g. watching an active Claude Code / build / render in the focused window)
+    that the AFK timeout would otherwise mark idle.
+
+    Guardrails are server-tunable: only the frontmost process is sampled, credit
+    is anchored to real input (extends at most ``max_credit_minutes`` past the
+    last keyboard/mouse input), and only sessions of at least
+    ``min_session_seconds`` are uploaded for server validation."""
+
+    enabled: bool = True
+    cpu_threshold_percent: float = 15.0  # Frontmost-app CPU (single-core basis)
+    max_credit_minutes: int = 20  # Max credit past the last real input
+    min_session_seconds: int = 30  # Skip accidental blips
+
+
+@dataclass
 class AWSettings:
     """ActivityWatch connection settings."""
 
@@ -411,6 +428,7 @@ class Config:
     engagement: EngagementConfig = field(default_factory=EngagementConfig)
     fraud_detection: FraudDetectionConfig = field(default_factory=FraudDetectionConfig)
     call_detection: CallDetectionSettings = field(default_factory=CallDetectionSettings)
+    foreground_activity: ForegroundActivitySettings = field(default_factory=ForegroundActivitySettings)
     setup_complete: bool = False
     auto_start: bool = False
     check_updates: bool = True
@@ -477,6 +495,7 @@ class Config:
         engagement_data = data.pop("engagement", {})
         fraud_detection_data = data.pop("fraud_detection", {})
         call_detection_data = data.pop("call_detection", {})
+        foreground_activity_data = data.pop("foreground_activity", {})
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
@@ -501,6 +520,7 @@ class Config:
             engagement=_safe(EngagementConfig, engagement_data) if engagement_data else EngagementConfig(),
             fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
+            foreground_activity=_safe(ForegroundActivitySettings, foreground_activity_data) if foreground_activity_data else ForegroundActivitySettings(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -684,6 +704,26 @@ class Config:
                     self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_call_duration from server, ignoring")
+
+        if "foreground_activity" in server_config:
+            fa = server_config["foreground_activity"]
+            try:
+                if "enabled" in fa:
+                    self.foreground_activity.enabled = self._to_bool(fa["enabled"])
+                if "cpu_threshold_percent" in fa:
+                    val = float(fa["cpu_threshold_percent"])
+                    # Clamp to a sane single-core-basis range; 0 would credit any
+                    # focused app, >100% is meaningless on a single-core basis.
+                    if math.isfinite(val):
+                        self.foreground_activity.cpu_threshold_percent = min(max(val, 1.0), 100.0)
+                if "max_credit_minutes" in fa:
+                    # Bound the farm window: never credit more than 2h past the
+                    # last real input regardless of server value.
+                    self.foreground_activity.max_credit_minutes = min(max(int(fa["max_credit_minutes"]), 1), 120)
+                if "min_session_seconds" in fa:
+                    self.foreground_activity.min_session_seconds = max(0, int(fa["min_session_seconds"]))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Invalid foreground_activity config from server: {e}")
 
         try:
             self.save()
