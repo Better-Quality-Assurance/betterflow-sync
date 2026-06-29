@@ -63,6 +63,7 @@ def _make(idle_in_call: bool):
     sync_engine.is_paused = False
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = idle_in_call
+    sync_engine.is_active_dev_session.return_value = False
 
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
@@ -213,7 +214,7 @@ def test_resumes_when_a_call_starts_during_an_existing_idle_pause():
 
     assert idle_mgr.idle_paused is False, "a call starting mid-idle must resume"
     reschedule.assert_called_once_with(idle_mgr.config.sync.interval_seconds)
-    trigger_sync.assert_called_once_with("call_resume_sync")
+    trigger_sync.assert_called_once_with("engaged_resume_sync")
     # The pre-call idle stretch is still recorded as idle (send_event=True path).
     idle_mgr.sync_engine.send_idle_event.assert_called_once_with(idle_start)
 
@@ -237,6 +238,7 @@ def test_stale_afk_bucket_does_not_pause_when_latest_betterflow_bucket_is_active
     sync_engine.is_paused = False
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = False
+    sync_engine.is_active_dev_session.return_value = False
 
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
@@ -263,6 +265,7 @@ def _make_with_afk_event(afk_event, *, in_call=False):
     sync_engine.is_paused = False
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = in_call
+    sync_engine.is_active_dev_session.return_value = False
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
     return idle_mgr, Mock(), Mock(), tray
