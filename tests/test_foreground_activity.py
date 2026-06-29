@@ -222,6 +222,114 @@ def test_base_last_input_at_none_on_linux_like_clock():
     assert src.base_last_input_at(T0) is None
 
 
+# -- PsutilForegroundProbe: process-tree CPU sum ------------------------------
+# A fake psutil so the tree-walk/seed/sum logic is testable without the real
+# dependency (cpu_percent's first call always seeds to 0.0, like real psutil).
+
+import sys  # noqa: E402
+import types  # noqa: E402
+
+from src.sync.foreground_activity import PsutilForegroundProbe  # noqa: E402
+
+
+class _FakeError(Exception):
+    pass
+
+
+class _FakeProc:
+    def __init__(self, pid, cpu, children=()):
+        self.pid = pid
+        self._cpu = cpu
+        self._children = list(children)
+        self._calls = 0
+        self.alive = True
+
+    def cpu_percent(self, interval):
+        if not self.alive:
+            raise _FakeError(self.pid)
+        self._calls += 1
+        return 0.0 if self._calls == 1 else self._cpu  # first call seeds
+
+    def children(self, recursive=False):
+        return [c for c in self._children if c.alive]
+
+
+def _install_fake_psutil(monkeypatch, table):
+    mod = types.ModuleType("psutil")
+    mod.Error = _FakeError
+
+    def Process(pid):  # noqa: N802 (mirror psutil.Process)
+        p = table.get(pid)
+        if p is None or not p.alive:
+            raise _FakeError(pid)
+        return p
+
+    mod.Process = Process
+    monkeypatch.setitem(sys.modules, "psutil", mod)
+
+
+def test_probe_sums_root_and_children(monkeypatch):
+    child = _FakeProc(11, 80.0)
+    root = _FakeProc(10, 20.0, children=[child])
+    _install_fake_psutil(monkeypatch, {10: root, 11: child})
+    probe = PsutilForegroundProbe(pid_getter=lambda: (10, "Terminal"))
+    assert probe.sample().cpu_percent is None      # seed cycle
+    s = probe.sample()
+    assert s.cpu_percent == 100.0                  # 20 (terminal) + 80 (child)
+    assert s.pid == 10 and s.app == "Terminal"
+
+
+def test_probe_excludes_children_when_disabled(monkeypatch):
+    child = _FakeProc(11, 80.0)
+    root = _FakeProc(10, 20.0, children=[child])
+    _install_fake_psutil(monkeypatch, {10: root, 11: child})
+    probe = PsutilForegroundProbe(pid_getter=lambda: (10, "Terminal"), include_children=False)
+    probe.sample()                                 # seed
+    assert probe.sample().cpu_percent == 20.0      # root only
+
+
+def test_probe_skips_child_that_dies(monkeypatch):
+    child = _FakeProc(11, 80.0)
+    root = _FakeProc(10, 20.0, children=[child])
+    _install_fake_psutil(monkeypatch, {10: root, 11: child})
+    probe = PsutilForegroundProbe(pid_getter=lambda: (10, "Terminal"))
+    probe.sample()                                 # seed both
+    child.alive = False                            # child exits
+    assert probe.sample().cpu_percent == 20.0      # only root counts
+
+
+def test_probe_new_child_is_seeded_then_counted(monkeypatch):
+    root = _FakeProc(10, 20.0)                      # no children yet
+    child = _FakeProc(11, 80.0)
+    _install_fake_psutil(monkeypatch, {10: root, 11: child})
+    probe = PsutilForegroundProbe(pid_getter=lambda: (10, "Terminal"))
+    probe.sample()                                 # seed root
+    root._children.append(child)                    # child spawns
+    # Child is newly-seen -> seeded this cycle (0), only root counts.
+    assert probe.sample().cpu_percent == 20.0
+    # Next cycle the child contributes.
+    assert probe.sample().cpu_percent == 100.0
+
+
+def test_probe_reseeds_on_foreground_change(monkeypatch):
+    a = _FakeProc(10, 20.0)
+    b = _FakeProc(20, 50.0)
+    _install_fake_psutil(monkeypatch, {10: a, 20: b})
+    fg = {"pid": 10}
+    probe = PsutilForegroundProbe(pid_getter=lambda: (fg["pid"], "App"))
+    probe.sample()                                 # seed app A
+    assert probe.sample().cpu_percent == 20.0
+    fg["pid"] = 20                                 # user switches apps
+    assert probe.sample().cpu_percent is None      # reseed B, unknown this cycle
+    assert probe.sample().cpu_percent == 50.0
+
+
+def test_probe_no_foreground_returns_none(monkeypatch):
+    _install_fake_psutil(monkeypatch, {})
+    probe = PsutilForegroundProbe(pid_getter=lambda: (None, ""))
+    assert probe.sample().cpu_percent is None
+
+
 # -- SyncEngine wiring --------------------------------------------------------
 
 def _engine():

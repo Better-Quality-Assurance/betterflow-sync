@@ -31,6 +31,7 @@ is present, so a CPU-only signal must not become an hours farm:
     backend can re-decide, exactly as ``ActivityMetrics`` does for engagement.
 """
 
+import contextlib
 import logging
 import sys
 import threading
@@ -303,17 +304,40 @@ def _default_pid_getter():
 
 
 class PsutilForegroundProbe:
-    """Foreground probe backed by psutil. Caches the foreground process so
-    ``cpu_percent(None)`` measures average utilization over the interval since the
-    previous cycle (ideal at a 60s cadence) rather than a blocking spot read."""
+    """Foreground probe backed by psutil.
 
-    def __init__(self, pid_getter=None):
+    Reports the CPU of the frontmost process **and its descendants** (when
+    ``include_children``, the default). This is what makes terminal-hosted work
+    register: an active Claude Code / build / test run is a CHILD of the focused
+    terminal, so the terminal's *own* process CPU stays low while the child burns
+    a core — summing the tree credits it. GUI apps that do their own work
+    (IDE builds, browser/Electron compute, renders) are covered either way.
+
+    ``cpu_percent(None)`` is per-process and measures the average over the
+    interval since that object's previous call, so each tracked process is cached
+    across cycles (ideal at a 30-60s cadence). A process seen for the first time
+    seeds its counter and contributes from the NEXT cycle (its first reading is
+    always 0.0); a process that dies between membership and read is skipped."""
+
+    def __init__(self, pid_getter=None, include_children: bool = True):
         self._pid_getter = pid_getter or _default_pid_getter()
-        self._proc = None  # cached psutil.Process for the current foreground pid
+        self._include_children = include_children
+        self._root_pid: Optional[int] = None
+        # pid -> psutil.Process for the current foreground tree (all seeded).
+        self._procs: dict = {}
 
     @property
     def available(self) -> bool:
         return self._pid_getter is not None
+
+    def _tree_pids(self, psutil, root) -> set:
+        pids = {root.pid}
+        if self._include_children:
+            # children() can race a dying process; a missed child this cycle is
+            # harmless (picked up next cycle), so suppress rather than spam logs.
+            with contextlib.suppress(psutil.Error):
+                pids |= {c.pid for c in root.children(recursive=True)}
+        return pids
 
     def sample(self) -> ForegroundSample:
         if self._pid_getter is None:
@@ -322,29 +346,61 @@ class PsutilForegroundProbe:
 
         pid, app = self._pid_getter()
         if pid is None:
-            self._proc = None
+            self._root_pid = None
+            self._procs = {}
             return ForegroundSample(None, app, None)
 
-        if self._proc is None or self._proc.pid != pid:
-            # New foreground process: seed its CPU counter and report unknown
-            # this cycle (the first cpu_percent(None) call always returns 0.0).
+        if pid != self._root_pid:
+            # Foreground changed: (re)seed the new process tree's counters and
+            # report unknown this cycle (every counter's first read is 0.0).
+            self._root_pid = pid
+            self._procs = {}
             try:
-                self._proc = psutil.Process(pid)
-                self._proc.cpu_percent(None)
+                root = psutil.Process(pid)
+                for tpid in self._tree_pids(psutil, root):
+                    try:
+                        proc = psutil.Process(tpid)
+                        proc.cpu_percent(None)  # seed
+                        self._procs[tpid] = proc
+                    except psutil.Error:
+                        continue
             except psutil.Error:
-                self._proc = None
-                return ForegroundSample(pid, app, None)
+                self._root_pid = None
+                self._procs = {}
             return ForegroundSample(pid, app, None)
 
+        # Same foreground: refresh membership and sum CPU over the interval.
+        # Single-core basis: 100 == one fully-busy core (can exceed 100 on
+        # multi-core), so the threshold reads as "% of one core" across the tree.
         try:
-            # Average CPU% over the interval since the last call, on psutil's
-            # single-core basis: 100 == one fully-busy core (so it can exceed 100
-            # on multi-core), and the threshold reads as "% of one core".
-            cpu = self._proc.cpu_percent(None)
+            root = self._procs.get(pid) or psutil.Process(pid)
         except psutil.Error:
-            self._proc = None
+            self._root_pid = None
+            self._procs = {}
             return ForegroundSample(pid, app, None)
-        return ForegroundSample(pid, app, cpu)
+
+        total = 0.0
+        got_reading = False
+        next_procs: dict = {}
+        for tpid in self._tree_pids(psutil, root):
+            proc = self._procs.get(tpid)
+            if proc is None:
+                # Newly-spawned member: seed now, contributes next cycle.
+                try:
+                    proc = psutil.Process(tpid)
+                    proc.cpu_percent(None)
+                    next_procs[tpid] = proc
+                except psutil.Error:
+                    pass
+                continue
+            try:
+                total += proc.cpu_percent(None)
+                got_reading = True
+                next_procs[tpid] = proc
+            except psutil.Error:
+                continue  # died between membership and read — drop it
+        self._procs = next_procs
+        return ForegroundSample(pid, app, total if got_reading else None)
 
 
 def create_detector(config, hostname: str) -> Optional[ForegroundActivityDetector]:
