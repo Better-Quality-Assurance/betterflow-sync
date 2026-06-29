@@ -22,6 +22,7 @@ BUCKET_TYPE_AFK_ALT = "aw-watcher-afk"
 BUCKET_TYPE_WEB = "aw-watcher-web"
 BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
 BUCKET_TYPE_CALL = "call"
+BUCKET_TYPE_DEV_SESSION = "dev-session"  # Foreground-CPU activity (engaged, no input)
 
 
 @dataclass(frozen=True)
