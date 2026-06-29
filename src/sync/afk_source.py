@@ -27,6 +27,7 @@ class AfkSource:
         hostname: str,
         *,
         input_watcher=None,
+        activity_sources: Optional[list] = None,
         idle_clock: Callable[[], Optional[float]] = get_system_idle_seconds,
         retention_seconds: float = 7200.0,
         max_samples: int = 20000,
@@ -34,6 +35,12 @@ class AfkSource:
         self._afk_timeout = float(afk_timeout_seconds)
         self._hostname = hostname
         self._input_watcher = input_watcher
+        # Supplementary non-input activity sources (e.g. foreground-CPU). Each
+        # exposes ``get_last_active_at(base_last_input, now) -> Optional[datetime]``
+        # and can only ever move last_input_at FORWARD (toward now), never back —
+        # so a buggy source can over-credit at most up to ``now``, never strand
+        # real idle as active beyond it.
+        self._activity_sources = list(activity_sources or [])
         self._idle_clock = idle_clock
         self._retention_seconds = float(retention_seconds)
         self._retention = timedelta(seconds=retention_seconds)
@@ -109,18 +116,19 @@ class AfkSource:
             self._consecutive_clock_failures += 1
             return
         self._consecutive_clock_failures = 0
-        last_input_at = now - timedelta(seconds=idle)
-        # macOS in-process watcher holds the main app's grant — prefer it when
-        # it reports a *more recent* input than the OS idle clock.
-        watcher = self._input_watcher
-        if watcher is not None:
+        last_input_at = self._apply_input_watcher(now - timedelta(seconds=idle))
+        # Fold in supplementary activity sources (foreground-CPU, etc.). They are
+        # passed the current last_input_at as their human-presence anchor and may
+        # only advance it toward `now` — clamped here as a hard backstop so no
+        # source can ever push activity into the future.
+        for src in self._activity_sources:
             try:
-                wli = watcher.get_last_input_at()
+                a = src.get_last_active_at(last_input_at, now)
             except Exception as e:
-                logger.debug("AfkSource input watcher failed: %s", e)
-                wli = None
-            if wli is not None and wli > last_input_at:
-                last_input_at = wli
+                logger.debug("AfkSource activity source failed: %s", e)
+                a = None
+            if a is not None and last_input_at < a <= now:
+                last_input_at = a
         with self._lock:
             self._samples.append((now, last_input_at))
             cutoff = now - self._retention
@@ -130,6 +138,37 @@ class AfkSource:
                 if protect_since is not None and self._samples[0][0] >= protect_since:
                     break
                 self._samples.popleft()
+
+    def _apply_input_watcher(self, last_input_at: datetime) -> datetime:
+        """Prefer the in-process input watcher when it reports a *more recent*
+        input than the OS idle clock — it holds the main app's Input Monitoring
+        grant, so it sees keystrokes the separate-TCC bf-idle-tracker can miss."""
+        watcher = self._input_watcher
+        if watcher is None:
+            return last_input_at
+        try:
+            wli = watcher.get_last_input_at()
+        except Exception as e:
+            logger.debug("AfkSource input watcher failed: %s", e)
+            return last_input_at
+        if wli is not None and wli > last_input_at:
+            return wli
+        return last_input_at
+
+    def base_last_input_at(self, now: datetime) -> Optional[datetime]:
+        """The real keyboard/mouse input anchor (OS idle clock + in-process input
+        watcher), WITHOUT supplementary activity sources. None when the OS idle
+        clock is unreadable (Linux). Activity sources use this as their
+        human-presence anchor; reading it here doesn't touch the failure counter
+        (a no-op read must not flap in-process AFK off)."""
+        try:
+            idle = self._idle_clock()
+        except Exception as e:
+            logger.debug("AfkSource base_last_input_at idle clock failed: %s", e)
+            return None
+        if idle is None:
+            return None
+        return self._apply_input_watcher(now - timedelta(seconds=idle))
 
     def finalize_point(self, now: datetime) -> datetime:
         """The latest instant whose afk classification is FINAL.

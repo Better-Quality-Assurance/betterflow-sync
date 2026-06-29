@@ -31,6 +31,7 @@ try:
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
+    from .foreground_activity import ForegroundActivityDetector, create_detector
     from .os_idle import get_system_idle_seconds
 except ImportError:
     from browser_tracker import is_browser_app
@@ -41,6 +42,7 @@ except ImportError:
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from sync.daily_time_tracker import DailyTimeTracker
     from sync.call_detector import CallDetector, CallEvent
+    from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.os_idle import get_system_idle_seconds
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,11 @@ class _SyncCycleContext:
 
     has_input_data: bool = False
     afk_events: list = field(default_factory=list)
+    # Most recent real keyboard/mouse input observed in the input buckets this
+    # cycle (end-time of the latest input event). The cross-platform
+    # human-presence anchor for foreground-activity credit — works on Linux,
+    # where the OS idle clock is unreadable.
+    last_input_at: Optional[datetime] = None
 
 
 @dataclass
@@ -98,6 +105,7 @@ class SyncStats:
     buckets_synced: int = 0
     gaps_filled: int = 0
     calls_detected: int = 0
+    dev_sessions_detected: int = 0
     # Window-filter diagnostics: separate "the watcher produced nothing"
     # (v1.5.83 logs that watcher-side) from "the watcher produced window events
     # but the privacy filter dropped them all" (this side). window_seen = window
@@ -318,6 +326,18 @@ class SyncEngine:
             else None
         )
 
+        # Foreground-CPU activity detection: credits engaged-but-no-input work
+        # (an active Claude Code / build / render in the focused window) that the
+        # AFK timeout would otherwise mark idle. None when disabled or
+        # unsupportable here (no frontmost-pid getter, or psutil missing). Wired
+        # into AfkSource as an activity source by main.py so the uploaded AFK
+        # stream stays not-afk on macOS/Windows; the uploaded dev-session span is
+        # the server-validated path (and the only one on Linux, where in-process
+        # AFK is inert).
+        self._foreground_detector: Optional[ForegroundActivityDetector] = create_detector(
+            config.foreground_activity, self._hostname
+        )
+
         # The local day the counted-time cache is scoped to; a change across a
         # sync cycle triggers daily housekeeping (prune) without a restart.
         self._counted_cache_day = self._local_day_iso()
@@ -432,6 +452,50 @@ class SyncEngine:
         """
         detector = self._call_detector
         return bool(detector and detector.is_in_call())
+
+    def is_active_dev_session(self) -> bool:
+        """True while the foreground-CPU detector reports an active session.
+
+        Consulted by idle detection alongside ``is_in_call`` so an engaged
+        no-input session (an active Claude Code / build / render in the focused
+        window) isn't mistaken for idle. False when the detector is disabled or
+        unsupported on this platform.
+        """
+        detector = self._foreground_detector
+        return bool(detector and detector.is_active())
+
+    def _observe_foreground_activity(
+        self, all_events: list, stats: "SyncStats", cycle: "_SyncCycleContext"
+    ) -> None:
+        """Sample the foreground process and append any dev-session span.
+
+        Anchors credit to the most recent real input: the OS idle clock / input
+        watcher (macOS/Windows, via the AFK source) OR the latest input-bucket
+        event (all platforms, incl. Linux) — whichever is newer. The session is
+        kept OPEN across cycles (so ``is_active_dev_session`` doesn't flap and
+        wrongly trip the idle pause); a live snapshot is uploaded each cycle for
+        server validation, and the final span is emitted when it naturally ends.
+        Both carry a deterministic id, so the server upserts one record."""
+        detector = self._foreground_detector
+        if detector is None:
+            return
+        now = datetime.now(timezone.utc)
+        last_real = cycle.last_input_at
+        if self.afk_source is not None:
+            base = self.afk_source.base_last_input_at(now)
+            if base is not None and (last_real is None or base > last_real):
+                last_real = base
+        try:
+            ended = detector.observe(now, last_real)
+            live = detector.snapshot() if ended is None else None
+        except Exception as e:
+            logger.debug("foreground activity observe failed: %s", e)
+            return
+        span = ended or live
+        if span:
+            all_events.append(span)
+            if ended is not None:
+                stats.dev_sessions_detected += 1
 
     def set_current_project(self, project: Optional[dict]) -> None:
         """Set the current project for event tagging."""
@@ -610,6 +674,14 @@ class SyncEngine:
             window_buckets, stats, cycle
         )
 
+        # Foreground-CPU activity: sample the focused process and credit engaged
+        # no-input work (an active Claude Code / build / render). Anchored to the
+        # most recent real input so credit only ever extends near genuine human
+        # presence. Updates is_active_dev_session() for the idle guard, advances
+        # the AFK activity-source credit (folded by next cycle's record_sample),
+        # and emits an auditable dev-session span when a session ends.
+        self._observe_foreground_activity(all_events, stats, cycle)
+
         # Clear window-specific AFK context before processing non-window buckets
         # so AFK events from one window bucket don't leak into unrelated buckets.
         cycle.afk_events = []
@@ -753,7 +825,17 @@ class SyncEngine:
             except AWClientError as e:
                 logger.debug("input bucket %s fetch failed: %s", bucket.id, e)
         self._activity_analyzer.add_input_events(input_events_for_analysis)
-        return _SyncCycleContext(has_input_data=len(input_events_for_analysis) > 0)
+        # Latest real-input instant (end-time of the newest input event) as the
+        # cross-platform human-presence anchor for foreground-activity credit.
+        last_input_at: Optional[datetime] = None
+        for ev in input_events_for_analysis:
+            end = ev.timestamp + timedelta(seconds=ev.duration)
+            if last_input_at is None or end > last_input_at:
+                last_input_at = end
+        return _SyncCycleContext(
+            has_input_data=len(input_events_for_analysis) > 0,
+            last_input_at=last_input_at,
+        )
 
     def _sync_window_buckets(
         self, window_buckets: list, stats: "SyncStats", cycle: "_SyncCycleContext"
@@ -2761,5 +2843,13 @@ class SyncEngine:
         # daily total must NOT be re-counted — restore the persisted per-event
         # counts so a same-day re-login doesn't double-count the tray's hours.
         self._load_counted_time_cache()
+        # Close any open foreground-activity session so is_active_dev_session()
+        # doesn't stay True across a logout. The last per-cycle snapshot already
+        # uploaded the span, so the discarded return here loses nothing.
+        if self._foreground_detector is not None:
+            try:
+                self._foreground_detector.flush()
+            except Exception as e:
+                logger.debug("foreground detector flush on shutdown failed: %s", e)
         # Close time tracker
         self._time_tracker.close()
