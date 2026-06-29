@@ -13,6 +13,37 @@ from unittest.mock import MagicMock, patch
 from src.ui.tray import TrayIcon
 
 
+class _FakeItem:
+    """Stand-in for pystray.MenuItem exposing the .text the assertions read.
+
+    The real pystray (and thus ``src.ui.tray.Item``) is None on a headless box
+    where the backend can't bind — e.g. Linux CI — so calling the real
+    ``_create_menu`` there raises ``'NoneType' object is not callable``. Faking
+    Item/Menu keeps the test exercising the real menu-building logic without
+    depending on a usable tray backend.
+    """
+
+    def __init__(self, text=None, action=None, *args, **kwargs):
+        self.text = text
+        self.action = action
+
+
+class _FakeMenu:
+    """Stand-in for pystray.Menu exposing .items as the passed tuple."""
+
+    def __init__(self, *items):
+        self.items = items
+
+
+def _menu_labels(tray) -> list:
+    """Build the menu under faked pystray/Item and return top-level item texts."""
+    fake_pystray = MagicMock()
+    fake_pystray.Menu = _FakeMenu
+    with patch("src.ui.tray.pystray", fake_pystray), patch("src.ui.tray.Item", _FakeItem):
+        menu = tray._create_menu()
+    return [getattr(i, "text", None) for i in menu.items]
+
+
 def _make_tray(on_work_outside_hours=None) -> TrayIcon:
     with patch("src.ui.tray.pystray"):
         tray = TrayIcon(
@@ -51,11 +82,11 @@ def test_override_item_present_only_when_offered():
     tray.model.user_email = "x@y.co"  # logged-in so items render
 
     tray.set_schedule_state(suspended=True, offer_override=True)
-    labels = [getattr(i, "text", None) for i in tray._create_menu().items]
+    labels = _menu_labels(tray)
     assert any("Work outside hours" in (t or "") for t in labels)
 
     tray.set_schedule_state(suspended=False, offer_override=False)
-    labels = [getattr(i, "text", None) for i in tray._create_menu().items]
+    labels = _menu_labels(tray)
     assert not any("Work outside hours" in (t or "") for t in labels)
 
 
