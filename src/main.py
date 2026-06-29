@@ -43,6 +43,7 @@ try:
     from .hours_tracker import HoursTracker
     from .update_handler import UpdateHandler
     from .system_event_handler import SystemEventHandler
+    from .work_schedule_gate import WorkScheduleGate
 except ImportError:
     from src import __version__
     from auth import KeychainManager, LoginManager
@@ -68,6 +69,7 @@ except ImportError:
     from hours_tracker import HoursTracker
     from update_handler import UpdateHandler
     from system_event_handler import SystemEventHandler
+    from work_schedule_gate import WorkScheduleGate
 
 # Import send_notification at module level so tests can patch src.main.send_notification
 try:
@@ -227,6 +229,11 @@ class SyncCoordinator:
         # is hit (the engine/tray/paused-flag teardown lives on the app). Called
         # with the elapsed seconds. None until wired (e.g. in tests).
         self.on_private_auto_end: Optional[Callable[[float], None]] = None
+        # Wired by BetterFlowApp: re-evaluate the working-hours capture gate every
+        # tick (suspend capture outside enforced hours, auto-resume on re-entry).
+        # The watcher/engine teardown lives on the app; the coordinator only
+        # triggers the check. None in tests / unrestricted setups.
+        self.on_schedule_gate: Optional[Callable[[], None]] = None
 
         # In-process input watcher reference, wired by the App after
         # construction. Used by `_check_idle_tracker_health` to cross-check
@@ -864,6 +871,11 @@ class SyncCoordinator:
         for fn, label in (
             (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
+            # Working-hours gate runs BEFORE the idle check: outside enforced
+            # hours it suspends capture outright, so the idle logic never needs
+            # to reason about a window it shouldn't be tracking in. On re-entry
+            # it resumes; idle then re-evaluates normally in the same tick.
+            (self._check_schedule_gate, "schedule_gate"),
             (self._check_idle_status, "idle_check"),
             (self._liveness_heartbeat, "liveness_heartbeat"),
             (self._refresh_hours_today, "hours_refresh"),
@@ -958,6 +970,14 @@ class SyncCoordinator:
         if eng.afk_source is None:
             return
         self.aw_manager.set_inproc_afk_active(eng.inproc_afk_active)
+
+    def _check_schedule_gate(self) -> None:
+        """Re-evaluate the working-hours capture gate (no-op until the app wires
+        on_schedule_gate). Only meaningful while logged in — a logged-out agent
+        isn't capturing anything to gate."""
+        if not self.logged_in or self.on_schedule_gate is None:
+            return
+        self.on_schedule_gate()
 
     def _check_idle_status(self) -> None:
         self.idle_mgr.check_idle_status(
@@ -1401,6 +1421,15 @@ class BetterFlowApp:
         self.config = Config.load()
         setup_logging(self.config.debug_mode)
 
+        # Working-hours capture gate. Built from the persisted schedule (restored
+        # by Config.load) so the launch decision below is correct BEFORE the
+        # first post-login server fetch — a returning restricted user who opens
+        # their laptop at night never starts capturing. Refreshed each 60s tick
+        # and right after every server-config fetch.
+        self.schedule_gate = WorkScheduleGate(self.config)
+        self._schedule_lock = threading.Lock()
+        self._schedule_suspended = False
+
         logger.info("BetterFlow starting...")
         logger.info(f"Using API URL: {self.config.api_url}")
 
@@ -1436,8 +1465,11 @@ class BetterFlowApp:
             self.display_tracker = None
 
         # Active browser-tab URL tracker (macOS). Off unless enabled; without it
-        # browser events carry no URL and collapse to generic "browsing".
-        if self.config.privacy.track_browser_urls:
+        # browser events carry no URL and collapse to generic "browsing". Also
+        # held back when launched outside enforced working hours — reading the
+        # active tab's URL is exactly the out-of-hours collection the gate must
+        # prevent. The gate starts it on re-entry (_start_capture_watchers).
+        if self.config.privacy.track_browser_urls and self.schedule_gate.collection_allowed():
             self.browser_tracker = start_browser_tracker()
         else:
             self.browser_tracker = None
@@ -1489,6 +1521,7 @@ class BetterFlowApp:
             on_check_update=lambda: self.update_handler._periodic_update_check(),
             on_tray_died=self._on_tray_died,
             on_show_hours=self._on_show_hours,
+            on_work_outside_hours=self._on_work_outside_hours,
         )
         self.tray.set_config(self.config)
 
@@ -1515,6 +1548,7 @@ class BetterFlowApp:
         )
         self.coordinator._on_auth_error = self._on_session_expired
         self.coordinator.on_private_auto_end = self._auto_end_private
+        self.coordinator.on_schedule_gate = self._apply_schedule_gate
         self.coordinator._input_watcher = self.input_watcher
         # The idle manager uses the same in-process watcher as an authoritative
         # override so a blind/stuck bf-idle-tracker can't paint live work as
@@ -1593,7 +1627,12 @@ class BetterFlowApp:
             if not check_accessibility() or not check_input_monitoring():
                 logger.info("Missing macOS permissions, attempting TCC grant")
                 grant_tcc_permissions()
-        if self.window_watcher:
+        # Window titles are personal content — don't start the window watcher
+        # when launched outside enforced hours (the gate resumes it on re-entry).
+        # The input watcher only records input-occurred timing (no content) and
+        # is left running: idle detection needs it, and restarting the macOS
+        # input watcher has proven unreliable.
+        if self.window_watcher and self.schedule_gate.collection_allowed():
             self.window_watcher.start()
         if self.input_watcher:
             self.input_watcher.start()
@@ -1647,6 +1686,13 @@ class BetterFlowApp:
         except Exception:
             logger.exception("Failed to fetch server configuration during startup")
 
+        # Reconcile capture against the freshly-fetched schedule: a launch
+        # decision made from the persisted (possibly stale) schedule is corrected
+        # here the moment the server's truth lands — e.g. a brand-new install
+        # whose disk config defaulted to unrestricted but is actually restricted
+        # + currently out-of-hours gets suspended now, not 60s later.
+        self._apply_schedule_gate()
+
         self.coordinator.fetch_projects()
         self._check_stale_session()
         self.coordinator.start()
@@ -1677,6 +1723,23 @@ class BetterFlowApp:
                 return
 
             self._set_startup_status("Starting trackers...")
+            # Fail-closed launch: if we're starting outside the enforced window,
+            # mark the gate suspended and pre-disable the subprocess window
+            # tracker (Windows/Linux) BEFORE the stack comes up, so it never
+            # records a single out-of-hours window title. macOS uses the
+            # in-process watcher, held back in _start_watchers below. The first
+            # post-login tick (and the reconcile after fetch_server_config)
+            # resumes everything the moment we're back inside hours.
+            if not self.schedule_gate.collection_allowed():
+                with self._schedule_lock:
+                    self._schedule_suspended = True
+                logger.info("Launched outside working hours — capture suspended until the work window")
+                if sys.platform != "darwin":
+                    self.aw_manager.suspend_watcher("bf-window-tracker")
+                try:
+                    self.sync_engine.pause()
+                except Exception:
+                    logger.exception("Launch suspend: engine pause failed")
             self.aw_manager.start()
             if self._shutdown_event.is_set():
                 return
@@ -2187,6 +2250,149 @@ class BetterFlowApp:
                 self.reminder_manager.on_tracking_started()
         if paused:
             self._try_auto_install()
+
+    # ── Working-hours capture gate ──────────────────────────────────────
+    def _is_user_paused(self) -> bool:
+        """Whether the user has an explicit pause/private active. Read under the
+        shared pause lock so a schedule-resume can't clobber a manual pause."""
+        with self._pause_state_lock:
+            return bool(getattr(self.sys_events, "_user_paused", False))
+
+    def _apply_schedule_gate(self) -> None:
+        """Edge-triggered: suspend capture when we leave the enforced window,
+        resume it when we re-enter (or the override is armed). Safe to call every
+        tick and after every config fetch — it only acts on a state change, so it
+        never fights the idle/manual/break pause sources, and it refreshes the
+        tray's "work outside hours" hint each call. Unrestricted users never trip
+        it (collection_allowed is always True for them)."""
+        try:
+            allowed = self.schedule_gate.collection_allowed()
+        except Exception:
+            logger.exception("Schedule-gate decision failed; leaving capture unchanged")
+            return
+
+        with self._schedule_lock:
+            was_suspended = self._schedule_suspended
+            transition = None
+            if not allowed and not was_suspended:
+                self._schedule_suspended = True
+                transition = "suspend"
+            elif allowed and was_suspended:
+                self._schedule_suspended = False
+                transition = "resume"
+
+        if transition == "suspend":
+            self._suspend_capture_for_schedule()
+        elif transition == "resume":
+            self._resume_capture_for_schedule()
+        elif not allowed:
+            # Steady out-of-hours with no edge — e.g. launched outside the window
+            # (suspended pre-login) and the user has now logged in. The capture
+            # was already held back at launch; just make sure the tray reflects
+            # it (no notification — that's only for the suspend edge).
+            self.tray.set_state(TrayState.PAUSED, "Outside working hours")
+
+        # The override item can appear/disappear without a suspend/resume edge
+        # (e.g. while steadily outside hours), so refresh the hint every call.
+        try:
+            self.tray.set_schedule_state(
+                suspended=not allowed,
+                offer_override=self.schedule_gate.should_offer_override(),
+            )
+        except Exception:
+            logger.debug("Tray schedule-state update failed", exc_info=True)
+
+    def _stop_capture_watchers(self) -> None:
+        """Stop the personal-content collectors: the window-title watcher (the
+        in-process one on macOS, the subprocess one elsewhere) and the browser
+        URL poller. The input watcher (input-occurred timing, no content) and the
+        AFK tracker are left running."""
+        if self.window_watcher is not None:
+            try:
+                self.window_watcher.stop()
+            except Exception:
+                logger.exception("Schedule suspend: window watcher stop failed")
+        if sys.platform != "darwin":
+            try:
+                self.aw_manager.suspend_watcher("bf-window-tracker")
+            except Exception:
+                logger.exception("Schedule suspend: window tracker suspend failed")
+        if getattr(self, "browser_tracker", None) is not None:
+            try:
+                self.browser_tracker.stop()
+            except Exception:
+                logger.exception("Schedule suspend: browser tracker stop failed")
+            self.browser_tracker = None
+            try:
+                self.sync_engine.set_browser_tracker(None)
+            except Exception:
+                logger.debug("Schedule suspend: clearing engine browser tracker failed", exc_info=True)
+
+    def _start_capture_watchers(self) -> None:
+        """Restart the collectors stopped by _stop_capture_watchers. The inverse
+        of suspension; mirrors the launch wiring so a resumed agent captures
+        exactly as a freshly-launched in-hours one does."""
+        if self.window_watcher is not None:
+            try:
+                self.window_watcher.start()
+            except Exception:
+                logger.exception("Schedule resume: window watcher start failed")
+        if sys.platform != "darwin":
+            try:
+                self.aw_manager.resume_watcher("bf-window-tracker")
+            except Exception:
+                logger.exception("Schedule resume: window tracker resume failed")
+        if self.config.privacy.track_browser_urls and getattr(self, "browser_tracker", None) is None:
+            try:
+                self.browser_tracker = start_browser_tracker()
+                self.sync_engine.set_browser_tracker(self.browser_tracker)
+            except Exception:
+                logger.exception("Schedule resume: browser tracker start failed")
+
+    def _suspend_capture_for_schedule(self) -> None:
+        """Enter the out-of-hours state: stop capture and pause upload."""
+        logger.info("Outside working hours — suspending activity capture")
+        self._stop_capture_watchers()
+        try:
+            self.sync_engine.pause()
+        except Exception:
+            logger.exception("Schedule suspend: engine pause failed")
+        self.tray.set_state(TrayState.PAUSED, "Outside working hours")
+        send_notification(
+            "Outside working hours",
+            "Tracking is paused. It resumes automatically at the start of your next work window.",
+            sound=False,
+        )
+
+    def _resume_capture_for_schedule(self) -> None:
+        """Leave the out-of-hours state: restart capture, and resume upload
+        unless the user has an independent manual pause / private time active —
+        in which case capture is restored to the normal baseline but their pause
+        is respected (the engine stays paused, exactly as during work hours)."""
+        logger.info("Back inside working hours — resuming activity capture")
+        self._start_capture_watchers()
+        if self._is_user_paused():
+            logger.info("Schedule resume: user pause/private active — leaving upload paused")
+            return
+        try:
+            self.sync_engine.resume()
+        except Exception:
+            logger.exception("Schedule resume: engine resume failed")
+        self.tray.set_state(TrayState.SYNCING)
+        self.coordinator.trigger_sync("schedule_resume_sync")
+
+    def _on_work_outside_hours(self) -> None:
+        """Tray action: the explicit 'strictly requested' escape. Arms the
+        override (collect until end of the local day), then re-evaluates the gate
+        so capture resumes immediately. Auto-expires at the next local midnight,
+        and a normal work-window start clears it implicitly."""
+        self.schedule_gate.request_work_outside_hours()
+        send_notification(
+            "Working outside hours",
+            "Tracking enabled until end of day. It returns to your schedule tomorrow.",
+            sound=False,
+        )
+        self._apply_schedule_gate()
 
     def _on_sync_now(self) -> None:
         """Handle sync now action from tray."""
