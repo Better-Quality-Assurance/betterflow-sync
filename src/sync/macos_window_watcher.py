@@ -99,6 +99,11 @@ class MacOSWindowWatcher:
 
         Returns True if started successfully, False otherwise.
         """
+        # Clear any prior stop signal so the watcher is restartable — the
+        # working-hours capture gate stops it outside hours and starts it again
+        # on re-entry. Without this, a restarted thread would see the set event
+        # and exit on its first loop, leaving window capture silently dead.
+        self._stop_event.clear()
         # Verify PyObjC Accessibility APIs are available
         try:
             from AppKit import NSWorkspace  # noqa: F401
