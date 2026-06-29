@@ -9,9 +9,11 @@ import sys
 import threading
 import uuid
 from dataclasses import dataclass, field, fields as dc_fields, asdict
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
@@ -413,6 +415,32 @@ class WorkingHoursConfig:
     working_days: list = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
     timezone: str = ""
 
+    def enforces(self) -> bool:
+        """True only when the server restricts the time-of-day window. The single
+        gate for every out-of-hours decision (capture suspension AND the upload
+        filter) so they can never disagree about whether a user is restricted."""
+        return bool(self.enforced)
+
+    def is_within_window(self, dt: datetime) -> bool:
+        """True if the aware datetime ``dt`` falls inside the working-hours
+        window, evaluated in the schedule's timezone (falling back to the
+        machine's local timezone when none is set). Independent of ``enforced``
+        — callers must check :meth:`enforces` first. Naive datetimes are treated
+        as UTC. Overnight windows (work_end <= work_start) are not supported,
+        mirroring the server, which rejects them on save."""
+        try:
+            tz = ZoneInfo(self.timezone) if self.timezone else None
+        except Exception:
+            tz = None
+        if dt.tzinfo is None:
+            from datetime import timezone as _tz
+            dt = dt.replace(tzinfo=_tz.utc)
+        local = dt.astimezone(tz) if tz else dt.astimezone()
+        if self.working_days and local.isoweekday() not in self.working_days:
+            return False
+        hhmm = local.strftime("%H:%M")
+        return self.work_start <= hhmm <= self.work_end
+
 
 @dataclass
 class Config:
@@ -496,6 +524,12 @@ class Config:
         fraud_detection_data = data.pop("fraud_detection", {})
         call_detection_data = data.pop("call_detection", {})
         foreground_activity_data = data.pop("foreground_activity", {})
+        # Pop working_hours so it's reconstructed as a WorkingHoursConfig below.
+        # Without this it fell through the generic **data path as a raw dict, so
+        # getattr(wh, "enforced") read False on every restart — the persisted
+        # schedule was silently lost, defeating fail-closed launch (the agent
+        # forgot it was restricted until the first post-login server fetch).
+        working_hours_data = data.pop("working_hours", {})
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
@@ -521,6 +555,7 @@ class Config:
             fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
             foreground_activity=_safe(ForegroundActivitySettings, foreground_activity_data) if foreground_activity_data else ForegroundActivitySettings(),
+            working_hours=_safe(WorkingHoursConfig, working_hours_data) if working_hours_data else WorkingHoursConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
