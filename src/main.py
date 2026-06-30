@@ -1008,13 +1008,21 @@ class SyncCoordinator:
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="liveness_heartbeat")
 
-    _DO_SYNC_DEADLINE = 120  # seconds — must exceed request_timeout * (max_retries + 1)
+    # Must exceed the worst-case wall-clock of one in-cycle network chain so a
+    # slow/hung server can't masquerade as a wedged sync. The batch-upload path
+    # runs on BaseApiClient.DEFAULT_RETRY_CONFIG (max_retries=2) at a 30s timeout:
+    # 3 attempts * 30s + backoff ≈ 94s, plus the heartbeat (~11s) and bookkeeping.
+    # 150s leaves margin above that ~105s realistic worst case; only a genuine
+    # multi-minute hang trips it. (The old 120s was < the then-129s chain, which
+    # false-fired "Sync hung" during the 2026-06-30 outage.) Guarded by
+    # tests/test_sync_watchdog_budget.py.
+    _DO_SYNC_DEADLINE = 150  # seconds
     # A _do_sync holding _sync_lock longer than this is treated as wedged
     # (deadlock, or a call hung past the watchdog). A new cycle then abandons the
     # stuck holder and re-arms a fresh lock so syncing resumes instead of skipping
     # forever. Must exceed _DO_SYNC_DEADLINE so the watchdog's session-reset gets
     # its chance first.
-    _SYNC_WEDGE_CEILING = 300  # seconds
+    _SYNC_WEDGE_CEILING = 420  # seconds
 
     def _acquire_sync_slot(self) -> Optional[threading.Lock]:
         """Take the sync slot, returning the lock to release later, or None to
