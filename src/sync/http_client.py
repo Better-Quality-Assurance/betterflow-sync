@@ -158,8 +158,17 @@ class BaseApiClient:
     Single Responsibility: HTTP communication only.
     """
 
+    # In-cycle network budget. A single retrying request runs at most
+    # (max_retries + 1) attempts * timeout + backoff. With max_retries=3 and a
+    # 30s timeout that is ~129s — past the 120s sync watchdog (SyncCoordinator
+    # ._DO_SYNC_DEADLINE), so a hung/slow server (e.g. the 2026-06-30 Redis/502
+    # outage) false-trips "Sync hung". max_retries=2 bounds the worst-case chain
+    # to ~94s, comfortably inside the watchdog; the OfflineQueue is the durable
+    # cross-cycle retry, so a failed batch is re-sent next cycle regardless — the
+    # 4th in-cycle attempt only amplified the stall. Guarded by
+    # tests/test_sync_watchdog_budget.py.
     DEFAULT_RETRY_CONFIG = RetryConfig(
-        max_retries=3,
+        max_retries=2,
         base_delay=1.0,
         max_delay=30.0,
         exponential_base=2.0,
