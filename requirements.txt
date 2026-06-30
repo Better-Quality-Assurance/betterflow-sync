@@ -10,7 +10,7 @@ platformdirs>=3.0,<5
 Pillow>=10.0,<13
 # psutil -> foreground-process CPU sampling for activity detection (credits
 # engaged no-input work like an active Claude Code/build session). Cross-platform.
-psutil>=5.9,<7
+psutil>=7.2.2,<8
 pyobjc-framework-SystemConfiguration>=10.0,<13; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices>=10.0,<13; sys_platform == "darwin"
 
