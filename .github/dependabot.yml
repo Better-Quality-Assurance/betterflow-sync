@@ -1,0 +1,46 @@
+version: 2
+
+# Dependabot config. Weekly dependency updates + monthly GitHub Actions.
+# Minor/patch bumps are grouped into one PR per directory per week;
+# major bumps come as individual PRs so each gets a human review.
+# Covers every committed manifest directory (monorepo packages included).
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Bucharest
+    open-pull-requests-limit: 10
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - automated
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Bucharest
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - github-actions
+      - automated
+    commit-message:
+      prefix: "chore(ci)"
