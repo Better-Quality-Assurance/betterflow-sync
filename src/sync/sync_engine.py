@@ -2355,6 +2355,17 @@ class SyncEngine:
                 raise
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
+    # A transient whole-batch failure normally does NOT count toward the drop, so
+    # a server outage can't drop good activity (#99). But a batch that fails
+    # transiently DETERMINISTICALLY — a content-specific 5xx, or a server stuck
+    # returning no-confirmation — would otherwise sit at the oldest-first dequeue
+    # head forever, freezing every newer event up to the 30-day expiry, silently
+    # (the heartbeat stays green). After this many consecutive failed queue cycles
+    # (with the backoff schedule, ~3h of sustained failure) we count the stuck
+    # head toward the drop so it ages out and the queue unblocks. The counter
+    # (_queue_consecutive_failures) resets on ANY success, so an outage that
+    # recovers never reaches this — only a genuinely stuck head does.
+    _STUCK_HEAD_CEILING = 20
 
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
@@ -2429,16 +2440,33 @@ class SyncEngine:
                     # still increments so it can't head-of-line-block the queue.
                     if not result.transient:
                         self.queue.increment_retry(event_ids)
+                    elif self._queue_consecutive_failures >= self._STUCK_HEAD_CEILING:
+                        # Transient, but this oldest batch has failed transiently
+                        # for so many consecutive cycles that it's almost certainly
+                        # a poison batch (a content-specific 5xx / a no-confirmation
+                        # loop) — or an outage far past any realistic duration. It
+                        # blocks every newer event at the dequeue head. Count it
+                        # toward the drop so it ages out and the queue unblocks.
+                        logger.warning(
+                            "Queue head batch (%d events) failed transiently for "
+                            "%d consecutive cycles — counting it toward the drop to "
+                            "unblock the queue (likely a poison batch or an outage "
+                            "past the ceiling).",
+                            len(event_ids), self._queue_consecutive_failures,
+                        )
+                        self.queue.increment_retry(event_ids)
                     self._apply_queue_backoff()
                     break
             except BetterFlowAuthError:
                 # Auth errors won't self-heal with retries; re-raise so
                 # the caller's auth handler can trigger re-login.
                 raise
-            except BetterFlowClientError:
-                # send_events normally returns a SyncResult; reaching here means
-                # an unexpected client error surfaced. Treat as transient
-                # (server-side): back off and retry without counting a retry.
+            except BetterFlowClientError as e:
+                # send_events normally returns a SyncResult; reaching here means an
+                # unexpected client error escaped it (should never fire). Surface
+                # it, then treat as transient (server-side): back off without
+                # counting a retry.
+                logger.warning("Unexpected BetterFlowClientError escaped send_events: %s", e)
                 self._apply_queue_backoff()
                 break
 
