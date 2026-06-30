@@ -107,31 +107,47 @@ def test_definitive_rejection_still_drops_to_avoid_head_of_line_block():
     )
 
 
-def test_stuck_transient_head_eventually_drops_to_unblock_queue():
-    """A batch that fails transiently DETERMINISTICALLY (a content-specific 5xx,
-    or a server stuck returning no-confirmation) must not block the oldest-first
-    queue head forever. After _STUCK_HEAD_CEILING consecutive transient failures
-    it is counted toward the drop so newer events can flow again — otherwise it
-    would freeze the whole upload stream up to the 30-day expiry, silently.
+def _unstorable_events(n: int) -> list[dict]:
+    """n events the server would reject anyway: bucketless (nowhere to route)."""
+    now = datetime.now(timezone.utc).isoformat()
+    return [
+        {"id": f"u-{i}", "timestamp": now, "duration": 60.0, "data": {}}
+        for i in range(n)
+    ]
 
-    Guards against the regression #99 introduced (transient never increments)."""
+
+def test_storable_stuck_head_is_held_not_dropped():
+    """A stuck head that still holds RECENT, BUCKETED activity must be HELD, never
+    dropped — a long events-route degradation (server reachable, batches 5xx,
+    nothing draining) past the ceiling must not lose real billable time (audit
+    round 4: the round-1 ceiling-drop could shed good events here)."""
     from src.sync.sync_engine import SyncEngine
 
     tmp = Path(tempfile.mkdtemp())
     engine = _engine(tmp)
-    engine.queue.enqueue(_events(3))
-
-    # Permanent transient failure (server is "up" but this batch always fails).
+    engine.queue.enqueue(_events(3))  # storable: recent ts + bucket_id
     engine.bf.send_events = Mock(
         return_value=SyncResult(success=False, events_queued=3, transient=True)
     )
-    # Ceiling consecutive failures + max_retries(5) + margin.
+    _run_cycles(engine, SyncEngine._STUCK_HEAD_CEILING + 10)  # well past the ceiling
+
+    assert engine.queue.size() == 3, "storable activity must never be shed at the ceiling"
+
+
+def test_unstorable_stuck_head_is_dropped_to_unblock():
+    """A stuck head the server would reject anyway (bucketless / stale) IS shed at
+    the ceiling so it stops blocking the queue head."""
+    from src.sync.sync_engine import SyncEngine
+
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine.queue.enqueue(_unstorable_events(3))
+    engine.bf.send_events = Mock(
+        return_value=SyncResult(success=False, events_queued=3, transient=True)
+    )
     _run_cycles(engine, SyncEngine._STUCK_HEAD_CEILING + 8)
 
-    assert engine.queue.size() == 0, (
-        "a permanently-stuck transient head must eventually drop so newer events "
-        "are not blocked forever"
-    )
+    assert engine.queue.size() == 0, "an unstorable stuck head must be shed to unblock"
 
 
 def test_transient_outage_within_ceiling_still_holds_events():
