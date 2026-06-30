@@ -502,6 +502,12 @@ class Config:
         fraud_detection_data = data.pop("fraud_detection", {})
         call_detection_data = data.pop("call_detection", {})
         foreground_activity_data = data.pop("foreground_activity", {})
+        # Ignore any persisted foreground_activity.enabled — it's server-driven
+        # and default-OFF. A device that ran a default-ON beta build already has
+        # enabled=true on disk; honouring it would override the safe default on
+        # update. Drop it on load so the code default wins; the server re-enables
+        # per-session via update_from_server. (save() also stops writing it.)
+        foreground_activity_data.pop("enabled", None)
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
@@ -540,6 +546,14 @@ class Config:
         # accumulate in the app_categories DB table. Don't persist to avoid
         # unbounded growth and inability for the server to retract entries.
         data.get("privacy", {}).pop("default_categories", None)
+        # Never persist foreground_activity.enabled. It is a SERVER-driven,
+        # billing-affecting flag (default OFF) and update_from_server toggles it
+        # per-session. Persisting it would let a build that shipped it default-ON
+        # (v1.5.85-beta.*) pin enabled=true in config.json and override the safe
+        # default on a later update — so the "ship inert" guarantee held only for
+        # devices that never saved it. Drop it so the code default always wins on
+        # load and only the server can switch it on.
+        data.get("foreground_activity", {}).pop("enabled", None)
         tmp_file = config_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:

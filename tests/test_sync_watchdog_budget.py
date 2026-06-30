@@ -146,3 +146,22 @@ def test_real_request_chain_attempt_count_matches_budget_formula():
     # instant, so this is essentially the backoff sum) — proves the formula is an
     # upper bound on real wall-clock.
     assert elapsed <= _worst_case_chain_seconds(fast_cfg, timeout=2) + 1.0
+
+
+def test_queue_drain_skip_keeps_dual_chain_under_watchdog():
+    """The regular send AND the queue drain both run inside one watchdog cycle.
+    The queue is skipped once the cycle has spent _QUEUE_SKIP_IF_CYCLE_ELAPSED, so
+    the worst case is that elapsed budget + ONE more request chain. That must stay
+    under the watchdog deadline, or a slow server + non-empty queue false-trips
+    "Sync hung" (audit round 2)."""
+    from src.sync.sync_engine import SyncEngine
+
+    cfg = BaseApiClient.DEFAULT_RETRY_CONFIG
+    worst_chain = _worst_case_chain_seconds(cfg, _client_default_timeout())
+    deadline = SyncCoordinator._DO_SYNC_DEADLINE
+    budget = SyncEngine._QUEUE_SKIP_IF_CYCLE_ELAPSED
+
+    assert budget + worst_chain < deadline, (
+        f"queue-skip budget {budget}s + one chain {worst_chain:.1f}s = "
+        f"{budget + worst_chain:.1f}s must stay under the {deadline}s watchdog"
+    )

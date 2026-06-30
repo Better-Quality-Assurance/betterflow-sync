@@ -192,3 +192,32 @@ class TestUuidRegex:
 def test_in_process_afk_defaults_on():
     from src.config import Config
     assert Config().sync.in_process_afk is True
+
+
+def test_foreground_enabled_is_not_persisted(tmp_path, monkeypatch):
+    """foreground_activity.enabled must never be written to config.json — it's a
+    server-driven, default-OFF billing flag. Persisting it let a default-ON beta
+    build pin enabled=true and override the safe default on update (audit
+    round 2). On load, the code default (False) must win regardless of the saved
+    file."""
+    import json
+
+    from src.config import Config
+
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(Config, "get_config_file", lambda self: cfg_file)
+
+    cfg = Config()
+    cfg.foreground_activity.enabled = True  # as a beta build would have it
+    cfg.save()
+
+    written = json.loads(cfg_file.read_text())
+    assert "enabled" not in written.get("foreground_activity", {}), (
+        "foreground_activity.enabled must not be persisted"
+    )
+
+    # Even a hand-edited config with enabled=true must not re-activate it.
+    written.setdefault("foreground_activity", {})["enabled"] = True
+    cfg_file.write_text(json.dumps(written))
+    reloaded = Config._from_dict(json.loads(cfg_file.read_text()))
+    assert reloaded.foreground_activity.enabled is False

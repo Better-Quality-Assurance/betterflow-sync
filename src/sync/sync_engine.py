@@ -552,6 +552,7 @@ class SyncEngine:
         6. Send heartbeat periodically
         """
         stats = SyncStats()
+        cycle_start = time.monotonic()  # to keep the queue drain inside the watchdog budget
 
         # Daily housekeeping before anything else, so it still runs while paused:
         # a long-running agent that never restarts across midnight would
@@ -736,8 +737,15 @@ class SyncEngine:
         # (the send was confirmed) — otherwise rebuild it next cycle (finding B).
         self._commit_inproc_afk_checkpoint(stats)
 
-        # Process offline queue if we're online
-        if self.bf.is_reachable() and not self.queue.is_empty():
+        # Process offline queue if we're online — but only if this cycle hasn't
+        # already burned most of the watchdog budget on a slow/hung regular send
+        # (else two ~94s chains stack past _DO_SYNC_DEADLINE; the queue drains
+        # next cycle).
+        if (
+            self.bf.is_reachable()
+            and not self.queue.is_empty()
+            and (time.monotonic() - cycle_start) < self._QUEUE_SKIP_IF_CYCLE_ELAPSED
+        ):
             self._process_queue(stats)
 
         # Check heartbeat counter — actual HTTP call is deferred to
@@ -2366,6 +2374,15 @@ class SyncEngine:
     # (_queue_consecutive_failures) resets on ANY success, so an outage that
     # recovers never reaches this — only a genuinely stuck head does.
     _STUCK_HEAD_CEILING = 20
+    # The regular event upload AND the offline-queue drain both run inside one
+    # sync() — i.e. inside the _do_sync watchdog. Each is a single retrying
+    # request chain that can take ~94s against a hung server, so back-to-back they
+    # can exceed _DO_SYNC_DEADLINE (150s) and false-trip "Sync hung" even though
+    # neither is wedged (the regular send hangs, then is_reachable()'s /health
+    # answers fast, then the queue drain hangs too). If the cycle has ALREADY
+    # spent this long before the queue drain, skip it this cycle (it drains next
+    # cycle); 50s + one ~94s chain stays under the 150s deadline with margin.
+    _QUEUE_SKIP_IF_CYCLE_ELAPSED = 50  # seconds
 
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
@@ -2410,6 +2427,14 @@ class SyncEngine:
                     processed += len(events)
                     self._queue_consecutive_failures = 0
                 elif result.accepted_ids:
+                    # A per-event verdict and a transient (no-verdict) failure are
+                    # mutually exclusive in send_events — guard it, because this
+                    # branch increments retry unconditionally, and if a future
+                    # path returned accepted_ids alongside transient=True it would
+                    # drop the unconfirmed events during an outage (#99's bug).
+                    assert not result.transient, (
+                        "accepted_ids and transient are mutually exclusive"
+                    )
                     # Partial success: remove accepted, increment retry on rest.
                     # An event without an "id" cannot be matched against
                     # accepted_ids — treat it as failed so it gets retried
