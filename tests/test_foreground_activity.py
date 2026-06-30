@@ -401,3 +401,17 @@ def test_engine_is_active_dev_session_false_without_detector():
     eng, _ = _engine()
     eng._foreground_detector = None
     assert eng.is_active_dev_session() is False
+
+
+def test_foreground_activity_is_default_off_for_billing_safety():
+    """The foreground-CPU detector must default OFF. It changes tracked/billed
+    time (AFK credit + dev-session spans) and its backend support is an
+    unfinished follow-up, so a fleet update must NOT activate it for everyone;
+    the server enables it deliberately via update_from_server. Guards against a
+    silent flip back to on. See PR shipping v1.5.85."""
+    from src.config import ForegroundActivitySettings
+    from src.sync.foreground_activity import create_detector
+
+    assert ForegroundActivitySettings().enabled is False
+    # With the default (disabled) config, no detector is built — fully inert.
+    assert create_detector(ForegroundActivitySettings(), "test-host") is None

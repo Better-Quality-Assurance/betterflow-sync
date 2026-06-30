@@ -365,7 +365,12 @@ class ForegroundActivitySettings:
     last keyboard/mouse input), and only sessions of at least
     ``min_session_seconds`` are uploaded for server validation."""
 
-    enabled: bool = True
+    # Default OFF: this changes tracked/billed time (it injects AFK credit and
+    # dev-session spans) and its backend support (the dev-session bucket type) is
+    # still an unfinished follow-up. Ship inert so a fleet update can't flip
+    # billing for everyone; the server enables it via update_from_server once the
+    # backend lands and it's been validated.
+    enabled: bool = False
     cpu_threshold_percent: float = 15.0  # Frontmost-app CPU (single-core basis)
     max_credit_minutes: int = 20  # Max credit past the last real input
     min_session_seconds: int = 30  # Skip accidental blips
