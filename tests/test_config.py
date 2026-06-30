@@ -192,3 +192,27 @@ class TestUuidRegex:
 def test_in_process_afk_defaults_on():
     from src.config import Config
     assert Config().sync.in_process_afk is True
+
+
+def test_browser_url_tracking_defaults_on():
+    """On by default so web activity is categorized (e.g. netflix.com flagged)
+    without the user enabling any setting; only the bare domain is uploaded."""
+    from src.config import Config
+    privacy = Config().privacy
+    assert privacy.track_browser_urls is True
+    assert privacy.domain_only_urls is True
+    assert privacy.collect_full_urls is False
+
+
+def test_server_can_disable_browser_url_tracking():
+    from src.config import Config
+    config = Config()
+    config.update_from_server({"collection": {"track_browser_urls": False}})
+    assert config.privacy.track_browser_urls is False
+
+
+def test_browser_url_tracking_unchanged_when_server_omits_it():
+    from src.config import Config
+    config = Config()
+    config.update_from_server({"collection": {"collect_page_category": True}})
+    assert config.privacy.track_browser_urls is True

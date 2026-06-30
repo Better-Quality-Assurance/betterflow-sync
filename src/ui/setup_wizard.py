@@ -584,13 +584,21 @@ class SetupWizard:
             return
         self._perm_prompted = True
         try:
-            from ..ui.permissions import input_monitoring_active
+            from ..ui.permissions import input_monitoring_active, prime_browser_automation
         except ImportError:
-            from ui.permissions import input_monitoring_active
+            from ui.permissions import input_monitoring_active, prime_browser_automation
         try:
             input_monitoring_active(prompt=True)
         except Exception:
             logger.exception("Input Monitoring prompt failed during setup")
+        # Browser-tab URL reading needs Automation permission; surface its
+        # consent dialog here, in context, rather than silently later from the
+        # background poll thread. Optional and fail-closed — never blocks the
+        # required Input Monitoring gate.
+        try:
+            prime_browser_automation()
+        except Exception:
+            logger.exception("Browser Automation prime failed during setup")
 
     def _render_permissions(self) -> None:
         """Draw the single-permission gate and re-poll until granted.
@@ -651,6 +659,14 @@ class SetupWizard:
             self._make_button(
                 "Continue", lambda: self._finish_gate("granted"), cx, 446, width=280
             )
+            # Optional: Automation permission lets us categorize web activity
+            # (e.g. flag netflix.com as a distraction) instead of bucketing
+            # every tab as generic "browsing". Never gates Continue.
+            if sys.platform == "darwin":
+                self._make_text_link(
+                    "Categorize web activity? Set up browser access",
+                    self._setup_browser_automation, cx, 492,
+                )
             return
 
         # Step-by-step instructions for the macOS Settings dance. The
@@ -799,6 +815,23 @@ class SetupWizard:
             open_input_monitoring_settings()
         except Exception:
             logger.exception("Failed to open Input Monitoring settings during setup")
+
+    def _setup_browser_automation(self) -> None:
+        """Trigger the Automation consent prompt, then open the Automation pane.
+
+        Optional enhancement: with Automation permission the agent reads the
+        active browser tab's URL so web activity is categorized (e.g. distracting
+        sites are flagged) rather than collapsing to a generic "browsing" bucket.
+        """
+        try:
+            from ..ui.permissions import open_automation_settings, prime_browser_automation
+        except ImportError:
+            from ui.permissions import open_automation_settings, prime_browser_automation
+        try:
+            prime_browser_automation()
+            open_automation_settings()
+        except Exception:
+            logger.exception("Failed to set up browser Automation during setup")
 
     def _finish(self) -> None:
         """Complete and close the wizard only."""

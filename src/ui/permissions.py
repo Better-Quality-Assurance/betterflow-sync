@@ -306,6 +306,55 @@ def open_input_monitoring_settings() -> None:
         logger.warning(f"Failed to open Input Monitoring settings: {e}")
 
 
+def open_automation_settings() -> None:
+    """Open System Settings to the Automation pane.
+
+    Automation (Apple Events) permission is what lets BetterFlow read the active
+    browser tab's URL so web activity can be categorized (e.g. netflix.com →
+    distraction) instead of collapsing to a generic "browsing" bucket.
+    """
+    if not _IS_MACOS:
+        return
+
+    try:
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation",
+        ])
+    except Exception as e:
+        logger.warning(f"Failed to open Automation settings: {e}")
+
+
+def prime_browser_automation() -> bool:
+    """Issue one browser Apple Event so macOS surfaces the Automation prompt.
+
+    Reading the active-tab URL uses AppleScript, which macOS gates behind
+    per-target Automation permission. The system shows its consent dialog the
+    first time we send an Apple Event; triggering one here — while the user is
+    on the permission screen — surfaces that dialog *in context* instead of
+    silently later from the background poll thread, where a reflexive "Don't
+    Allow" would permanently disable browser categorization.
+
+    Reuses the tracker's reader, which resolves the frontmost app via System
+    Events first and only scripts it when it is a browser, so it never launches
+    a browser that isn't already running. Fail-closed: returns True when a URL
+    was read (Automation working), else False; never raises.
+    """
+    if not _IS_MACOS:
+        return True
+
+    try:
+        try:
+            from src.browser_tracker import get_active_browser_url
+        except ImportError:
+            from browser_tracker import get_active_browser_url
+
+        return get_active_browser_url() is not None
+    except Exception as e:
+        logger.debug("browser automation prime failed: %s", e)
+        return False
+
+
 _BUNDLE_ID = "co.betterqa.betterflow"
 
 

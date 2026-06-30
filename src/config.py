@@ -231,7 +231,14 @@ class PrivacySettings:
     collect_page_category: bool = True  # Include coarse page category classification
     auto_categorize: bool = True  # Enrich events with app_category from server mappings
     track_display_info: bool = False  # Track monitor name and virtual desktop
-    track_browser_urls: bool = False  # read active-tab URL without an extension (macOS: AppleScript / Windows: UI Automation)
+    # On by default: without the active-tab URL, every browser event collapses
+    # to a generic "browsing" category server-side (it can't tell netflix.com
+    # from github.com), so distracting sites are never flagged. domain_only_urls
+    # (above) still strips it to the bare host before upload, so only the domain
+    # ever leaves this process. macOS additionally needs Automation permission;
+    # the reader is fail-closed, so when that's absent this is simply a no-op.
+    # The server can still disable it per-device via collection.track_browser_urls.
+    track_browser_urls: bool = True  # read active-tab URL without an extension (macOS: AppleScript / Windows: UI Automation)
     exclude_apps: list[str] = field(
         default_factory=lambda: [
             "1Password",

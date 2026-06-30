@@ -21,9 +21,9 @@ Per-platform readers:
              build); the foreground process is checked so Electron apps that
              share Chromium's window class aren't mis-read as browsers.
 
-Opt-in (privacy.track_browser_urls = False by default). Every reader is
-fail-closed: a missing permission/library or any error returns None and
-tracking is simply a no-op — never a crash.
+On by default (privacy.track_browser_urls = True); the server can disable it
+per-device. Every reader is fail-closed: a missing permission/library or any
+error returns None and tracking is simply a no-op — never a crash.
 """
 
 import logging
@@ -236,7 +236,7 @@ def _start_macos_tracker(
 #      (chrome://, edge://) yields nothing rather than garbage.
 #
 # Everything is fail-closed: missing UIA libs, no permission, or any traversal
-# error returns None. Opt-in via privacy.track_browser_urls, same as macOS.
+# error returns None. On by default via privacy.track_browser_urls, same as macOS.
 
 # Foreground process basenames (lowercased) we treat as Chromium browsers.
 _WINDOWS_BROWSER_PROCS = {
