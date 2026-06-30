@@ -126,9 +126,17 @@ def _new_verified_session() -> requests.Session:
 
 
 class BetterFlowClientError(Exception):
-    """BetterFlow client error."""
+    """BetterFlow client error.
 
-    pass
+    ``status_code`` is set only when the failure is a definitive HTTP rejection
+    (a 4xx). Transient failures — 5xx, timeouts, connection/DNS errors, retries
+    exhausted — leave it None. The queue uses this to avoid counting a transient
+    server outage against an event's drop threshold (2026-06-30 data loss).
+    """
+
+    def __init__(self, message: str = "", status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class BetterFlowAuthError(BetterFlowClientError):
@@ -436,7 +444,8 @@ class BaseApiClient:
                 except (ValueError, AttributeError) as parse_err:
                     logger.debug("HTTPError body parse failed: %s", parse_err)
                 raise BetterFlowClientError(
-                    f"API error ({e.response.status_code}): {error_detail or str(e)}"
+                    f"API error ({e.response.status_code}): {error_detail or str(e)}",
+                    status_code=e.response.status_code,
                 ) from e
 
         effective_retry_config = retry_config_override or self.retry_config

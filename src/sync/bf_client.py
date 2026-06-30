@@ -93,6 +93,12 @@ class SyncResult:
     events_queued: int = 0
     error: Optional[str] = None
     accepted_ids: list[int] = field(default_factory=list)
+    # True when a failed sync was TRANSIENT (server down / 5xx / timeout / no
+    # delivery confirmation) rather than a definitive rejection of the batch (a
+    # 4xx). The queue uses this to decide whether to count a retry toward the
+    # drop threshold: a transient failure must NOT, or a long outage drops good
+    # activity (2026-06-30). Only meaningful when success is False.
+    transient: bool = False
 
 
 class BetterFlowClient(BaseApiClient):
@@ -296,11 +302,15 @@ class BetterFlowClient(BaseApiClient):
 
             if synced is None and not accepted_ids:
                 # No delivery confirmation — do not assume anything persisted.
+                # The server was reached but gave no per-event verdict, so this
+                # is transient (an idempotent replay, an unrecognised body): hold
+                # the batch, don't count it toward the drop threshold.
                 return SyncResult(
                     success=False,
                     events_synced=0,
                     events_queued=len(events),
                     error="server returned no delivery confirmation; re-queuing batch",
+                    transient=True,
                 )
 
             events_synced = synced if synced is not None else len(accepted_ids)
@@ -324,7 +334,13 @@ class BetterFlowClient(BaseApiClient):
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login
         except BetterFlowClientError as e:
-            return SyncResult(success=False, error=str(e))
+            # Transient unless the server gave a definitive 4xx rejection. A
+            # 5xx / timeout / connection / DNS failure (status_code None) is the
+            # server being unavailable, not a problem with these events — the
+            # queue must NOT count it toward the drop threshold.
+            status = getattr(e, "status_code", None)
+            transient = status is None or status >= 500
+            return SyncResult(success=False, error=str(e), transient=transient)
 
     def start_session(self) -> dict:
         """Start a tracking session."""

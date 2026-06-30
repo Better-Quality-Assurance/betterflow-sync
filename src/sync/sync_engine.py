@@ -2417,7 +2417,18 @@ class SyncEngine:
                         self.queue.increment_retry(failed_ids)
                     processed += len(succeeded_ids)
                 else:
-                    self.queue.increment_retry(event_ids)
+                    # Whole-batch failure with no per-event verdict. Only count
+                    # it toward the drop threshold when the server DEFINITIVELY
+                    # rejected the batch (a 4xx). A transient failure — server
+                    # down / 5xx / timeout / DNS / no delivery confirmation — is
+                    # not these events' fault; incrementing here drops good
+                    # activity after 5 down-cycles (the 2026-06-30 outage lost
+                    # real spans this way). Hold the events at their current
+                    # retry_count and retry next cycle; expire_old is the backstop
+                    # against unbounded growth, and a genuinely poison 4xx batch
+                    # still increments so it can't head-of-line-block the queue.
+                    if not result.transient:
+                        self.queue.increment_retry(event_ids)
                     self._apply_queue_backoff()
                     break
             except BetterFlowAuthError:
@@ -2425,7 +2436,9 @@ class SyncEngine:
                 # the caller's auth handler can trigger re-login.
                 raise
             except BetterFlowClientError:
-                self.queue.increment_retry(event_ids)
+                # send_events normally returns a SyncResult; reaching here means
+                # an unexpected client error surfaced. Treat as transient
+                # (server-side): back off and retry without counting a retry.
                 self._apply_queue_backoff()
                 break
 
