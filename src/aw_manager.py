@@ -834,7 +834,11 @@ class AWManager:
                 # one probe-restart per retry interval instead of kill+relaunching
                 # every tick. Tracking continues via the activity stream meanwhile.
                 now_mono = time.monotonic()
-                blind = self._window_consecutive_stale >= WINDOW_BLIND_RESTART_THRESHOLD
+                # Read the authoritative flag (set once consecutive crossed the
+                # threshold and cleared on recovery together with the counter) so
+                # the backoff gate and the heartbeat's window_tracker_blind never
+                # diverge as this method grows.
+                blind = self._window_tracker_blind
                 if blind and (now_mono - self._window_last_restart_mono) < WINDOW_BLIND_RETRY_INTERVAL:
                     logger.debug(
                         "%s still stale but blind (%d restarts didn't take) — "
