@@ -78,6 +78,15 @@ IDLE_BLIND_RESTART_THRESHOLD = 5
 # Once blind, probe-restart at most this often (so a later permission grant still
 # auto-recovers) instead of restarting on every health-check tick.
 IDLE_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
+# Same idea for bf-window-tracker. The launch-grace re-probe above only throttles
+# the BLIND (zero-events) case; a FROZEN tracker (an old event whose age keeps
+# growing) returns age > threshold every tick and so was kill+relaunched every
+# health-check with no backoff (Sachi, win32, 2026-06-30: restart #1→#5 every 30s
+# while the event age climbed 148→268s, never recovering). After this many
+# consecutive stale-restarts that don't take, treat it as blind, stop churning,
+# and probe at most once per retry interval.
+WINDOW_BLIND_RESTART_THRESHOLD = 5
+WINDOW_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
 
 
 def _get_platform_key() -> str:
@@ -379,6 +388,13 @@ class AWManager:
         self._idle_consecutive_stale: int = 0
         self._idle_tracker_blind: bool = False
         self._idle_last_restart_mono: float = 0.0
+        # Same trio for bf-window-tracker: once it stays stale across
+        # WINDOW_BLIND_RESTART_THRESHOLD restarts it is blind (wedged/blocked
+        # window-capture source a restart can't fix) — back off churning and flag
+        # it. Reset to 0 when the tracker emits fresh window events again.
+        self._window_consecutive_stale: int = 0
+        self._window_tracker_blind: bool = False
+        self._window_last_restart_mono: float = 0.0
         # When the agent uploads its own in-process AFK stream, the external
         # bf-idle-tracker bucket is ignored — don't restart it or raise blind
         # alerts about a tracker we no longer consume.
@@ -392,6 +408,16 @@ class AWManager:
         restarts. Clears automatically once the tracker emits fresh events."""
         with self._lifecycle_lock:
             return self._idle_tracker_blind
+
+    @property
+    def window_tracker_blind(self) -> bool:
+        """True when bf-window-tracker has stayed stale across repeated restarts —
+        a wedged/blocked window-capture source a restart can't fix. The watchdog
+        reads this to stop churning restarts and surface it; per-app attribution
+        pauses but billing continues via the activity stream. Clears automatically
+        once the tracker emits fresh window events again."""
+        with self._lifecycle_lock:
+            return self._window_tracker_blind
 
     def set_inproc_afk_active(self, active: bool) -> None:
         """Mark whether the agent is uploading its own in-process AFK stream. When
@@ -715,6 +741,7 @@ class AWManager:
         with self._lifecycle_lock:
             idle_restarts = self._idle_stale_restart_count
             blind = self._idle_tracker_blind
+            window_blind = self._window_tracker_blind
             inproc = self._inproc_afk_active
 
         window_age = self._get_latest_window_event_age()
@@ -730,6 +757,10 @@ class AWManager:
             # figure isn't inflated by an unrelated flapping window watcher.
             "idle_tracker_stale_restarts": idle_restarts,
             "idle_tracker_blind": blind,
+            # Chronically-blind window tracker: per-app attribution is degraded
+            # even though active/billed time keeps flowing — lets the backend tell
+            # "no app breakdown" apart from "not tracking".
+            "window_tracker_blind": window_blind,
             # True => agent generates its own AFK stream; backend should ignore
             # external-tracker staleness for this device.
             "inproc_afk": inproc,
@@ -788,23 +819,68 @@ class AWManager:
             age = self._get_latest_window_event_age()
             running_for = self._component_running_seconds(watcher)
             reachable = self._port_in_use()
-            if self._is_window_tracker_stale(age, running_for, reachable):
-                self._stale_restart_count += 1
-                detail = (
-                    f"no new events for {age:.0f}s" if age is not None
-                    else f"no events {running_for:.0f}s after launch (blind)"
-                )
-                logger.warning(
-                    f"{watcher} stale: {detail} (threshold {STALE_THRESHOLD}s, "
-                    f"restart #{self._stale_restart_count})"
-                )
-                proc = self._processes[watcher]
-                proc.terminate()
-                try:
-                    proc.wait(timeout=SHUTDOWN_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                self._start_component(watcher, binaries_dir)
+            if not self._is_window_tracker_stale(age, running_for, reachable):
+                # Emitting fresh window events again: clear blind state so a
+                # future genuine stall restarts promptly. (age None here is just
+                # launch lag or an AW outage, not recovery — don't reset on it.)
+                if age is not None and age <= STALE_THRESHOLD:
+                    self._window_consecutive_stale = 0
+                    self._window_tracker_blind = False
+            else:
+                # Stale. If it has stayed stale across several restarts it is
+                # blind — a wedged/blocked window-capture source a restart can't
+                # fix (Sachi, win32, 2026-06-30: restart #1→#5 every 30s while the
+                # event age climbed, never recovering), not a crash. Back off to
+                # one probe-restart per retry interval instead of kill+relaunching
+                # every tick. Tracking continues via the activity stream meanwhile.
+                now_mono = time.monotonic()
+                blind = self._window_consecutive_stale >= WINDOW_BLIND_RESTART_THRESHOLD
+                if blind and (now_mono - self._window_last_restart_mono) < WINDOW_BLIND_RETRY_INTERVAL:
+                    logger.debug(
+                        "%s still stale but blind (%d restarts didn't take) — "
+                        "backing off; next probe in %.0fs",
+                        watcher,
+                        self._window_consecutive_stale,
+                        WINDOW_BLIND_RETRY_INTERVAL - (now_mono - self._window_last_restart_mono),
+                    )
+                else:
+                    self._stale_restart_count += 1
+                    self._window_consecutive_stale += 1
+                    self._window_last_restart_mono = now_mono
+                    detail = (
+                        f"no new events for {age:.0f}s" if age is not None
+                        else f"no events {running_for:.0f}s after launch (blind)"
+                    )
+                    logger.warning(
+                        f"{watcher} stale: {detail} (threshold {STALE_THRESHOLD}s, "
+                        f"restart #{self._stale_restart_count}, "
+                        f"consecutive {self._window_consecutive_stale})"
+                    )
+                    proc = self._processes[watcher]
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=SHUTDOWN_TIMEOUT)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    # An orphan window watcher fighting over the bucket keeps us
+                    # stale no matter how often we restart our own PID — reap it
+                    # too (the "stale survives restarts" signature, same as idle).
+                    self._reap_orphan_processes(watcher, binaries_dir)
+                    self._start_component(watcher, binaries_dir)
+                    if (
+                        self._window_consecutive_stale >= WINDOW_BLIND_RESTART_THRESHOLD
+                        and not self._window_tracker_blind
+                    ):
+                        self._window_tracker_blind = True
+                        logger.warning(
+                            "%s has stayed stale across %d restarts — a restart "
+                            "can't fix it (the window-capture source is wedged or "
+                            "blocked). Backing off and flagging blind; per-app "
+                            "attribution is paused but billing continues via the "
+                            "activity stream.",
+                            watcher,
+                            self._window_consecutive_stale,
+                        )
 
         # Detect a stalled idle/AFK tracker (process alive but emitting no new
         # events). The AFK watcher heartbeats its current event, so a frozen
