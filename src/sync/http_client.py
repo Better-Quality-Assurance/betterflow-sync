@@ -138,6 +138,17 @@ class BetterFlowClientError(Exception):
         super().__init__(message)
         self.status_code = status_code
 
+    @property
+    def is_transient(self) -> bool:
+        """True when this failure is transient (hold the events, don't count them
+        toward the drop): server unreachable, timeout/DNS, 5xx, or a retryable 4xx
+        (429/408/503/504 are raised WITHOUT a status_code). ``status_code`` is set
+        ONLY for a definitive client rejection (a non-retryable 4xx), so "no code"
+        means transient. NOTE: this is a rejection classifier, not a raw HTTP
+        status — do not set status_code on a retryable 4xx or it becomes
+        definitive and its events burn retries during e.g. a rate-limit window."""
+        return self.status_code is None or self.status_code >= 500
+
 
 class BetterFlowAuthError(BetterFlowClientError):
     """Authentication error."""

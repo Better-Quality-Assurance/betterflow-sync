@@ -105,3 +105,47 @@ def test_definitive_rejection_still_drops_to_avoid_head_of_line_block():
         "a definitively-rejected (4xx) batch must still drop after max retries "
         "so it can't head-of-line-block the queue"
     )
+
+
+def test_stuck_transient_head_eventually_drops_to_unblock_queue():
+    """A batch that fails transiently DETERMINISTICALLY (a content-specific 5xx,
+    or a server stuck returning no-confirmation) must not block the oldest-first
+    queue head forever. After _STUCK_HEAD_CEILING consecutive transient failures
+    it is counted toward the drop so newer events can flow again — otherwise it
+    would freeze the whole upload stream up to the 30-day expiry, silently.
+
+    Guards against the regression #99 introduced (transient never increments)."""
+    from src.sync.sync_engine import SyncEngine
+
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine.queue.enqueue(_events(3))
+
+    # Permanent transient failure (server is "up" but this batch always fails).
+    engine.bf.send_events = Mock(
+        return_value=SyncResult(success=False, events_queued=3, transient=True)
+    )
+    # Ceiling consecutive failures + max_retries(5) + margin.
+    _run_cycles(engine, SyncEngine._STUCK_HEAD_CEILING + 8)
+
+    assert engine.queue.size() == 0, (
+        "a permanently-stuck transient head must eventually drop so newer events "
+        "are not blocked forever"
+    )
+
+
+def test_transient_outage_within_ceiling_still_holds_events():
+    """The unblock escape must NOT fire for an outage shorter than the ceiling —
+    those events are held, not dropped (the #99 guarantee still holds)."""
+    from src.sync.sync_engine import SyncEngine
+
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine.queue.enqueue(_events(5))
+    engine.bf.send_events = Mock(
+        return_value=SyncResult(success=False, events_queued=5, transient=True)
+    )
+    _run_cycles(engine, SyncEngine._STUCK_HEAD_CEILING - 1)  # below the ceiling
+
+    assert engine.queue.size() == 5, "a sub-ceiling outage must not drop activity"
+    assert engine.queue.failed_event_summary(max_retries=5)["count"] == 0

@@ -385,7 +385,13 @@ class TestBetterFlowClient:
         result = self.client.send_events(events)
 
         assert result.success is False
-        assert result.events_queued == 0  # server reported 0 failed; caller re-queues whole batch
+        # processed:0/failed:0 is an ambiguous no-verdict, NOT a definitive
+        # rejection: re-queue the whole batch and HOLD it (transient), don't let
+        # it be counted toward the drop. Previously this fell through to the
+        # definitive default (transient False) and dropped good events after 5
+        # cycles (Finding 2).
+        assert result.events_queued == len(events)
+        assert result.transient is True
 
     @responses.activate
     def test_send_events_empty_list(self):

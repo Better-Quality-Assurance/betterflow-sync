@@ -300,11 +300,19 @@ class BetterFlowClient(BaseApiClient):
             synced = payload.get("processed", payload.get("synced"))
             queued = payload.get("failed", payload.get("queued", 0))
 
-            if synced is None and not accepted_ids:
-                # No delivery confirmation — do not assume anything persisted.
-                # The server was reached but gave no per-event verdict, so this
-                # is transient (an idempotent replay, an unrecognised body): hold
-                # the batch, don't count it toward the drop threshold.
+            # No delivery confirmation — do not assume anything persisted. The
+            # server was reached but gave no per-event verdict, so this is
+            # transient (an idempotent replay, an unrecognised body), NOT a
+            # definitive rejection: hold the batch, don't count it toward the
+            # drop threshold. Covers both a confirmation-less body (synced None)
+            # AND an explicit zero-verdict (processed:0, failed:0) on a 2xx — the
+            # latter is just as ambiguous and must not silently drop good events.
+            no_confirmation = (
+                not accepted_ids
+                and (synced is None or synced == 0)
+                and not queued
+            )
+            if no_confirmation:
                 return SyncResult(
                     success=False,
                     events_synced=0,
@@ -334,13 +342,11 @@ class BetterFlowClient(BaseApiClient):
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login
         except BetterFlowClientError as e:
-            # Transient unless the server gave a definitive 4xx rejection. A
-            # 5xx / timeout / connection / DNS failure (status_code None) is the
-            # server being unavailable, not a problem with these events — the
-            # queue must NOT count it toward the drop threshold.
-            status = getattr(e, "status_code", None)
-            transient = status is None or status >= 500
-            return SyncResult(success=False, error=str(e), transient=transient)
+            # Transient unless the server gave a definitive 4xx rejection. The
+            # error classifies itself (5xx / timeout / connection / DNS / 429 =>
+            # transient; a non-retryable 4xx => definitive) so the queue knows
+            # whether to count it toward the drop threshold.
+            return SyncResult(success=False, error=str(e), transient=e.is_transient)
 
     def start_session(self) -> dict:
         """Start a tracking session."""
