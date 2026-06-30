@@ -506,8 +506,14 @@ class Config:
         # and default-OFF. A device that ran a default-ON beta build already has
         # enabled=true on disk; honouring it would override the safe default on
         # update. Drop it on load so the code default wins; the server re-enables
-        # per-session via update_from_server. (save() also stops writing it.)
-        foreground_activity_data.pop("enabled", None)
+        # per-session via update_from_server. (save() also stops writing it.) Log
+        # when we drop a persisted True so a beta user's "dev-session credit
+        # stopped after update" has a trail rather than a silent flip-off.
+        if foreground_activity_data.pop("enabled", None) is True:
+            logger.info(
+                "Ignoring persisted foreground_activity.enabled=true on load; it "
+                "is server-driven and default-OFF (server re-enables per-session)"
+            )
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
