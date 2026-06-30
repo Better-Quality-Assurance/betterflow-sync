@@ -225,7 +225,7 @@ jobs:
           ./scripts/build-appimage.sh "dist/${{ matrix.asset_name }}.AppImage"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: |
