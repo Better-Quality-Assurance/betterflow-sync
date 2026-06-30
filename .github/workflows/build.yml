@@ -253,25 +253,25 @@ jobs:
 
     steps:
       - name: Download macOS ARM artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: BetterFlow-macOS-arm64
           path: ./artifacts
 
       - name: Download macOS Intel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: BetterFlow-macOS-x86_64
           path: ./artifacts
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: BetterFlow-Windows
           path: ./artifacts
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: BetterFlow-linux-x86_64
           path: ./artifacts
