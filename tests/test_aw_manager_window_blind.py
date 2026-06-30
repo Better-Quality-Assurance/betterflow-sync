@@ -98,3 +98,43 @@ def test_fresh_window_tracker_not_restarted():
     mgr, window = _mgr(window_age=5, running_for=WINDOW_BLIND_GRACE + 120)
     mgr.restart_if_needed()
     assert not window.terminate.called
+
+
+def test_blind_window_tracker_stops_churning_and_flags_blind():
+    """A window tracker that stays stale across repeated restarts is blind — a
+    wedged/blocked capture source a restart can't fix, not a crash. After the
+    threshold we stop kill+relaunching every tick and flag window_tracker_blind
+    (Sachi, win32, 2026-06-30: restart #1->#5 every 30s while the event age
+    climbed 148->268s, never recovering). Pre-fix this restarted every tick."""
+    from src.aw_manager import WINDOW_BLIND_RESTART_THRESHOLD
+
+    # Frozen tracker: an old event whose age stays > threshold every tick.
+    mgr, window = _mgr(window_age=STALE_THRESHOLD + 80, running_for=WINDOW_BLIND_GRACE + 120)
+    for _ in range(WINDOW_BLIND_RESTART_THRESHOLD + 5):
+        window.poll.return_value = None  # re-mocked alive each tick
+        mgr.restart_if_needed()
+
+    assert mgr.window_tracker_blind is True, "stale-across-restarts must flag blind"
+    assert mgr._start_component.call_count == WINDOW_BLIND_RESTART_THRESHOLD, (
+        f"expected backoff after {WINDOW_BLIND_RESTART_THRESHOLD} restarts, got "
+        f"{mgr._start_component.call_count} (pre-fix: one per tick)"
+    )
+
+
+def test_window_blind_clears_when_tracker_recovers():
+    """Once the window tracker emits fresh events again, the blind flag and the
+    consecutive counter reset so a future genuine stall restarts promptly."""
+    from src.aw_manager import WINDOW_BLIND_RESTART_THRESHOLD
+
+    mgr, window = _mgr(window_age=STALE_THRESHOLD + 80, running_for=WINDOW_BLIND_GRACE + 120)
+    for _ in range(WINDOW_BLIND_RESTART_THRESHOLD):
+        window.poll.return_value = None
+        mgr.restart_if_needed()
+    assert mgr.window_tracker_blind is True
+
+    # Recovers: fresh window events.
+    mgr._get_latest_window_event_age = MagicMock(return_value=5)
+    mgr.restart_if_needed()
+
+    assert mgr.window_tracker_blind is False
+    assert mgr._window_consecutive_stale == 0
