@@ -408,3 +408,29 @@ class TestOfflineQueue:
         assert removed == 2
         assert self.queue.get_counted_times("2026-06-15") == {("b", "3"): 3.0}
         assert self.queue.get_counted_times("2026-06-14") == {}
+
+    # ---- dequeue offset (drain-around-a-stuck-head) ----
+
+    def test_dequeue_offset_skips_oldest_events(self):
+        """dequeue(offset=N) steps past the oldest N eligible events, in a stable
+        total order — this is how _process_queue serves the events BEHIND a stuck
+        head instead of head-of-line-blocking on it."""
+        self.queue.enqueue([
+            {"id": "a", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+            {"id": "b", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+            {"id": "c", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+        ])
+
+        # offset 0 = oldest first (stable by id when created_at ties).
+        assert [e.event_data["id"] for e in self.queue.dequeue()] == ["a", "b", "c"]
+        # offset 1 skips the stuck head "a"; "b","c" still get served.
+        assert [e.event_data["id"] for e in self.queue.dequeue(offset=1)] == ["b", "c"]
+        # offset 2 skips two.
+        assert [e.event_data["id"] for e in self.queue.dequeue(offset=2)] == ["c"]
+
+    def test_dequeue_offset_beyond_size_returns_empty(self):
+        """An offset past the end returns [] (the loop terminates cleanly once
+        every remaining event has been stepped past this cycle)."""
+        self.queue.enqueue([{"id": "a", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}])
+        assert self.queue.dequeue(offset=1) == []
+        assert self.queue.size() == 1  # still held, not removed

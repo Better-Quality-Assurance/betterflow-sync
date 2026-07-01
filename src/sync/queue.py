@@ -294,14 +294,28 @@ class OfflineQueue:
             )
             return count
 
-    def dequeue(self, batch_size: int = 100, max_retries: int = 5) -> list[QueuedEvent]:
+    def dequeue(
+        self,
+        batch_size: int = 100,
+        max_retries: int = 5,
+        *,
+        offset: int = 0,
+    ) -> list[QueuedEvent]:
         """Get a batch of events from the queue (oldest first).
 
         Skips events that have exceeded max_retries (N7).
 
+        ``offset`` skips the oldest N eligible events. _process_queue uses it to
+        step past a batch that just failed this cycle (which stays at the head
+        because it isn't removed), so the events BEHIND a stuck head still get
+        served instead of being head-of-line-blocked. Ordering is a stable total
+        order (created_at, then id) so a fixed offset is deterministic even when
+        several events share a created_at.
+
         Args:
             batch_size: Maximum number of events to return
             max_retries: Skip events with retry_count >= this value
+            offset: Number of oldest eligible events to skip
 
         Returns:
             List of QueuedEvent objects
@@ -316,10 +330,10 @@ class OfflineQueue:
                 SELECT id, event_data, created_at, retry_count
                 FROM queued_events
                 WHERE retry_count < ?
-                ORDER BY created_at ASC
-                LIMIT ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT ? OFFSET ?
                 """,
-                (max_retries, batch_size),
+                (max_retries, batch_size, offset),
             )
             rows = cursor.fetchall()
             result: list[QueuedEvent] = []
