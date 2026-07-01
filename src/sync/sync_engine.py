@@ -1220,12 +1220,24 @@ class SyncEngine:
         new bucket-processing path can't silently classify against an empty
         context (this is the window-classification entry point).
         """
-        # Feed window events to activity analyzer for window change detection
+        # Feed window events to activity analyzer for window change detection.
+        # The analyzer sees the RAW events (unchanged) — coalescing below only
+        # affects what we upload, not window-change/fraud detection.
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             self._activity_analyzer.add_window_events(events)
 
+        # Coalesce same-app title flicker so a run of sub-minimum window events
+        # isn't dropped wholesale by the flicker filter (per-app attribution
+        # loss). The checkpoint below is still computed from the ORIGINAL events,
+        # so a merged span never rewinds or double-advances the checkpoint.
+        events_to_transform = (
+            self._coalesce_window_flicker(events)
+            if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT)
+            else events
+        )
+
         transformed = []
-        for event in events:
+        for event in events_to_transform:
             # Dedup: skip if already sent with same duration.
             # For gap-filled events, also accept the original AW duration
             # (gap-filling is deterministic, so the extended version was
@@ -1445,6 +1457,81 @@ class SyncEngine:
                     continue
             collapsed.append(ev)
         return collapsed
+
+    # AW emits back-to-back window events (no gap) on a focus/title change, so
+    # bridging only needs to absorb sub-second rounding between adjacent events.
+    _WINDOW_FLICKER_GAP_TOLERANCE = 2.0  # seconds
+
+    def _coalesce_window_flicker(self, events: list[AWEvent]) -> list[AWEvent]:
+        """Merge runs of consecutive SAME-APP window events when the run would
+        otherwise lose data to the flicker filter.
+
+        A window title that updates faster than ``min_window_event_seconds`` (a
+        browser tab with a live counter, a terminal, a media player) makes AW
+        emit a new window event on every title change — each shorter than the
+        minimum, so ``_transform_event`` drops them ALL and the app loses its
+        per-app timeline entirely (Sachi Navodi, 2026-07-01: chrome.exe, 99
+        sub-5s events dropped every cycle → "No activity tracked" while hours
+        still tracked). Continuous focus on ONE app must not be discarded just
+        because its title flickers.
+
+        We merge a maximal run of consecutive, contiguous, same-app events into a
+        single span (earliest start → latest end) so the run clears the minimum;
+        the representative title/url comes from the longest-lived event in the
+        run. A run is only merged when it actually rescues data — length >= 2 AND
+        at least one member is below the minimum — so a normal user's already-
+        passing events are left byte-identical (strictly additive change).
+        DIFFERENT apps are never merged, so genuine cross-app alt-tab noise is
+        still suppressed by the per-event minimum.
+
+        Safe by construction: window/web events are ATTRIBUTION-ONLY (billing
+        rides the AFK/input stream), and the server upserts by AW event id and
+        aggregates per app/day — so this only affects per-app attribution, never
+        billed hours. Source events are frozen and never mutated; merged spans
+        are new AWEvents anchored on the run's LAST id, matching the newest-event
+        heartbeat-extension semantics the dedup path already assumes.
+        """
+        if len(events) < 2:
+            return events
+        min_seconds = self.config.sync.min_window_event_seconds
+        tolerance = timedelta(seconds=self._WINDOW_FLICKER_GAP_TOLERANCE)
+        ordered = sorted(events, key=lambda e: e.timestamp)
+
+        merged: list[AWEvent] = []
+
+        def flush(run: list[AWEvent]) -> None:
+            # Merge only when the run would otherwise lose data: >=2 events and at
+            # least one below the minimum. Otherwise emit the run unchanged.
+            if len(run) >= 2 and any(e.duration < min_seconds for e in run):
+                first = run[0]
+                last = max(run, key=lambda e: e.timestamp + timedelta(seconds=e.duration))
+                end = last.timestamp + timedelta(seconds=last.duration)
+                span = round((end - first.timestamp).total_seconds(), 2)
+                rep = max(run, key=lambda e: e.duration)  # longest-lived title/url
+                merged.append(AWEvent(
+                    id=last.id,
+                    timestamp=first.timestamp,
+                    duration=span,
+                    data=rep.data,
+                ))
+            else:
+                merged.extend(run)
+
+        run: list[AWEvent] = []
+        for ev in ordered:
+            if run:
+                prev = run[-1]
+                prev_end = prev.timestamp + timedelta(seconds=prev.duration)
+                same_app = ev.app is not None and ev.app == prev.app
+                contiguous = ev.timestamp <= prev_end + tolerance
+                if same_app and contiguous:
+                    run.append(ev)
+                    continue
+                flush(run)
+                run = []
+            run.append(ev)
+        flush(run)
+        return merged
 
     def _get_afk_events_for_range(
         self, start: datetime, end: datetime
