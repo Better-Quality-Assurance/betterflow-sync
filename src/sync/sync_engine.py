@@ -2371,20 +2371,28 @@ class SyncEngine:
                 raise
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
-    # A transient whole-batch failure normally does NOT count toward the drop, so
-    # a server outage can't drop good activity (#99). But a batch that fails
-    # transiently DETERMINISTICALLY — a content-specific 5xx, or a server stuck
-    # returning no-confirmation — would otherwise sit at the oldest-first dequeue
-    # head forever, freezing every newer event up to the 30-day expiry, silently
-    # (the heartbeat stays green). After this many consecutive failed queue cycles
-    # (with the backoff schedule, ~3h of sustained failure) we count the stuck
-    # head toward the drop so it ages out and the queue unblocks — BUT only if the
-    # head batch is unstorable (stale/bucketless); a stuck head that still holds
-    # recent bucketed activity is held, never dropped, so a long events-route
-    # degradation (server reachable, batches 5xx, nothing draining) can't lose real
-    # billable time. The counter (_queue_consecutive_failures) counts every
-    # transient queue failure and resets on any success.
-    _STUCK_HEAD_CEILING = 20
+    # A transient whole-batch failure does NOT count toward the drop, so a server
+    # outage can't drop good activity (#99). The old risk was that a batch which
+    # fails transiently but DETERMINISTICALLY (a content-specific 5xx, or a server
+    # stuck returning no-confirmation) would sit at the oldest-first dequeue head
+    # forever, freezing every newer event up to the 30-day expiry — silently, with
+    # the heartbeat green. We now fix that at the source: on a failure the drain
+    # CONTINUES with a growing dequeue OFFSET that steps past the stuck head, so
+    # the events BEHIND it still get served. The queue drains AROUND a stuck head
+    # instead of blocking on it; nothing good is ever dropped to "unblock" it. The
+    # skip is in-memory and per-cycle: the next cycle starts at offset 0 and
+    # re-attempts the head, so a recovered server drains immediately (no persisted
+    # backoff to wait out). A definitively-rejected (4xx) batch still increments
+    # retry_count and drops after max_retries; a transiently-failing batch is held
+    # (retry_count untouched) and retried next cycle. This replaced the old
+    # stuck-head-ceiling shed heuristic.
+    #
+    # Bail out of a drain once this many batches fail transiently back-to-back
+    # with no success in between: the server is likely down, so stop hammering it
+    # this cycle and let the queue backoff throttle the retry cadence. A success
+    # resets the counter, so a lone poison head amid healthy traffic never trips
+    # it — the queue keeps draining around it.
+    _MAX_CONSECUTIVE_TRANSIENT_SKIPS = 3
     # The regular event upload AND the offline-queue drain both run inside one
     # sync() — i.e. inside the _do_sync watchdog. Each is a single retrying
     # request chain that can take ~94s against a hung server, so back-to-back they
@@ -2419,23 +2427,33 @@ class SyncEngine:
         # Process queue in batches
         deadline = time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
         batch_size = self.config.sync.batch_size
-        processed = 0
+        attempted = 0
         max_per_cycle = batch_size * 10  # Max 10 batches per cycle
+        made_progress = False    # any event accepted this cycle
+        had_transient = False    # at least one transient (no-verdict) failure
+        # Events that FAIL this cycle stay at the queue head (not removed; a
+        # transient failure also leaves retry_count untouched). We step past them
+        # with a growing OFFSET so the events BEHIND a stuck head still get served
+        # — draining AROUND the stuck head instead of head-of-line-blocking on it.
+        skip_offset = 0
+        consecutive_transient = 0  # back-to-back transient failures (reset on success)
 
-        while processed < max_per_cycle and time.monotonic() < deadline:
-            queued = self.queue.dequeue(batch_size)
+        while attempted < max_per_cycle and time.monotonic() < deadline:
+            queued = self.queue.dequeue(batch_size, offset=skip_offset)
             if not queued:
                 break
 
             events = [q.event_data for q in queued]
             event_ids = [q.id for q in queued]
+            attempted += len(events)
 
             try:
                 result = self.bf.send_events(events)
                 if result.success:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
-                    processed += len(events)
+                    made_progress = True
+                    consecutive_transient = 0
                     self._queue_consecutive_failures = 0
                 elif result.accepted_ids and not result.transient:
                     # A per-event verdict and a transient (no-verdict) failure are
@@ -2443,16 +2461,15 @@ class SyncEngine:
                     # result.transient` is a fail-safe (NOT an assert: an assert is
                     # stripped under python -O, and an AssertionError would crash
                     # the whole sync cycle): if a future path ever returns both,
-                    # fall through to the transient `else` and HOLD the batch
-                    # rather than increment-and-drop the unconfirmed events during
-                    # an outage (#99's bug).
+                    # fall through to the transient branch and HOLD the batch
+                    # rather than increment-and-drop unconfirmed events during an
+                    # outage (#99's bug).
                     #
-                    # Partial success: remove accepted, increment retry on rest.
-                    # An event without an "id" cannot be matched against
-                    # accepted_ids — treat it as failed so it gets retried
-                    # rather than silently dropped. All event producers
-                    # (regular events, status spans, call events) now include
-                    # a stable id; this is defensive against future regressions.
+                    # Partial success: remove accepted, increment retry on the
+                    # server-rejected rest, and step past them (offset) so they
+                    # aren't re-served this cycle. An event without an "id" cannot
+                    # be matched against accepted_ids — treat it as failed so it
+                    # gets retried rather than silently dropped.
                     accepted_set = set(result.accepted_ids)
                     succeeded_ids = [eid for eid, ev in zip(event_ids, events)
                                      if ev.get("id") in accepted_set]
@@ -2460,47 +2477,35 @@ class SyncEngine:
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
                         stats.events_sent += len(succeeded_ids)
+                        made_progress = True
                         self._queue_consecutive_failures = 0
                     if failed_ids:
                         self.queue.increment_retry(failed_ids)
-                    processed += len(succeeded_ids)
+                        skip_offset += len(failed_ids)
+                    consecutive_transient = 0
+                elif not result.transient:
+                    # Whole-batch DEFINITIVE rejection (4xx). Count it toward the
+                    # drop so a genuinely poison batch ages out after max_retries,
+                    # and step past it so it isn't re-served (burning all its
+                    # retries) within this same cycle — retries spread across
+                    # cycles, and dequeue serves newer events meanwhile.
+                    self.queue.increment_retry(event_ids)
+                    skip_offset += len(event_ids)
+                    consecutive_transient = 0
                 else:
-                    # Whole-batch failure with no per-event verdict. Only count
-                    # it toward the drop threshold when the server DEFINITIVELY
-                    # rejected the batch (a 4xx). A transient failure — server
-                    # down / 5xx / timeout / DNS / no delivery confirmation — is
-                    # not these events' fault; incrementing here drops good
-                    # activity after 5 down-cycles (the 2026-06-30 outage lost
-                    # real spans this way). Hold the events at their current
-                    # retry_count and retry next cycle; expire_old is the backstop
-                    # against unbounded growth, and a genuinely poison 4xx batch
-                    # still increments so it can't head-of-line-block the queue.
-                    if not result.transient:
-                        self.queue.increment_retry(event_ids)
-                    elif (
-                        self._queue_consecutive_failures >= self._STUCK_HEAD_CEILING
-                        and not self._batch_has_storable_activity(events)
-                    ):
-                        # Transient and stuck for many cycles AND the head batch is
-                        # entirely UNSTORABLE (stale past retention or bucketless —
-                        # the server would reject it anyway). Count it toward the
-                        # drop so it ages out and stops blocking the queue head.
-                        #
-                        # We deliberately do NOT shed a stuck head that still holds
-                        # recent, bucketed activity: a long events-route degradation
-                        # (server reachable, batches 5xx) where nothing drains would
-                        # otherwise lose real billable time after ~3h. Those events
-                        # are held for recovery / the 30-day expire_old backstop.
-                        # (A truly poison recent batch blocks only until it ages out
-                        # of the retention window — rare, and never a wrong drop.)
-                        logger.warning(
-                            "Unstorable queue head batch (%d events) stuck %d cycles "
-                            "— counting it toward the drop to unblock the queue.",
-                            len(event_ids), self._queue_consecutive_failures,
-                        )
-                        self.queue.increment_retry(event_ids)
-                    self._apply_queue_backoff()
-                    break
+                    # Whole-batch TRANSIENT failure (server down / 5xx / timeout /
+                    # DNS / no delivery confirmation). NOT these events' fault, so
+                    # retry_count is untouched — nothing good is ever dropped for a
+                    # server outage (#99). Step past this stuck head so the events
+                    # behind it still drain (fixes the silent head-of-line freeze);
+                    # it's retried from offset 0 next cycle. Bail if several
+                    # batches fail transiently back-to-back — the server is likely
+                    # down, so stop hammering and let the queue backoff throttle.
+                    skip_offset += len(event_ids)
+                    had_transient = True
+                    consecutive_transient += 1
+                    if consecutive_transient >= self._MAX_CONSECUTIVE_TRANSIENT_SKIPS:
+                        break
             except BetterFlowAuthError:
                 # Auth errors won't self-heal with retries; re-raise so
                 # the caller's auth handler can trigger re-login.
@@ -2508,39 +2513,17 @@ class SyncEngine:
             except BetterFlowClientError as e:
                 # send_events normally returns a SyncResult; reaching here means an
                 # unexpected client error escaped it (should never fire). Surface
-                # it, then treat as transient (server-side): back off without
-                # counting a retry.
+                # it and stop this cycle (treated as transient — no retry counted).
                 logger.warning("Unexpected BetterFlowClientError escaped send_events: %s", e)
-                self._apply_queue_backoff()
+                had_transient = True
                 break
 
-    def _batch_has_storable_activity(
-        self, events: list, *, now: Optional[datetime] = None
-    ) -> bool:
-        """True if any event in the batch is STORABLE — has a bucket to route to
-        AND a timestamp within the server's retention window. A batch with no
-        storable event (all stale past retention or bucketless) is one the server
-        would reject anyway, so it's safe to shed when it blocks the queue head.
-        Mirrors OfflineQueue.failed_event_summary's real-loss classification, so a
-        stuck head holding genuine recent activity is held, never dropped."""
-        now = now or datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=7)  # matches the queue's stale_after_days
-        for ev in events:
-            if not isinstance(ev, dict):
-                continue
-            bid = ev.get("bucket_id")
-            ts = ev.get("timestamp")
-            if not bid or not ts:
-                continue
-            try:
-                parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                continue
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            if parsed >= cutoff:
-                return True
-        return False
+        # Throttle a genuine outage: if the whole cycle made no progress but hit
+        # transient failures, back off before the next drain. When we DID make
+        # progress (queue is flowing, even around a stuck poison head), stay on
+        # the normal cadence so the head is retried promptly next cycle.
+        if had_transient and not made_progress:
+            self._apply_queue_backoff()
 
     def _apply_queue_backoff(self) -> None:
         """Apply exponential backoff for queue processing failures."""
