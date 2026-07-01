@@ -20,6 +20,15 @@ __all__ = ["OfflineQueue", "QueuedEvent"]
 
 logger = logging.getLogger(__name__)
 
+# Client-side retention window for queued events, in days. This MUST stay in
+# lockstep with the server's ingest cutoff: internal-tool2
+# AgentEventProcessor::isValidEventTimestamp rejects any event older than 7 days
+# (and more than 5 min in the future). We use it to classify a queue drop as
+# benign — "unstorable": the server would reject it anyway — versus real activity
+# loss. Single source of truth so the two ends can't silently drift; if the
+# server window ever changes, change this too (ideally the server advertises it).
+STALE_AFTER_DAYS = 7
+
 
 @dataclass
 class QueuedEvent:
@@ -387,7 +396,7 @@ class OfflineQueue:
         max_retries: int = 5,
         *,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = STALE_AFTER_DAYS,
     ) -> dict:
         """Summarize events at/over the retry ceiling that remove_failed() is
         about to drop. Read-only — does NOT delete.
