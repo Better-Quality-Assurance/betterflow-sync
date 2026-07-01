@@ -458,6 +458,30 @@ class BetterFlowClient(BaseApiClient):
             files["relaunch_log"] = ("self-update-relaunch.log", relaunch_tail, "text/plain")
         return self._request("POST", "logs", files=files, retry=False)
 
+    def upload_events_tail(self, events: list[dict]) -> dict:
+        """Upload a bounded, read-only tail of recently-queued activity events on
+        a server logs_requested pull, so a QUIET device's real activity can be
+        backfilled — not just its diagnostic text logs. POST /api/agent/logs with
+        the events as a JSON file part (``events``).
+
+        The events are a COPY exported from the offline queue; they are NOT
+        removed from the queue and still sync through the normal events route.
+        Mirrors upload_logs: not retried here — if it fails, the server keeps
+        logs_requested_at set and the next heartbeat re-attempts.
+
+        NOTE: this needs a matching backend endpoint/field in internal-tool2 to
+        consume the ``events`` part (that backend work is a separate task). Until
+        it lands the server simply ignores the extra multipart field.
+
+        Privacy note: same trust model as upload_logs — an admin-initiated
+        diagnostic pull within the tenant. These are already-collected activity
+        events (window titles are sent raw to the backend as normal), so this
+        adds no data the events route wouldn't carry anyway.
+        """
+        payload = json.dumps({"events": events}).encode("utf-8")
+        files: dict = {"events": ("events.json", payload, "application/json")}
+        return self._request("POST", "logs", files=files, retry=False)
+
     # =========================================================================
     # Web login passthrough
     # =========================================================================

@@ -26,6 +26,9 @@ class TestSyncEngine:
         self.queue = Mock()
         # Mock the exclude_apps as a list so "in" checks work
         self.queue.get_checkpoint.return_value = None
+        # The logs_requested handler also exports a queued-event tail; default it
+        # to empty so log-upload-focused tests don't hit the event-tail path.
+        self.queue.export_recent_tail.return_value = []
         self.config = Config()
 
         # Create mock activity analyzer and time tracker

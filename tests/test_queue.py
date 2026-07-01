@@ -44,6 +44,60 @@ class TestOfflineQueue:
         assert count == 3
         assert self.queue.size() == 3
 
+    def test_export_recent_tail_newest_first_and_queue_intact(self):
+        """export_recent_tail returns a read-only copy (newest first) without
+        removing anything from the queue — events must still sync normally."""
+        events = [
+            {"timestamp": "2026-02-18T10:00:00Z", "data": {"order": 1}},
+            {"timestamp": "2026-02-18T10:01:00Z", "data": {"order": 2}},
+            {"timestamp": "2026-02-18T10:02:00Z", "data": {"order": 3}},
+        ]
+        self.queue.enqueue(events)
+
+        tail = self.queue.export_recent_tail()
+
+        # Newest first
+        assert [e["data"]["order"] for e in tail] == [3, 2, 1]
+        # Read-only: queue is left fully intact for the normal sync path
+        assert self.queue.size() == 3
+        assert len(self.queue.dequeue(batch_size=10)) == 3
+
+    def test_export_recent_tail_bounded_by_rows(self):
+        """The row cap keeps a huge queue from being dumped wholesale."""
+        events = [
+            {"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {"order": i}}
+            for i in range(10)
+        ]
+        self.queue.enqueue(events)
+
+        tail = self.queue.export_recent_tail(max_rows=3)
+
+        assert len(tail) == 3
+        # Newest three (orders 9, 8, 7)
+        assert [e["data"]["order"] for e in tail] == [9, 8, 7]
+        assert self.queue.size() == 10  # still intact
+
+    def test_export_recent_tail_bounded_by_bytes(self):
+        """The byte cap stops accumulation but always keeps at least the newest
+        event even when it alone exceeds the cap."""
+        events = [
+            {"timestamp": f"2026-02-18T10:{i:02d}:00Z", "data": {"blob": "x" * 200}}
+            for i in range(5)
+        ]
+        self.queue.enqueue(events)
+
+        # Cap smaller than a single serialized event → exactly one returned.
+        tail = self.queue.export_recent_tail(max_bytes=10)
+        assert len(tail) == 1
+
+        # A cap fitting ~2 events returns a bounded subset, never all 5.
+        tail2 = self.queue.export_recent_tail(max_bytes=500)
+        assert 1 <= len(tail2) < 5
+        assert self.queue.size() == 5  # still intact
+
+    def test_export_recent_tail_empty_queue(self):
+        assert self.queue.export_recent_tail() == []
+
     def test_dequeue_returns_oldest_first(self):
         """Test that dequeue returns events in FIFO order."""
         events = [

@@ -2697,6 +2697,49 @@ class SyncEngine:
             logger.debug("Log upload failed (will retry next heartbeat): %s", e)
             self._report_upload_failure(f"upload POST failed: {e}")
 
+        # Also backfill the recent activity-event tail from the offline queue so
+        # a QUIET device's actual activity can be recovered, not just diagnostics.
+        # Read-only export: the events stay queued and sync normally. Best-effort
+        # and independent of the text-log upload above.
+        self._upload_event_tail()
+
+    def _upload_event_tail(self) -> None:
+        """Export a bounded, read-only tail of recently-queued activity events
+        and upload it alongside the requested logs, so a quiet device's real
+        activity can be backfilled — not just its text logs.
+
+        Never mutates the queue (the events still sync normally). Best-effort:
+        DB and upload errors are logged (never silently swallowed) and never
+        block the text-log upload. An auth error IS re-raised so _send_heartbeat
+        can surface re-login, matching the text-log path.
+
+        NOTE: requires a matching backend endpoint/field in internal-tool2 to
+        consume the uploaded events (that backend work is a separate task);
+        until it lands the server ignores this extra multipart part.
+        """
+        try:
+            events = self.queue.export_recent_tail()
+        except Exception as e:  # noqa: BLE001
+            # export_recent_tail already handles sqlite errors and returns [];
+            # this guards any unexpected escape so a queue hiccup can't sink the
+            # heartbeat — but log it rather than swallow silently.
+            logger.warning("logs_requested: could not export event tail: %s", e)
+            return
+        if not events:
+            logger.debug("logs_requested: no queued events to upload")
+            return
+        try:
+            self.bf.upload_events_tail(events)
+            logger.info(
+                "Uploaded %d queued event(s) on server request", len(events)
+            )
+        except BetterFlowAuthError:
+            logger.warning("Event-tail upload auth error — session likely expired")
+            raise  # let _send_heartbeat surface re-login
+        except BetterFlowClientError as e:
+            logger.debug("Event-tail upload failed (will retry next heartbeat): %s", e)
+            self._report_upload_failure(f"event-tail POST failed: {e}")
+
     def _report_dropped_events(self, summary: dict) -> None:
         """Surface permanently-dropped queued events to the ops ingest, split by
         whether the drop is genuine loss or a benign flush.

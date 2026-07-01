@@ -362,6 +362,59 @@ class OfflineQueue:
                 )
             return result
 
+    def export_recent_tail(
+        self, max_rows: int = 500, max_bytes: int = 512 * 1024
+    ) -> list[dict]:
+        """Return a bounded, READ-ONLY tail of the most recently queued event
+        payloads (newest first) for an admin-requested diagnostic pull.
+
+        Used to backfill a quiet device's real activity when the server requests
+        logs — the offline queue holds window/AFK/input events that have not yet
+        synced. This is a COPY: it does NOT dequeue, delete, or mutate anything,
+        so the events still sync normally through the events route.
+
+        Bounded on two axes so it never dumps the whole DB: at most ``max_rows``
+        rows, and it stops once the accumulated serialized JSON would exceed
+        ``max_bytes`` (the first event is always included even if oversized, so
+        the caller never gets an empty list purely from the byte cap). Corrupt
+        rows are skipped (already logged by QueuedEvent.from_row).
+
+        Returns [] on any DB error (logged, never silently swallowed).
+        """
+        try:
+            limit = max(1, int(max_rows))
+            cap = max(1, int(max_bytes))
+        except (TypeError, ValueError):
+            limit, cap = 500, 512 * 1024
+        try:
+            with self._cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, event_data, created_at, retry_count
+                    FROM queued_events
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+        except sqlite3.DatabaseError as e:
+            logger.error("[queue] export_recent_tail failed: %s", e)
+            return []
+
+        events: list[dict] = []
+        total = 0
+        for row in rows:
+            event = QueuedEvent.from_row(tuple(row))
+            if event is None:
+                continue  # corrupt row already logged in from_row
+            size = len(json.dumps(event.event_data))
+            if events and total + size > cap:
+                break  # byte cap reached; keep the newest that fit
+            total += size
+            events.append(event.event_data)
+        return events
+
     def remove(self, event_ids: list[int]) -> int:
         """Remove events from the queue.
 

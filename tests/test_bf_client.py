@@ -184,6 +184,24 @@ class TestBetterFlowClient:
         assert b"relaunch_log" not in raw        # omitted when None
 
     @responses.activate
+    def test_upload_events_tail_posts_json_part_to_logs_endpoint(self):
+        """upload_events_tail POSTs the event tail as a JSON file part to /logs."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/logs",
+            json={"data": {"received": 1}},
+            status=200,
+        )
+        events = [{"id": "e1", "bucket_id": "aw-watcher-window_host", "duration": 5}]
+        self.client.upload_events_tail(events)
+        assert len(responses.calls) == 1
+        body = responses.calls[0].request.body
+        raw = body if isinstance(body, bytes) else body.encode()
+        assert b"events.json" in raw       # multipart field/filename present
+        assert b"aw-watcher-window" in raw  # the event payload was serialized in
+        assert b'"events"' in raw           # wrapped under the events key
+
+    @responses.activate
     def test_is_reachable_true(self):
         """Test is_reachable when server responds."""
         responses.add(
