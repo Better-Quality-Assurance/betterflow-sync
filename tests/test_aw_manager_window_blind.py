@@ -121,10 +121,15 @@ def test_blind_window_tracker_stops_churning_and_flags_blind():
     )
 
 
-def test_window_blind_clears_when_tracker_recovers():
-    """Once the window tracker emits fresh events again, the blind flag and the
-    consecutive counter reset so a future genuine stall restarts promptly."""
-    from src.aw_manager import WINDOW_BLIND_RESTART_THRESHOLD
+def test_window_blind_clears_after_sustained_recovery():
+    """The blind flag clears only after the tracker emits fresh events across
+    WINDOW_BLIND_CLEAR_HEALTHY_CYCLES consecutive health-checks — sustained
+    recovery, not a single stray event (see flapping test below). Once cleared,
+    the consecutive counter resets so a future genuine stall restarts promptly."""
+    from src.aw_manager import (
+        WINDOW_BLIND_CLEAR_HEALTHY_CYCLES,
+        WINDOW_BLIND_RESTART_THRESHOLD,
+    )
 
     mgr, window = _mgr(window_age=STALE_THRESHOLD + 80, running_for=WINDOW_BLIND_GRACE + 120)
     for _ in range(WINDOW_BLIND_RESTART_THRESHOLD):
@@ -132,9 +137,50 @@ def test_window_blind_clears_when_tracker_recovers():
         mgr.restart_if_needed()
     assert mgr.window_tracker_blind is True
 
-    # Recovers: fresh window events.
+    # Recovers: fresh window events, sustained across the required cycles.
     mgr._get_latest_window_event_age = MagicMock(return_value=5)
-    mgr.restart_if_needed()
+    for i in range(WINDOW_BLIND_CLEAR_HEALTHY_CYCLES):
+        assert mgr.window_tracker_blind is True, (
+            f"must stay latched until {WINDOW_BLIND_CLEAR_HEALTHY_CYCLES} healthy "
+            f"cycles (cleared early at cycle {i})"
+        )
+        mgr.restart_if_needed()
 
     assert mgr.window_tracker_blind is False
     assert mgr._window_consecutive_stale == 0
+
+
+def test_flapping_window_tracker_stays_backed_off():
+    """A win32 capture source that FLAPS — a lone fresh event between blind
+    spells — must not re-enter a full restart burst. Clearing blind on the first
+    stray event (pre-fix) reset the counter and let a second 5-restart burst run
+    ~30s later, defeating the retry-interval backoff (Sachi, win32, 2026-07-01:
+    blind at 09:50, a lone event ~09:55 cleared it, then a 4-restart burst at
+    09:57). Once blind, a single healthy cycle followed by staleness again must
+    stay backed off (no new restart) until sustained recovery clears the flag."""
+    from src.aw_manager import WINDOW_BLIND_RESTART_THRESHOLD
+
+    mgr, window = _mgr(window_age=STALE_THRESHOLD + 80, running_for=WINDOW_BLIND_GRACE + 120)
+    for _ in range(WINDOW_BLIND_RESTART_THRESHOLD):
+        window.poll.return_value = None
+        mgr.restart_if_needed()
+    assert mgr.window_tracker_blind is True
+    restarts_at_blind = mgr._start_component.call_count
+    assert restarts_at_blind == WINDOW_BLIND_RESTART_THRESHOLD
+
+    # One stray fresh event (the flap) — NOT sustained recovery.
+    mgr._get_latest_window_event_age = MagicMock(return_value=5)
+    mgr.restart_if_needed()
+
+    # Source dies again immediately. Because it's still blind and within the
+    # retry interval, the watchdog must back off, not launch a fresh burst.
+    mgr._get_latest_window_event_age = MagicMock(return_value=STALE_THRESHOLD + 80)
+    for _ in range(WINDOW_BLIND_RESTART_THRESHOLD + 2):
+        window.poll.return_value = None
+        mgr.restart_if_needed()
+
+    assert mgr.window_tracker_blind is True, "a flap must not unlatch the blind flag"
+    assert mgr._start_component.call_count == restarts_at_blind, (
+        "a flapping source must stay backed off — no new restart burst "
+        f"(expected {restarts_at_blind} restarts, got {mgr._start_component.call_count})"
+    )

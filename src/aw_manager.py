@@ -87,6 +87,14 @@ IDLE_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
 # and probe at most once per retry interval.
 WINDOW_BLIND_RESTART_THRESHOLD = 5
 WINDOW_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
+# A FLAPPING (not permanently-wedged) window-capture source emits the odd event
+# between blind spells; clearing the blind flag on the first one reset the churn
+# counter and let it re-enter a full restart burst ~30s later, defeating the
+# retry-interval backoff (Sachi, win32, 2026-07-01: blind at 09:50, a lone event
+# ~09:55 cleared it, then a second 4-restart burst at 09:57). Require this many
+# CONSECUTIVE healthy health-checks (~30s each) before trusting recovery and
+# unlatching, so a flapping source stays backed off instead of churning per flap.
+WINDOW_BLIND_CLEAR_HEALTHY_CYCLES = 3
 
 
 def _get_platform_key() -> str:
@@ -395,6 +403,11 @@ class AWManager:
         self._window_consecutive_stale: int = 0
         self._window_tracker_blind: bool = False
         self._window_last_restart_mono: float = 0.0
+        # Consecutive healthy (fresh-event) health-checks observed WHILE blind.
+        # The blind flag only clears once this reaches
+        # WINDOW_BLIND_CLEAR_HEALTHY_CYCLES so a flapping source's stray events
+        # don't unlatch it prematurely (see WINDOW_BLIND_CLEAR_HEALTHY_CYCLES).
+        self._window_healthy_streak: int = 0
         # When the agent uploads its own in-process AFK stream, the external
         # bf-idle-tracker bucket is ignored — don't restart it or raise blind
         # alerts about a tracker we no longer consume.
@@ -820,13 +833,38 @@ class AWManager:
             running_for = self._component_running_seconds(watcher)
             reachable = self._port_in_use()
             if not self._is_window_tracker_stale(age, running_for, reachable):
-                # Emitting fresh window events again: clear blind state so a
-                # future genuine stall restarts promptly. (age None here is just
-                # launch lag or an AW outage, not recovery — don't reset on it.)
+                # Emitting fresh window events again. (age None here is just
+                # launch lag or an AW outage, not recovery — don't count it.)
                 if age is not None and age <= STALE_THRESHOLD:
-                    self._window_consecutive_stale = 0
-                    self._window_tracker_blind = False
+                    if self._window_tracker_blind:
+                        # A flapping source emits a stray event between blind
+                        # spells; unlatching on the FIRST one lets it re-enter a
+                        # full restart burst, defeating the retry-interval backoff
+                        # (see WINDOW_BLIND_CLEAR_HEALTHY_CYCLES). Require sustained
+                        # emission before we trust recovery and clear the flag.
+                        self._window_healthy_streak += 1
+                        if self._window_healthy_streak >= WINDOW_BLIND_CLEAR_HEALTHY_CYCLES:
+                            self._window_tracker_blind = False
+                            self._window_consecutive_stale = 0
+                            self._window_healthy_streak = 0
+                            logger.info(
+                                "%s emitting steadily again across %d checks — "
+                                "clearing blind flag; per-app attribution restored",
+                                watcher,
+                                WINDOW_BLIND_CLEAR_HEALTHY_CYCLES,
+                            )
+                    else:
+                        # Not blind: reset promptly so a future genuine stall
+                        # restarts on the next tick, not after a fresh burst.
+                        self._window_consecutive_stale = 0
+                else:
+                    # age None (launch lag / AW outage): not proof of recovery —
+                    # a flap through such a gap must not count toward the streak.
+                    self._window_healthy_streak = 0
             else:
+                # Staleness breaks any in-progress recovery streak — the healthy
+                # cycles must be CONSECUTIVE for the blind flag to clear.
+                self._window_healthy_streak = 0
                 # Stale. If it has stayed stale across several restarts it is
                 # blind — a wedged/blocked window-capture source a restart can't
                 # fix (Sachi, win32, 2026-06-30: restart #1→#5 every 30s while the
