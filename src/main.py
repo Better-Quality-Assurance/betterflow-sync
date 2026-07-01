@@ -277,6 +277,13 @@ class SyncCoordinator:
         # session alive. monotonic-throttled so it's at most one per interval.
         self._last_liveness_heartbeat: Optional[float] = None
 
+        # Fast-poll heartbeat while ACTIVE so a server-set logs_requested flag is
+        # picked up within ~1-2 min instead of waiting up to the full ~5-min
+        # sync-cycle heartbeat. Complements _liveness_heartbeat (which covers the
+        # paused case). monotonic-throttled to at most one per configured
+        # interval, independent of the 60s tick rate.
+        self._last_logs_poll_heartbeat: Optional[float] = None
+
         # Auth-warn throttle (Emilian, 2026-06-11): after his laptop restart
         # auto-login silently failed and the tray went to WAITING_AUTH without
         # any system notification — he could have worked a full day untracked.
@@ -866,6 +873,7 @@ class SyncCoordinator:
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
             (self._liveness_heartbeat, "liveness_heartbeat"),
+            (self._logs_poll_heartbeat, "logs_poll_heartbeat"),
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
             (self._check_auth_warn, "auth_warn"),
@@ -1007,6 +1015,67 @@ class SyncCoordinator:
         auth_err = self.sync_engine.send_heartbeat_now()
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="liveness_heartbeat")
+
+    # Fallback fast-poll cadence when the configured value is missing/invalid.
+    # Floored at 60s (the tick rate) so this can never become a per-tick storm.
+    _LOGS_POLL_INTERVAL_FALLBACK = 90  # seconds
+    _LOGS_POLL_INTERVAL_FLOOR = 60  # seconds
+
+    @property
+    def _logs_poll_interval(self) -> int:
+        """Fast-poll heartbeat cadence in seconds, read live from config and
+        floor-clamped so a bad/missing value can't turn this into a per-tick
+        heartbeat storm."""
+        try:
+            return max(
+                self._LOGS_POLL_INTERVAL_FLOOR,
+                int(self.config.sync.logs_poll_interval_seconds),
+            )
+        except (TypeError, ValueError, AttributeError):
+            return self._LOGS_POLL_INTERVAL_FALLBACK
+
+    def _logs_poll_heartbeat(self) -> None:
+        """Fast poll while ACTIVE so a server-set logs_requested (or any other
+        heartbeat-driven command) is seen within ~1-2 min.
+
+        The full heartbeat rides _do_sync and only fires every few cycles (~5
+        min), so an admin's logs request could sit unseen for minutes. This
+        lightweight tick reuses the SAME on-demand heartbeat path
+        (send_heartbeat_now — identical body, no duplication) at a shorter,
+        configurable cadence. It is the active-state complement of
+        _liveness_heartbeat (which covers the paused case), so the two never
+        fire on the same tick.
+
+        Cheap and idempotent: heartbeats only refresh last_seen_at and carry no
+        activity, and a monotonic throttle keeps this to at most one per
+        configured interval regardless of the 60s tick rate. Skipped when
+        logged out (nothing to keep alive) or offline (the heartbeat would just
+        fail; resume on reconnect).
+        """
+        if not self.logged_in:
+            return
+        if self.paused_by_network:
+            return  # offline — the heartbeat would just fail; resume on reconnect
+        paused = (
+            self.sync_engine.is_paused
+            or self.sync_engine.is_private
+            or self.is_on_break
+        )
+        if paused:
+            return  # paused case is covered by _liveness_heartbeat; don't double up
+
+        interval = self._logs_poll_interval
+        now = time.monotonic()
+        if (
+            self._last_logs_poll_heartbeat is not None
+            and now - self._last_logs_poll_heartbeat < interval
+        ):
+            return
+        self._last_logs_poll_heartbeat = now
+
+        auth_err = self.sync_engine.send_heartbeat_now()
+        if auth_err is not None:
+            self._handle_auth_error(auth_err, source="logs_poll_heartbeat")
 
     # Must exceed the worst-case wall-clock of one in-cycle network chain so a
     # slow/hung server can't masquerade as a wedged sync. The batch-upload path

@@ -300,6 +300,13 @@ class SyncSettings:
     batch_size: int = DEFAULT_BATCH_SIZE
     compress: bool = True  # Use gzip compression
     idle_pause_minutes: int = 20  # Pause sync after this many minutes AFK
+    # Fast-poll heartbeat cadence (seconds). The full heartbeat rides the sync
+    # cycle and only fires every ~5 min, so an admin-set logs_requested flag
+    # could wait that long to be seen. A lighter tick reuses the on-demand
+    # heartbeat path while a session is active so a logs request is picked up
+    # within ~1-2 min. Floor-clamped in the coordinator so a bad value can't
+    # turn this into a per-tick heartbeat storm.
+    logs_poll_interval_seconds: int = 90
     min_window_event_seconds: float = 5.0  # Drop window/web events shorter than this
     # Generate the AFK/active stream in-process from the OS idle clock + input
     # watcher instead of the external bf-idle-tracker bucket. Kill-switch: set
@@ -660,6 +667,15 @@ class Config:
                     self.sync.batch_size = max(1, min(int(sync["batch_size"]), MAX_BATCH_SIZE))
                 except (TypeError, ValueError):
                     logger.warning("Invalid batch_size from server, ignoring")
+            if "logs_poll_interval_seconds" in sync:
+                try:
+                    val = int(sync["logs_poll_interval_seconds"])
+                    if 60 <= val <= 600:
+                        self.sync.logs_poll_interval_seconds = val
+                    else:
+                        logger.warning("logs_poll_interval_seconds out of range, ignoring")
+                except (TypeError, ValueError):
+                    logger.warning("Invalid logs_poll_interval_seconds from server, ignoring")
             if "idle_pause_minutes" in sync:
                 try:
                     val = int(sync["idle_pause_minutes"])
