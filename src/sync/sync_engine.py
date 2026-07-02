@@ -1220,9 +1220,20 @@ class SyncEngine:
         new bucket-processing path can't silently classify against an empty
         context (this is the window-classification entry point).
         """
-        # Feed window events to activity analyzer for window change detection
+        # Feed window events to activity analyzer for window change detection.
+        # Uses the RAW events (pre-coalesce) so genuine window switches are
+        # still visible to change detection.
         if bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT):
             self._activity_analyzer.add_window_events(events)
+
+        # Coalesce runs of sub-threshold same-window fragments so an AW
+        # heartbeat-merge failure doesn't cost the whole span's per-app
+        # attribution to the flicker filter (see _coalesce_window_flickers).
+        # The checkpoint below is computed from the ORIGINAL events, so
+        # coalescing cannot skip, re-fetch, or double-send anything.
+        checkpoint_events = events
+        if _is_window_like(bucket_type):
+            events = self._coalesce_window_flickers(events)
 
         transformed = []
         for event in events:
@@ -1307,8 +1318,8 @@ class SyncEngine:
                     ev["activity_metrics"].update(fraud.extra_metrics)
 
         pending_checkpoint = None
-        if events:
-            newest = max(events, key=lambda e: e.timestamp)
+        if checkpoint_events:
+            newest = max(checkpoint_events, key=lambda e: e.timestamp)
             pending_checkpoint = (bucket_id, newest.timestamp, newest.id)
 
         return transformed, pending_checkpoint
@@ -1445,6 +1456,63 @@ class SyncEngine:
                     continue
             collapsed.append(ev)
         return collapsed
+
+    # Two same-window fragments this far apart (or closer) are treated as one
+    # continuous focus. AW polls every ~1-2s, so a couple of seconds of slack
+    # bridges normal polling jitter without merging across a real gap (a real
+    # gap means a DIFFERENT window was focused, which breaks the run anyway).
+    _WINDOW_COALESCE_GAP_TOLERANCE_S = 2.0
+
+    @staticmethod
+    def _coalesce_window_flickers(events: list[AWEvent]) -> list[AWEvent]:
+        """Merge a run of consecutive, time-contiguous events that describe the
+        SAME window (app + title + url) into one event.
+
+        ActivityWatch is supposed to heartbeat-merge successive polls of an
+        unchanged window into a single growing event. When that merge fails it
+        emits the focus as dozens of sub-second/second fragments (observed:
+        bursts of ~100 window events all under the 5s flicker filter — Sachi
+        device 16, recurring). Each fragment then falls under
+        ``min_window_event_seconds`` in ``_transform_event`` and is dropped, so
+        the WHOLE span's per-app attribution is lost even though the watcher
+        was producing data the entire time.
+
+        Merging the run restores it as one event whose duration is the real
+        span, which clears the filter. This only ever combines fragments that
+        are provably the same window (identical app/title/url, back-to-back in
+        time) — exactly analogous to ``_collapse_afk_duplicates`` — so it can
+        only recover real attribution, never invent it. Billing is unaffected
+        either way (time comes from the AFK/input streams, not window events).
+
+        Source events are not mutated (new events via ``dataclasses.replace``);
+        the merged event keeps the FIRST fragment's id, so the ``_sent_cache``
+        dedup keys deterministically and the checkpoint (computed by the caller
+        from the ORIGINAL event list) is unaffected.
+        """
+        if len(events) <= 1:
+            return events
+        tolerance = timedelta(seconds=SyncEngine._WINDOW_COALESCE_GAP_TOLERANCE_S)
+        ordered = sorted(events, key=lambda e: e.timestamp)
+        merged: list[AWEvent] = []
+        for ev in ordered:
+            if merged:
+                last = merged[-1]
+                last_end = last.timestamp + timedelta(seconds=last.duration)
+                same_window = (
+                    last.app == ev.app
+                    and last.title == ev.title
+                    and last.url == ev.url
+                )
+                if same_window and last.timestamp <= ev.timestamp <= last_end + tolerance:
+                    ev_end = ev.timestamp + timedelta(seconds=ev.duration)
+                    if ev_end > last_end:
+                        merged[-1] = dataclasses.replace(
+                            last, duration=(ev_end - last.timestamp).total_seconds()
+                        )
+                    # else: ev is fully contained in last — drop the duplicate.
+                    continue
+            merged.append(ev)
+        return merged
 
     def _get_afk_events_for_range(
         self, start: datetime, end: datetime
