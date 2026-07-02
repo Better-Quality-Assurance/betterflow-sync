@@ -1570,6 +1570,8 @@ class BetterFlowApp:
         self._shutdown_event = threading.Event()
         self._pause_state_lock = threading.RLock()
         self._login_lock = threading.Lock()
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_thread: Optional[threading.Thread] = None
         self._startup_thread: Optional[threading.Thread] = None
         self._system_events_started = False
         self._system_events_lock = threading.Lock()
@@ -1692,17 +1694,89 @@ class BetterFlowApp:
             self._start_watchers()
             self._ensure_system_event_listener()
 
-            if state.logged_in:
-                self._finish_logged_in_startup(state, send_greeting=True)
-            else:
-                self.coordinator.logged_in = False
-                self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
-                self.coordinator._maybe_warn_login_required(source="startup")
-                self._ensure_update_checks_started()
+            self._apply_startup_login_state(state)
 
             logger.info("Background startup complete")
         finally:
             self._login_lock.release()
+
+    # How often the background reconnect loop retries auto-login after a
+    # transient (server-unreachable) startup failure. The loop runs until the
+    # session comes back, the user logs in manually, or the app shuts down.
+    _RECONNECT_RETRY_INTERVAL_S = 30.0
+
+    def _apply_startup_login_state(self, state) -> None:
+        """Dispatch on the outcome of the startup auto-login.
+
+        Three outcomes, only two of which should ever prompt the user:
+
+        - logged in            → finish startup normally.
+        - transient failure    → the stored session is still valid but the
+          server was unreachable (e.g. the 2026-07-02 Railway outage). Do NOT
+          prompt re-auth — a re-auth flow can't complete while the server is
+          down, and the credentials are fine. Show an offline state and retry
+          auto-login in the background until connectivity returns.
+        - genuine logged-out   → no/invalid credentials: show WAITING_AUTH and
+          notify the user to sign back in.
+        """
+        if state.logged_in:
+            self._finish_logged_in_startup(state, send_greeting=True)
+            return
+
+        self.coordinator.logged_in = False
+        if getattr(state, "transient", False):
+            self.tray.set_state(TrayState.QUEUED, "Offline — reconnecting...")
+            self._start_reconnect_retry()
+        else:
+            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+            self.coordinator._maybe_warn_login_required(source="startup")
+        self._ensure_update_checks_started()
+
+    def _start_reconnect_retry(self) -> None:
+        """Spawn the background auto-login retry loop (idempotent)."""
+        with self._reconnect_lock:
+            if self._reconnect_thread is not None and self._reconnect_thread.is_alive():
+                return
+            self._reconnect_thread = threading.Thread(
+                target=self._reconnect_loop, daemon=True, name="auth-reconnect"
+            )
+            self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        """Retry auto-login until the transient outage clears.
+
+        On success, finish startup as if the session had been restored at
+        launch. If the credentials turn out to be genuinely invalid (e.g. the
+        token was revoked while we were offline), fall back to the real
+        re-auth prompt. Interruptible via the shutdown event.
+        """
+        while not self._shutdown_event.is_set():
+            # Interruptible sleep: returns True the moment shutdown is set.
+            if self._shutdown_event.wait(self._RECONNECT_RETRY_INTERVAL_S):
+                return
+            if self.coordinator.logged_in:
+                return  # a manual login (or another path) beat us to it
+            if not self._login_lock.acquire(timeout=5):
+                continue
+            try:
+                if self._shutdown_event.is_set() or self.coordinator.logged_in:
+                    return
+                state = self.login_manager.try_auto_login()
+                if state.logged_in:
+                    logger.info("Auto-login recovered after transient startup failure")
+                    self._finish_logged_in_startup(state, send_greeting=True)
+                    return
+                if not getattr(state, "transient", False):
+                    # Credentials are genuinely gone now — prompt re-auth.
+                    self.coordinator.logged_in = False
+                    self.tray.set_state(
+                        TrayState.WAITING_AUTH, "Waiting for browser login..."
+                    )
+                    self.coordinator._maybe_warn_login_required(source="reconnect")
+                    return
+                # Still transient — keep the offline state and try again.
+            finally:
+                self._login_lock.release()
 
     def run(self) -> None:
         """Run the application."""
