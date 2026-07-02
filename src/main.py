@@ -354,6 +354,17 @@ class SyncCoordinator:
                 id="trends_refresh_job",
                 replace_existing=True,
             )
+            # Frequent frontmost-window sampler for the in-process window source.
+            # Window focus changes far faster than the 60s sync cycle, so we
+            # sample every few seconds to give the reconstructed per-app spans
+            # real resolution. Gated + cheap: a no-op unless in_process_window is
+            # on and the probe is usable, so it adds nothing to the default path.
+            self.scheduler.add_job(
+                self._sample_window,
+                trigger=IntervalTrigger(seconds=self.WINDOW_SAMPLE_INTERVAL_SECONDS),
+                id="window_sample_job",
+                replace_existing=True,
+            )
             self.scheduler.start()
             logger.info(
                 f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -848,6 +859,22 @@ class SyncCoordinator:
                 "please enable BetterFlow and bf-idle-tracker under Input "
                 "Monitoring.",
             )
+
+    # Frontmost-window sampling cadence for the in-process window source. Window
+    # focus changes far faster than the 60s sync cycle; ~5s keeps the sample log
+    # dense enough for real per-app span resolution without meaningful cost
+    # (one GetForegroundWindow + psutil name lookup). Only fires work when
+    # in_process_window is enabled and the probe is usable.
+    WINDOW_SAMPLE_INTERVAL_SECONDS = 5
+
+    def _sample_window(self) -> None:
+        """Dedicated fast sampler for the in-process window source. Gated no-op
+        unless in_process_window is on and the frontmost-window probe is usable,
+        so it costs nothing on the default path."""
+        try:
+            self.sync_engine.record_window_sample_if_active(datetime.now(timezone.utc))
+        except Exception as e:
+            logger.debug("window sample tick failed: %s", e)
 
     def _tick_60s(self) -> None:
         """Unified 60-second tick - one wakeup instead of five.

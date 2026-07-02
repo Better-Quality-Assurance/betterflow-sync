@@ -648,14 +648,10 @@ class SyncEngine:
             except Exception as e:
                 logger.debug("afk_source.record_sample failed: %s", e)
 
-        # Record a frontmost-window sample for the in-process window timeline
-        # (no-op when no source is wired, the flag is off, or the probe is
-        # unusable). Done every cycle so the sample log stays dense.
-        if self._should_use_inproc_window():
-            try:
-                self.window_source.record_sample(datetime.now(timezone.utc))
-            except Exception as e:
-                logger.debug("window_source.record_sample failed: %s", e)
+        # Record a frontmost-window sample for the in-process window timeline.
+        # Done every cycle too (in addition to the dedicated fast sampler) so a
+        # fresh sample always exists right before build_window_events runs.
+        self.record_window_sample_if_active(datetime.now(timezone.utc))
 
         # Get buckets to sync
         try:
@@ -2308,6 +2304,20 @@ class SyncEngine:
             and self.window_source is not None
             and self.window_source.available()
         )
+
+    def record_window_sample_if_active(self, now: datetime) -> None:
+        """Sample the frontmost window IFF the in-process window source is the
+        active per-app source. Called both per sync cycle and by the dedicated
+        fast sampler (~5s) — window focus changes far faster than the 60s cycle,
+        so dense samples are what give minute-vs-cycle resolution to the spans
+        build_window_events reconstructs. Cheap, gated, and a no-op when the
+        flag is off (default), so it adds no work to the default path."""
+        if not self._should_use_inproc_window():
+            return
+        try:
+            self.window_source.record_sample(now)
+        except Exception as e:
+            logger.debug("window_source.record_sample failed: %s", e)
 
     def _should_skip_external_window(self) -> bool:
         """Whether to drop the external bf-window-tracker bucket(s) from this

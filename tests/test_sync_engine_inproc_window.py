@@ -126,3 +126,27 @@ def test_external_window_buckets_kept_when_flag_off():
     skip = eng._should_skip_external_window()
     to_sync = [b for b in window_buckets if not _is_window_like(b.type)] if skip else window_buckets
     assert to_sync == window_buckets  # unchanged when dormant
+
+
+def test_record_window_sample_if_active_gates_on_flag():
+    """The public sampler (used by both the per-cycle call and the ~5s tick)
+    records only when the in-process window source is active, and is a cheap
+    no-op otherwise — so the default (flag-off) path adds no window sampling."""
+    # Active: a fresh sample is appended.
+    eng = _engine(True)
+    src = _FakeSource([])
+    eng.window_source = src
+    before = len(src.samples)
+    eng.record_window_sample_if_active(T0)
+    assert len(src.samples) == before + 1
+
+    # Flag off: no-op (no sample recorded).
+    eng_off = _engine(False)
+    src_off = _FakeSource([])
+    eng_off.window_source = src_off
+    eng_off.record_window_sample_if_active(T0)
+    assert len(src_off.samples) == 0
+
+    # No source wired: no crash, no-op.
+    eng_none = _engine(True)
+    eng_none.record_window_sample_if_active(T0)  # must not raise
