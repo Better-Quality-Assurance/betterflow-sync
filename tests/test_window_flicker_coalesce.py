@@ -48,6 +48,37 @@ class TestCoalesceWindowFlickers:
         assert merged[0].duration == 6.0
         assert merged[0].timestamp == BASE
 
+    def test_continuing_run_past_checkpoint_does_not_re_merge_sent_time(self):
+        """Cross-cycle: a flicker run that outlives the 2-min lookback must not be
+        re-merged (under a shifted id) over time already sent last cycle — that
+        double-counts per-app attribution. Fragments at/before the checkpoint are
+        excluded from the merge; only newer ones coalesce into an ADJACENT event.
+        """
+        # Cycle 1: fragments at 0,2,4,6,8 (ids 0..4) -> one merged [BASE, BASE+10].
+        c1 = [_win(i, i * 2, 2) for i in range(5)]
+        m1 = SyncEngine._coalesce_window_flickers(c1)
+        assert len(m1) == 1 and m1[0].timestamp == BASE and m1[0].duration == 10.0
+        checkpoint = BASE + timedelta(seconds=8)  # newest raw fragment sent
+
+        # Cycle 2: 2-min lookback re-fetches the tail (offsets 6,8) + new (10,12,14).
+        c2 = [_win(3, 6, 2), _win(4, 8, 2), _win(5, 10, 2), _win(6, 12, 2), _win(7, 14, 2)]
+        m2 = SyncEngine._coalesce_window_flickers(c2, checkpoint)
+
+        merged_runs = [e for e in m2 if e.duration >= 5]
+        assert merged_runs, "post-checkpoint fragments must still coalesce"
+        for e in merged_runs:
+            # A merged run must not start before the checkpoint — otherwise it
+            # overlaps and re-sends time cycle 1 already delivered.
+            assert e.timestamp >= checkpoint, (
+                f"merged run at {e.timestamp} re-covers already-sent time "
+                f"(checkpoint {checkpoint})"
+            )
+
+    def test_no_checkpoint_still_merges_whole_run(self):
+        """First-ever sync (checkpoint None) coalesces the whole run, unchanged."""
+        c = [_win(i, i * 2, 2) for i in range(5)]
+        assert len(SyncEngine._coalesce_window_flickers(c, None)) == 1
+
     def test_does_not_merge_different_apps(self):
         events = [_win(1, 0, 2, app="Code.exe"), _win(2, 2, 2, app="Chrome.exe")]
         merged = SyncEngine._coalesce_window_flickers(events)
@@ -118,6 +149,39 @@ class TestFlickerSurvivesFilterEndToEnd:
         # the coalesced event (id 1) — coalescing must not rewind progress.
         assert checkpoint is not None
         assert checkpoint[2] == 3
+
+    def test_multicycle_flicker_run_is_not_re_sent_over_the_lookback(self):
+        """End-to-end 2-cycle proof of the cross-cycle fix: a flicker run that
+        outlives the 2-min lookback must NOT re-emit time already delivered. The
+        already-sent fragments re-fetched by the lookback must drop on replay; the
+        new fragments emit as one ADJACENT event, not an overlapping one."""
+        engine = self._engine()
+        bucket = "aw-watcher-window_host"
+
+        # Cycle 1: fragments at 0,2,4,6,8 -> one merged [BASE, BASE+10] survives.
+        engine.queue.get_checkpoint.return_value = None
+        c1 = [_win(i, i * 2, 2) for i in range(5)]
+        t1, _ = engine._transform_and_checkpoint(
+            c1, bucket, BUCKET_TYPE_WINDOW, SyncStats(), _SyncCycleContext()
+        )
+        assert len(t1) == 1
+        c1_start = datetime.fromisoformat(t1[0]["timestamp"])
+
+        # Cycle 2: the 2-min lookback re-fetches the tail (6,8) + new (10,12,14).
+        # The bucket checkpoint is now the newest raw fragment sent (BASE+8).
+        engine.queue.get_checkpoint.return_value = BASE + timedelta(seconds=8)
+        c2 = [_win(3, 6, 2), _win(4, 8, 2), _win(5, 10, 2), _win(6, 12, 2), _win(7, 14, 2)]
+        t2, _ = engine._transform_and_checkpoint(
+            c2, bucket, BUCKET_TYPE_WINDOW, SyncStats(), _SyncCycleContext()
+        )
+        # Exactly one new merged event, and it starts at/after the checkpoint —
+        # the re-fetched already-sent fragments (6,8) dropped, no overlap re-send.
+        assert len(t2) == 1
+        c2_start = datetime.fromisoformat(t2[0]["timestamp"])
+        assert c2_start >= BASE + timedelta(seconds=8), "must not re-cover sent time"
+        assert c2_start >= c1_start + timedelta(seconds=t1[0]["duration"] - 2), (
+            "cycle-2 event overlaps the cycle-1 span (cross-cycle double-count)"
+        )
 
     def test_genuine_short_distinct_windows_still_filtered(self):
         # Two different sub-5s windows that are NOT the same focus must still be

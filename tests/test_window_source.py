@@ -120,6 +120,34 @@ def test_same_app_run_coalesces_into_one_span():
     assert _spans(ev) == [("Code", "a.py", T0.isoformat(), 90)]
 
 
+def test_unobserved_gap_is_not_credited_as_focus():
+    """A gap longer than MAX_UNOBSERVED_GAP_SECONDS (sleep/lid-close) must NOT be
+    billed as focus on the last-seen app. Two samples of the same app 1h apart
+    should credit at most ~cap seconds around each, never the whole hour."""
+    src = _src(_Getter([]))
+    _seed(src,
+          (T0, "Code", "a.py"),
+          (T0 + timedelta(seconds=3600), "Code", "a.py"))
+    ev = src.build_window_events(T0, T0 + timedelta(seconds=3610))
+    total = sum(e["duration"] for e in ev)
+    cap = src.MAX_UNOBSERVED_GAP_SECONDS
+    # Bounded: the boundary run (~cap) + the trailing tail (~10s), never ~3610.
+    assert total <= cap + 60, f"unobserved 1h gap fabricated {total}s of focus"
+    assert total < 3600, "the sleep gap must not be credited as focus"
+
+
+def test_small_gaps_within_cap_still_coalesce():
+    """Gaps within the cap are normal sampling and still merge into one run (no
+    regression to the intended coalescing)."""
+    src = _src(_Getter([]), max_unobserved_gap_seconds=120)
+    _seed(src,
+          (T0, "Code", "a.py"),
+          (T0 + timedelta(seconds=60), "Code", "a.py"),
+          (T0 + timedelta(seconds=110), "Code", "a.py"))
+    ev = src.build_window_events(T0, T0 + timedelta(seconds=120))
+    assert _spans(ev) == [("Code", "a.py", T0.isoformat(), 120)]
+
+
 def test_app_change_opens_new_span():
     src = _src(_Getter([]))
     _seed(src,
