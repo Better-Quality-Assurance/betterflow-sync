@@ -266,6 +266,21 @@ class SyncEngine:
         self._inproc_blind_reported = False
         self._INPROC_BLIND_THRESHOLD = 3
 
+        # Optional in-process WINDOW source (set by the SyncCoordinator), the
+        # per-app analogue of afk_source. When present, enabled by config, and
+        # the OS frontmost-window probe is usable, the agent uploads its own
+        # per-app active-window stream and the external bf-window-tracker bucket
+        # is skipped so the two never double-count. Ships dormant
+        # (in_process_window defaults False). Same checkpoint discipline as AFK:
+        # the checkpoint is the last instant covered by an upload, seeded to
+        # `now` on the first cycle, committed only after a confirmed send.
+        # Mutated only on the sync thread.
+        self.window_source = None
+        self._window_inproc_checkpoint: Optional[datetime] = None
+        # Proposed next checkpoint for the span built this cycle; committed by
+        # _commit_inproc_window_checkpoint only after a confirmed send.
+        self._window_inproc_pending: Optional[datetime] = None
+
         # Queue retry backoff
         self._queue_consecutive_failures = 0
         self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
@@ -633,6 +648,15 @@ class SyncEngine:
             except Exception as e:
                 logger.debug("afk_source.record_sample failed: %s", e)
 
+        # Record a frontmost-window sample for the in-process window timeline
+        # (no-op when no source is wired, the flag is off, or the probe is
+        # unusable). Done every cycle so the sample log stays dense.
+        if self._should_use_inproc_window():
+            try:
+                self.window_source.record_sample(datetime.now(timezone.utc))
+            except Exception as e:
+                logger.debug("window_source.record_sample failed: %s", e)
+
         # Get buckets to sync
         try:
             window_buckets = self.aw.get_window_buckets()
@@ -670,9 +694,20 @@ class SyncEngine:
         # transform path — no per-cycle state lives on the instance.
         cycle = self._prepare_input_analysis(input_buckets)
 
+        # When the agent is the sole per-app window source (in-process), drop the
+        # external bf-window-tracker bucket(s) entirely — we upload our own stream
+        # below instead, so its (possibly blind) events never reach the server and
+        # can't double-count. No-op when the flag is off (default): the external
+        # window bucket syncs exactly as today.
+        skip_external_window = self._should_skip_external_window()
+        window_buckets_to_sync = (
+            [b for b in window_buckets if not _is_window_like(b.type)]
+            if skip_external_window else window_buckets
+        )
+
         # Sync window buckets with gap-filling
         all_events, call_events, pending_checkpoints = self._sync_window_buckets(
-            window_buckets, stats, cycle
+            window_buckets_to_sync, stats, cycle
         )
 
         # Foreground-CPU activity: sample the focused process and credit engaged
@@ -722,6 +757,11 @@ class SyncEngine:
             if synth_afk:
                 all_events.append(synth_afk)
 
+        if skip_external_window:
+            # Sole-source path: upload the in-process per-app window stream for
+            # the slice since the last covered instant.
+            all_events.extend(self._build_inproc_window(datetime.now(timezone.utc)))
+
         # Flush any ongoing call at sync boundary
         if self._call_detector:
             remaining = self._call_detector.flush()
@@ -736,6 +776,9 @@ class SyncEngine:
         # Commit the in-process AFK checkpoint only if its bucket wasn't queued
         # (the send was confirmed) — otherwise rebuild it next cycle (finding B).
         self._commit_inproc_afk_checkpoint(stats)
+        # Same discipline for the in-process window stream: advance its checkpoint
+        # only after a confirmed send.
+        self._commit_inproc_window_checkpoint(stats)
 
         # Process offline queue if we're online — but only if this cycle hasn't
         # already burned most of the watchdog budget on a slow/hung regular send
@@ -2254,6 +2297,77 @@ class SyncEngine:
             self._afk_inproc_checkpoint = pending
         self._afk_inproc_pending = None
 
+    def _should_use_inproc_window(self) -> bool:
+        """True when the in-process window source should be the sole per-app
+        window source — config flag on, a source is wired, and the OS
+        frontmost-window probe is usable (macOS/Windows; False on Linux without
+        an X11 active-window pid). Gates every in-process-window action, so the
+        whole path is a no-op when the flag is off (default)."""
+        return (
+            bool(self.config.sync.in_process_window)
+            and self.window_source is not None
+            and self.window_source.available()
+        )
+
+    def _should_skip_external_window(self) -> bool:
+        """Whether to drop the external bf-window-tracker bucket(s) from this
+        cycle's upload (because the agent uploads its own per-app window stream
+        instead). Mirrors ``_should_skip_external_afk``."""
+        return self._should_use_inproc_window()
+
+    def _build_inproc_window(self, now: datetime) -> list[dict]:
+        """Build in-process window events for [checkpoint, now]. First cycle seeds
+        the checkpoint at `now` (we only account for time while running). The
+        checkpoint is NOT advanced here — it is committed by
+        ``_commit_inproc_window_checkpoint`` only once the send succeeds, so a
+        terminal send failure can't lose a span. Returns [] when not active."""
+        if not self._should_use_inproc_window():
+            return []
+        cp = self._window_inproc_checkpoint
+        if cp is None:
+            self._window_inproc_checkpoint = now
+            return []
+        # Re-seed rather than reconstruct when the checkpoint can't be trusted
+        # (mirrors _build_inproc_afk):
+        #  - now <= cp: the wall clock stepped backward (NTP/manual), or nothing
+        #    new to cover. Re-seed to `now` so the stream doesn't stall.
+        #  - gap > retention: a pause/sleep froze the checkpoint while samples
+        #    were pruned (2h). Reconstructing over an unsampled multi-hour window
+        #    would mis-count; the unobserved span is simply left uncovered.
+        if now <= cp:
+            self._window_inproc_checkpoint = now
+            self._window_inproc_pending = None
+            return []
+        gap = (now - cp).total_seconds()
+        if gap > self.window_source.retention_seconds:
+            logger.info(
+                "in-process window: re-seeding checkpoint (gap %.0fs) — leaving "
+                "the unobserved window uncovered",
+                gap,
+            )
+            self._window_inproc_checkpoint = now
+            self._window_inproc_pending = None
+            return []
+        events = self.window_source.build_window_events(cp, now)
+        # Defer the checkpoint advance to _commit_inproc_window_checkpoint.
+        self._window_inproc_pending = now
+        return events
+
+    def _commit_inproc_window_checkpoint(self, stats: SyncStats) -> None:
+        """Advance the in-process window checkpoint past the just-built span, but
+        only if its bucket wasn't queued (the send succeeded). On a queued/failed
+        send we leave the checkpoint where it was so the next cycle rebuilds the
+        same span from samples — the synthetic ids are stable, so a later queue
+        drain + the rebuild upsert idempotently. Mirrors
+        ``_commit_inproc_afk_checkpoint``."""
+        pending = self._window_inproc_pending
+        if pending is None:
+            return
+        inproc_bucket = self.window_source.bucket_id
+        if inproc_bucket not in stats.queued_bucket_ids:
+            self._window_inproc_checkpoint = pending
+        self._window_inproc_pending = None
+
     def _report_inproc_blind(self, failures: int) -> None:
         """Surface a blind in-process idle clock to the ops ingest. Logged-only
         clock failures are invisible until billing is already wrong; the
@@ -2883,6 +2997,13 @@ class SyncEngine:
         if self._afk_inproc_checkpoint is not None:
             self._afk_inproc_checkpoint = now
         self._afk_inproc_pending = None
+
+        # Same for the in-process window stream (its own checkpoint, not an AW
+        # bucket) — otherwise the next _build_inproc_window reconstructs the
+        # paused/private window and uploads it. Forward-only.
+        if self._window_inproc_checkpoint is not None:
+            self._window_inproc_checkpoint = now
+        self._window_inproc_pending = None
 
         bucket_ids: set[str] = set()
 

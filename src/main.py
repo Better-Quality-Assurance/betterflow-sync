@@ -1559,6 +1559,27 @@ class BetterFlowApp:
             self.config.sync.in_process_afk and afk_source.available()
         )
 
+        # In-process WINDOW source: the per-app analogue of afk_source. The agent
+        # generates its own per-app active-window stream from the OS
+        # frontmost-window probe (+ psutil process name) and uploads it as the
+        # sole window source, so a bf-window-tracker that launches but captures
+        # zero events (the Windows blind-capture failure) can't lose per-app
+        # coverage. Ships dormant: inert unless config enables it AND the probe
+        # is usable (macOS/Windows; off on Linux without an X11 active-window pid).
+        try:
+            from .sync.window_source import WindowSource
+        except ImportError:
+            from sync.window_source import WindowSource
+        window_source = WindowSource(
+            hostname=self.coordinator.sync_engine._hostname,
+        )
+        self.coordinator.sync_engine.window_source = window_source
+        logger.info(
+            "In-process window source: %s",
+            "active" if (self.config.sync.in_process_window and window_source.available())
+            else "inactive",
+        )
+
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(self.config.reminders)
         self.coordinator.reminder_manager = self.reminder_manager
