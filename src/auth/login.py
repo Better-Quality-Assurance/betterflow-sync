@@ -39,6 +39,14 @@ class LoginState:
     user_role: Optional[str] = None
     device_id: Optional[str] = None
     error: Optional[str] = None
+    # True when login failed for a TRANSIENT reason (server unreachable —
+    # timeout / 5xx / connection drop) with the stored credentials left
+    # intact. The caller must NOT prompt re-auth in this case (the session is
+    # still valid; a re-auth flow can't even complete while the server is
+    # down) — it should retry auto-login in the background. False for a
+    # genuine logged-out state (no credentials, or credentials cleared after
+    # a definitive auth failure).
+    transient: bool = False
 
 
 class LoginManager:
@@ -119,8 +127,15 @@ class LoginManager:
                 return LoginState(logged_in=False, error="Stored credentials are invalid")
             except BetterFlowClientError as e:
                 logger.warning(f"Auto-login failed (network): {e}")
-                # Don't clear credentials on network error - might be temporary
-                return LoginState(logged_in=False, error="Network error - check your connection")
+                # Don't clear credentials on network error - might be temporary.
+                # transient=True tells the caller to retry in the background
+                # rather than kick the (still-authenticated) user to a re-auth
+                # prompt that can't complete while the server is unreachable.
+                return LoginState(
+                    logged_in=False,
+                    transient=True,
+                    error="Network error - check your connection",
+                )
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.

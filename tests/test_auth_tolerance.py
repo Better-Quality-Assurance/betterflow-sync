@@ -93,6 +93,7 @@ class TestTryAutoLoginRetries:
         with patch("src.auth.login.time.sleep"):
             state = mgr.try_auto_login()
         assert state.logged_in is False
+        assert state.transient is False  # definitive: caller should prompt re-auth
         bf.clear_credentials.assert_called_once()
 
     def test_network_error_never_clears(self):
@@ -100,4 +101,8 @@ class TestTryAutoLoginRetries:
         with patch("src.auth.login.time.sleep"):
             state = mgr.try_auto_login()
         assert state.logged_in is False
+        # A server outage is transient — credentials stay, caller must NOT
+        # prompt re-auth (Railway outage, 2026-07-02: valid sessions were
+        # wrongly kicked to a browser login that couldn't complete).
+        assert state.transient is True
         bf.clear_credentials.assert_not_called()
