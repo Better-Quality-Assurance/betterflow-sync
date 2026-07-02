@@ -281,6 +281,13 @@ class SyncEngine:
         # _commit_inproc_window_checkpoint only after a confirmed send.
         self._window_inproc_pending: Optional[datetime] = None
 
+        # Monotonic timestamp of the current sync() cycle's start, stamped at the
+        # top of sync(). Gates the per-bucket send loop's in-cycle network budget
+        # (_SEND_SKIP_IF_CYCLE_ELAPSED) so N buckets can't stack N retry chains
+        # past the _do_sync watchdog. None outside a sync() cycle (e.g. a direct
+        # _send_events call in a unit test) -> the budget guard is inert.
+        self._cycle_start_monotonic: Optional[float] = None
+
         # Queue retry backoff
         self._queue_consecutive_failures = 0
         self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
@@ -568,6 +575,9 @@ class SyncEngine:
         """
         stats = SyncStats()
         cycle_start = time.monotonic()  # to keep the queue drain inside the watchdog budget
+        # Publish the cycle start so _send_events can bound the per-bucket send
+        # loop to the same in-cycle network budget as the queue drain.
+        self._cycle_start_monotonic = cycle_start
 
         # Daily housekeeping before anything else, so it still runs while paused:
         # a long-running agent that never restarts across midnight would
@@ -2487,7 +2497,34 @@ class SyncEngine:
             by_bucket.setdefault(event.get("bucket_id", ""), []).append(event)
 
         bucket_groups = list(by_bucket.values())
+        start = self._cycle_start_monotonic
+        budget = self._SEND_SKIP_IF_CYCLE_ELAPSED
         for idx, group in enumerate(bucket_groups):
+            # In-cycle network budget: each bucket group is its own retrying
+            # request chain (~94s against a hung server). Once this cycle has
+            # spent the budget on network, queue the remaining groups instead of
+            # starting another chain that would stack past the _do_sync watchdog
+            # ("Sync hung" / "Sync wedged"). The first group always attempts
+            # (idx == 0) so a cycle still makes forward progress. No-op when the
+            # cycle start is unset (direct _send_events call outside sync()).
+            if (
+                idx > 0
+                and start is not None
+                and (time.monotonic() - start) >= budget
+            ):
+                logger.warning(
+                    "Send budget spent (%.0fs elapsed >= %ds) — queuing %d "
+                    "remaining bucket group(s) for next cycle instead of stacking "
+                    "another upload chain past the watchdog",
+                    time.monotonic() - start, budget, len(bucket_groups) - idx,
+                )
+                for remaining in bucket_groups[idx:]:
+                    self.queue.enqueue(remaining)
+                    stats.events_queued += len(remaining)
+                    stats.queued_bucket_ids.update(
+                        e.get("bucket_id", "") for e in remaining
+                    )
+                return
             try:
                 self._send_bucket_events(group, stats)
             except BetterFlowAuthError:
@@ -2586,6 +2623,19 @@ class SyncEngine:
     # spent this long before the queue drain, skip it this cycle (it drains next
     # cycle); 50s + one ~94s chain stays under the 150s deadline with margin.
     _QUEUE_SKIP_IF_CYCLE_ELAPSED = 50  # seconds
+    # Same in-cycle network budget, applied to the REGULAR send. _send_events
+    # groups the cycle's events by bucket and sends each group in its own
+    # retrying request chain (~94s against a hung server). A device with N
+    # distinct buckets (window, afk, input, inproc-afk, inproc-window, call)
+    # would otherwise stack N chains inside one _do_sync watchdog: N~=3 overruns
+    # the 150s deadline ("Sync hung"), N~=6 overruns the 420s wedge ceiling
+    # ("Sync wedged") — the same root cause, differing only in bucket count
+    # (Azorel outage 2026-07-02, fps 707a9ecc/63a18e4f/d31bb248). Once the cycle
+    # has spent this budget, remaining buckets are queued (the durable
+    # OfflineQueue drains them next cycle) instead of starting another chain; the
+    # first bucket always attempts so a cycle still makes forward progress.
+    # 50s + one ~94s chain stays under the 150s deadline with margin.
+    _SEND_SKIP_IF_CYCLE_ELAPSED = 50  # seconds
 
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
