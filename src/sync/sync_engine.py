@@ -265,6 +265,12 @@ class SyncEngine:
         # Blind-clock escalation latch + threshold (finding E).
         self._inproc_blind_reported = False
         self._INPROC_BLIND_THRESHOLD = 3
+        # Same escalation latch for the in-process WINDOW probe: when its OS
+        # frontmost-window read goes blind (e.g. psutil access-denied on win32),
+        # it silently uploads zero per-app attribution while ALSO suppressing the
+        # external tracker — the exact blind-capture failure the feature exists to
+        # cure. Surface it to ops AND fall back to the external source while blind.
+        self._window_inproc_blind_reported = False
 
         # Optional in-process WINDOW source (set by the SyncCoordinator), the
         # per-app analogue of afk_source. When present, enabled by config, and
@@ -277,9 +283,9 @@ class SyncEngine:
         # Mutated only on the sync thread.
         self.window_source = None
         self._window_inproc_checkpoint: Optional[datetime] = None
-        # Proposed next checkpoint for the span built this cycle; committed by
-        # _commit_inproc_window_checkpoint only after a confirmed send.
-        self._window_inproc_pending: Optional[datetime] = None
+        # NB: the per-cycle "pending" checkpoint is a LOCAL in sync() (threaded
+        # build -> commit), not an instance field — see _build_inproc_window for
+        # why (wedge re-arm can run two sync()s concurrently).
 
         # Monotonic timestamp of the current sync() cycle's start, stamped at the
         # top of sync(). Gates the per-bucket send loop's in-cycle network budget
@@ -705,6 +711,9 @@ class SyncEngine:
         # below instead, so its (possibly blind) events never reach the server and
         # can't double-count. No-op when the flag is off (default): the external
         # window bucket syncs exactly as today.
+        # Escalate a blind in-process window probe once per episode (and, via
+        # _should_skip_external_window below, fall back to the external tracker).
+        self._check_window_source_health()
         skip_external_window = self._should_skip_external_window()
         window_buckets_to_sync = (
             [b for b in window_buckets if not _is_window_like(b.type)]
@@ -763,10 +772,17 @@ class SyncEngine:
             if synth_afk:
                 all_events.append(synth_afk)
 
+        # Pending in-process window checkpoint for this cycle, kept as a LOCAL
+        # (not an instance field) so a concurrent wedge-recovery cycle can't
+        # clobber the value this cycle will commit after its own confirmed send.
+        window_pending: Optional[datetime] = None
         if skip_external_window:
             # Sole-source path: upload the in-process per-app window stream for
             # the slice since the last covered instant.
-            all_events.extend(self._build_inproc_window(datetime.now(timezone.utc)))
+            window_events, window_pending = self._build_inproc_window(
+                datetime.now(timezone.utc)
+            )
+            all_events.extend(window_events)
 
         # Flush any ongoing call at sync boundary
         if self._call_detector:
@@ -783,16 +799,15 @@ class SyncEngine:
         # (the send was confirmed) — otherwise rebuild it next cycle (finding B).
         self._commit_inproc_afk_checkpoint(stats)
         # Same discipline for the in-process window stream: advance its checkpoint
-        # only after a confirmed send.
-        self._commit_inproc_window_checkpoint(stats)
+        # only after a confirmed send. Pass this cycle's own pending value.
+        self._commit_inproc_window_checkpoint(stats, window_pending)
 
         # Process offline queue if we're online — but only if this cycle hasn't
         # already burned most of the watchdog budget on a slow/hung regular send
         # (else two ~94s chains stack past _DO_SYNC_DEADLINE; the queue drains
         # next cycle).
         if self.bf.is_reachable() and not self.queue.is_empty():
-            elapsed = time.monotonic() - cycle_start
-            if elapsed < self._QUEUE_SKIP_IF_CYCLE_ELAPSED:
+            if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
                 self._process_queue(stats)
             else:
                 # The regular send already burned most of the watchdog budget
@@ -800,9 +815,9 @@ class SyncEngine:
                 # don't stack past the deadline; it drains next cycle. Log it so a
                 # climbing queue_size traces to drain-skips, not ingest failure.
                 logger.debug(
-                    "Skipping queue drain this cycle: %.0fs already elapsed "
-                    "(budget %ds, queue_size=%d)",
-                    elapsed, self._QUEUE_SKIP_IF_CYCLE_ELAPSED, self.queue.size(),
+                    "Skipping queue drain this cycle: budget %ds already spent "
+                    "(queue_size=%d)",
+                    self._QUEUE_SKIP_IF_CYCLE_ELAPSED, self.queue.size(),
                 )
 
         # Check heartbeat counter — actual HTTP call is deferred to
@@ -1279,10 +1294,14 @@ class SyncEngine:
         # heartbeat-merge failure doesn't cost the whole span's per-app
         # attribution to the flicker filter (see _coalesce_window_flickers).
         # The checkpoint below is computed from the ORIGINAL events, so
-        # coalescing cannot skip, re-fetch, or double-send anything.
+        # coalescing cannot skip, re-fetch, or double-send anything. Passing the
+        # bucket's last-sent checkpoint keeps a multi-cycle flicker run from being
+        # re-merged over time already delivered (cross-cycle double-count).
         checkpoint_events = events
         if _is_window_like(bucket_type):
-            events = self._coalesce_window_flickers(events)
+            events = self._coalesce_window_flickers(
+                events, self.queue.get_checkpoint(bucket_id)
+            )
 
         transformed = []
         for event in events:
@@ -1513,7 +1532,9 @@ class SyncEngine:
     _WINDOW_COALESCE_GAP_TOLERANCE_S = 2.0
 
     @staticmethod
-    def _coalesce_window_flickers(events: list[AWEvent]) -> list[AWEvent]:
+    def _coalesce_window_flickers(
+        events: list[AWEvent], checkpoint: Optional[datetime] = None
+    ) -> list[AWEvent]:
         """Merge a run of consecutive, time-contiguous events that describe the
         SAME window (app + title + url) into one event.
 
@@ -1537,11 +1558,42 @@ class SyncEngine:
         the merged event keeps the FIRST fragment's id, so the ``_sent_cache``
         dedup keys deterministically and the checkpoint (computed by the caller
         from the ORIGINAL event list) is unaffected.
+
+        Only fragments STRICTLY AFTER ``checkpoint`` (the bucket's last-sent
+        position) are merged. A flicker run that outlives the 2-minute re-fetch
+        lookback would otherwise be re-merged each cycle under a SHIFTED first-
+        fragment id (its true start ages out of the lookback), evading the
+        (id, duration) dedup and re-sending time already delivered last cycle —
+        double-counting the very per-app attribution this recovers. Fragments
+        at/before the checkpoint pass through unmerged for the normal per-event
+        dedup / min_window filter to drop (they were already sent). checkpoint is
+        None on the first sync for a bucket, which merges the whole run.
+
+        (Narrow known edge: a passed-through already-sent fragment is dropped on
+        replay by the min_window filter because flicker fragments are sub-5s by
+        definition and were never cached under their own id. A same-window run
+        containing an individual fragment AT/ABOVE min_window_event_seconds that
+        isn't the group's first fragment could re-send once — outside the observed
+        flicker shape, and billing-neutral, so not tracked with per-fragment state.)
         """
         if len(events) <= 1:
             return events
+        if checkpoint is not None:
+            already_sent = sorted(
+                (e for e in events if e.timestamp <= checkpoint),
+                key=lambda e: e.timestamp,
+            )
+            to_merge = [e for e in events if e.timestamp > checkpoint]
+        else:
+            already_sent = []
+            to_merge = events
+        if len(to_merge) <= 1:
+            return already_sent + to_merge
         tolerance = timedelta(seconds=SyncEngine._WINDOW_COALESCE_GAP_TOLERANCE_S)
-        ordered = sorted(events, key=lambda e: e.timestamp)
+        ordered = sorted(to_merge, key=lambda e: e.timestamp)
+        # Merge ONLY among the post-checkpoint fragments (never with an
+        # already-sent one), so a new run stays adjacent to — not overlapping —
+        # what was delivered last cycle.
         merged: list[AWEvent] = []
         for ev in ordered:
             if merged:
@@ -1561,7 +1613,7 @@ class SyncEngine:
                     # else: ev is fully contained in last — drop the duplicate.
                     continue
             merged.append(ev)
-        return merged
+        return already_sent + merged
 
     def _get_afk_events_for_range(
         self, start: datetime, end: datetime
@@ -2397,24 +2449,88 @@ class SyncEngine:
         except Exception as e:
             logger.debug("window_source.record_sample failed: %s", e)
 
+    def _window_source_blind(self) -> bool:
+        """True when the in-process window probe has failed to read the frontmost
+        window for enough consecutive samples to be considered blind (e.g. psutil
+        access-denied on win32). While blind it produces no per-app spans, so the
+        external tracker must NOT be suppressed."""
+        return (
+            self.window_source is not None
+            and self.window_source.consecutive_failures >= self._INPROC_BLIND_THRESHOLD
+        )
+
+    def _check_window_source_health(self) -> None:
+        """Escalate a blind in-process window probe to ops exactly once per blind
+        episode. Called each cycle. Mirrors the AFK blind-clock escalation
+        (finding E): a logged-only blind probe is invisible until per-app
+        attribution is already silently lost."""
+        if not self._should_use_inproc_window():
+            self._window_inproc_blind_reported = False
+            return
+        if self._window_source_blind():
+            if not self._window_inproc_blind_reported:
+                self._window_inproc_blind_reported = True
+                self._report_window_blind(self.window_source.consecutive_failures)
+        else:
+            self._window_inproc_blind_reported = False
+
+    def _report_window_blind(self, failures: int) -> None:
+        """Surface a blind in-process window probe to the ops ingest (mirrors
+        ``_report_inproc_blind``). While blind, ``_should_skip_external_window``
+        also returns False so the external tracker covers per-app attribution
+        instead of the device going dark."""
+        logger.warning(
+            "in-process window probe blind for %d consecutive samples — falling "
+            "back to the external window tracker until it recovers",
+            failures,
+        )
+        if self.error_reporter is None:
+            return
+        try:
+            self.error_reporter.capture(
+                f"In-process window probe blind for {failures} consecutive samples",
+                level="warning",
+                tags={"component": "inproc-window"},
+                fingerprint="inproc-window-blind",
+            )
+        except Exception:
+            logger.debug("inproc-window-blind report failed", exc_info=True)
+
     def _should_skip_external_window(self) -> bool:
         """Whether to drop the external bf-window-tracker bucket(s) from this
         cycle's upload (because the agent uploads its own per-app window stream
-        instead). Mirrors ``_should_skip_external_afk``."""
-        return self._should_use_inproc_window()
+        instead). Mirrors ``_should_skip_external_afk``. Falls back to the external
+        source (returns False) while the in-process probe is blind, so a device
+        never loses per-app coverage entirely."""
+        return self._should_use_inproc_window() and not self._window_source_blind()
 
-    def _build_inproc_window(self, now: datetime) -> list[dict]:
+    def _build_inproc_window(
+        self, now: datetime
+    ) -> tuple[list[dict], Optional[datetime]]:
         """Build in-process window events for [checkpoint, now]. First cycle seeds
-        the checkpoint at `now` (we only account for time while running). The
-        checkpoint is NOT advanced here — it is committed by
-        ``_commit_inproc_window_checkpoint`` only once the send succeeds, so a
-        terminal send failure can't lose a span. Returns [] when not active."""
+        the checkpoint at `now` (we only account for time while running).
+
+        Returns ``(events, pending)`` where `pending` is the checkpoint the caller
+        must commit via ``_commit_inproc_window_checkpoint`` AFTER a confirmed send
+        (or None to commit nothing). The pending value is RETURNED rather than
+        stored on the instance: the wedge re-arm (main.py) can run two ``sync()``
+        calls concurrently on this engine, and a shared ``_window_inproc_pending``
+        field would let the second cycle clobber the first's in-flight value —
+        advancing the checkpoint past a span the first cycle never confirmed
+        (silent per-app loss). A local can't be clobbered.
+
+        This closes the pending-clobber path specifically. The ``_window_inproc_checkpoint``
+        field itself is still reassigned unsynchronized in the reseed branches
+        below (a concurrent reseed could rewind it) — but that only re-emits spans
+        that upsert idempotently by stable id, never fabricates or loses time, and
+        it mirrors the pre-existing in-process AFK checkpoint. Full serialization
+        would require gating both streams' checkpoints together and is deferred."""
         if not self._should_use_inproc_window():
-            return []
+            return [], None
         cp = self._window_inproc_checkpoint
         if cp is None:
             self._window_inproc_checkpoint = now
-            return []
+            return [], None
         # Re-seed rather than reconstruct when the checkpoint can't be trusted
         # (mirrors _build_inproc_afk):
         #  - now <= cp: the wall clock stepped backward (NTP/manual), or nothing
@@ -2424,8 +2540,7 @@ class SyncEngine:
         #    would mis-count; the unobserved span is simply left uncovered.
         if now <= cp:
             self._window_inproc_checkpoint = now
-            self._window_inproc_pending = None
-            return []
+            return [], None
         gap = (now - cp).total_seconds()
         if gap > self.window_source.retention_seconds:
             logger.info(
@@ -2434,27 +2549,32 @@ class SyncEngine:
                 gap,
             )
             self._window_inproc_checkpoint = now
-            self._window_inproc_pending = None
-            return []
+            return [], None
         events = self.window_source.build_window_events(cp, now)
-        # Defer the checkpoint advance to _commit_inproc_window_checkpoint.
-        self._window_inproc_pending = now
-        return events
+        return events, now
 
-    def _commit_inproc_window_checkpoint(self, stats: SyncStats) -> None:
+    def _commit_inproc_window_checkpoint(
+        self, stats: SyncStats, pending: Optional[datetime]
+    ) -> None:
         """Advance the in-process window checkpoint past the just-built span, but
         only if its bucket wasn't queued (the send succeeded). On a queued/failed
         send we leave the checkpoint where it was so the next cycle rebuilds the
         same span from samples — the synthetic ids are stable, so a later queue
         drain + the rebuild upsert idempotently. Mirrors
-        ``_commit_inproc_afk_checkpoint``."""
-        pending = self._window_inproc_pending
+        ``_commit_inproc_afk_checkpoint``.
+
+        `pending` is passed in (this cycle's own value from ``_build_inproc_window``)
+        rather than read from a shared field, and the advance is forward-only: a
+        stale pending from an abandoned wedge-recovery zombie can't rewind the
+        checkpoint past a newer cycle's advance or a pause/private reset."""
         if pending is None:
             return
         inproc_bucket = self.window_source.bucket_id
-        if inproc_bucket not in stats.queued_bucket_ids:
+        if inproc_bucket in stats.queued_bucket_ids:
+            return
+        cp = self._window_inproc_checkpoint
+        if cp is None or pending > cp:
             self._window_inproc_checkpoint = pending
-        self._window_inproc_pending = None
 
     def _report_inproc_blind(self, failures: int) -> None:
         """Surface a blind in-process idle clock to the ops ingest. Logged-only
@@ -2497,8 +2617,6 @@ class SyncEngine:
             by_bucket.setdefault(event.get("bucket_id", ""), []).append(event)
 
         bucket_groups = list(by_bucket.values())
-        start = self._cycle_start_monotonic
-        budget = self._SEND_SKIP_IF_CYCLE_ELAPSED
         for idx, group in enumerate(bucket_groups):
             # In-cycle network budget: each bucket group is its own retrying
             # request chain (~94s against a hung server). Once this cycle has
@@ -2507,16 +2625,14 @@ class SyncEngine:
             # ("Sync hung" / "Sync wedged"). The first group always attempts
             # (idx == 0) so a cycle still makes forward progress. No-op when the
             # cycle start is unset (direct _send_events call outside sync()).
-            if (
-                idx > 0
-                and start is not None
-                and (time.monotonic() - start) >= budget
+            if idx > 0 and self._cycle_network_budget_exceeded(
+                self._SEND_SKIP_IF_CYCLE_ELAPSED
             ):
                 logger.warning(
-                    "Send budget spent (%.0fs elapsed >= %ds) — queuing %d "
-                    "remaining bucket group(s) for next cycle instead of stacking "
-                    "another upload chain past the watchdog",
-                    time.monotonic() - start, budget, len(bucket_groups) - idx,
+                    "Send budget spent (>=%ds) — queuing %d remaining bucket "
+                    "group(s) for next cycle instead of stacking another upload "
+                    "chain past the watchdog",
+                    self._SEND_SKIP_IF_CYCLE_ELAPSED, len(bucket_groups) - idx,
                 )
                 for remaining in bucket_groups[idx:]:
                     self.queue.enqueue(remaining)
@@ -2614,28 +2730,31 @@ class SyncEngine:
     # billable time. The counter (_queue_consecutive_failures) counts every
     # transient queue failure and resets on any success.
     _STUCK_HEAD_CEILING = 20
-    # The regular event upload AND the offline-queue drain both run inside one
-    # sync() — i.e. inside the _do_sync watchdog. Each is a single retrying
-    # request chain that can take ~94s against a hung server, so back-to-back they
-    # can exceed _DO_SYNC_DEADLINE (150s) and false-trip "Sync hung" even though
-    # neither is wedged (the regular send hangs, then is_reachable()'s /health
-    # answers fast, then the queue drain hangs too). If the cycle has ALREADY
-    # spent this long before the queue drain, skip it this cycle (it drains next
-    # cycle); 50s + one ~94s chain stays under the 150s deadline with margin.
-    _QUEUE_SKIP_IF_CYCLE_ELAPSED = 50  # seconds
-    # Same in-cycle network budget, applied to the REGULAR send. _send_events
-    # groups the cycle's events by bucket and sends each group in its own
-    # retrying request chain (~94s against a hung server). A device with N
-    # distinct buckets (window, afk, input, inproc-afk, inproc-window, call)
-    # would otherwise stack N chains inside one _do_sync watchdog: N~=3 overruns
-    # the 150s deadline ("Sync hung"), N~=6 overruns the 420s wedge ceiling
-    # ("Sync wedged") — the same root cause, differing only in bucket count
-    # (Azorel outage 2026-07-02, fps 707a9ecc/63a18e4f/d31bb248). Once the cycle
-    # has spent this budget, remaining buckets are queued (the durable
-    # OfflineQueue drains them next cycle) instead of starting another chain; the
-    # first bucket always attempts so a cycle still makes forward progress.
-    # 50s + one ~94s chain stays under the 150s deadline with margin.
-    _SEND_SKIP_IF_CYCLE_ELAPSED = 50  # seconds
+    # ONE in-cycle network budget, shared by every retrying request chain a cycle
+    # can start: the per-bucket regular send (_send_events) AND the offline-queue
+    # drain (_process_queue). Each chain can take ~94s against a hung server; run
+    # back-to-back inside the single _do_sync watchdog they exceed _DO_SYNC_DEADLINE
+    # (150s -> "Sync hung") and, stacked deep enough (N buckets), the 420s wedge
+    # ceiling ("Sync wedged") — the Azorel outage 2026-07-02 (fps 707a9ecc /
+    # 63a18e4f / d31bb248). Once a cycle has spent this budget, no NEW chain is
+    # started: remaining bucket groups / the queue drain are deferred to the next
+    # cycle (durable OfflineQueue). The first bucket group always attempts so a
+    # cycle makes forward progress. 50s + one ~94s chain stays under 150s with
+    # margin. Both gates check it via `_cycle_network_budget_exceeded`.
+    _CYCLE_NETWORK_BUDGET_SECONDS = 50  # seconds
+    # Named aliases kept for the two call sites / their tests; both resolve to the
+    # single source of truth above so the two gates can never drift apart.
+    _QUEUE_SKIP_IF_CYCLE_ELAPSED = _CYCLE_NETWORK_BUDGET_SECONDS
+    _SEND_SKIP_IF_CYCLE_ELAPSED = _CYCLE_NETWORK_BUDGET_SECONDS
+
+    def _cycle_network_budget_exceeded(self, budget_seconds: float) -> bool:
+        """True when the current sync() cycle has already spent `budget_seconds`
+        on network IO — the shared gate that stops a second ~94s retry chain from
+        stacking past the _do_sync watchdog. Used by both the per-bucket send loop
+        and the offline-queue drain. Returns False when the cycle start is unset
+        (a direct call outside sync(), e.g. a unit test)."""
+        start = self._cycle_start_monotonic
+        return start is not None and (time.monotonic() - start) >= budget_seconds
 
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
@@ -3128,10 +3247,11 @@ class SyncEngine:
 
         # Same for the in-process window stream (its own checkpoint, not an AW
         # bucket) — otherwise the next _build_inproc_window reconstructs the
-        # paused/private window and uploads it. Forward-only.
+        # paused/private window and uploads it. Forward-only. (No pending field to
+        # clear: it's a per-cycle local now; the commit's forward-only guard stops
+        # an in-flight cycle from rewinding past this reset.)
         if self._window_inproc_checkpoint is not None:
             self._window_inproc_checkpoint = now
-        self._window_inproc_pending = None
 
         bucket_ids: set[str] = set()
 

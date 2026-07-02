@@ -684,8 +684,10 @@ class Config:
                     logger.warning("Invalid min_window_event_seconds from server, ignoring")
             if "in_process_window" in sync:
                 # Opt-in remote enable of the in-process window source (ships
-                # dormant). Bool-coerced and logged so a rollout is auditable.
-                self.sync.in_process_window = bool(sync["in_process_window"])
+                # dormant). Use _to_bool (not bool()) like every sibling flag: a
+                # server payload of the STRING "false"/"0" must stay off —
+                # bool("false") is True and would silently enable it fleet-wide.
+                self.sync.in_process_window = self._to_bool(sync["in_process_window"])
                 logger.info(
                     "Server config: in_process_window=%s", self.sync.in_process_window
                 )

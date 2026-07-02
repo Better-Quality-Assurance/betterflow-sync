@@ -34,7 +34,7 @@ def test_flag_off_is_no_op():
     assert eng._should_use_inproc_window() is False
     assert eng._should_skip_external_window() is False
     # Build is inert even with samples present.
-    assert eng._build_inproc_window(T0 + timedelta(seconds=60)) == []
+    assert eng._build_inproc_window(T0 + timedelta(seconds=60)) == ([], None)
 
 
 def test_active_when_flag_on_and_available():
@@ -62,9 +62,10 @@ def test_inproc_window_events_built_for_uploaded_range():
         (T0, "Code", "a"),
         (T0 + timedelta(seconds=30), "Code", "a"),
     ])
-    eng._build_inproc_window(T0)  # first call seeds the checkpoint at T0, returns []
-    events = eng._build_inproc_window(T0 + timedelta(seconds=30))
+    eng._build_inproc_window(T0)  # first call seeds the checkpoint at T0, returns ([], None)
+    events, pending = eng._build_inproc_window(T0 + timedelta(seconds=30))
     assert events
+    assert pending == T0 + timedelta(seconds=30)
     assert all(e["bucket_id"] == "bf-window-inproc_host" for e in events)
     assert events[0]["data"]["app"] == "Code"
 
@@ -76,16 +77,14 @@ def test_checkpoint_committed_only_after_successful_send():
         (T0 + timedelta(seconds=30), "Code", "a"),
     ])
     eng._build_inproc_window(T0)  # seed
-    eng._build_inproc_window(T0 + timedelta(seconds=30))  # sets pending
-    pending = eng._window_inproc_pending
+    _, pending = eng._build_inproc_window(T0 + timedelta(seconds=30))
     assert pending is not None
 
-    # Queued send -> checkpoint held, pending cleared so next cycle rebuilds.
+    # Queued send -> checkpoint held so next cycle rebuilds.
     stats = SyncStats()
     stats.queued_bucket_ids.add("bf-window-inproc_host")
-    eng._commit_inproc_window_checkpoint(stats)
+    eng._commit_inproc_window_checkpoint(stats, pending)
     assert eng._window_inproc_checkpoint == T0  # unchanged
-    assert eng._window_inproc_pending is None
 
 
 def test_checkpoint_advances_on_confirmed_send():
@@ -95,10 +94,25 @@ def test_checkpoint_advances_on_confirmed_send():
         (T0 + timedelta(seconds=30), "Code", "a"),
     ])
     eng._build_inproc_window(T0)
-    eng._build_inproc_window(T0 + timedelta(seconds=30))
+    _, pending = eng._build_inproc_window(T0 + timedelta(seconds=30))
     stats = SyncStats()  # no queued buckets -> confirmed send
-    eng._commit_inproc_window_checkpoint(stats)
+    eng._commit_inproc_window_checkpoint(stats, pending)
     assert eng._window_inproc_checkpoint == T0 + timedelta(seconds=30)
+
+
+def test_commit_is_forward_only_stale_pending_cannot_rewind():
+    """A stale pending from an abandoned wedge-recovery cycle (or one built before
+    a pause/private reset advanced the checkpoint) must not rewind the checkpoint.
+    Guards the concurrency fix: pending is threaded per-cycle + advance is
+    monotonic."""
+    eng = _engine(True)
+    eng.window_source = _FakeSource([(T0, "Code", "a")])
+    # A newer cycle / reset has already advanced the checkpoint.
+    eng._window_inproc_checkpoint = T0 + timedelta(seconds=100)
+    stats = SyncStats()  # confirmed send
+    # A stale pending from an older build tries to commit an EARLIER instant.
+    eng._commit_inproc_window_checkpoint(stats, T0 + timedelta(seconds=30))
+    assert eng._window_inproc_checkpoint == T0 + timedelta(seconds=100)  # not rewound
 
 
 def _bucket(bucket_id, btype):
@@ -126,6 +140,41 @@ def test_external_window_buckets_kept_when_flag_off():
     skip = eng._should_skip_external_window()
     to_sync = [b for b in window_buckets if not _is_window_like(b.type)] if skip else window_buckets
     assert to_sync == window_buckets  # unchanged when dormant
+
+
+def test_blind_window_probe_escalates_once_and_falls_back_to_external():
+    """When the in-process window probe goes blind, the agent must escalate to
+    ops (once per episode) AND stop suppressing the external tracker, so a device
+    never loses per-app attribution silently."""
+    eng = _engine(True)
+    # A probe that always fails to read the frontmost window.
+    src = WindowSource(hostname="host", foreground_getter=lambda: None)
+    src._available_latched = True  # was usable once, now blind
+    eng.window_source = src
+    eng.error_reporter = Mock()
+
+    # Drive it blind past the threshold.
+    for i in range(eng._INPROC_BLIND_THRESHOLD):
+        src.record_sample(T0 + timedelta(seconds=i))
+    assert src.consecutive_failures >= eng._INPROC_BLIND_THRESHOLD
+
+    # While blind: fall back to external (don't skip it).
+    assert eng._should_skip_external_window() is False
+
+    # Escalates exactly once across repeated cycles.
+    eng._check_window_source_health()
+    eng._check_window_source_health()
+    assert eng.error_reporter.capture.call_count == 1
+    fp = eng.error_reporter.capture.call_args.kwargs.get("fingerprint")
+    assert fp == "inproc-window-blind"
+
+    # Recovery: a successful read clears the blind state and re-arms escalation.
+    src._getter = lambda: ("Code", "a")
+    src.record_sample(T0 + timedelta(seconds=60))
+    assert src.consecutive_failures == 0
+    assert eng._should_skip_external_window() is True
+    eng._check_window_source_health()  # not blind -> latch reset, no new capture
+    assert eng.error_reporter.capture.call_count == 1
 
 
 def test_record_window_sample_if_active_gates_on_flag():

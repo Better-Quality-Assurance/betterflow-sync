@@ -118,7 +118,11 @@ def _running_from_downloads(app_path: Optional[Path]) -> bool:
         downloads = (Path.home() / "Downloads").resolve()
         resolved = app_path.resolve()
         return resolved == downloads or downloads in resolved.parents
-    except Exception:
+    except Exception as e:
+        # Fail OPEN (allow the update) but never silently: if path resolution
+        # throws on the affected win32 machine, the guard would quietly disable
+        # itself and the churn loop it exists to stop resumes with no trace.
+        logger.debug("Downloads-path check failed, allowing update: %s", e, exc_info=True)
         return False
 
 

@@ -72,7 +72,27 @@ def _default_foreground_getter() -> Optional[Callable[[], Optional[tuple[str, st
 
 
 class WindowSource:
-    """Records frontmost-window samples and reconstructs per-app focus spans."""
+    """Records frontmost-window samples and reconstructs per-app focus spans.
+
+    Divergence from ``AfkSource`` (the module docstring says "mirrors AfkSource" —
+    it does for the deque/lock/latch/bucket_id/build shape, but NOT for gap
+    handling): AfkSource carries a ``protect_since`` salvage so a span covering an
+    un-acked checkpoint survives a long pause/sleep, because AFK time is billed.
+    Window events are billing-neutral (time comes from AFK/input), so instead of
+    salvaging across an unobserved gap this source *caps* it: an inter-sample gap
+    longer than ``MAX_UNOBSERVED_GAP_SECONDS`` closes the current run and is
+    credited to no app (see ``build_window_events``). That upholds "never invent
+    time for a focus we couldn't observe" without the salvage machinery.
+    """
+
+    # An interval between two consecutive samples longer than this is treated as
+    # UNOBSERVED (machine asleep / lid closed / scheduler suspended), not as
+    # continuous focus. The sampler runs every ~5s and at least once per ~60s sync
+    # cycle, so a gap past 2 minutes cannot be normal sampling. Without this cap a
+    # sub-retention sleep (< the 2h retention, so the coarse gap>retention reseed
+    # in _build_inproc_window never trips) would fabricate the ENTIRE gap as focus
+    # on the last-seen app.
+    MAX_UNOBSERVED_GAP_SECONDS = 120.0
 
     def __init__(
         self,
@@ -81,8 +101,14 @@ class WindowSource:
         foreground_getter=_UNSET,
         retention_seconds: float = 7200.0,
         max_samples: int = 20000,
+        max_unobserved_gap_seconds: Optional[float] = None,
     ) -> None:
         self._hostname = hostname
+        self._max_unobserved_gap = (
+            self.MAX_UNOBSERVED_GAP_SECONDS
+            if max_unobserved_gap_seconds is None
+            else float(max_unobserved_gap_seconds)
+        )
         # Not passed -> platform default probe. Passed as None -> unsupported
         # platform (no frontmost probe): the source stays permanently
         # unavailable, exactly like AfkSource on Linux.
@@ -118,7 +144,8 @@ class WindowSource:
 
     @property
     def consecutive_failures(self) -> int:
-        return self._consecutive_failures
+        with self._lock:
+            return self._consecutive_failures
 
     @property
     def bucket_id(self) -> str:
@@ -152,24 +179,30 @@ class WindowSource:
         fabricate window time. No-op when the probe is unsupported."""
         if self._getter is None:
             return
+        # Call the OS probe OUTSIDE the lock (it can block on a slow syscall); do
+        # all shared-state mutation under the lock. record_sample runs on BOTH the
+        # ~5s sampler thread and the per-cycle sync thread, so an unlocked
+        # `_consecutive_failures += 1` is a genuine lost-update race — harmless
+        # only while nothing reads the counter, but it now feeds blind-detection.
         try:
             result = self._getter()
         except Exception as e:
             logger.debug("WindowSource foreground getter failed: %s", e)
-            self._consecutive_failures += 1
+            with self._lock:
+                self._consecutive_failures += 1
             return
-        if result is None:
-            self._consecutive_failures += 1
-            return
-        app, title = result
-        app = str(app or "").strip()
-        if not app:
-            # Readable focus but no resolvable app — treat as a gap, never invent.
-            self._consecutive_failures += 1
-            return
-        self._consecutive_failures = 0
-        title = str(title or "")
+        app = ""
+        title = ""
+        if result is not None:
+            app = str(result[0] or "").strip()
+            title = str(result[1] or "")
         with self._lock:
+            if not app:
+                # None result, or readable focus but no resolvable app — treat as a
+                # gap, never invent.
+                self._consecutive_failures += 1
+                return
+            self._consecutive_failures = 0
             self._samples.append((now, app, title))
             cutoff = now - self._retention
             while self._samples and self._samples[0][0] < cutoff:
@@ -194,6 +227,7 @@ class WindowSource:
         if not samples:
             return []
         samples.sort(key=lambda s: s[0])
+        cap = self._max_unobserved_gap
 
         events: list = []
         run_start = samples[0][0]
@@ -207,30 +241,37 @@ class WindowSource:
         def _close(end: datetime) -> None:
             # Credit the final observed title's tail up to the span end.
             title_held[prev_title] = (
-                title_held.get(prev_title, 0.0) + (end - prev_time).total_seconds()
+                title_held.get(prev_title, 0.0)
+                + max(0.0, (end - prev_time).total_seconds())
             )
             title = max(title_held, key=lambda k: title_held[k]) if title_held else ""
             self._append_event(events, run_start, end, run_app, title, range_start, range_end)
 
         for t, app, title in samples[1:]:
-            if app != run_app:
-                # App changed: close the run at this instant, open a new one.
-                _close(t)
+            delta = (t - prev_time).total_seconds()
+            unobserved = delta > cap
+            if app != run_app or unobserved:
+                # App changed OR an unobserved gap (sleep/lock/suspend). The switch
+                # or gap happened somewhere in (prev_time, t]. For a normal delta we
+                # close at t (the switch instant); for an unobserved gap we credit
+                # no more than `cap`, so the gap itself is never billed as focus.
+                close_end = (
+                    prev_time + timedelta(seconds=min(delta, cap)) if unobserved else t
+                )
+                _close(close_end)
                 run_start = t
                 run_app = app
                 title_held = {}
                 prev_time = t
                 prev_title = title
                 continue
-            # Same app: accrue the just-elapsed interval to the previously-held
-            # title, then advance the cursor.
-            title_held[prev_title] = (
-                title_held.get(prev_title, 0.0) + (t - prev_time).total_seconds()
-            )
+            # Same app, observed interval: accrue it to the previously-held title.
+            title_held[prev_title] = title_held.get(prev_title, 0.0) + delta
             prev_time = t
             prev_title = title
-        # Close the trailing run at range_end.
-        _close(range_end)
+        # Trailing run: cap the tail too, so a device that slept right after the
+        # last sample doesn't credit [last_sample, range_end] in full.
+        _close(min(range_end, prev_time + timedelta(seconds=cap)))
         return events
 
     def _append_event(

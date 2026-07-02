@@ -357,14 +357,18 @@ class SyncCoordinator:
             # Frequent frontmost-window sampler for the in-process window source.
             # Window focus changes far faster than the 60s sync cycle, so we
             # sample every few seconds to give the reconstructed per-app spans
-            # real resolution. Gated + cheap: a no-op unless in_process_window is
-            # on and the probe is usable, so it adds nothing to the default path.
-            self.scheduler.add_job(
-                self._sample_window,
-                trigger=IntervalTrigger(seconds=self.WINDOW_SAMPLE_INTERVAL_SECONDS),
-                id="window_sample_job",
-                replace_existing=True,
-            )
+            # real resolution. Only registered when the (dormant, opt-in) feature
+            # is enabled — otherwise ~100% of the fleet would wake every 5s to run
+            # a no-op, defeating the unified-60s-tick timer coalescing above. The
+            # per-cycle 60s sample in _do_sync still covers a server-side enable
+            # until the next restart picks up the persisted flag and adds this job.
+            if self.config.sync.in_process_window:
+                self.scheduler.add_job(
+                    self._sample_window,
+                    trigger=IntervalTrigger(seconds=self.WINDOW_SAMPLE_INTERVAL_SECONDS),
+                    id="window_sample_job",
+                    replace_existing=True,
+                )
             self.scheduler.start()
             logger.info(
                 f"Sync loop started (interval: {self.config.sync.interval_seconds}s)"
@@ -1812,7 +1816,13 @@ class BetterFlowApp:
                 state = self.login_manager.try_auto_login()
                 if state.logged_in:
                     logger.info("Auto-login recovered after transient startup failure")
-                    self._finish_logged_in_startup(state, send_greeting=True)
+                    # A resumed session, not a cold launch: use the same
+                    # "Welcome back" convention as the manual re-login path
+                    # (do_browser_login), not the time-of-day launch greeting.
+                    self._finish_logged_in_startup(state, send_greeting=False)
+                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
+                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+                    send_notification(greeting, _day_greeting())
                     return
                 if not getattr(state, "transient", False):
                     # Credentials are genuinely gone now — prompt re-auth.
@@ -1823,6 +1833,23 @@ class BetterFlowApp:
                     self.coordinator._maybe_warn_login_required(source="reconnect")
                     return
                 # Still transient — keep the offline state and try again.
+            except Exception as e:
+                # This thread is the ONLY recovery path after a transient startup
+                # outage; an unexpected exception (e.g. a keyring read error)
+                # must not kill it silently and strand the user on
+                # "Offline — reconnecting..." forever. Log, surface to ops, and
+                # keep retrying.
+                logger.warning("Reconnect attempt failed unexpectedly: %s", e, exc_info=True)
+                if self.error_reporter is not None:
+                    try:
+                        self.error_reporter.capture(
+                            f"Reconnect attempt raised unexpectedly: {e}",
+                            level="warning",
+                            tags={"component": "reconnect"},
+                            fingerprint="reconnect-unexpected-error",
+                        )
+                    except Exception:
+                        logger.debug("reconnect-error report failed", exc_info=True)
             finally:
                 self._login_lock.release()
 
