@@ -92,6 +92,68 @@ def _get_app_bundle_path() -> Optional[Path]:
     return None
 
 
+# Set once per process so the "install properly" nag isn't repeated on every
+# stage / staged-apply attempt within a single run.
+_downloads_warning_sent = False
+
+
+def _running_from_downloads(app_path: Optional[Path]) -> bool:
+    """True when the running app lives inside a Downloads folder.
+
+    Windows can't reliably replace a locked .exe in place, so a self-update
+    applied to an app that was unzipped-and-run from Downloads silently fails
+    to persist: the next cold start comes back on the bundled (often ancient)
+    version and re-applies the update, churning forever. Observed on Sachi's
+    device (16), 2026-07-02 — stuck bouncing back to 1.5.29 out of
+    ``C:\\Users\\Administrator\\Downloads\\BetterFlow-Windows (1)``.
+
+    Matches both the standard ``~/Downloads`` and any path with a ``Downloads``
+    component (a relocated-but-still-named Downloads folder).
+    """
+    if app_path is None:
+        return False
+    try:
+        if any(part.lower() == "downloads" for part in app_path.parts):
+            return True
+        downloads = (Path.home() / "Downloads").resolve()
+        resolved = app_path.resolve()
+        return resolved == downloads or downloads in resolved.parents
+    except Exception:
+        return False
+
+
+def _warn_downloads_install(
+    app_path: Path, on_progress: Optional[Callable[[str], None]]
+) -> None:
+    """Log, surface status, and (once per process) notify the user that a
+    Downloads install can't self-update and needs to be installed properly."""
+    global _downloads_warning_sent
+    logger.warning(
+        "self-update: app is running from a Downloads folder (%s); an in-place "
+        "update can't persist there and would revert on next launch. Skipping "
+        "the update and asking the user to install to a stable location.",
+        app_path,
+    )
+    if on_progress:
+        on_progress("Install BetterFlow outside Downloads to get updates")
+    if _downloads_warning_sent:
+        return
+    _downloads_warning_sent = True
+    try:
+        try:
+            from .notifications import send_notification
+        except ImportError:
+            from notifications import send_notification
+        send_notification(
+            "BetterFlow can't update itself",
+            "You're running BetterFlow from your Downloads folder, so updates "
+            "won't stick. Please install it to a permanent location and delete "
+            "the copies in Downloads.",
+        )
+    except Exception:
+        logger.debug("Downloads-install notification failed", exc_info=True)
+
+
 def _artifact_filename_from_url(download_url: str) -> str:
     """Derive a safe local filename (keeping the real extension) from the URL.
 
@@ -219,6 +281,16 @@ def _apply_local_artifact(
     logger.info("self-update: sys.executable=%s resolved app_path=%s", sys.executable, app_path)
     if app_path is None:
         _status("Cannot determine app location - update aborted")
+        return False
+
+    # Refuse to apply into a Downloads folder on Windows: the in-place replace
+    # can't persist a locked .exe there, so the update silently reverts on the
+    # next launch and the app churns re-applying it forever (Sachi, device 16).
+    # Sitting still on the current version + nagging to install properly beats
+    # an endless relaunch loop. macOS/Linux replace the whole bundle/AppImage
+    # atomically, so they aren't affected.
+    if sys.platform == "win32" and _running_from_downloads(app_path):
+        _warn_downloads_install(app_path, on_progress)
         return False
 
     is_dmg = artifact_path.name.lower().endswith(".dmg")
@@ -747,6 +819,15 @@ def stage_update(
         # Match apply_update: HTTPS + GitHub-host allowlist, not just HTTPS.
         logger.warning("Refusing to stage update from disallowed URL host")
         return False
+
+    # No point downloading ~60 MB every launch if the apply will be refused:
+    # a Windows Downloads-folder install can't persist an update (see
+    # _apply_local_artifact / _running_from_downloads).
+    if sys.platform == "win32":
+        app_path = _get_app_bundle_path()
+        if _running_from_downloads(app_path):
+            _warn_downloads_install(app_path, on_progress)
+            return False
 
     clear_staged_update()
     staging = _staging_dir()
