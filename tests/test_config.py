@@ -194,6 +194,19 @@ def test_in_process_afk_defaults_on():
     assert Config().sync.in_process_afk is True
 
 
+def test_in_process_window_defaults_off():
+    # Ships dormant/opt-in — the in-process window source must be off by default.
+    from src.config import Config
+    assert Config().sync.in_process_window is False
+
+
+def test_in_process_window_enabled_from_server():
+    from src.config import Config
+    cfg = Config()
+    cfg.update_from_server({"sync": {"in_process_window": True}})
+    assert cfg.sync.in_process_window is True
+
+
 def test_foreground_enabled_is_not_persisted(tmp_path, monkeypatch):
     """foreground_activity.enabled must never be written to config.json — it's a
     server-driven, default-OFF billing flag. Persisting it let a default-ON beta

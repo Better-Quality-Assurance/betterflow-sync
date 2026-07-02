@@ -311,6 +311,14 @@ class SyncSettings:
     # independently reversible: with the tracker stopped, recovery can't fall back
     # to it without flipping a flag, so this ships dark until validated.
     stop_external_afk_tracker: bool = False
+    # Generate the per-app active-window stream in-process from the OS
+    # frontmost-window probe (+ psutil process name) instead of the external
+    # bf-window-tracker bucket. Same convergence move as in_process_afk, for
+    # machines where the bundled aw-watcher-window launches but its Win32 capture
+    # returns zero events for hours. Default OFF — ships dormant/opt-in; when on
+    # AND the probe is usable, the external window bucket is skipped so the two
+    # sources never double-count.
+    in_process_window: bool = False
 
 
 @dataclass
@@ -674,6 +682,13 @@ class Config:
                         self.sync.min_window_event_seconds = val
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_window_event_seconds from server, ignoring")
+            if "in_process_window" in sync:
+                # Opt-in remote enable of the in-process window source (ships
+                # dormant). Bool-coerced and logged so a rollout is auditable.
+                self.sync.in_process_window = bool(sync["in_process_window"])
+                logger.info(
+                    "Server config: in_process_window=%s", self.sync.in_process_window
+                )
 
         if "engagement" in server_config:
             eng = server_config["engagement"]
