@@ -13,6 +13,10 @@ fcntl path. The key case is `second instance blocked even when the lock file is
 already non-empty`, which is exactly what the offset bug broke.
 """
 
+import sys
+
+import pytest
+
 from src.main import SingleInstanceLock
 
 
@@ -59,6 +63,13 @@ def test_context_manager_releases(tmp_path):
     b.release()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows byte-range locks are MANDATORY, so reading the locked lock "
+    "file raises PermissionError. The structural guarantee (acquire fails at "
+    "msvcrt.locking before the truncate/write) is covered by the 'second instance "
+    "blocked' test, which passes on the Windows runner.",
+)
 def test_first_instance_pid_survives_a_blocked_second_attempt(tmp_path):
     """A blocked second acquire must NOT truncate/overwrite the holder's lock
     file (the old Windows path locked a different byte, then truncated + wrote its
