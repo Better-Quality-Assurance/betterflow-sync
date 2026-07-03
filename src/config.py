@@ -319,6 +319,14 @@ class SyncSettings:
     # AND the probe is usable, the external window bucket is skipped so the two
     # sources never double-count.
     in_process_window: bool = False
+    # Count keystrokes/clicks/scrolls in-process (Windows ctypes low-level hooks
+    # / macOS CGEventTap) instead of relying on the external aw-watcher-input
+    # tracker. Same convergence move as in_process_window, for machines where
+    # aw-watcher-input's low-level hook is blocked (UIPI / AV) and reports ZERO
+    # keystrokes/clicks for hours (Fraud Risk 75). Default OFF — ships
+    # dormant/opt-in; when on AND an in-process backend is usable, the external
+    # input bucket is skipped so the two sources never double-count.
+    in_process_input: bool = False
 
 
 @dataclass
@@ -690,6 +698,15 @@ class Config:
                 self.sync.in_process_window = self._to_bool(sync["in_process_window"])
                 logger.info(
                     "Server config: in_process_window=%s", self.sync.in_process_window
+                )
+            if "in_process_input" in sync:
+                # Opt-in remote enable of the in-process input source (ships
+                # dormant). Use _to_bool (not bool()) like every sibling flag: a
+                # server payload of the STRING "false"/"0" must stay off —
+                # bool("false") is True and would silently enable it fleet-wide.
+                self.sync.in_process_input = self._to_bool(sync["in_process_input"])
+                logger.info(
+                    "Server config: in_process_input=%s", self.sync.in_process_input
                 )
 
         if "engagement" in server_config:

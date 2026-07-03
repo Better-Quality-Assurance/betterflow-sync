@@ -1611,6 +1611,29 @@ class BetterFlowApp:
             else "inactive",
         )
 
+        # In-process INPUT source: the keystroke/click/scroll-count analogue of
+        # window_source. Counts input inside the agent process (Windows ctypes
+        # low-level hooks / macOS CGEventTap) and uploads it as the sole input
+        # source, so a device where the external aw-watcher-input hook is blocked
+        # (UIPI / AV) and reports ZERO input (Fraud Risk 75) still gets real
+        # counts. Ships dormant: inert unless config enables it AND a backend is
+        # usable (macOS/Windows; off on Linux). The backend listener thread is
+        # started with the other in-process watchers in _start_watchers().
+        try:
+            from .sync.input_source import InputSource
+        except ImportError:
+            from sync.input_source import InputSource
+        input_source = InputSource(
+            hostname=self.coordinator.sync_engine._hostname,
+        )
+        self.coordinator.sync_engine.input_source = input_source
+        self.input_source = input_source
+        logger.info(
+            "In-process input source: %s",
+            "active" if (self.config.sync.in_process_input and input_source.available())
+            else "inactive",
+        )
+
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(self.config.reminders)
         self.coordinator.reminder_manager = self.reminder_manager
@@ -1659,6 +1682,14 @@ class BetterFlowApp:
             self.window_watcher.start()
         if self.input_watcher:
             self.input_watcher.start()
+        # Start the in-process input-count backend only when the (dormant, opt-in)
+        # feature is enabled — otherwise ~100% of the fleet would install an OS
+        # input hook for a source nothing drains. Gated + no-op when off.
+        if self.input_source is not None and self.config.sync.in_process_input:
+            try:
+                self.input_source.start()
+            except Exception as e:
+                logger.warning("In-process input source start failed: %s", e)
 
     def _ensure_system_event_listener(self) -> None:
         """Start system event listeners once without blocking tray startup."""
@@ -2650,6 +2681,11 @@ class BetterFlowApp:
             self.window_watcher.stop()
         if self.input_watcher:
             self.input_watcher.stop()
+        if getattr(self, "input_source", None) is not None:
+            try:
+                self.input_source.stop()
+            except Exception:
+                logger.debug("In-process input source stop failed", exc_info=True)
         if self.display_tracker is not None:
             self.display_tracker.stop()
         if getattr(self, "browser_tracker", None) is not None:
