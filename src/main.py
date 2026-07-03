@@ -2697,6 +2697,15 @@ class SingleInstanceLock:
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
         self._file = open(self._path, "a+")  # noqa: SIM115
         try:
+            # Lock byte 0 explicitly. msvcrt.locking() locks bytes at the CURRENT
+            # file position, and "a+" leaves the pointer at end-of-file — so once
+            # a prior instance has written its PID, a second instance would open
+            # at a non-zero offset, lock a DIFFERENT byte, and never conflict. That
+            # let two BetterFlow instances run side-by-side on Windows, fighting
+            # over the AW server port + input hook -> 0 events for the user.
+            # Seeking to 0 first makes every instance contend for the same byte.
+            # fcntl.flock ignores the position, so this is a no-op on Unix.
+            self._file.seek(0)
             if sys.platform == "win32":
                 import msvcrt
                 msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -2720,6 +2729,9 @@ class SingleInstanceLock:
                 if sys.platform == "win32":
                     import msvcrt
                     try:
+                        # Unlock the SAME byte 0 we locked in acquire() (the file
+                        # pointer is at end-of-file after writing the PID).
+                        self._file.seek(0)
                         msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
                     except OSError as e:
                         logger.debug("msvcrt unlock failed: %s", e)
