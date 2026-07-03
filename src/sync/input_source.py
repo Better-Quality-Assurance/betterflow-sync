@@ -466,18 +466,18 @@ class _MacOSTapBackend:
         self._watcher = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # Last cumulative counts read from the watcher, to compute deltas.
-        self._last = (0, 0, 0)
 
     def _build_watcher(self):
         try:
             from .macos_input_watcher import MacOSInputWatcher
         except ImportError:
             from sync.macos_input_watcher import MacOSInputWatcher
-        # A tiny AW stub: this backend only needs the watcher's COUNTERS, never
-        # its emitter (InputSource owns the drain/upload). A no-op client keeps
-        # the watcher self-contained and off the AW input bucket entirely.
-        return MacOSInputWatcher(_NullAwClient())
+        # count_only=True: the watcher runs ONLY its CGEventTap counter — no
+        # emitter thread, no AW bucket. This backend drains the raw counters
+        # itself (below); if the watcher's own emitter also ran it would subtract
+        # counts out from under our poll and undercount. The no-op AW client is
+        # then never touched, but kept as a defensive stub.
+        return MacOSInputWatcher(_NullAwClient(), count_only=True)
 
     def available(self) -> bool:
         """True when Quartz is importable (the CGEventTap capability). The
@@ -501,7 +501,6 @@ class _MacOSTapBackend:
         if not ok:
             return False
         self._stop.clear()
-        self._last = self._read_watcher_counts()
         self._thread = threading.Thread(
             target=self._poll_loop, daemon=True, name="macos-input-poll",
         )
@@ -510,38 +509,48 @@ class _MacOSTapBackend:
 
     def stop(self) -> None:
         self._stop.set()
+        # Stop the poll thread first so it can't race the final drain below.
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        # Final drain: capture whatever accrued since the last poll (<= poll
+        # interval) before tearing down the tap, so a shutdown loses nothing.
+        presses, clicks, scrolls = self._drain_watcher_counts()
+        if presses > 0:
+            self._source._on_press(presses)
+        if clicks > 0:
+            self._source._on_click(clicks)
+        if scrolls > 0:
+            self._source._on_scroll(scrolls)
         if self._watcher is not None:
             try:
                 self._watcher.stop()
             except Exception:
                 logger.debug("MacOS input watcher stop failed", exc_info=True)
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        self._thread = None
 
-    def _read_watcher_counts(self) -> tuple[int, int, int]:
+    def _drain_watcher_counts(self) -> tuple[int, int, int]:
+        """Atomically read AND zero the watcher's counters under its lock, so
+        this backend is the SOLE drainer. With count_only=True the watcher has no
+        emitter subtracting concurrently, so nothing is lost between polls."""
         w = self._watcher
         if w is None:
             return (0, 0, 0)
-        # Read under the watcher's own lock so the triple is coherent.
         with w._lock:
-            return (w._presses, w._clicks, w._scrolls)
+            counts = (w._presses, w._clicks, w._scrolls)
+            w._presses = 0
+            w._clicks = 0
+            w._scrolls = 0
+            return counts
 
     def _poll_loop(self) -> None:
         while not self._stop.wait(self._POLL_INTERVAL_S):
-            cur = self._read_watcher_counts()
-            dp = cur[0] - self._last[0]
-            dc = cur[1] - self._last[1]
-            ds = cur[2] - self._last[2]
-            self._last = cur
-            # The watcher subtracts its counters after each emit, so a delta can
-            # go negative; clamp to 0 so a mid-emit read never under/over-counts.
-            if dp > 0:
-                self._source._on_press(dp)
-            if dc > 0:
-                self._source._on_click(dc)
-            if ds > 0:
-                self._source._on_scroll(ds)
+            presses, clicks, scrolls = self._drain_watcher_counts()
+            if presses > 0:
+                self._source._on_press(presses)
+            if clicks > 0:
+                self._source._on_click(clicks)
+            if scrolls > 0:
+                self._source._on_scroll(scrolls)
 
 
 class _NullAwClient:

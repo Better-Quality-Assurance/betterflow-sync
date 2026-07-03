@@ -1,7 +1,8 @@
+import threading
 from datetime import datetime, timedelta, timezone
 
 from src.sync.aw_client import BUCKET_TYPE_INPUT
-from src.sync.input_source import InputSource
+from src.sync.input_source import InputSource, _MacOSTapBackend
 
 T0 = datetime(2026, 6, 19, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -169,3 +170,55 @@ def test_event_omits_app_when_getter_blank_or_fails():
 def test_bucket_id_is_single_source_of_truth():
     src = _src(_FakeBackend())
     assert src.bucket_id == "bf-input-inproc_host"
+
+
+# -- macOS backend: drain (not delta) so nothing is lost to the emitter --------
+
+
+class _StubWatcher:
+    def __init__(self, presses=0, clicks=0, scrolls=0):
+        self._lock = threading.Lock()
+        self._presses = presses
+        self._clicks = clicks
+        self._scrolls = scrolls
+
+
+def test_macos_backend_drains_and_zeroes_watcher_counters():
+    backend = _MacOSTapBackend(_src(backend=None))
+    backend._watcher = _StubWatcher(presses=5, clicks=2, scrolls=1)
+    assert backend._drain_watcher_counts() == (5, 2, 1)
+    # Zeroed, so this backend is the SOLE drainer and the next drain starts fresh.
+    assert backend._drain_watcher_counts() == (0, 0, 0)
+
+
+def test_macos_backend_drain_accumulates_without_loss():
+    # Two poll ticks with fresh counts arriving between them: draining owns the
+    # reset, so nothing is lost (the old delta+emitter-subtract path could lose
+    # counts the watcher subtracted before the next poll).
+    src = _src(backend=None)
+    backend = _MacOSTapBackend(src)
+    w = _StubWatcher()
+    backend._watcher = w
+
+    def poll_once():
+        p, c, s = backend._drain_watcher_counts()
+        if p:
+            src._on_press(p)
+        if c:
+            src._on_click(c)
+        if s:
+            src._on_scroll(s)
+
+    with w._lock:
+        w._presses = 10
+    poll_once()
+    with w._lock:
+        w._presses = 7  # more arrived after the first drain
+    poll_once()
+    assert src.counts == (17, 0, 0)
+
+
+def test_macos_watcher_count_only_skips_emitter_flag():
+    from src.sync.macos_input_watcher import MacOSInputWatcher
+    assert MacOSInputWatcher(aw_client=object(), count_only=True)._count_only is True
+    assert MacOSInputWatcher(aw_client=object())._count_only is False

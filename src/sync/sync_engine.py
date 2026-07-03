@@ -2684,21 +2684,21 @@ class SyncEngine:
     def _commit_inproc_input_checkpoint(
         self, stats: SyncStats, pending: Optional[datetime]
     ) -> None:
-        """Advance the in-process input checkpoint past the just-drained span, but
-        only if its bucket wasn't queued (the send succeeded). On a queued/failed
-        send we leave the checkpoint where it was; the counts were already drained
-        into this cycle's (stable-id) event which the offline queue redelivers, so
-        the server upserts it idempotently — we must NOT rebuild from counters (the
-        drain already reset them). Forward-only advance, mirroring
-        ``_commit_inproc_window_checkpoint``."""
+        """Advance the in-process input checkpoint past the just-drained span.
+
+        UNLIKE the window/AFK commits, this advances even on a QUEUED (failed)
+        send. drain_input_event already destructively reset the counters into
+        this cycle's stable-id event, so the counts now live ONLY in that event —
+        which the offline queue redelivers, upserted idempotently by id. Holding
+        the checkpoint (as window/AFK do, to rebuild from samples) would instead
+        make the next cycle re-drain an already-empty counter into a duplicate,
+        overlapping span; there is no counter left to rebuild from. `stats` is
+        unused here for exactly that reason — the queued/not-queued distinction
+        doesn't change the advance. Forward-only, mirroring
+        ``_commit_inproc_window_checkpoint``'s monotonic guard."""
+        del stats  # intentionally unused; see docstring (advance is unconditional)
         if pending is None:
             return
-        inproc_bucket = self.input_source.bucket_id
-        if inproc_bucket in stats.queued_bucket_ids:
-            # The drained counts live in the queued event; advance anyway so we
-            # don't re-drain an empty counter into a duplicate span. The queued
-            # event's stable id makes the eventual redelivery idempotent.
-            pass
         cp = self._input_inproc_checkpoint
         if cp is None or pending > cp:
             self._input_inproc_checkpoint = pending
