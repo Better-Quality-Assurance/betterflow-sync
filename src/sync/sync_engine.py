@@ -232,6 +232,12 @@ class SyncEngine:
         # reach idle/paused devices whose sync-cadence heartbeat has gone
         # dormant. None until the first heartbeat this process.
         self._last_heartbeat_monotonic: Optional[float] = None
+        # Non-blocking guard so the send + command-processing body of
+        # _send_heartbeat runs on only one thread at a time. The sync-cadence
+        # path (_do_sync) and the 60s-tick heartbeat floor can both reach it,
+        # and on an idle device both are live with harmonic periods — see
+        # _send_heartbeat for why a second concurrent caller must no-op.
+        self._heartbeat_inflight = threading.Lock()
         # Optional callable returning agent-health telemetry to ride along with
         # each heartbeat (set by the SyncCoordinator, which owns the AwManager
         # and the sync-failure counter). Returning None / raising is tolerated.
@@ -3103,6 +3109,17 @@ class SyncEngine:
         # floor re-firing every tick (mirrors the paused-liveness throttle).
         with self._state_lock:
             self._last_heartbeat_monotonic = time.monotonic()
+        # Serialize the send + command-processing body. _send_heartbeat is
+        # reachable from two scheduler threads at once — the sync-cadence path
+        # (_do_sync → send_heartbeat_if_due) and the 60s-tick heartbeat floor
+        # (_tick_60s → send_heartbeat_now). On an idle device both are live and
+        # their periods are harmonics (cadence 5×300s, floor 300s), so they
+        # periodically fire near-coincidentally. Without this guard two
+        # concurrent runs would double-POST, double-upload logs, and race
+        # fetch_server_config() on the shared config object. The stamp above is
+        # already refreshed, so a second caller that no-ops loses nothing.
+        if not self._heartbeat_inflight.acquire(blocking=False):
+            return None
         try:
             health = None
             if self.health_provider is not None:
@@ -3190,6 +3207,8 @@ class SyncEngine:
             return e
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
+        finally:
+            self._heartbeat_inflight.release()
         return None
 
     def _upload_requested_logs(self) -> None:

@@ -269,14 +269,6 @@ class SyncCoordinator:
         self._input_tracking_ok: Optional[bool] = None  # None = not yet checked
         self._last_perm_warn_at: Optional[datetime] = None
 
-        # Liveness heartbeat while paused. The normal heartbeat rides _do_sync,
-        # which is skipped when paused (break / lock / manual), so a break longer
-        # than the server's 30-min stale-session cleanup gets its session marked
-        # "crashed" and tracking doesn't resume on return. Send a lightweight
-        # heartbeat from the 60s tick while paused-but-running to keep the
-        # session alive. monotonic-throttled so it's at most one per interval.
-        self._last_liveness_heartbeat: Optional[float] = None
-
         # Auth-warn throttle (Emilian, 2026-06-11): after his laptop restart
         # auto-login silently failed and the tray went to WAITING_AUTH without
         # any system notification — he could have worked a full day untracked.
@@ -896,7 +888,7 @@ class SyncCoordinator:
             (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
-            (self._liveness_heartbeat, "liveness_heartbeat"),
+            (self._heartbeat_floor, "heartbeat_floor"),
             (self._refresh_hours_today, "hours_refresh"),
             (self._check_permissions, "permissions"),
             (self._check_auth_warn, "auth_warn"),
@@ -1000,62 +992,60 @@ class SyncCoordinator:
 
     # Keep the server session alive at least this often while paused. Well under
     # the server's 30-min stale-session cleanup so a long break never trips it.
-    _LIVENESS_HEARTBEAT_INTERVAL = 300  # seconds
+    # How long the heartbeat may go dormant before the 60s tick forces one.
+    # Bounded ABOVE by the server's ~30-min stale-session cleanup (a paused
+    # device must beat well inside that or its session is marked 'crashed') and
+    # BELOW by the worst acceptable remote-command delivery latency — commands
+    # (pause / deregister / min-version / logs_requested) ride the heartbeat.
+    # 300s sits comfortably under the cleanup and caps command delivery to
+    # idle/paused devices at ~5 min. If ops ever needs faster command delivery,
+    # lowering this one number tightens both concerns (harmlessly).
+    _HEARTBEAT_FLOOR_INTERVAL = 300  # seconds
 
-    def _liveness_heartbeat(self) -> None:
-        """Heartbeat floor from the 60s tick — keep paused sessions alive AND
-        keep idle devices reachable by remote commands.
+    def _heartbeat_floor(self) -> None:
+        """Force a heartbeat from the 60s tick once the sync-cadence heartbeat
+        has gone dormant — keeping paused sessions alive AND idle devices
+        reachable by remote commands.
 
-        The normal heartbeat rides _do_sync. Two states leave it dormant:
+        The normal heartbeat rides _do_sync (every 5th sync cycle). Two states
+        leave it dormant:
 
-        - PAUSED (break / screen lock / manual / private): _do_sync early-returns,
-          so during a break longer than the server's 30-min cleanup last_seen_at
-          goes stale and the session is marked 'crashed' — tracking then doesn't
-          resume on return. A paused agent is alive, not crashed.
+        - PAUSED (break / screen lock / manual / private): _do_sync early-returns
+          before its heartbeat, so during a break longer than the server's 30-min
+          cleanup last_seen_at goes stale and the session is marked 'crashed' —
+          tracking then doesn't resume on return. A paused agent is alive.
         - IDLE: _do_sync keeps running but on the 300s reduced interval, so its
           every-5th-cycle heartbeat lands only ~every 25 min. Every server->agent
           command (pause / deregister / minimum_agent_version / logs_requested)
           rides that heartbeat, so on an idle device those take ~25 min to arrive.
 
-        Fire whenever the sync-cadence heartbeat has gone stale — which covers
-        both cases — capping keep-alive/command latency at ~one interval. Active
-        devices heartbeat ~every 150s, keeping the stamp under the floor, so this
-        never trips for them (no added load). Heartbeats only refresh
-        last_seen_at, never active/tracked time.
+        Both reduce to one condition: the last heartbeat (from ANY path) has aged
+        past the floor. The engine stamps every heartbeat attempt, so
+        seconds_since_last_heartbeat() is the single source of truth — no separate
+        throttle here, and no need to special-case paused vs idle. This floor's
+        own beat resets that stamp, so it self-throttles to one per interval.
+        Active devices heartbeat ~every 150s via the cadence path, keeping the
+        stamp fresh, so the floor never fires for them in steady state — it fires
+        once at cold start (before the first cadence beat, active or idle alike:
+        a single extra beat). Heartbeats only refresh last_seen_at, never
+        active/tracked time.
 
-        Skipped while offline (no server to reach). Throttled to one per interval.
+        Skipped only while logged out or offline (no server to reach).
         """
         if not self.logged_in:
             return
         if self.paused_by_network:
             return  # offline — the heartbeat would just fail; resume on reconnect
-        paused = (
-            self.sync_engine.is_paused
-            or self.sync_engine.is_private
-            or self.is_on_break
-        )
-        if not paused:
-            # Not paused — but if the device is idle, _do_sync is on the 300s
-            # interval and its heartbeat is ~25 min apart. Fire the floor once
-            # the sync-cadence heartbeat has gone stale so pending commands land
-            # within an interval. A fresh stamp (active device, ~150s heartbeat)
-            # stays under the floor and returns here — no added load. A None
-            # stamp (no beat yet, e.g. idle since startup) is treated as stale.
-            since = self.sync_engine.seconds_since_last_heartbeat()
-            if since is not None and since < self._LIVENESS_HEARTBEAT_INTERVAL:
-                return
-
-        now = time.monotonic()
-        if (
-            self._last_liveness_heartbeat is not None
-            and now - self._last_liveness_heartbeat < self._LIVENESS_HEARTBEAT_INTERVAL
-        ):
+        # Single source of truth: the engine stamps every heartbeat attempt
+        # (cadence path and this floor). A None stamp (no beat yet this process)
+        # is treated as stale so a device idle-since-startup still registers.
+        since = self.sync_engine.seconds_since_last_heartbeat()
+        if since is not None and since < self._HEARTBEAT_FLOOR_INTERVAL:
             return
-        self._last_liveness_heartbeat = now
 
         auth_err = self.sync_engine.send_heartbeat_now()
         if auth_err is not None:
-            self._handle_auth_error(auth_err, source="liveness_heartbeat")
+            self._handle_auth_error(auth_err, source="heartbeat_floor")
 
     # Must exceed the worst-case wall-clock of one in-cycle network chain so a
     # slow/hung server can't masquerade as a wedged sync. The batch-upload path
