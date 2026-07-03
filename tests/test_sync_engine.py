@@ -539,6 +539,32 @@ class TestSyncEngine:
             "second concurrent _send_heartbeat must no-op, not re-enter the body"
         )
 
+    def test_concurrent_no_op_loser_does_not_advance_stamp(self):
+        """The guard loser must NOT refresh the last-heartbeat stamp. Otherwise,
+        if the in-flight beat hangs past the floor interval, every subsequent
+        no-op loser would keep the stamp 'fresh' and the floor would silently
+        never fire — defeating command delivery to a device stuck behind a
+        wedged heartbeat. Only the guard holder (the real attempter) stamps."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_heartbeat(*_a, **_k):
+            entered.set()
+            release.wait(timeout=1.0)
+            return {"success": True, "data": {}}
+
+        self.bf.heartbeat.side_effect = slow_heartbeat
+        t1 = threading.Thread(target=self.engine._send_heartbeat)
+        t1.start()
+        assert entered.wait(1.0)  # t1 holds the guard and has already stamped
+        stamp_from_holder = self.engine._last_heartbeat_monotonic
+        assert stamp_from_holder is not None
+        # A losing caller must return without touching the stamp.
+        self.engine._send_heartbeat()
+        assert self.engine._last_heartbeat_monotonic == stamp_from_holder
+        release.set()
+        t1.join(2.0)
+
     def test_seconds_since_last_heartbeat_frozen_clock_stays_fresh(self):
         """monotonic can freeze across macOS sleep. If it does, the beat's age
         stays ~0 so the floor reads 'fresh' and won't fire a burst on wake — the

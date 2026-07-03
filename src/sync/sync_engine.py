@@ -3103,12 +3103,6 @@ class SyncEngine:
         re-login. Other client errors are logged at debug and swallowed —
         a transient heartbeat failure should not surface as a user error.
         """
-        # Stamp the attempt time up front (before the HTTP) so the 60s-tick
-        # heartbeat floor sees a fresh beat regardless of outcome — a down
-        # server then still counts as one attempt per interval instead of the
-        # floor re-firing every tick (mirrors the paused-liveness throttle).
-        with self._state_lock:
-            self._last_heartbeat_monotonic = time.monotonic()
         # Serialize the send + command-processing body. _send_heartbeat is
         # reachable from two scheduler threads at once — the sync-cadence path
         # (_do_sync → send_heartbeat_if_due) and the 60s-tick heartbeat floor
@@ -3116,11 +3110,21 @@ class SyncEngine:
         # their periods are harmonics (cadence 5×300s, floor 300s), so they
         # periodically fire near-coincidentally. Without this guard two
         # concurrent runs would double-POST, double-upload logs, and race
-        # fetch_server_config() on the shared config object. The stamp above is
-        # already refreshed, so a second caller that no-ops loses nothing.
+        # fetch_server_config() on the shared config object.
         if not self._heartbeat_inflight.acquire(blocking=False):
+            # A beat is already in flight; a second caller no-ops WITHOUT
+            # advancing the stamp — so if the in-flight beat ever hangs past the
+            # floor interval, the stamp keeps ageing (staleness stays truthful)
+            # rather than losers refreshing it to a false "fresh" and silently
+            # defeating the floor.
             return None
         try:
+            # Stamp the ATTEMPT time (before the HTTP) so a down/failed beat still
+            # counts as one attempt — the floor throttles on this and must not
+            # re-fire every 60s against a down server. Only the guard holder (the
+            # real attempter) advances it; see the acquire-failure branch above.
+            with self._state_lock:
+                self._last_heartbeat_monotonic = time.monotonic()
             health = None
             if self.health_provider is not None:
                 try:

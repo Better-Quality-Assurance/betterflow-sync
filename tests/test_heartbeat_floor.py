@@ -106,6 +106,20 @@ def test_paused_device_kept_alive_when_stamp_stale():
     coord.sync_engine.send_heartbeat_now.assert_called_once()
 
 
+def test_paused_but_fresh_stamp_does_not_fire():
+    """The floor tracks staleness, not the paused-family flags: a paused device
+    whose stamp is still fresh (the floor itself beat recently) must NOT beat
+    again — self-throttling holds even while paused. Guards against anyone
+    re-adding a paused fast-path that ignores the stamp."""
+    coord = _make_coordinator()
+    coord.sync_engine.is_paused = True
+    coord.break_mgr.is_on_break = True
+    coord.sync_engine.is_private = True
+    coord.sync_engine.seconds_since_last_heartbeat.return_value = 100.0  # fresh
+    coord._heartbeat_floor()
+    coord.sync_engine.send_heartbeat_now.assert_not_called()
+
+
 def test_offline_skips():
     """Stale but offline: no server to reach, don't try; resume on reconnect."""
     coord = _make_coordinator()
