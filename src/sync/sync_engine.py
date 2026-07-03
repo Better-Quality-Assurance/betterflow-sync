@@ -64,6 +64,13 @@ def _is_afk_like(bucket_type: str) -> bool:
     return bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)
 
 
+def _is_input_like(bucket_type: str) -> bool:
+    """Input buckets (keystroke/click/scroll counts, fraud detection). Single
+    source of truth so suppressing the external aw-watcher-input bucket when the
+    in-process source is active is a one-line membership check."""
+    return bucket_type == BUCKET_TYPE_INPUT
+
+
 # Seconds the latest AFK event may lag "now" before the tracker is presumed
 # frozen. A healthy bf-idle-tracker heartbeats its current event continuously,
 # so its end-time tracks now; a larger gap means it hung/went blind and its last
@@ -286,6 +293,19 @@ class SyncEngine:
         # NB: the per-cycle "pending" checkpoint is a LOCAL in sync() (threaded
         # build -> commit), not an instance field — see _build_inproc_window for
         # why (wedge re-arm can run two sync()s concurrently).
+
+        # Optional in-process INPUT source (set by the SyncCoordinator), the
+        # keystroke/click/scroll-count analogue of window_source. When present,
+        # enabled by config, and an in-process counting backend is usable
+        # (Windows ctypes hooks / macOS CGEventTap; off on Linux), the agent
+        # uploads its own input-count stream and the external aw-watcher-input
+        # bucket is skipped so the two never double-count. Ships dormant
+        # (in_process_input defaults False). Counts accrue continuously on the
+        # backend listener thread; the sync thread only DRAINS them into an event
+        # each cycle. Checkpoint committed only after a confirmed send, mirroring
+        # AFK/window. Mutated only on the sync thread.
+        self.input_source = None
+        self._input_inproc_checkpoint: Optional[datetime] = None
 
         # Monotonic timestamp of the current sync() cycle's start, stamped at the
         # top of sync(). Gates the per-bucket send loop's in-cycle network budget
@@ -747,8 +767,15 @@ class SyncEngine:
         # with the engine every active cycle — one source of truth, not a cache a
         # separate timer keeps in sync (and silently failed to: Bug A, #76/#78).
         self._publish_inproc_afk_flag(skip_external_afk)
+        # When the agent counts input in-process (the sole input source), drop the
+        # external aw-watcher-input bucket(s) so its (possibly hook-blocked, zero)
+        # events never reach the server and can't double-count. No-op when the
+        # flag is off (default): the external input bucket syncs exactly as today.
+        skip_external_input = self._should_skip_external_input()
         for bucket in web_buckets + afk_buckets + input_buckets:
             if skip_external_afk and _is_afk_like(bucket.type):
+                continue
+            if skip_external_input and _is_input_like(bucket.type):
                 continue
             try:
                 events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats, cycle)
@@ -784,6 +811,18 @@ class SyncEngine:
             )
             all_events.extend(window_events)
 
+        # Pending in-process input checkpoint for this cycle, kept as a LOCAL for
+        # the same wedge-recovery reason window_pending is (see _build_inproc_window).
+        input_pending: Optional[datetime] = None
+        if skip_external_input:
+            # Sole-source path: drain the accumulated keystroke/click/scroll
+            # counts into one event for the slice since the last covered instant.
+            input_event, input_pending = self._build_inproc_input(
+                datetime.now(timezone.utc)
+            )
+            if input_event is not None:
+                all_events.append(input_event)
+
         # Flush any ongoing call at sync boundary
         if self._call_detector:
             remaining = self._call_detector.flush()
@@ -801,6 +840,8 @@ class SyncEngine:
         # Same discipline for the in-process window stream: advance its checkpoint
         # only after a confirmed send. Pass this cycle's own pending value.
         self._commit_inproc_window_checkpoint(stats, window_pending)
+        # Same discipline for the in-process input stream.
+        self._commit_inproc_input_checkpoint(stats, input_pending)
 
         # Process offline queue if we're online — but only if this cycle hasn't
         # already burned most of the watchdog budget on a slow/hung regular send
@@ -2575,6 +2616,92 @@ class SyncEngine:
         cp = self._window_inproc_checkpoint
         if cp is None or pending > cp:
             self._window_inproc_checkpoint = pending
+
+    def _should_use_inproc_input(self) -> bool:
+        """True when the in-process input source should be the sole input source —
+        config flag on, a source is wired, and an in-process counting backend is
+        usable (Windows ctypes hooks / macOS CGEventTap; False on Linux). Gates
+        every in-process-input action, so the whole path is a no-op when the flag
+        is off (default). Mirrors ``_should_use_inproc_window``."""
+        return (
+            bool(self.config.sync.in_process_input)
+            and self.input_source is not None
+            and self.input_source.available()
+        )
+
+    def _should_skip_external_input(self) -> bool:
+        """Whether to drop the external aw-watcher-input bucket(s) from this
+        cycle's upload (because the agent uploads its own count stream instead).
+        Mirrors ``_should_skip_external_afk`` / ``_should_skip_external_window``.
+
+        Note: unlike the window source, the input backend has no per-sample
+        "blind" fallback — a period with no keystrokes is a legitimate gap, not a
+        blind probe. If the backend fails to install at all, ``available()`` never
+        latches on and this returns False, so the external tracker keeps its job.
+        """
+        return self._should_use_inproc_input()
+
+    def _build_inproc_input(
+        self, now: datetime
+    ) -> tuple[Optional[dict], Optional[datetime]]:
+        """Drain accumulated input counts into one event for [checkpoint, now].
+        First cycle seeds the checkpoint at `now` (account only while running).
+
+        Returns ``(event_or_None, pending)`` where `pending` is the checkpoint the
+        caller must commit via ``_commit_inproc_input_checkpoint`` AFTER a
+        confirmed send. The pending value is RETURNED, not stored on the instance,
+        for the same wedge-recovery concurrency reason as ``_build_inproc_window``.
+
+        Re-seed rather than build when the checkpoint can't be trusted (mirrors
+        _build_inproc_window):
+          - now <= cp: the wall clock stepped backward (NTP/manual), or nothing
+            new to cover. Re-seed to `now` so the stream doesn't stall. Any counts
+            accrued so far are intentionally dropped (we can't attribute them to a
+            trustworthy range) — unlike window/AFK, counts have no sample log to
+            rebuild from, but a clock step back is rare and bounded.
+        Unlike AFK/window there is no gap>retention branch: counts don't come from
+        a time-bounded sample deque, so a long sleep simply means whatever was
+        typed before it drains into the (long) span — harmless, since the counts
+        themselves are real. The drain returns None on a zero-count span, so an
+        idle span emits nothing."""
+        if not self._should_use_inproc_input():
+            return None, None
+        cp = self._input_inproc_checkpoint
+        if cp is None:
+            self._input_inproc_checkpoint = now
+            return None, None
+        if now <= cp:
+            self._input_inproc_checkpoint = now
+            return None, None
+        event = self.input_source.drain_input_event(cp, now)
+        if event is None:
+            # Nothing counted this span: advance the checkpoint so the next span
+            # starts at `now` (no event to send, so no confirmed-send gate needed).
+            self._input_inproc_checkpoint = now
+            return None, None
+        return event, now
+
+    def _commit_inproc_input_checkpoint(
+        self, stats: SyncStats, pending: Optional[datetime]
+    ) -> None:
+        """Advance the in-process input checkpoint past the just-drained span.
+
+        UNLIKE the window/AFK commits, this advances even on a QUEUED (failed)
+        send. drain_input_event already destructively reset the counters into
+        this cycle's stable-id event, so the counts now live ONLY in that event —
+        which the offline queue redelivers, upserted idempotently by id. Holding
+        the checkpoint (as window/AFK do, to rebuild from samples) would instead
+        make the next cycle re-drain an already-empty counter into a duplicate,
+        overlapping span; there is no counter left to rebuild from. `stats` is
+        unused here for exactly that reason — the queued/not-queued distinction
+        doesn't change the advance. Forward-only, mirroring
+        ``_commit_inproc_window_checkpoint``'s monotonic guard."""
+        del stats  # intentionally unused; see docstring (advance is unconditional)
+        if pending is None:
+            return
+        cp = self._input_inproc_checkpoint
+        if cp is None or pending > cp:
+            self._input_inproc_checkpoint = pending
 
     def _report_inproc_blind(self, failures: int) -> None:
         """Surface a blind in-process idle clock to the ops ingest. Logged-only

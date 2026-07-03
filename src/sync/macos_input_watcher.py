@@ -46,9 +46,14 @@ class MacOSInputWatcher:
     # of toggling the switch in System Settings, without spamming logs.
     _PERMISSION_RETRY_INTERVAL_S = 30.0
 
-    def __init__(self, aw_client, emit_interval: float = 10.0):
+    def __init__(self, aw_client, emit_interval: float = 10.0, count_only: bool = False):
         self._aw = aw_client
         self._emit_interval = emit_interval
+        # count_only: run ONLY the CGEventTap counter — no emitter thread and no
+        # AW bucket. The in-process InputSource macOS backend uses this and
+        # drains the raw counters itself; running the emitter too would subtract
+        # the counts out from under the backend and undercount.
+        self._count_only = count_only
         self._stop_event = threading.Event()
         self._tap_thread: Optional[threading.Thread] = None
         self._emit_thread: Optional[threading.Thread] = None
@@ -139,10 +144,11 @@ class MacOSInputWatcher:
             )
             self._ensure_permission_retry()
             return False
-        try:
-            self._aw.create_bucket(self._bucket_id, "aw-watcher-input", self._hostname)
-        except Exception as e:
-            logger.warning(f"Failed to create input bucket: {e}")
+        if not self._count_only:
+            try:
+                self._aw.create_bucket(self._bucket_id, "aw-watcher-input", self._hostname)
+            except Exception as e:
+                logger.warning(f"Failed to create input bucket: {e}")
 
         # Reset stop signal so new threads don't exit immediately
         self._stop_event.clear()
@@ -157,14 +163,16 @@ class MacOSInputWatcher:
         self._tap_thread = threading.Thread(
             target=self._run_tap, daemon=True, name="macos-input-tap",
         )
-        self._emit_thread = threading.Thread(
-            target=self._run_emitter, daemon=True, name="macos-input-emitter",
-        )
         self._tap_thread.start()
-        self._emit_thread.start()
+        # count_only: no emitter — the backend drains the counters itself.
+        if not self._count_only:
+            self._emit_thread = threading.Thread(
+                target=self._run_emitter, daemon=True, name="macos-input-emitter",
+            )
+            self._emit_thread.start()
         logger.info(
             f"MacOSInputWatcher started (bucket={self._bucket_id}, "
-            f"interval={self._emit_interval}s)"
+            f"count_only={self._count_only}, interval={self._emit_interval}s)"
         )
         return True
 
