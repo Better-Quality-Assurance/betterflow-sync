@@ -990,8 +990,6 @@ class SyncCoordinator:
             trigger_sync=self.trigger_sync,
         )
 
-    # Keep the server session alive at least this often while paused. Well under
-    # the server's 30-min stale-session cleanup so a long break never trips it.
     # How long the heartbeat may go dormant before the 60s tick forces one.
     # Bounded ABOVE by the server's ~30-min stale-session cleanup (a paused
     # device must beat well inside that or its session is marked 'crashed') and
