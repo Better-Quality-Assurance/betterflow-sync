@@ -483,6 +483,109 @@ class TestSyncEngine:
         self.bf.upload_logs.assert_called_once()
         self.engine.error_reporter.capture.assert_not_called()
 
+    def test_heartbeat_stamps_last_beat_time(self):
+        """_send_heartbeat records a monotonic stamp so the 60s-tick heartbeat
+        floor (main loop) can measure how long since the sync-cadence heartbeat
+        last fired. Exercised through the real engine, not a forwarded mock:
+        None before the first beat, a small non-negative age after."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {}}
+        assert self.engine.seconds_since_last_heartbeat() is None
+        self.engine._send_heartbeat()
+        since = self.engine.seconds_since_last_heartbeat()
+        assert since is not None and since >= 0.0
+
+    def test_heartbeat_stamps_even_on_client_error(self):
+        """The stamp updates on ATTEMPT (before the HTTP), so a down server
+        can't leave the floor thinking a beat never happened and re-firing every
+        tick — one attempt per interval, mirroring the paused-liveness throttle."""
+        from src.sync.http_client import BetterFlowClientError
+        self.bf.heartbeat.side_effect = BetterFlowClientError("500")
+        self.engine._send_heartbeat()
+        assert self.engine.seconds_since_last_heartbeat() is not None
+
+    def test_concurrent_send_heartbeat_no_double_dispatch(self):
+        """_send_heartbeat is reachable from two scheduler threads at once (the
+        sync-cadence path and the 60s-tick floor), which for an idle device are
+        both live with harmonic periods. The non-blocking in-flight guard must
+        make a second concurrent caller no-op instead of double-POSTing and
+        double-processing commands (e.g. a double logs_requested upload)."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_heartbeat(*_a, **_k):
+            entered.set()
+            release.wait(timeout=1.0)
+            return {"success": True, "data": {"logs_requested": True}}
+
+        self.bf.heartbeat.side_effect = slow_heartbeat
+        with patch.object(SyncEngine, "_read_log_tail", return_value=b"x"):
+            t1 = threading.Thread(target=self.engine._send_heartbeat)
+            t1.start()
+            assert entered.wait(1.0)  # t1 now holds the guard, inside heartbeat()
+            entered.clear()
+            t2 = threading.Thread(target=self.engine._send_heartbeat)
+            t2.start()
+            # Guarded: t2 no-ops fast. Unguarded (the bug): t2 re-enters
+            # heartbeat() and blocks on release, re-setting `entered`.
+            t2.join(0.3)
+            second_re_entered = entered.is_set()
+            release.set()
+            t1.join(2.0)
+            t2.join(2.0)
+
+        assert self.bf.heartbeat.call_count == 1
+        self.bf.upload_logs.assert_called_once()
+        assert not second_re_entered, (
+            "second concurrent _send_heartbeat must no-op, not re-enter the body"
+        )
+
+    def test_concurrent_no_op_loser_does_not_advance_stamp(self):
+        """The guard loser must NOT refresh the last-heartbeat stamp. Otherwise,
+        if the in-flight beat hangs past the floor interval, every subsequent
+        no-op loser would keep the stamp 'fresh' and the floor would silently
+        never fire — defeating command delivery to a device stuck behind a
+        wedged heartbeat. Only the guard holder (the real attempter) stamps."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_heartbeat(*_a, **_k):
+            entered.set()
+            release.wait(timeout=1.0)
+            return {"success": True, "data": {}}
+
+        self.bf.heartbeat.side_effect = slow_heartbeat
+        t1 = threading.Thread(target=self.engine._send_heartbeat)
+        t1.start()
+        assert entered.wait(1.0)  # t1 holds the guard and has already stamped
+        stamp_from_holder = self.engine._last_heartbeat_monotonic
+        assert stamp_from_holder is not None
+        # A losing caller must return without touching the stamp.
+        self.engine._send_heartbeat()
+        assert self.engine._last_heartbeat_monotonic == stamp_from_holder
+        release.set()
+        t1.join(2.0)
+
+    def test_seconds_since_last_heartbeat_frozen_clock_stays_fresh(self):
+        """monotonic can freeze across macOS sleep. If it does, the beat's age
+        stays ~0 so the floor reads 'fresh' and won't fire a burst on wake — the
+        lid-flap protection the audit added, now at the engine stamp (its single
+        source of truth) instead of a separate main.py throttle."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {}}
+        with patch("src.sync.sync_engine.time.monotonic", return_value=1000.0):
+            self.engine._send_heartbeat()  # stamp = 1000
+            assert self.engine.seconds_since_last_heartbeat() == 0.0
+
+    def test_seconds_since_last_heartbeat_backward_clock_reads_fresh(self):
+        """A backward-jumping monotonic yields a negative age, which is below any
+        positive floor, so it reads as fresh — never a spurious stale-fire."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {}}
+        with patch(
+            "src.sync.sync_engine.time.monotonic", side_effect=[1000.0, 500.0]
+        ):
+            self.engine._send_heartbeat()  # stamp = 1000
+            since = self.engine.seconds_since_last_heartbeat()  # reads 500
+        assert since == -500.0  # < any positive floor -> treated fresh
+
     def test_heartbeat_below_min_version_triggers_update(self):
         """When the server advertises a minimum_agent_version above ours, the
         heartbeat fires on_update_required so the handler can stage the build —

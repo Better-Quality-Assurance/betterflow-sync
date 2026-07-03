@@ -226,6 +226,18 @@ class SyncEngine:
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
+        # Monotonic time of the last heartbeat ATTEMPT (any path — the
+        # sync-cadence heartbeat and the 60s-tick floor both funnel through
+        # _send_heartbeat). The main loop's heartbeat floor reads its age to
+        # reach idle/paused devices whose sync-cadence heartbeat has gone
+        # dormant. None until the first heartbeat this process.
+        self._last_heartbeat_monotonic: Optional[float] = None
+        # Non-blocking guard so the send + command-processing body of
+        # _send_heartbeat runs on only one thread at a time. The sync-cadence
+        # path (_do_sync) and the 60s-tick heartbeat floor can both reach it,
+        # and on an idle device both are live with harmonic periods — see
+        # _send_heartbeat for why a second concurrent caller must no-op.
+        self._heartbeat_inflight = threading.Lock()
         # Optional callable returning agent-health telemetry to ride along with
         # each heartbeat (set by the SyncCoordinator, which owns the AwManager
         # and the sync-failure counter). Returning None / raising is tolerated.
@@ -3069,6 +3081,21 @@ class SyncEngine:
         """
         return self._send_heartbeat()
 
+    def seconds_since_last_heartbeat(self) -> Optional[float]:
+        """Monotonic age of the last heartbeat attempt (any path), or None if
+        none has been sent this process. The main loop's 60s-tick heartbeat
+        floor reads this to reach idle/paused devices whose sync-cadence
+        heartbeat has gone dormant: an idle device drops to the 300s sync
+        interval, whose every-5th-cycle heartbeat is ~25 min apart, so remote
+        commands (pause / deregister / min-version / logs_requested) would
+        otherwise take that long to land. Active devices heartbeat ~every 150s,
+        keeping this age under the floor, so the floor never fires for them."""
+        with self._state_lock:
+            last = self._last_heartbeat_monotonic
+        if last is None:
+            return None
+        return time.monotonic() - last
+
     def _send_heartbeat(self) -> Optional["BetterFlowAuthError"]:
         """Send heartbeat to server and process commands.
 
@@ -3076,7 +3103,28 @@ class SyncEngine:
         re-login. Other client errors are logged at debug and swallowed —
         a transient heartbeat failure should not surface as a user error.
         """
+        # Serialize the send + command-processing body. _send_heartbeat is
+        # reachable from two scheduler threads at once — the sync-cadence path
+        # (_do_sync → send_heartbeat_if_due) and the 60s-tick heartbeat floor
+        # (_tick_60s → send_heartbeat_now). On an idle device both are live and
+        # their periods are harmonics (cadence 5×300s, floor 300s), so they
+        # periodically fire near-coincidentally. Without this guard two
+        # concurrent runs would double-POST, double-upload logs, and race
+        # fetch_server_config() on the shared config object.
+        if not self._heartbeat_inflight.acquire(blocking=False):
+            # A beat is already in flight; a second caller no-ops WITHOUT
+            # advancing the stamp — so if the in-flight beat ever hangs past the
+            # floor interval, the stamp keeps ageing (staleness stays truthful)
+            # rather than losers refreshing it to a false "fresh" and silently
+            # defeating the floor.
+            return None
         try:
+            # Stamp the ATTEMPT time (before the HTTP) so a down/failed beat still
+            # counts as one attempt — the floor throttles on this and must not
+            # re-fire every 60s against a down server. Only the guard holder (the
+            # real attempter) advances it; see the acquire-failure branch above.
+            with self._state_lock:
+                self._last_heartbeat_monotonic = time.monotonic()
             health = None
             if self.health_provider is not None:
                 try:
@@ -3163,6 +3211,8 @@ class SyncEngine:
             return e
         except BetterFlowClientError as e:
             logger.debug(f"Heartbeat failed: {e}")
+        finally:
+            self._heartbeat_inflight.release()
         return None
 
     def _upload_requested_logs(self) -> None:
