@@ -1003,17 +1003,27 @@ class SyncCoordinator:
     _LIVENESS_HEARTBEAT_INTERVAL = 300  # seconds
 
     def _liveness_heartbeat(self) -> None:
-        """Heartbeat while paused-but-running so the server keeps the session.
+        """Heartbeat floor from the 60s tick — keep paused sessions alive AND
+        keep idle devices reachable by remote commands.
 
-        The normal heartbeat rides _do_sync, which early-returns when paused
-        (break / screen lock / manual / private), so during a break longer than
-        the server's 30-min cleanup the device's last_seen_at goes stale and the
-        session is marked 'crashed' — then tracking doesn't resume on return.
-        A paused agent is alive, not crashed: send a lightweight heartbeat to
-        keep the session open. It only refreshes last_seen_at, never active time.
+        The normal heartbeat rides _do_sync. Two states leave it dormant:
 
-        Skipped while actively syncing (that path already heartbeats) and while
-        offline (no server to reach). Throttled to one per interval.
+        - PAUSED (break / screen lock / manual / private): _do_sync early-returns,
+          so during a break longer than the server's 30-min cleanup last_seen_at
+          goes stale and the session is marked 'crashed' — tracking then doesn't
+          resume on return. A paused agent is alive, not crashed.
+        - IDLE: _do_sync keeps running but on the 300s reduced interval, so its
+          every-5th-cycle heartbeat lands only ~every 25 min. Every server->agent
+          command (pause / deregister / minimum_agent_version / logs_requested)
+          rides that heartbeat, so on an idle device those take ~25 min to arrive.
+
+        Fire whenever the sync-cadence heartbeat has gone stale — which covers
+        both cases — capping keep-alive/command latency at ~one interval. Active
+        devices heartbeat ~every 150s, keeping the stamp under the floor, so this
+        never trips for them (no added load). Heartbeats only refresh
+        last_seen_at, never active/tracked time.
+
+        Skipped while offline (no server to reach). Throttled to one per interval.
         """
         if not self.logged_in:
             return
@@ -1025,7 +1035,15 @@ class SyncCoordinator:
             or self.is_on_break
         )
         if not paused:
-            return  # active sync already sends heartbeats
+            # Not paused — but if the device is idle, _do_sync is on the 300s
+            # interval and its heartbeat is ~25 min apart. Fire the floor once
+            # the sync-cadence heartbeat has gone stale so pending commands land
+            # within an interval. A fresh stamp (active device, ~150s heartbeat)
+            # stays under the floor and returns here — no added load. A None
+            # stamp (no beat yet, e.g. idle since startup) is treated as stale.
+            since = self.sync_engine.seconds_since_last_heartbeat()
+            if since is not None and since < self._LIVENESS_HEARTBEAT_INTERVAL:
+                return
 
         now = time.monotonic()
         if (

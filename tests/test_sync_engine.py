@@ -483,6 +483,26 @@ class TestSyncEngine:
         self.bf.upload_logs.assert_called_once()
         self.engine.error_reporter.capture.assert_not_called()
 
+    def test_heartbeat_stamps_last_beat_time(self):
+        """_send_heartbeat records a monotonic stamp so the 60s-tick heartbeat
+        floor (main loop) can measure how long since the sync-cadence heartbeat
+        last fired. Exercised through the real engine, not a forwarded mock:
+        None before the first beat, a small non-negative age after."""
+        self.bf.heartbeat.return_value = {"success": True, "data": {}}
+        assert self.engine.seconds_since_last_heartbeat() is None
+        self.engine._send_heartbeat()
+        since = self.engine.seconds_since_last_heartbeat()
+        assert since is not None and since >= 0.0
+
+    def test_heartbeat_stamps_even_on_client_error(self):
+        """The stamp updates on ATTEMPT (before the HTTP), so a down server
+        can't leave the floor thinking a beat never happened and re-firing every
+        tick — one attempt per interval, mirroring the paused-liveness throttle."""
+        from src.sync.http_client import BetterFlowClientError
+        self.bf.heartbeat.side_effect = BetterFlowClientError("500")
+        self.engine._send_heartbeat()
+        assert self.engine.seconds_since_last_heartbeat() is not None
+
     def test_heartbeat_below_min_version_triggers_update(self):
         """When the server advertises a minimum_agent_version above ours, the
         heartbeat fires on_update_required so the handler can stage the build —

@@ -226,6 +226,12 @@ class SyncEngine:
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
+        # Monotonic time of the last heartbeat ATTEMPT (any path — the
+        # sync-cadence heartbeat and the 60s-tick floor both funnel through
+        # _send_heartbeat). The main loop's heartbeat floor reads its age to
+        # reach idle/paused devices whose sync-cadence heartbeat has gone
+        # dormant. None until the first heartbeat this process.
+        self._last_heartbeat_monotonic: Optional[float] = None
         # Optional callable returning agent-health telemetry to ride along with
         # each heartbeat (set by the SyncCoordinator, which owns the AwManager
         # and the sync-failure counter). Returning None / raising is tolerated.
@@ -3069,6 +3075,21 @@ class SyncEngine:
         """
         return self._send_heartbeat()
 
+    def seconds_since_last_heartbeat(self) -> Optional[float]:
+        """Monotonic age of the last heartbeat attempt (any path), or None if
+        none has been sent this process. The main loop's 60s-tick heartbeat
+        floor reads this to reach idle/paused devices whose sync-cadence
+        heartbeat has gone dormant: an idle device drops to the 300s sync
+        interval, whose every-5th-cycle heartbeat is ~25 min apart, so remote
+        commands (pause / deregister / min-version / logs_requested) would
+        otherwise take that long to land. Active devices heartbeat ~every 150s,
+        keeping this age under the floor, so the floor never fires for them."""
+        with self._state_lock:
+            last = self._last_heartbeat_monotonic
+        if last is None:
+            return None
+        return time.monotonic() - last
+
     def _send_heartbeat(self) -> Optional["BetterFlowAuthError"]:
         """Send heartbeat to server and process commands.
 
@@ -3076,6 +3097,12 @@ class SyncEngine:
         re-login. Other client errors are logged at debug and swallowed —
         a transient heartbeat failure should not surface as a user error.
         """
+        # Stamp the attempt time up front (before the HTTP) so the 60s-tick
+        # heartbeat floor sees a fresh beat regardless of outcome — a down
+        # server then still counts as one attempt per interval instead of the
+        # floor re-firing every tick (mirrors the paused-liveness throttle).
+        with self._state_lock:
+            self._last_heartbeat_monotonic = time.monotonic()
         try:
             health = None
             if self.health_provider is not None:

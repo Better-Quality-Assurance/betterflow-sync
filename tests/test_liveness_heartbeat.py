@@ -43,6 +43,10 @@ def _make_coordinator() -> SyncCoordinator:
 
 def test_no_heartbeat_while_actively_syncing():
     coord = _make_coordinator()  # not paused
+    # Active device: the sync-cadence heartbeat is fresh (well under the floor),
+    # so the 60s tick must not add a beat. Pin it deterministically — the floor
+    # now consults this age when the device isn't paused.
+    coord.sync_engine.seconds_since_last_heartbeat.return_value = 10.0
     coord._liveness_heartbeat()
     coord.sync_engine.send_heartbeat_now.assert_not_called()
 
