@@ -624,8 +624,26 @@ class SyncEngine:
         self._maybe_rollover_counted_day()
 
         with self._state_lock:
-            if self._paused or self._private_mode:
-                return stats
+            paused = self._paused
+            private_mode = self._private_mode
+            private_start = self._private_start
+        if paused or private_mode:
+            # While Private Time is on, nothing is synced — so the backend
+            # cannot tell an ongoing private session from a network gap, and
+            # its tracked-hours trailing grace painted the window as counted
+            # "Tracked time" until the leave-time private_time event finally
+            # arrived (Ecaterina/Martin, 2026-07-07). Re-send the growing span
+            # every cycle: same deterministic id (private_<startts>_<engine>),
+            # so the server patches the duration in place and the timeline
+            # shows Private within one sync cycle instead of only after the
+            # session ends. Snapshots are NOT queued on failure — the next
+            # cycle's longer span supersedes this one; only the final
+            # leave-time send (set_private_mode) is queued for retry.
+            if private_mode and private_start is not None:
+                self._send_status_span(
+                    kind="private", start=private_start, queue_on_failure=False
+                )
+            return stats
 
         # Fetch server config on first successful sync
         if not self._config_fetched and self.bf.is_reachable():
@@ -2126,12 +2144,21 @@ class SyncEngine:
         kind: str,
         start: datetime,
         end: Optional[datetime] = None,
+        queue_on_failure: bool = True,
     ) -> None:
         """Send a duration event for a state-span (break/idle/private).
 
         Consolidates three formerly-identical send_*_event helpers. The only
         variation between them was the ``kind`` string used in the id prefix,
         bucket_type, and data.status field.
+
+        ``queue_on_failure=False`` is for periodic in-progress snapshots of a
+        still-growing span (the per-cycle private_time refresh): a failed
+        snapshot must not be queued because the next cycle re-sends the same
+        event id with a longer duration, which supersedes it — queueing every
+        snapshot would replay a stack of stale intermediate durations after
+        an outage. Final spans (sent when the state ends) keep the default
+        and are queued for offline retry.
         """
         if end is None:
             end = datetime.now(timezone.utc)
@@ -2174,9 +2201,15 @@ class SyncEngine:
             return
         if result.success:
             logger.info("Sent %s event (%.0fs)", bucket_type, duration)
-        else:
+        elif queue_on_failure:
             logger.warning("Failed to send %s event: %s — queueing", bucket_type, result.error or "unknown")
             self.queue.enqueue([event])
+        else:
+            # In-progress snapshot: superseded by the next cycle's re-send.
+            logger.debug(
+                "Failed to send %s snapshot: %s — not queued (next cycle re-sends)",
+                bucket_type, result.error or "unknown",
+            )
 
     def send_break_event(self, start: datetime, end: Optional[datetime] = None) -> None:
         """Send a break_time event covering the break duration."""

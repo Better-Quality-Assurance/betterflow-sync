@@ -1484,6 +1484,102 @@ class TestStatusSpanEvents:
         assert break_ev["data"]["status"] == "break"
 
 
+class TestPrivateOngoingSpanRefresh:
+    """While Private Time is ON, each sync cycle re-sends the growing span.
+
+    Without this the backend hears nothing until the user leaves private, so
+    an ongoing private session is indistinguishable from a network gap and the
+    dashboard's tracked-hours trailing grace painted it as counted "Tracked
+    time" (Ecaterina/Martin, 2026-07-07). The re-send uses the same
+    deterministic event id every cycle so the server patches the duration in
+    place instead of inserting duplicate rows.
+    """
+
+    def setup_method(self):
+        from src.sync.bf_client import SyncResult
+        self.aw = Mock()
+        self.bf = Mock()
+        self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
+        self.queue = Mock()
+        self.queue.get_checkpoint.return_value = None
+        self.config = Config()
+        self.engine = SyncEngine(
+            aw=self.aw, bf=self.bf, queue=self.queue, config=self.config,
+            activity_analyzer=Mock(spec=ActivityAnalyzer),
+            time_tracker=Mock(spec=DailyTimeTracker),
+        )
+
+    def _enter_private(self, seconds_ago=120):
+        self.engine._private_mode = True
+        self.engine._private_start = (
+            datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        )
+
+    def test_sync_while_private_sends_growing_span_with_stable_id(self):
+        self._enter_private(seconds_ago=120)
+
+        self.engine.sync()
+        assert self.bf.send_events.call_count == 1
+        first = self.bf.send_events.call_args[0][0][0]
+        assert first["bucket_type"] == "private_time"
+        assert first["data"]["status"] == "private"
+        assert first["duration"] == pytest.approx(120, abs=5)
+
+        self.engine.sync()
+        assert self.bf.send_events.call_count == 2
+        second = self.bf.send_events.call_args[0][0][0]
+        # Same deterministic id → the server patches the row in place.
+        assert second["id"] == first["id"]
+        assert second["duration"] >= first["duration"]
+
+    def test_private_snapshot_failure_is_not_queued(self):
+        """A failed in-progress snapshot must NOT be queued: the next cycle
+        re-sends the same id with a longer duration, superseding it. Queueing
+        every snapshot would replay a stack of stale durations after an
+        outage."""
+        from src.sync.bf_client import SyncResult
+        self.bf.send_events.return_value = SyncResult(success=False, error="offline")
+        self._enter_private()
+
+        self.engine.sync()
+
+        self.queue.enqueue.assert_not_called()
+
+    def test_leave_private_final_span_shares_id_with_snapshots(self):
+        """The leave-time event must carry the SAME id as the per-cycle
+        snapshots, otherwise the server would keep both the snapshot row and
+        a separate final row and double-count the private window."""
+        self._enter_private(seconds_ago=300)
+
+        self.engine.sync()
+        snapshot = self.bf.send_events.call_args[0][0][0]
+
+        self.engine.set_private_mode(False)
+        final = self.bf.send_events.call_args[0][0][0]
+        assert final["bucket_type"] == "private_time"
+        assert final["id"] == snapshot["id"]
+        assert final["duration"] >= snapshot["duration"]
+
+    def test_paused_sync_sends_no_private_span(self):
+        """Pause (break/screen lock) is not Private Time — the early return
+        must stay silent."""
+        self.engine._paused = True
+
+        self.engine.sync()
+
+        self.bf.send_events.assert_not_called()
+
+    def test_private_without_start_sends_nothing(self):
+        """Defensive: private flag set but no start timestamp — never send a
+        span with an unbounded start."""
+        self.engine._private_mode = True
+        self.engine._private_start = None
+
+        self.engine.sync()
+
+        self.bf.send_events.assert_not_called()
+
+
 class TestSystemSleepWakeEmitsSleepSpan:
     """on_system_wake must emit a sleep_time event for the sleep span."""
 
