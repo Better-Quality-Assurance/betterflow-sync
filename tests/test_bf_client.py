@@ -699,6 +699,26 @@ class TestBetterFlowClient:
         assert "Invalid" in result.error
 
     @responses.activate
+    def test_exchange_code_device_conflict_409_surfaces_server_message(self):
+        """A 409 (device_id already registered to another account) must show the
+        server's explanatory message, not a bare 'HTTP error: 409'."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/v1/sync/auth/token",
+            json={
+                "error": "device_conflict",
+                "message": "This device is already registered to another account. If this is your machine, contact your administrator.",
+            },
+            status=409,
+        )
+
+        result = self.client.exchange_code(code="code", device_name="device", code_verifier="verifier")
+
+        assert result.success is False
+        assert "already registered to another account" in result.error
+        assert "HTTP error" not in result.error
+
+    @responses.activate
     def test_exchange_code_connection_error(self):
         """Test exchange handles connection errors."""
         responses.add(
