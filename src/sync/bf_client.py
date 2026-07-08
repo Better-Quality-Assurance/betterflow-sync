@@ -199,7 +199,11 @@ class BetterFlowClient(BaseApiClient):
                 headers=headers,
                 timeout=self.timeout,
             )
-            if response.status_code in (400, 401, 403, 422):
+            # 409 = device already registered to another account (a duplicate
+            # machine_id, e.g. a cloned VM image). Include it here so the user
+            # sees the server's explanatory message instead of a bare
+            # "HTTP error: 409" from the raise_for_status() path below.
+            if response.status_code in (400, 401, 403, 409, 422):
                 try:
                     data = response.json()
                     msg = data.get("message", data.get("error", "Authentication failed"))
