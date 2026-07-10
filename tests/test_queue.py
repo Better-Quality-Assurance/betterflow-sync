@@ -110,6 +110,54 @@ class TestOfflineQueue:
         assert removed == 1
         assert self.queue.is_empty()
 
+    def test_remove_failed_moves_to_dead_letter_not_lost(self):
+        """A 4xx-exhausted event must be MOVED to dead_letter_events, not hard
+        deleted — nothing is lost. Its event_data, bucket_id, retry_count and a
+        dropped_at stamp are preserved, and it leaves queued_events."""
+        event = {
+            "id": "real-activity",
+            "bucket_id": "aw-watcher-afk_host",
+            "timestamp": "2026-07-09T05:00:00+00:00",
+            "duration": 42,
+            "data": {"status": "not-afk"},
+        }
+        self.queue.enqueue([event])
+        queued = self.queue.dequeue(batch_size=1)
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+
+        assert self.queue.dead_letter_count() == 0
+        moved = self.queue.remove_failed(
+            max_retries=5, last_error="definitive 4xx"
+        )
+
+        # Removed from the live queue...
+        assert moved == 1
+        assert self.queue.is_empty()
+        # ...but preserved in the dead-letter table, nothing lost.
+        assert self.queue.dead_letter_count() == 1
+        dead = self.queue.get_dead_letter_events()
+        assert len(dead) == 1
+        row = dead[0]
+        assert row["bucket_id"] == "aw-watcher-afk_host"
+        assert row["retry_count"] >= 5
+        assert row["last_error"] == "definitive 4xx"
+        assert row["dropped_at"] is not None
+        # Original payload is intact and replayable.
+        import json
+        restored = json.loads(row["event_data"])
+        assert restored["id"] == "real-activity"
+        assert restored["data"]["status"] == "not-afk"
+
+    def test_remove_failed_no_events_leaves_dead_letter_empty(self):
+        """Nothing past the ceiling → nothing moved, dead-letter stays empty."""
+        self.queue.enqueue([
+            {"id": "fresh", "timestamp": "2026-07-09T05:00:00+00:00", "data": {}}
+        ])
+        assert self.queue.remove_failed(max_retries=5) == 0
+        assert self.queue.dead_letter_count() == 0
+        assert self.queue.size() == 1
+
     def test_failed_event_summary_reports_buckets_and_span(self):
         """The drop summary carries enough to diagnose the loss: count, the
         distinct bucket_ids affected, and the oldest/newest event timestamps."""

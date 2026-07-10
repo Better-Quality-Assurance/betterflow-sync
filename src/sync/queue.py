@@ -161,6 +161,35 @@ class OfflineQueue:
                 """
             )
 
+            # Dead-letter table: events that exhausted their retries are MOVED
+            # here rather than hard-deleted. An event only reaches the retry
+            # ceiling on a DEFINITIVE 4xx (transient 5xx/timeout deliberately
+            # don't increment), which can still be real aw-watcher-afk /
+            # aw-watcher-input activity — so a blind DELETE was permanent data
+            # loss. Preserving event_data (plus bucket_id, timestamps,
+            # retry_count, and dropped_at/last_error) keeps the activity
+            # inspectable and replayable instead of gone.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dead_letter_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_id INTEGER,
+                    event_data TEXT NOT NULL,
+                    bucket_id TEXT,
+                    created_at TEXT NOT NULL,
+                    retry_count INTEGER,
+                    last_error TEXT,
+                    dropped_at TEXT NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dead_letter_dropped_at
+                ON dead_letter_events(dropped_at)
+                """
+            )
+
             # Also track sync checkpoints
             cursor.execute(
                 """
@@ -463,27 +492,111 @@ class OfflineQueue:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed >= cutoff
 
-    def remove_failed(self, max_retries: int = 5) -> int:
-        """Remove events that have exceeded max retries.
+    def remove_failed(
+        self, max_retries: int = 5, *, last_error: Optional[str] = None
+    ) -> int:
+        """Move events that have exceeded max retries to the dead-letter table.
+
+        Previously this HARD-DELETED exhausted events, permanently losing real
+        activity that hit a definitive 4xx (transient 5xx/timeout don't increment
+        retry_count, so anything here is a genuine rejection — but still real
+        aw-watcher-afk / aw-watcher-input data worth keeping). Now each row is
+        MOVED to ``dead_letter_events`` with its event_data, bucket_id (parsed
+        out for queryability), created_at, retry_count, an optional last_error,
+        and a dropped_at stamp — nothing is silently lost.
+
+        The INSERT and the matching DELETE run inside the SAME ``_cursor()``
+        transaction (committed atomically on exit), so a crash can never both
+        drop the events from the queue AND fail to record the dead letter. The
+        DELETE targets the exact ids that were moved (not the ``>= max_retries``
+        predicate) so a concurrent writer that pushes another event over the
+        ceiling between the SELECT and the DELETE can't have it deleted without
+        first being dead-lettered.
 
         Args:
             max_retries: Maximum retry attempts
+            last_error: Optional context recorded on each dead-lettered row
 
         Returns:
-            Number of events removed
+            Number of events moved out of the queue
         """
+        now = datetime.now(timezone.utc).isoformat()
         with self._cursor() as cursor:
             cursor.execute(
                 """
-                DELETE FROM queued_events
+                SELECT id, event_data, created_at, retry_count
+                FROM queued_events
                 WHERE retry_count >= ?
                 """,
                 (max_retries,),
             )
+            rows = cursor.fetchall()
+            if not rows:
+                return 0
+
+            dead_rows = []
+            for row in rows:
+                bucket_id = None
+                try:
+                    parsed = json.loads(row[1])
+                    if isinstance(parsed, dict):
+                        bucket_id = parsed.get("bucket_id")
+                except (json.JSONDecodeError, TypeError):
+                    # Keep the raw event_data regardless; only the queryable
+                    # bucket_id column is left NULL for an unparseable payload.
+                    bucket_id = None
+                dead_rows.append(
+                    (row[0], row[1], bucket_id, row[2], row[3], last_error, now)
+                )
+
+            cursor.executemany(
+                """
+                INSERT INTO dead_letter_events
+                    (original_id, event_data, bucket_id, created_at,
+                     retry_count, last_error, dropped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                dead_rows,
+            )
+
+            ids = [row[0] for row in rows]
+            placeholders = ",".join("?" * len(ids))
+            cursor.execute(
+                f"DELETE FROM queued_events WHERE id IN ({placeholders})",
+                ids,
+            )
             count = cursor.rowcount
             if count > 0:
-                logger.warning(f"Removed {count} events that exceeded max retries")
+                logger.warning(
+                    "Moved %d event(s) that exceeded max retries to "
+                    "dead_letter_events",
+                    count,
+                )
             return count
+
+    def dead_letter_count(self) -> int:
+        """Number of events currently held in the dead-letter table."""
+        with self._cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM dead_letter_events")
+            return cursor.fetchone()[0]
+
+    def get_dead_letter_events(self, limit: int = 100) -> list[dict]:
+        """Return dead-lettered events (newest first) for inspection/replay.
+
+        Read-only helper — does not modify the table.
+        """
+        with self._cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT original_id, event_data, bucket_id, created_at,
+                       retry_count, last_error, dropped_at
+                FROM dead_letter_events
+                ORDER BY dropped_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def size(self) -> int:
         """Get the current queue size."""
