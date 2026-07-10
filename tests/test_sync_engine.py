@@ -629,7 +629,9 @@ class TestSyncEngine:
         assert self.engine.error_reporter.capture.call_args.kwargs["fingerprint"] == (
             "offline-queue-events-dropped"
         )
-        self.queue.remove_failed.assert_called_once_with(max_retries=5)
+        self.queue.remove_failed.assert_called_once_with(
+            max_retries=5, last_error="exceeded max retries (5); definitive rejection"
+        )
 
     def test_no_dropped_events_does_not_report(self):
         """A clean queue (nothing past the retry ceiling) must not fire a report."""
@@ -1134,6 +1136,55 @@ class TestSyncEngine:
         assert stats.aw_bucket_fetch_failed is True
         assert stats.success is False
 
+    def test_session_start_attempted_once_per_cycle(self):
+        """start_session() retries internally (~94s worst case). The old outer
+        `for attempt in range(2)` loop doubled that to ~188s and blew the 150s
+        watchdog on its own. A cycle must call start_session at most ONCE — the
+        durable OfflineQueue + next cycle provide cross-cycle retry."""
+        from src.sync.aw_client import AWClientError
+        from src.sync.http_client import BetterFlowClientError
+        self.aw.is_running.return_value = True
+        self.bf.is_reachable.return_value = True
+        self.engine._config_fetched = True
+        self.engine._session_active = False
+        self.bf.start_session.side_effect = BetterFlowClientError("session start 503")
+        # Bail out right after the session-start block so the cycle ends cleanly.
+        self.aw.get_window_buckets.side_effect = AWClientError("503")
+
+        self.engine.sync()
+
+        assert self.bf.start_session.call_count == 1, (
+            "session start must be attempted exactly once per cycle (no outer "
+            f"retry multiplier); got {self.bf.start_session.call_count}"
+        )
+        # A failed start must not flip the session active.
+        assert self.engine._session_active is False
+
+    def test_session_start_skipped_when_network_budget_spent(self, monkeypatch):
+        """If the cycle has already spent the shared per-cycle network budget
+        (e.g. a slow config fetch), start_session must be SKIPPED this cycle so
+        the combined network time can't overrun the watchdog — it retries next
+        cycle instead."""
+        import src.sync.sync_engine as se
+        from src.sync.aw_client import AWClientError
+
+        # Monotonic clock that jumps far past the budget on every call after the
+        # cycle-start stamp, so the session-start budget gate sees it exceeded.
+        ticks = iter([1000.0] + [1000.0 + se.SyncEngine._CYCLE_NETWORK_BUDGET_SECONDS
+                                 + 10 + i for i in range(1000)])
+        monkeypatch.setattr(se.time, "monotonic", lambda: next(ticks))
+
+        self.aw.is_running.return_value = True
+        self.bf.is_reachable.return_value = True
+        self.engine._config_fetched = True  # skip the config-fetch branch
+        self.engine._session_active = False
+        self.aw.get_window_buckets.side_effect = AWClientError("503")
+
+        self.engine.sync()
+
+        self.bf.start_session.assert_not_called()
+        assert self.engine._session_active is False
+
     def test_transform_event_delta_time_tracking_on_refetch(self):
         """Test that re-fetched events with grown duration only add the delta."""
         cycle = _SyncCycleContext(has_input_data=True)
@@ -1482,6 +1533,88 @@ class TestStatusSpanEvents:
         assert idle_ev["data"]["status"] == "idle"
         assert sleep_ev["data"]["status"] == "sleep"
         assert break_ev["data"]["status"] == "break"
+
+    def test_status_span_carries_synthetic_bucket_id(self):
+        """Every status span must carry a stable synthetic bucket_id
+        (bf-status_<host>) so it is first-class in every bucket-keyed path
+        (offline-queue storability classifier, blast-radius grouping). Without it
+        a failed real idle/private span was mislabeled "unstorable ...
+        buckets=unknown" and silently dropped."""
+        from src.sync.bf_client import SyncResult
+        self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
+        start = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(minutes=30)
+
+        for send in (
+            self.engine.send_idle_event,
+            self.engine.send_break_event,
+            self.engine.send_sleep_event,
+        ):
+            self.bf.send_events.reset_mock()
+            send(start, end)
+            ev = self._captured_event()
+            assert ev["bucket_id"] == f"bf-status_{self.engine._hostname}"
+
+
+class TestFailedStatusSpanIsStorable:
+    """A failed real status span (idle/private/break/sleep) must be classified
+    STORABLE — routed through the dead-letter path — not silently flushed as
+    "unstorable ... buckets=unknown". Regression for the 2026 buckets=unknown
+    misclassification: the happy path proves the server accepts these spans, so a
+    failed one is real lost activity, not a benign flush."""
+
+    def setup_method(self):
+        import tempfile
+        from pathlib import Path
+
+        from src.sync.bf_client import SyncResult
+        from src.sync.queue import OfflineQueue
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.queue = OfflineQueue(db_path=self.tmp / "q.db", max_size=1000)
+        self.aw = Mock()
+        self.bf = Mock()
+        # Force the offline path so the span is queued, not accepted.
+        self.bf.send_events.return_value = SyncResult(success=False, error="offline")
+        self.engine = SyncEngine(
+            aw=self.aw, bf=self.bf, queue=self.queue, config=Config(),
+            activity_analyzer=Mock(spec=ActivityAnalyzer),
+            time_tracker=Mock(spec=DailyTimeTracker),
+        )
+
+    def teardown_method(self):
+        self.queue.close()
+
+    def test_failed_idle_span_classified_storable_and_dead_lettered(self):
+        # A recent idle span whose send fails → queued.
+        start = datetime.now(timezone.utc) - timedelta(minutes=30)
+        end = datetime.now(timezone.utc)
+        self.engine.send_idle_event(start, end)
+        assert self.queue.size() == 1
+
+        # Push it past the retry ceiling (a definitive rejection).
+        queued = self.queue.dequeue(batch_size=1)
+        span_event = queued[0].event_data
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+
+        # The emitted span carries the synthetic bucket id (Fix 3).
+        assert span_event["bucket_id"] == f"bf-status_{self.engine._hostname}"
+
+        # Classifier now treats it as REAL loss (has bucket_id + recent ts),
+        # NOT an unstorable flush, and the bucket label is bf-status, not unknown.
+        summary = self.queue.failed_event_summary(max_retries=5)
+        assert summary["real_loss_count"] == 1
+        assert summary["unstorable_count"] == 0
+        assert summary["bucket_ids"] == [f"bf-status_{self.engine._hostname}"]
+
+        # _batch_has_storable_activity mirrors that verdict for the same event.
+        assert self.engine._batch_has_storable_activity([span_event])
+
+        # And it routes through the dead-letter path — preserved, not lost.
+        moved = self.queue.remove_failed(max_retries=5)
+        assert moved == 1
+        assert self.queue.dead_letter_count() == 1
 
 
 class TestPrivateOngoingSpanRefresh:

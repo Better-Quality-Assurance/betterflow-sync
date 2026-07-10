@@ -645,8 +645,20 @@ class SyncEngine:
                 )
             return stats
 
-        # Fetch server config on first successful sync
-        if not self._config_fetched and self.bf.is_reachable():
+        # Fetch server config on first successful sync. Gated by the shared
+        # per-cycle network budget: get_config() runs a full retry chain
+        # (~94s against a hung server), so it must count toward the SAME 50s
+        # budget the _do_sync watchdog was sized around. Otherwise it stacks
+        # ahead of the session-start and send chains and the cycle overruns the
+        # 150s deadline ("Sync hung"). The budget-start is stamped at the top of
+        # sync() (self._cycle_start_monotonic), so every per-cycle network call
+        # after it — this fetch, start_session, the send loop, the queue drain —
+        # shares one budget.
+        if (
+            not self._config_fetched
+            and not self._cycle_network_budget_exceeded(self._CYCLE_NETWORK_BUDGET_SECONDS)
+            and self.bf.is_reachable()
+        ):
             self.fetch_server_config()
 
         # Check ActivityWatch
@@ -676,22 +688,31 @@ class SyncEngine:
                     stats.calls_detected += 1
             return stats
 
-        # Start session if needed (attempt directly; no pre-check to avoid TOCTOU)
-        # Retry once on transient failure (N13)
+        # Start session if needed (attempt directly; no pre-check to avoid TOCTOU).
+        # start_session() ALREADY retries internally (retry=True -> up to ~94s
+        # against a hung server). An OUTER `for attempt in range(2)` loop doubled
+        # that to ~188s — enough to blow the 150s _do_sync watchdog on its own
+        # (the "Sync hung" reports). Call it ONCE per cycle: the durable
+        # OfflineQueue plus the next sync cycle already provide cross-cycle retry,
+        # so an outer multiplier buys nothing but watchdog overruns. Also gate it
+        # on the shared per-cycle network budget so a slow config-fetch ahead of
+        # it can't push the combined network time past the watchdog.
         with self._state_lock:
             need_session = not self._session_active
-        if need_session:
-            for attempt in range(2):
-                try:
-                    self.bf.start_session()
-                    with self._state_lock:
-                        self._session_active = True
-                    break
-                except BetterFlowClientError as e:
-                    if attempt == 0:
-                        logger.debug(f"Session start attempt 1 failed: {e}, retrying")
-                    else:
-                        logger.warning(f"Failed to start session after retry: {e}")
+        if need_session and not self._cycle_network_budget_exceeded(
+            self._CYCLE_NETWORK_BUDGET_SECONDS
+        ):
+            try:
+                self.bf.start_session()
+                with self._state_lock:
+                    self._session_active = True
+            except BetterFlowClientError as e:
+                # BetterFlowAuthError is a BetterFlowClientError subclass; the
+                # pre-existing behaviour swallowed both here (logged, not
+                # re-raised) and let the next cycle retry. Preserved to keep the
+                # session-start failure mode unchanged — only the retry MULTIPLIER
+                # is removed.
+                logger.warning(f"Failed to start session: {e}")
 
         # Record an activity sample for the in-process AFK timeline (no-op when
         # no source is wired or the OS idle clock is unavailable). Done every
@@ -2181,6 +2202,17 @@ class SyncEngine:
             "id": f"{kind}_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
             "duration": round(duration, 2),
+            # Stable synthetic bucket id, mirroring how call events carry
+            # bf-call-detector_<host>. The offline-queue storability classifier
+            # (queue.failed_event_summary / _batch_has_storable_activity) keys on
+            # bucket_id presence: without one, a failed real idle/private/break
+            # span was mislabeled "unstorable ... buckets=unknown" and silently
+            # flushed — even though the happy path proves the server accepts these
+            # spans. Giving them a bucket_id makes them first-class in every
+            # bucket-keyed path, so a failed span now routes through the
+            # dead-letter path instead of being dropped, and reports as bucket
+            # type "bf-status" rather than "unknown".
+            "bucket_id": f"bf-status_{self._hostname}",
             "bucket_type": bucket_type,
             "data": {"status": kind},
         }
@@ -2942,7 +2974,11 @@ class SyncEngine:
         drop_summary = self.queue.failed_event_summary(max_retries=5)
         if drop_summary.get("count", 0) > 0:
             self._report_dropped_events(drop_summary)
-        self.queue.remove_failed(max_retries=5)
+        # Moves (does NOT hard-delete) exhausted events to the dead-letter table
+        # so genuine 4xx-rejected activity is preserved for inspection/replay.
+        self.queue.remove_failed(
+            max_retries=5, last_error="exceeded max retries (5); definitive rejection"
+        )
 
         # Skip queue processing if in backoff period
         now = datetime.now(timezone.utc)
