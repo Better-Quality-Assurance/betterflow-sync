@@ -904,6 +904,147 @@ class OfflineQueue:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    # A dead-lettered row must sit at least this long before the replay retries
+    # it. Two reasons: (1) it keeps the replay from immediately re-resurrecting a
+    # row that ``remove_failed`` JUST dropped for a genuine definitive 4xx —
+    # without it, a poison-but-storable batch would drop→resurrect→drop every
+    # cycle and re-block the queue head (defeating the head-of-line-block drop).
+    # (2) the case the replay exists for — a brief bad-deploy / server-validation
+    # window that 4xx-rejected good events — has passed by the time the cooldown
+    # elapses, so the retry lands after the transient condition cleared. Longer
+    # than the bad-deploy windows seen in the incident history (~1-2h would still
+    # get a retry every cooldown until it succeeds or ages out of retention).
+    _DEAD_LETTER_REPLAY_COOLDOWN_SECONDS = 1800  # 30 min
+
+    def requeue_storable_dead_letter(
+        self,
+        *,
+        limit: int = 200,
+        now: Optional[datetime] = None,
+        stale_after_days: int = 7,
+        min_dead_age_seconds: Optional[float] = None,
+    ) -> dict:
+        """Resurrect dead-lettered rows that are STORABLE again — move them back
+        into the live queue for another delivery attempt.
+
+        Dead-lettering preserves rejected events (``remove_failed`` /
+        ``evict_unstorable``) but nothing re-enqueued them, so real activity that
+        hit a transient-looking-definitive 4xx (a server-side validation bug, a
+        brief bad-deploy window) sat in ``dead_letter_events`` forever. This is
+        the bounded, conservative replay path.
+
+        A row is eligible only if it is storable NOW, by the SAME classification
+        ``evict_unstorable`` and ``_batch_has_storable_activity`` use: it has a
+        ``bucket_id`` to route to AND a ``timestamp`` still within the server's
+        retention window (``stale_after_days``). Rows with no bucket, an
+        unparseable payload, or a timestamp that has since aged past retention are
+        genuinely unstorable and are LEFT in the dead-letter table — never
+        resurrected into a batch the server would only reject again.
+
+        Conservative by construction:
+        - **Cooldown** — a row is skipped until it has sat in the dead-letter
+          table for ``min_dead_age_seconds`` (default
+          ``_DEAD_LETTER_REPLAY_COOLDOWN_SECONDS``). This stops the replay from
+          instantly re-resurrecting a row ``remove_failed`` just dropped for a
+          genuine definitive rejection (which would re-block the queue head and
+          thrash drop→resurrect→drop every cycle), and gives a transient
+          server-side condition time to clear before the retry.
+        - **Bounded** — at most ``limit`` rows per call (oldest dead-letter
+          first), so a large table can't flood one cycle.
+        - **MOVE, not copy** — each resurrected row is INSERTed into
+          ``queued_events`` and DELETEd from ``dead_letter_events`` in ONE
+          transaction, so a row can never be resurrected twice (no double-send),
+          and a crash can't both drop it from the dead-letter table and fail to
+          re-enqueue it.
+        - **Fresh retry budget** — the row re-enters with ``retry_count`` reset
+          to 0 (the default), so it isn't instantly re-dropped at the ceiling.
+        - **Self-limiting churn** — a genuinely-poison row that keeps getting
+          re-rejected is retried at most once per cooldown, and only until its
+          timestamp ages past the retention window, after which it's classified
+          unstorable and left alone. The server also upserts by event id, so a
+          resurrected event that was actually already stored is deduped, not
+          duplicated.
+
+        Returns ``{examined, requeued, skipped_unstorable}`` — ``examined``
+        counts only rows past the cooldown (younger rows aren't looked at).
+
+        ``now`` is injectable for deterministic tests (defaults to UTC now).
+        """
+        now = now or datetime.now(timezone.utc)
+        if min_dead_age_seconds is None:
+            min_dead_age_seconds = self._DEAD_LETTER_REPLAY_COOLDOWN_SECONDS
+        stale_cutoff = now - timedelta(days=stale_after_days)
+        cooldown_cutoff = (now - timedelta(seconds=min_dead_age_seconds)).isoformat()
+        requeued_at = now.isoformat()
+
+        with self._cursor() as cursor:
+            # Only rows that have sat past the cooldown are candidates. The
+            # lexical comparison on ISO-8601 strings is chronological (every
+            # dropped_at is a tz-aware UTC isoformat), matching set_checkpoint_forward.
+            cursor.execute(
+                """
+                SELECT id, event_data FROM dead_letter_events
+                WHERE dropped_at <= ?
+                ORDER BY dropped_at ASC, id ASC
+                LIMIT ?
+                """,
+                (cooldown_cutoff, limit),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+
+            move_ids: list[int] = []
+            new_rows: list[tuple] = []
+            for row in rows:
+                dead_id, raw = row[0], row[1]
+                bucket_id = None
+                ts = None
+                try:
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict):
+                        bucket_id = ev.get("bucket_id")
+                        ts = ev.get("timestamp")
+                except (json.JSONDecodeError, TypeError):
+                    # Unparseable → can never be stored → leave it dead-lettered.
+                    pass
+                storable = bool(bucket_id) and self._timestamp_within(ts, stale_cutoff)
+                if not storable:
+                    continue
+                move_ids.append(dead_id)
+                # Re-enter with a fresh created_at and default retry_count (0).
+                new_rows.append((raw, requeued_at))
+
+            if not move_ids:
+                return {
+                    "examined": len(rows),
+                    "requeued": 0,
+                    "skipped_unstorable": len(rows),
+                }
+
+            cursor.executemany(
+                "INSERT INTO queued_events (event_data, created_at) VALUES (?, ?)",
+                new_rows,
+            )
+            placeholders = ",".join("?" * len(move_ids))
+            cursor.execute(
+                f"DELETE FROM dead_letter_events WHERE id IN ({placeholders})",
+                move_ids,
+            )
+            requeued = len(move_ids)
+
+        if requeued > 0:
+            logger.info(
+                "Resurrected %d storable dead-lettered event(s) back into the "
+                "queue for another delivery attempt",
+                requeued,
+            )
+        return {
+            "examined": len(rows),
+            "requeued": requeued,
+            "skipped_unstorable": len(rows) - requeued,
+        }
+
     def size(self) -> int:
         """Get the current queue size."""
         with self._cursor() as cursor:

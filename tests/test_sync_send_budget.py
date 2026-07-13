@@ -85,9 +85,18 @@ def _engine():
     return engine, bf, q, tt
 
 
-def test_over_budget_stops_sending_remaining_buckets():
-    """When the cycle has already spent the send budget, only the first bucket
-    group is sent over the network; the rest are queued for the next cycle."""
+def test_over_budget_queues_all_buckets_including_first():
+    """When the cycle has ALREADY spent the send budget before the send loop even
+    begins, NO bucket group starts a new network chain — every group is queued
+    for the next cycle.
+
+    This closes the residual the earlier fix left open (audit round 3): the first
+    group used to attempt unconditionally "for forward progress", but the only way
+    the budget is spent before the first group is a slow/hung pre-send network
+    chain — a session-start (~94s) or a config-fetch. Letting the first group then
+    stack its own ~94s chain reaches ~188s, blowing the 150s watchdog. The durable
+    OfflineQueue is the forward-progress mechanism across cycles; a hung server
+    must not force an in-cycle delivery that overruns the watchdog."""
     engine, bf, q, tt = _engine()
     try:
         # Simulate a cycle that has already burned past the budget (as it would
@@ -99,14 +108,46 @@ def test_over_budget_stops_sending_remaining_buckets():
         stats = SyncStats()
         engine._send_events(_events_across_buckets(), stats)
 
-        # Exactly ONE network chain (the first group, for forward progress); the
-        # other three buckets are queued without a send.
-        assert bf.send_events.call_count == 1, (
-            f"over-budget cycle must not start a chain per bucket; "
+        # NO network chain — all four buckets are queued without a send, so a
+        # pre-send chain can't stack a second one past the watchdog.
+        assert bf.send_events.call_count == 0, (
+            f"over-budget cycle must not start ANY send chain; "
             f"got {bf.send_events.call_count} send_events calls"
         )
-        assert stats.events_queued == 3
-        assert q.size() == 3
+        assert stats.events_queued == 4
+        assert q.size() == 4
+    finally:
+        q.close()
+        tt.close()
+
+
+def test_session_start_chain_then_send_does_not_stack_past_watchdog():
+    """P4 residual: a session-start chain (~94s, started at elapsed≈0) followed by
+    the send loop's first group (~94s) reaches ~188s > the 150s watchdog. Model
+    the post-session-start elapsed (a full worst-case chain) and assert the send
+    loop refuses to start a second stacked chain — it queues instead."""
+    engine, bf, q, tt = _engine()
+    try:
+        worst_chain = _worst_case_chain_seconds()
+        deadline = SyncCoordinator._DO_SYNC_DEADLINE
+        # Two full chains would blow the watchdog — that's the bug we prevent.
+        assert 2 * worst_chain > deadline, (
+            f"two stacked chains ({2 * worst_chain:.1f}s) should exceed the "
+            f"{deadline}s watchdog — otherwise this test proves nothing"
+        )
+
+        # Simulate the elapsed a session-start chain leaves behind (a full
+        # worst-case chain), then run the first (and only) send group.
+        engine._cycle_start_monotonic = time.monotonic() - worst_chain
+        from src.sync.sync_engine import SyncStats
+        stats = SyncStats()
+        engine._send_events(_events_across_buckets(), stats)
+
+        assert bf.send_events.call_count == 0, (
+            "a send chain stacked on a session-start chain would overrun the "
+            "watchdog — the send must be deferred (queued), not attempted"
+        )
+        assert q.size() == 4
     finally:
         q.close()
         tt.close()

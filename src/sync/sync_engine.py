@@ -3330,10 +3330,23 @@ class SyncEngine:
             # request chain (~94s against a hung server). Once this cycle has
             # spent the budget on network, queue the remaining groups instead of
             # starting another chain that would stack past the _do_sync watchdog
-            # ("Sync hung" / "Sync wedged"). The first group always attempts
-            # (idx == 0) so a cycle still makes forward progress. No-op when the
-            # cycle start is unset (direct _send_events call outside sync()).
-            if idx > 0 and self._cycle_network_budget_exceeded(
+            # ("Sync hung" / "Sync wedged").
+            #
+            # The check gates EVERY group, including the first (idx == 0). The
+            # first group used to attempt unconditionally "for forward progress",
+            # but the only way the budget is already spent when the send loop
+            # begins is a slow/hung PRE-send chain — a session-start (~94s) or a
+            # config-fetch, each gated only at ITS entry, so once started it runs
+            # to completion. A session-start chain (elapsed 0 -> ~94s) followed by
+            # an unconditional first-send chain (~94s) reaches ~188s, blowing the
+            # 150s watchdog even though nothing is wedged. Gating the first group
+            # too caps the cycle at one surviving chain (budget + ~94s = ~144s <
+            # 150s). Forward progress is preserved ACROSS cycles by the durable
+            # OfflineQueue; a hung server must not force an in-cycle delivery that
+            # overruns the watchdog. In a healthy cycle elapsed is ~0 here, so the
+            # first group still sends. No-op when the cycle start is unset (a
+            # direct _send_events call outside sync()).
+            if self._cycle_network_budget_exceeded(
                 self._SEND_SKIP_IF_CYCLE_ELAPSED
             ):
                 logger.warning(
@@ -3511,6 +3524,19 @@ class SyncEngine:
         now = datetime.now(timezone.utc)
         if now < self._queue_backoff_until:
             return
+
+        # Bounded dead-letter replay: resurrect rows that are storable AGAIN into
+        # the live queue for another delivery attempt. Done here — past the
+        # backoff gate, so only when we're actually about to drain (server
+        # presumed reachable) — so we never resurrect into an outage. The queue
+        # method is conservative (bounded batch, MOVE-not-copy so no double-send,
+        # same storable/retention classification as evict_unstorable, and rows
+        # that are genuinely unstorable or have aged past retention are left
+        # behind). Resurrected rows fall into the same drain loop below.
+        try:
+            self.queue.requeue_storable_dead_letter()
+        except Exception:  # noqa: BLE001
+            logger.debug("dead-letter replay failed", exc_info=True)
 
         # Process queue in batches
         deadline = time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
