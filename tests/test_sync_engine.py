@@ -26,6 +26,11 @@ class TestSyncEngine:
         self.queue = Mock()
         # Mock the exclude_apps as a list so "in" checks work
         self.queue.get_checkpoint.return_value = None
+        # Default: nothing unstorable to evict (real queue returns this shape).
+        self.queue.evict_unstorable.return_value = {
+            "count": 0, "bucket_ids": [], "oldest": None, "newest": None,
+            "real_loss_count": 0, "unstorable_count": 0,
+        }
         self.config = Config()
 
         # Create mock activity analyzer and time tracker

@@ -574,6 +574,129 @@ class OfflineQueue:
                 )
             return count
 
+    def evict_unstorable(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        stale_after_days: int = 7,
+        last_error: Optional[str] = None,
+    ) -> dict:
+        """Move events the server can NEVER accept out of the active queue and
+        into ``dead_letter_events`` BEFORE they are batched with storable events.
+
+        "Unstorable" is the SAME classification ``failed_event_summary`` and
+        ``SyncEngine._batch_has_storable_activity`` already use: an event with no
+        ``bucket_id`` (nowhere to route it) or a ``timestamp`` already past the
+        server's retention window (``stale_after_days``). The only change is
+        WHEN it's applied — proactively, up front — instead of only at the retry
+        ceiling after the damage is done.
+
+        Why up front: ``dequeue`` returns events oldest-first, so an unstorable
+        event sits at the queue head and is batched with storable events behind
+        it. The server 4xx-rejects the whole batch on account of the unstorable
+        "poison", and ``_process_queue``'s whole-batch retry bump then increments
+        EVERY event in the batch — the storable ones in lockstep with the poison.
+        After ``max_retries`` cycles the storable events cross the ceiling and are
+        dropped as "real lost activity" (the 2026-07 warnings: N real
+        aw-watcher-input/window events dropped alongside "M other unstorable").
+        Evicting the unstorable events first keeps every batch storable-only.
+
+        Storable events (``bucket_id`` present AND timestamp within retention) are
+        NEVER touched — a transient outage still holds them for retry. Each evicted
+        row is MOVED (not hard-deleted) to ``dead_letter_events`` in one
+        transaction, so nothing is silently lost.
+
+        Returns a summary shaped like ``failed_event_summary`` so the caller can
+        report it through the same path: ``{count, bucket_ids, oldest, newest,
+        real_loss_count (always 0), unstorable_count}`` — all zero/empty when the
+        queue holds nothing unstorable.
+
+        ``now`` is injectable for deterministic tests (defaults to UTC now).
+        """
+        now = now or datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(days=stale_after_days)
+        dropped_at = now.isoformat()
+
+        empty = {
+            "count": 0,
+            "bucket_ids": [],
+            "oldest": None,
+            "newest": None,
+            "real_loss_count": 0,
+            "unstorable_count": 0,
+        }
+
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT id, event_data, created_at, retry_count FROM queued_events"
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return empty
+
+            dead_rows = []
+            evict_ids: list[int] = []
+            bucket_ids: set[str] = set()
+            timestamps: list[str] = []
+            for row in rows:
+                rid, raw, created_at, retry_count = row[0], row[1], row[2], row[3]
+                bucket_id = None
+                ts = None
+                try:
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict):
+                        bucket_id = ev.get("bucket_id")
+                        ts = ev.get("timestamp")
+                except (json.JSONDecodeError, TypeError):
+                    # Unparseable payload → can never be stored → evict it.
+                    pass
+                storable = bool(bucket_id) and self._timestamp_within(ts, stale_cutoff)
+                if storable:
+                    continue
+                evict_ids.append(rid)
+                if bucket_id:
+                    bucket_ids.add(str(bucket_id))
+                if ts:
+                    timestamps.append(str(ts))
+                dead_rows.append(
+                    (rid, raw, bucket_id, created_at, retry_count, last_error, dropped_at)
+                )
+
+            if not evict_ids:
+                return empty
+
+            cursor.executemany(
+                """
+                INSERT INTO dead_letter_events
+                    (original_id, event_data, bucket_id, created_at,
+                     retry_count, last_error, dropped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                dead_rows,
+            )
+            placeholders = ",".join("?" * len(evict_ids))
+            cursor.execute(
+                f"DELETE FROM queued_events WHERE id IN ({placeholders})",
+                evict_ids,
+            )
+            count = cursor.rowcount
+
+        if count > 0:
+            logger.info(
+                "Evicted %d unstorable queued event(s) (no bucket / past "
+                "retention) to dead_letter before batching",
+                count,
+            )
+        timestamps.sort()
+        return {
+            "count": count,
+            "bucket_ids": sorted(bucket_ids),
+            "oldest": timestamps[0] if timestamps else None,
+            "newest": timestamps[-1] if timestamps else None,
+            "real_loss_count": 0,
+            "unstorable_count": count,
+        }
+
     def dead_letter_count(self) -> int:
         """Number of events currently held in the dead-letter table."""
         with self._cursor() as cursor:

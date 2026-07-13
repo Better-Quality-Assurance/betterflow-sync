@@ -2965,6 +2965,23 @@ class SyncEngine:
 
         Capped at 30s wall-clock time to prevent tying up the sync thread.
         """
+        # Evict genuinely-unstorable events (no bucket to route to, or already
+        # past the server's retention window) from the active queue BEFORE
+        # batching. dequeue() is oldest-first, so an unstorable event sits at the
+        # head and is batched with storable events behind it; the server 4xx's the
+        # whole batch on the poison, and the whole-batch retry bump below then
+        # drags the storable neighbours to the drop ceiling in lockstep — the
+        # 2026-07 "Dropped N ... likely real lost activity (... ; M other
+        # unstorable)" warnings. Removing them first keeps every batch
+        # storable-only, so the server accepts it and no real activity is lost.
+        # They're MOVED to dead_letter (preserved) and reported at info (benign
+        # flush), never as real loss.
+        evicted = self.queue.evict_unstorable(
+            last_error="unstorable (no bucket / past retention) — evicted before batching"
+        )
+        if evicted.get("count", 0) > 0:
+            self._report_dropped_events(evicted)
+
         # Remove events that exceeded retry limit. Surface the drop to ops FIRST
         # — with the server now confirming delivery per-event (accepted_ids),
         # anything that still exhausts its retries is a genuine permanent
