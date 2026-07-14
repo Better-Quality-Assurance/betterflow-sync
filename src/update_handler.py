@@ -3,8 +3,8 @@
 Model (chosen): updates are downloaded ("staged") in the background while the
 app runs and applied at a non-disruptive moment:
   - the initial check right after launch applies immediately (catch-on-launch);
-  - periodic (6h) checks stage silently and apply on the next restart or when
-    the user goes idle.
+  - periodic (every 30 min) checks notify the user once per version, stage
+    silently, and apply on the next restart or when the user goes idle.
 Applying a staged build is loop-safe (see src/self_updater.get_staged_update).
 """
 
@@ -40,6 +40,9 @@ class UpdateHandler:
 
         # Version of the currently-staged (downloaded, not yet applied) update.
         self._staged_version: Optional[str] = None
+        # Version we last toasted the user about, so the 30-min re-checks notify
+        # once per version instead of on every check.
+        self._notified_version: Optional[str] = None
         self._staged_lock = threading.Lock()
         self._update_jobs_started = False
         self._update_jobs_lock = threading.Lock()
@@ -106,7 +109,7 @@ class UpdateHandler:
             if self.coordinator.scheduler.running:
                 self.coordinator.scheduler.add_job(
                     self._periodic_update_check,
-                    trigger=IntervalTrigger(hours=6),
+                    trigger=IntervalTrigger(minutes=30),
                     id="update_check_job",
                     replace_existing=True,
                 )
@@ -126,19 +129,34 @@ class UpdateHandler:
     def _on_update_available(
         self, version: str, url: str, asset_url: Optional[str] = None, apply_now: bool = False
     ) -> None:
-        """Handle an available update: stage it (and maybe apply)."""
+        """Handle an available update: notify the user (once per version) and
+        stage it (and maybe apply)."""
         logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
 
-        if not asset_url:
-            send_notification("BetterFlow Update", f"Version {version} is available.")
+        # Notify ONCE per version, at detection — so the user always learns an
+        # update is available, including on the otherwise-silent auto-apply path,
+        # and the 30-min re-checks don't re-toast the same version.
+        if version != self._notified_version:
+            self._notified_version = version
+            if not asset_url:
+                msg = f"Version {version} is available."
+            elif not self.config.auto_install_updates:
+                msg = f"Version {version} is available. Click 'Install & Restart' in the menu."
+            else:
+                msg = f"Version {version} is available and will be installed automatically."
+            send_notification("BetterFlow Update", msg)
+
+        if not asset_url or not self.config.auto_install_updates:
             return
 
-        if not self.config.auto_install_updates:
-            send_notification(
-                "BetterFlow Update",
-                f"Version {version} is available. Click 'Install & Restart' in the menu.",
-            )
+        # Already downloaded this version — it applies on idle/restart; don't
+        # re-download it on every 30-min check (only re-stage a newer version).
+        with self._staged_lock:
+            already_staged = self._staged_version == version
+        if already_staged:
+            if apply_now:
+                self._apply_staged_update()
             return
 
         self._stage_and_maybe_apply(version, asset_url, apply_now)
@@ -158,11 +176,8 @@ class UpdateHandler:
                 self._staged_version = version
             if apply_now or self.coordinator.idle_paused:
                 self._apply_staged_update()
-            else:
-                send_notification(
-                    "BetterFlow Update",
-                    f"Version {version} downloaded — it will be applied next time you restart.",
-                )
+            # Otherwise it's staged and applies on the next restart/idle. The user
+            # was already notified once at detection, so no second toast here.
 
         stage_update_async(asset_url, version, on_complete=_on_staged)
 
@@ -195,7 +210,7 @@ class UpdateHandler:
         threading.Thread(target=_run, name="staged-update-apply", daemon=True).start()
 
     def _periodic_update_check(self) -> None:
-        """Re-check for updates (called every 6h by the scheduler)."""
+        """Re-check for updates (called every 30 min by the scheduler)."""
         if not self.config.check_updates:
             return
         with self.tray.model.lock:
@@ -223,7 +238,7 @@ class UpdateHandler:
         should be at least `target_version` and this agent is below it. Kick an
         off-cycle update check so the latest build stages now and applies on the
         next idle/restart — reaching the fleet in minutes instead of waiting up
-        to 6h for the periodic check. Non-disruptive (no mid-session restart).
+        to 30 min for the periodic check. Non-disruptive (no mid-session restart).
 
         Guards: respects check_updates; skips if a build >= target is already
         staged (it'll apply on idle); and throttles to one check per

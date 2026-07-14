@@ -69,3 +69,48 @@ def test_trigger_respects_check_updates_disabled():
     h.config.check_updates = False
     h.trigger_remote_update("1.5.71")
     h._periodic_update_check.assert_not_called()
+
+
+# --- detection-time notification (notify once per version) --------------------
+
+
+def test_notifies_user_once_per_version_at_detection():
+    """The 30-min re-checks must not re-toast the same version."""
+    h = _handler("1.5.100")
+    h.config.auto_install_updates = True
+    h._stage_and_maybe_apply = MagicMock()  # don't download in the test
+    with patch("src.update_handler.send_notification") as notify:
+        h._on_update_available("1.5.101", "http://rel", "http://asset")
+        h._on_update_available("1.5.101", "http://rel", "http://asset")  # re-check
+    notify.assert_called_once()
+    assert "1.5.101" in notify.call_args[0][1]
+
+
+def test_notifies_again_for_a_newer_version():
+    h = _handler("1.5.100")
+    h.config.auto_install_updates = True
+    h._stage_and_maybe_apply = MagicMock()
+    with patch("src.update_handler.send_notification") as notify:
+        h._on_update_available("1.5.101", "u", "a")
+        h._on_update_available("1.5.102", "u", "a")
+    assert notify.call_count == 2
+
+
+def test_auto_install_notification_says_it_will_install():
+    h = _handler("1.5.100")
+    h.config.auto_install_updates = True
+    h._stage_and_maybe_apply = MagicMock()
+    with patch("src.update_handler.send_notification") as notify:
+        h._on_update_available("1.5.101", "u", "a")
+    assert "automatically" in notify.call_args[0][1].lower()
+
+
+def test_already_staged_version_is_not_redownloaded_on_recheck():
+    """At 30-min checks, a version already downloaded must not be re-fetched."""
+    h = _handler("1.5.100")
+    h.config.auto_install_updates = True
+    h._staged_version = "1.5.101"  # already downloaded this session
+    h._stage_and_maybe_apply = MagicMock()
+    with patch("src.update_handler.send_notification"):
+        h._on_update_available("1.5.101", "u", "a", apply_now=False)
+    h._stage_and_maybe_apply.assert_not_called()
