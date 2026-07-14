@@ -425,25 +425,43 @@ class ReminderSettings:
     private_auto_end_hours: float = 4.0
 
 
-def _normalize_hhmm(value, fallback: str) -> str:
-    """Coerce a server-sent time to zero-padded HH:MM.
+def _normalize_hhmm(value) -> str:
+    """Coerce a server-sent time to zero-padded HH:MM, or RAISE.
 
-    WorkingHoursConfig.allows() compares times as STRINGS, which is only correct
-    when both sides are zero-padded ("7:30" > "22:00" lexically, so an unpadded
-    start would let every hour of the night through). Anything unparseable falls
-    back rather than raising — the caller's `known` flag is what keeps an
-    unparseable schedule from being treated as permission to record.
+    allows() compares times as STRINGS, which is only correct when both sides are
+    zero-padded ("7:30" > "22:00" lexically, so an unpadded start would let every
+    hour of the night through).
+
+    This must FAIL CLOSED, and an earlier version of this function did not: it
+    substituted the widest possible default on bad input ("00:00" / "23:59") and
+    the caller then set known=True anyway. A single backend typo — "7.30" instead
+    of "07:30" — would silently widen a restricted user's window to start at
+    midnight and record them all night. Raising instead lets update_from_server
+    keep the schedule it already trusted (or none at all).
     """
-    text = str(value if value is not None else fallback).strip()
+    text = str(value).strip() if value is not None else ""
     match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
     if not match:
-        logger.warning("Invalid working-hours time %r; using %s", value, fallback)
-        return fallback
+        raise ValueError(f"working-hours time is not HH:MM: {value!r}")
     hour, minute = int(match.group(1)), int(match.group(2))
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        logger.warning("Out-of-range working-hours time %r; using %s", value, fallback)
-        return fallback
+        raise ValueError(f"working-hours time out of range: {value!r}")
     return f"{hour:02d}:{minute:02d}"
+
+
+def _normalize_working_days(value) -> list:
+    """Coerce server-sent working days to a list of ISO weekdays, or RAISE.
+
+    Fails closed for the same reason as _normalize_hhmm: allows() reads an EMPTY
+    working_days as "no day restriction" (`if self.working_days and ...`), so a
+    malformed [] would quietly turn a Mon-Fri schedule into a 7-day one.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"working_days must be a non-empty list: {value!r}")
+    days = [int(d) for d in value]  # ValueError/TypeError on junk — intended
+    if any(d < 1 or d > 7 for d in days):
+        raise ValueError(f"working_days out of ISO 1-7 range: {value!r}")
+    return days
 
 
 @dataclass
@@ -485,16 +503,43 @@ class WorkingHoursConfig:
         try:
             tz = ZoneInfo(self.timezone) if self.timezone else None
         except Exception:
-            logger.warning(
-                "Unknown working-hours timezone %r; using machine-local time",
+            # An EMPTY timezone is the normal path — production genuinely sends none,
+            # and the employee's own clock is the right one for "don't watch my
+            # laptop at night". A timezone that is SET but unresolvable is not
+            # normal: it means the tz database is missing (Windows without tzdata,
+            # which we now bundle), and the machine-local fallback then evaluates the
+            # window in a timezone the employee themselves can change. Keep the
+            # fallback — failing closed here would silently stop tracking a whole
+            # platform — but make it loud rather than a shrug.
+            logger.error(
+                "Working-hours timezone %r could not be resolved (missing tz database?) "
+                "— falling back to machine-local time, which the user can change",
                 self.timezone,
             )
             tz = None
 
         local = when.astimezone(tz) if tz else when.astimezone()
-        if self.working_days and local.isoweekday() not in self.working_days:
+
+        # An empty working_days is treated as "no working day at all", not "every
+        # day". _normalize_working_days already rejects [] from the server, so
+        # this only bites a hand-edited config — and the safe reading of "no days
+        # configured" is to record nothing.
+        if local.isoweekday() not in self.working_days:
             return False
-        return self.work_start <= local.strftime("%H:%M") <= self.work_end
+
+        hhmm = local.strftime("%H:%M")
+        if self.work_start <= self.work_end:
+            return self.work_start <= hhmm <= self.work_end
+
+        # Overnight window (e.g. a 22:00-06:00 night shift). A plain
+        # start <= hhmm <= end is EMPTY when start > end, which would have
+        # recorded such a user for exactly zero seconds a day, with nothing in the
+        # log to say why. The day-of-week test above is applied to the instant's
+        # own local day, so a shift starting Friday 22:00 keeps recording into
+        # Saturday only if Saturday is itself a working day — deliberately
+        # conservative: we would rather under-record than record someone on a day
+        # their schedule says they do not work.
+        return hhmm >= self.work_start or hhmm <= self.work_end
 
 
 @dataclass
@@ -735,15 +780,21 @@ class Config:
             # error fired on every sync, was logged as a shrug, and enforcement
             # stayed off. If the shape is wrong we want to know loudly.
             try:
-                parsed = WorkingHoursConfig(
-                    enforced=self._to_bool(wh.get("enforced", False)),
-                    work_start=_normalize_hhmm(wh.get("work_start"), "00:00"),
-                    work_end=_normalize_hhmm(wh.get("work_end"), "23:59"),
-                    timezone=str(wh.get("timezone", "") or ""),
-                )
-                days = wh.get("working_days")
-                if isinstance(days, list) and days:
-                    parsed.working_days = [int(d) for d in days]
+                enforced = self._to_bool(wh.get("enforced", False))
+                if enforced:
+                    # Only a RESTRICTED schedule needs a window. Validators raise on
+                    # anything malformed rather than widening the window to its
+                    # defaults, so a backend typo can never reopen the night.
+                    parsed = WorkingHoursConfig(
+                        enforced=True,
+                        work_start=_normalize_hhmm(wh.get("work_start")),
+                        work_end=_normalize_hhmm(wh.get("work_end")),
+                        working_days=_normalize_working_days(wh.get("working_days")),
+                        timezone=str(wh.get("timezone", "") or ""),
+                    )
+                else:
+                    # Unrestricted (B2B): 24/7, no window to validate.
+                    parsed = WorkingHoursConfig(enforced=False)
                 parsed.known = True
                 self.working_hours = parsed
             except (TypeError, ValueError) as e:

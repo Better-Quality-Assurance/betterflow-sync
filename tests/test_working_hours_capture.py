@@ -84,15 +84,51 @@ class TestFailClosed:
         assert wh.allows(_at(2026, 7, 13, 3, 0)) is True
         assert wh.allows(_at(2026, 7, 12, 23, 59)) is True  # Sunday
 
-    def test_unparseable_server_payload_keeps_previous_schedule(self):
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            {"enforced": True, "work_start": "7.30", "work_end": "22:00",
+             "working_days": [1, 2, 3, 4, 5], "timezone": "Europe/Bucharest"},
+            {"enforced": True, "work_start": "07:30", "work_end": "nonsense",
+             "working_days": [1, 2, 3, 4, 5], "timezone": "Europe/Bucharest"},
+            {"enforced": True, "work_start": "07:30", "work_end": "22:00",
+             "working_days": [], "timezone": "Europe/Bucharest"},
+            {"enforced": True, "work_start": "07:30", "work_end": "22:00",
+             "working_days": ["not-a-day"], "timezone": "Europe/Bucharest"},
+            {"enforced": True},  # window fields missing entirely
+        ],
+    )
+    def test_a_malformed_window_never_widens_the_schedule(self, bad):
+        """The whole hole, in one line of backend typo. An earlier version of
+        _normalize_hhmm substituted the WIDEST defaults on bad input ("00:00" /
+        "23:59") and then set known=True anyway — so `work_start: "7.30"` silently
+        became a window starting at midnight and the restricted user was recorded
+        all night. Bad input must keep the schedule we already trusted."""
         cfg = Config()
         cfg.update_from_server(SERVER_PAYLOAD)
-        cfg.update_from_server({"working_hours": {"working_days": ["not-a-day"]}})
+        cfg.update_from_server({"working_hours": bad})
 
-        # Falls back to what we already knew, never to permissive.
         assert cfg.working_hours.enforced is True
+        assert cfg.working_hours.work_start == "07:30"
         assert cfg.working_hours.work_end == "22:00"
         assert cfg.working_hours.allows(_at(2026, 7, 13, 23, 55)) is False
+        assert cfg.working_hours.allows(_at(2026, 7, 13, 0, 30)) is False
+
+    def test_a_malformed_window_with_nothing_trusted_yet_records_nothing(self):
+        cfg = Config()
+        cfg.update_from_server({"working_hours": {"enforced": True, "work_start": "7.30"}})
+
+        assert cfg.working_hours.known is False
+        assert cfg.working_hours.allows(_at(2026, 7, 13, 12, 0)) is False
+
+    def test_unrestricted_payload_needs_no_window(self):
+        """B2B users get enforced:false and the server may send nothing else. That
+        must still mark the schedule KNOWN, or they would never be tracked."""
+        cfg = Config()
+        cfg.update_from_server({"working_hours": {"enforced": False}})
+
+        assert cfg.working_hours.known is True
+        assert cfg.working_hours.allows(_at(2026, 7, 12, 3, 0)) is True  # Sunday 03:00
 
 
 class TestWindow:
@@ -131,8 +167,43 @@ class TestWindow:
 class TestNormalizeHhmm:
     def test_pads_so_string_compare_is_valid(self):
         # "7:30" > "22:00" lexically — unpadded, the whole night would pass.
-        assert _normalize_hhmm("7:30", "00:00") == "07:30"
+        assert _normalize_hhmm("7:30") == "07:30"
 
-    @pytest.mark.parametrize("bad", ["", "nonsense", "25:00", "12:99", None])
-    def test_garbage_falls_back(self, bad):
-        assert _normalize_hhmm(bad, "09:00") == "09:00"
+    @pytest.mark.parametrize("bad", ["", "nonsense", "25:00", "12:99", "7.30", "0730", None])
+    def test_garbage_raises_rather_than_widening_the_window(self, bad):
+        # Must RAISE, not substitute a default. update_from_server catches this and
+        # keeps the last trusted schedule; a silent fallback to "00:00"/"23:59" is
+        # how a one-character backend typo reopens the whole night.
+        with pytest.raises(ValueError):
+            _normalize_hhmm(bad)
+
+
+class TestOvernightWindow:
+    """A night shift (22:00-06:00) made `start <= hhmm <= end` an EMPTY range, so
+    the user was recorded for exactly zero seconds a day with nothing in the log to
+    explain it. Fail-closed, but a total product break."""
+
+    def _night_shift(self):
+        cfg = Config()
+        cfg.update_from_server({
+            "working_hours": {
+                "enforced": True, "work_start": "22:00", "work_end": "06:00",
+                "working_days": [1, 2, 3, 4, 5], "timezone": "Europe/Bucharest",
+            }
+        })
+        return cfg.working_hours
+
+    @pytest.mark.parametrize(
+        "when,allowed",
+        [
+            (_at(2026, 7, 13, 21, 59), False),  # Mon, before the shift
+            (_at(2026, 7, 13, 22, 0), True),    # Mon, shift opens
+            (_at(2026, 7, 13, 23, 55), True),   # Mon, mid-shift
+            (_at(2026, 7, 14, 2, 0), True),     # Tue 02:00, still the shift
+            (_at(2026, 7, 14, 6, 0), True),     # Tue, last minute
+            (_at(2026, 7, 14, 6, 1), False),    # Tue, shift shut
+            (_at(2026, 7, 14, 12, 0), False),   # Tue midday
+        ],
+    )
+    def test_wraps_past_midnight(self, when, allowed):
+        assert self._night_shift().allows(when) is allowed

@@ -2209,6 +2209,18 @@ class SyncEngine:
         """
         if end is None:
             end = datetime.now(timezone.utc)
+
+        # Status spans are pushed by IdleManager / BreakManager / SystemEventHandler,
+        # NOT from inside sync(), so they never met the working-hours gate applied to
+        # bucket events. An idle span ending at 23:40 still told the server the
+        # employee became active at 23:40 — which is precisely the fact this feature
+        # exists not to collect. Gate on the span's START: a span that began inside
+        # the window is legitimately ours to record, even if it ends after it closed.
+        if not self.config.working_hours.allows(start):
+            logger.debug("Dropping %s_time span starting %s: outside working hours",
+                         kind, start.isoformat())
+            return
+
         duration = (end - start).total_seconds()
         if duration < 1:
             # Distinguish "expected sub-second guard" (scheduler race / no-op)
