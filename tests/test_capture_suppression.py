@@ -45,13 +45,23 @@ class TestAWManagerSuppression:
         assert manager.capture_suppressed is True
         assert manager._spy_stop.called
 
-    def test_suppression_is_idempotent(self, manager):
-        manager.set_capture_suppressed(True, "outside working hours")
-        manager.set_capture_suppressed(True, "outside working hours")
+    def test_repeated_suppression_converges_and_kills_strays(self):
+        """The 60s tick re-asserts suppression every cycle. That is deliberate: if
+        anything managed to spawn a tracker while we were suppressed, the next tick
+        takes it back down. (The real _stop_locked no-ops when there is nothing to
+        stop, so this costs nothing on a quiet night.)"""
+        mgr = AWManager(aw_port=5600, afk_timeout=1200)
+        mgr.set_capture_suppressed(True, "night")
+        assert mgr.is_managing is False
 
-        # The 60s policy tick calls this every cycle; it must not thrash the
-        # tracker stack.
-        assert manager._spy_stop.call_count == 1
+        stray = Mock()
+        stray.poll.return_value = None  # a live process appeared out of nowhere
+        mgr._processes["bf-window-tracker"] = stray
+
+        mgr.set_capture_suppressed(True, "night")  # next tick
+
+        stray.terminate.assert_called()
+        assert mgr.is_managing is False
 
     def test_resuming_starts_them_again(self, manager):
         manager.set_capture_suppressed(True, "night")
@@ -59,6 +69,29 @@ class TestAWManagerSuppression:
 
         assert manager.capture_suppressed is False
         assert manager._spy_start.called
+
+    def test_allowing_capture_on_a_fresh_process_starts_the_trackers(self, manager):
+        """Regression: set_capture_suppressed() is now the ONLY thing that starts
+        the trackers (AppController stopped calling start() directly). On a fresh
+        process the flag already reads False, so an early-return on "no transition"
+        left the trackers never started — the agent would record nothing, ever."""
+        assert manager.capture_suppressed is False  # fresh process, flag untouched
+
+        manager.set_capture_suppressed(False, "startup")
+
+        assert manager._spy_start.called
+
+    def test_allowing_capture_again_does_not_restart_a_live_stack(self, manager):
+        """The 60s policy tick calls this every cycle while inside the window.
+        Re-running _start_locked() on a live stack would see our OWN server on the
+        port and misfile it as an external instance we must not manage."""
+        manager.set_capture_suppressed(False, "startup")
+        manager._spy_start.reset_mock()
+        manager._processes["bf-data-service"] = Mock()  # stack is up
+
+        manager.set_capture_suppressed(False, "tick")
+
+        assert not manager._spy_start.called
 
 
 class TestSuppressionSurvivesTheHealthChecks:

@@ -541,7 +541,7 @@ class AWManager:
             return self._capture_suppressed
 
     def set_capture_suppressed(self, suppressed: bool, reason: str = "") -> None:
-        """Suppress or resume ALL local capture.
+        """Suppress or resume ALL local capture, converging on the desired state.
 
         Suppressing stops the tracker processes outright — this is the difference
         between "we don't upload your evening" and "we don't watch your evening".
@@ -549,17 +549,35 @@ class AWManager:
         written to a local store on the employee's machine around the clock; only
         stopping the watchers actually stops the recording.
 
-        Idempotent, so the 60s policy tick can call it every cycle.
+        This ENSURES the end state rather than reacting to a flag transition. It
+        is the sole owner of tracker startup now (AppController no longer calls
+        start() directly), so an early-return on "flag already False" would leave a
+        fresh process — where the flag starts False and nothing is running — with
+        the trackers never started at all.
+
+        Idempotent in both directions, so the 60s policy tick can call it every
+        cycle: _stop_locked() no-ops with no processes, and the start is guarded on
+        nothing of ours already running. Reviving processes that died mid-session
+        is restart_if_needed()'s job, not this one's — calling _start_locked() on a
+        live stack would see our own server on the port and misfile it as external.
         """
+        suppressed = bool(suppressed)
         with self._lifecycle_lock:
-            if self._capture_suppressed == bool(suppressed):
-                return
-            self._capture_suppressed = bool(suppressed)
-            if self._capture_suppressed:
-                logger.info("Capture suppressed (%s) — stopping trackers", reason or "outside working hours")
+            changed = self._capture_suppressed != suppressed
+            self._capture_suppressed = suppressed
+
+            if suppressed:
+                if changed:
+                    logger.info(
+                        "Capture suppressed (%s) — stopping trackers",
+                        reason or "outside working hours",
+                    )
                 self._stop_locked()
-            else:
-                logger.info("Capture resumed (%s) — starting trackers", reason or "inside working hours")
+            elif not self._processes:
+                logger.info(
+                    "Capture allowed (%s) — starting trackers",
+                    reason or "inside working hours",
+                )
                 self._start_locked()
 
     def start(self) -> bool:

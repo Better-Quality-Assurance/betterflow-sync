@@ -2569,13 +2569,9 @@ class BetterFlowApp:
         capture policy the server just told us about."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
 
-        # Persist the schedule so the NEXT cold start knows the window before it
-        # can reach the server. Without this, `known` is False on every launch and
-        # an offline machine would never capture at all.
-        try:
-            self.config.save()
-        except Exception as e:
-            logger.warning("Failed to persist working-hours schedule: %s", e)
+        # The schedule is already on disk by now: update_from_server() ends with
+        # self.save(), which is what lets the NEXT cold start know the window
+        # before it can reach the server. No second save here.
 
         # Re-evaluate immediately rather than waiting up to 60s for the next tick:
         # this is the moment a restricted user's agent first learns it is
