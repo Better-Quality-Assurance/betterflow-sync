@@ -58,6 +58,37 @@ def test_privacy_egress_settings_do_not_apply_on_upgrade():
     assert cfg.privacy.title_allowlist == before_allowlist, "title_allowlist deferred too"
 
 
+def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
+    # First-ever config delivery must not silently flip capture/billing behaviour
+    # from a stale device row. All of these stay at local defaults.
+    cfg = Config()
+    before = (
+        cfg.foreground_activity.enabled,
+        cfg.call_detection.enabled,
+        cfg.sync.in_process_input,
+        cfg.engagement.window_minutes,
+        cfg.fraud_detection.min_app_diversity,
+    )
+
+    cfg.update_from_server({
+        "foreground_activity": {"enabled": True, "max_credit_minutes": 90},
+        "call_detection": {"enabled": True},
+        "sync": {"in_process_input": True, "batch_size": 250},  # batch_size is benign → applies
+        "engagement": {"window_minutes": 99},
+        "fraud_detection": {"min_app_diversity": 42},
+    })
+
+    assert (
+        cfg.foreground_activity.enabled,
+        cfg.call_detection.enabled,
+        cfg.sync.in_process_input,
+        cfg.engagement.window_minutes,
+        cfg.fraud_detection.min_app_diversity,
+    ) == before, "capture/billing/engagement/fraud blocks must be deferred on upgrade"
+    # ...but benign sync tuning in the same payload still applies:
+    assert cfg.sync.batch_size == 250
+
+
 def test_working_hours_and_sync_tuning_still_apply():
     # The gate must NOT swallow the intended-live settings.
     cfg = Config()
