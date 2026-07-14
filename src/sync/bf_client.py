@@ -485,8 +485,35 @@ class BetterFlowClient(BaseApiClient):
     # =========================================================================
 
     def get_config(self) -> dict:
-        """Get configuration from server."""
-        return self._request("GET", "config")
+        """Get configuration from server, UNWRAPPED.
+
+        The API wraps every payload in BaseApiController::successResponse ->
+        {"success": true, "message": ..., "data": {...}}, and _request returns that
+        envelope verbatim — each caller unwraps for itself (see send_events, which
+        does exactly this at the `payload = response.get("data", response)` line).
+
+        This method forgot to, and handed the whole envelope to
+        Config.update_from_server(), which looks for TOP-LEVEL keys ("privacy",
+        "tracking", "sync", "working_hours"). None of them ever matched. So no
+        server-side configuration has ever been applied to any agent: not the AFK
+        timeout, not the privacy flags, and not the working-hours schedule — which
+        is why enforcement never worked, quite apart from the dict-vs-dataclass bug
+        downstream of it. The failure was totally silent: update_from_server ends
+        with save(), so the agent dutifully wrote the unchanged config back to disk
+        and logged "Server configuration applied".
+
+        This became load-bearing the moment capture went fail-closed: an agent that
+        can never learn its schedule has known=False forever, so it suppresses
+        capture forever and records nothing at all.
+        """
+        response = self._request("GET", "config")
+        if not isinstance(response, dict):
+            return {}
+        # A wrapped body carrying data:null (or a non-dict data) must not reach
+        # Config.update_from_server, which indexes it with `"privacy" in payload`
+        # and would raise TypeError on None — surfacing as a failed sync cycle.
+        payload = response.get("data", response)
+        return payload if isinstance(payload, dict) else {}
 
     def get_projects(self) -> list[dict]:
         """Get list of projects for app mapping."""

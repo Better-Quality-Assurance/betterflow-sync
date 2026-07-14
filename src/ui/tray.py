@@ -237,6 +237,11 @@ class TrayState(Enum):
     ERROR = "error"  # Red - auth failed or AW not running
     PAUSED = "paused"  # Gray - user paused tracking
     PRIVATE = "private"  # Dark gray - private time, nothing recorded
+    # Grey - outside the enforced working-hours window. Distinct from PRIVATE (which
+    # the USER declares) because the cause is different and the tooltip must say so:
+    # this one is not a choice they made, it is their contracted hours ending. Same
+    # effect though — nothing is recorded.
+    PRIVATE_HOURS = "private_hours"
     ON_BREAK = "on_break"  # Amber - auto-break active
     NEEDS_PERMISSIONS = "needs_permissions"  # Amber - macOS permissions missing
     STARTING = "starting"  # Blue - starting up
@@ -251,6 +256,7 @@ STATE_COLORS = {
     TrayState.ERROR: "#c96660",  # BetterFlow error red
     TrayState.PAUSED: "#9ca3af",  # Gray
     TrayState.PRIVATE: "#6b7280",  # Dark gray - private time
+    TrayState.PRIVATE_HOURS: "#94a3b8",  # Grey - outside working hours, not recording
     TrayState.ON_BREAK: "#B57EF5",  # BetterFlow light purple - break
     TrayState.NEEDS_PERMISSIONS: "#f59e0b",  # Amber - permissions missing
     TrayState.STARTING: "#614D87",  # BetterFlow dark purple

@@ -10,9 +10,12 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from dataclasses import fields as dc_fields
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
@@ -25,6 +28,7 @@ __all__ = [
     "EngagementConfig",
     "FraudDetectionConfig",
     "CallDetectionSettings",
+    "WorkingHoursConfig",
     "setup_logging",
     "get_machine_uuid",
     "DEFAULT_API_URL",
@@ -422,18 +426,189 @@ class ReminderSettings:
     private_auto_end_hours: float = 4.0
 
 
+def _normalize_hhmm(value) -> str:
+    """Coerce a server-sent time to zero-padded HH:MM, or RAISE.
+
+    allows() compares times as STRINGS, which is only correct when both sides are
+    zero-padded ("7:30" > "22:00" lexically, so an unpadded start would let every
+    hour of the night through).
+
+    This must FAIL CLOSED, and an earlier version of this function did not: it
+    substituted the widest possible default on bad input ("00:00" / "23:59") and
+    the caller then set known=True anyway. A single backend typo — "7.30" instead
+    of "07:30" — would silently widen a restricted user's window to start at
+    midnight and record them all night. Raising instead lets update_from_server
+    keep the schedule it already trusted (or none at all).
+    """
+    text = str(value).strip() if value is not None else ""
+    # Seconds are tolerated but ignored: agent_work_schedules.work_start is a
+    # string(5) today, so the wire carries "07:30" — but if that column is ever
+    # migrated to TIME, Eloquent starts emitting "07:30:00", this would raise, known
+    # would stay False, and EVERY restricted user would go dark. Cheap insurance.
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", text)
+    if not match:
+        raise ValueError(f"working-hours time is not HH:MM: {value!r}")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"working-hours time out of range: {value!r}")
+    return f"{hour:02d}:{minute:02d}"
+
+
+# Fixing the /config envelope unwrap (bf_client.get_config) means server settings reach
+# the agent for the FIRST TIME EVER — none of them have ever applied. Two of those move
+# real-world behaviour and have nothing to do with working-hours enforcement, so they
+# must land as their own deliberate change rather than as a side effect of a privacy fix:
+#
+#   tracking.afk_timeout_minutes  — 37 of 44 prod devices are set to 20 while every agent
+#                                   has run the client default of 10. Applying it lengthens
+#                                   the idle grace, i.e. it CHANGES BILLED HOURS.
+#   privacy.hash_window_titles    — 41 of 44 are set to ON. Applying it turns window titles
+#                                   into hashes, so admins lose readable titles.
+#
+# Both are what the DB has always said and what someone intended; they have simply never
+# taken effect. Each needs its own release, with the affected people told first. Flip this
+# to False (one setting at a time) to roll them out.
+#
+# working_hours is deliberately NOT gated by this: it is the whole point of the release.
+DEFER_UNAPPLIED_SERVER_SETTINGS = True
+
+
+@lru_cache(maxsize=8)
+def _resolve_schedule_tz(name: str):
+    """Resolve a schedule timezone, logging an unresolvable one ONCE.
+
+    allows() runs per event, so logging inside it flooded the log on a single
+    misconfigured timezone. lru_cache makes the body — and therefore the log line —
+    run once per distinct name for the life of the process.
+    """
+    if not name:
+        return None  # normal: production sends no timezone; use machine-local.
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        # SET but unresolvable means the tz database is missing (Windows without
+        # tzdata, which we now bundle). The machine-local fallback then evaluates the
+        # window in a clock the employee can change, so say so — but keep the
+        # fallback: failing closed here would silently stop tracking a whole platform.
+        logger.error(
+            "Working-hours timezone %r could not be resolved (missing tz database?) "
+            "— falling back to machine-local time, which the user can change",
+            name,
+        )
+        return None
+
+
+def _normalize_working_days(value) -> list:
+    """Coerce server-sent working days to a list of ISO weekdays, or RAISE.
+
+    Fails closed for the same reason as _normalize_hhmm: allows() reads an EMPTY
+    working_days as "no day restriction" (`if self.working_days and ...`), so a
+    malformed [] would quietly turn a Mon-Fri schedule into a 7-day one.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"working_days must be a non-empty list: {value!r}")
+    days = [int(d) for d in value]  # ValueError/TypeError on junk — intended
+    if any(d < 1 or d > 7 for d in days):
+        raise ValueError(f"working_days out of ISO 1-7 range: {value!r}")
+    return days
+
+
 @dataclass
 class WorkingHoursConfig:
     """Server-enforced working-hours window. When ``enforced``, the agent must
-    NOT record/upload events outside [work_start, work_end] on working_days,
-    evaluated in ``timezone``. For B2E / Trainee-Intern this is 08:00-22:00
-    Mon-Fri; B2B and others are unrestricted (enforced=False)."""
+    NOT record a thing outside [work_start, work_end] on working_days, evaluated
+    in ``timezone``. For B2E / Trainee-Intern this is 07:30-22:00 Mon-Fri; B2B
+    and others are unrestricted (enforced=False).
+
+    ``known`` is the fail-closed guard and the reason this class exists rather
+    than a bare dict. Until the server has told us the schedule at least once, we
+    do NOT know whether this person may be recorded, and "don't know" must mean
+    "don't record" — not "record everything", which is what an ``enforced=False``
+    default silently meant before. It is persisted, so an offline cold start
+    reuses the last known schedule instead of falling back to permissive.
+    """
 
     enforced: bool = False
     work_start: str = "00:00"
     work_end: str = "23:59"
     working_days: list = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
     timezone: str = ""
+    known: bool = False
+
+    def allows(self, when: "datetime") -> bool:
+        """True if this instant may be recorded at all — the single source of
+        truth for both capture suppression (main) and the upload gate (sync).
+
+        Fail-closed: an unknown schedule records nothing. Evaluated in the
+        schedule's timezone, falling back to the machine's local zone (the
+        employee's own clock is the right one for "don't watch my laptop at
+        night") when the server sends none.
+        """
+        if not self.known:
+            return False
+        if not self.enforced:
+            return True
+
+        tz = _resolve_schedule_tz(self.timezone)
+        local = when.astimezone(tz) if tz else when.astimezone()
+        hhmm = local.strftime("%H:%M")
+
+        # An empty working_days is treated as "no working day at all", not "every
+        # day". _normalize_working_days already rejects [] from the server, so this
+        # only bites a hand-edited config — and the safe reading of "no days
+        # configured" is to record nothing.
+
+        if self.work_start <= self.work_end:
+            # Normal daytime window: the shift belongs to the day it falls on.
+            if local.isoweekday() not in self.working_days:
+                return False
+            return self.work_start <= hhmm <= self.work_end
+
+        # Overnight window (e.g. a 22:00-06:00 night shift). A plain
+        # start <= hhmm <= end is EMPTY when start > end, which recorded such a user
+        # for exactly zero seconds a day.
+        #
+        # The shift is named for the day it STARTS on, so the day-of-week test has to
+        # be applied to that day — not to the instant's own local day. Testing the
+        # instant's day gets it wrong in BOTH directions:
+        #   - Sat 02:00 (the real tail of Friday's shift) would be denied, and
+        #   - Mon 02:00 (the tail of a SUNDAY NIGHT the user does not work) would be
+        #     ALLOWED and recorded. That second one is over-collection — precisely
+        #     what this feature exists to prevent.
+        if hhmm >= self.work_start:
+            shift_day = local.isoweekday()               # evening half: today's shift
+        elif hhmm <= self.work_end:
+            shift_day = (local - timedelta(days=1)).isoweekday()  # morning half: yesterday's
+        else:
+            return False                                  # the daylight gap between shifts
+        return shift_day in self.working_days
+
+    def window_close_after(self, start: "datetime") -> "Optional[datetime]":
+        """The instant the working-hours window containing ``start`` closes, in UTC.
+
+        Used to CLAMP the end of a status span (idle/break/sleep/private) that began
+        inside the window and ran past it. Gating those spans on their start alone was
+        not enough: an idle span beginning 21:45 and ending 23:55 passed the gate and
+        told the server the employee became active at 23:55 — the exact fact we are
+        here not to collect. Clamping to 22:00 keeps the true in-window portion and
+        leaks nothing about the evening.
+
+        Returns None when there is no window to clamp to (unknown or unrestricted).
+        """
+        if not self.known or not self.enforced:
+            return None
+
+        tz = _resolve_schedule_tz(self.timezone)
+        local = start.astimezone(tz) if tz else start.astimezone()
+        end_h, end_m = (int(p) for p in self.work_end.split(":"))
+        close = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+
+        # For an overnight window the close belongs to the NEXT local day whenever
+        # `start` is in the evening half.
+        if self.work_start > self.work_end and local.strftime("%H:%M") >= self.work_start:
+            close += timedelta(days=1)
+
+        return close.astimezone(timezone.utc)
 
 
 @dataclass
@@ -518,6 +693,15 @@ class Config:
         fraud_detection_data = data.pop("fraud_detection", {})
         call_detection_data = data.pop("call_detection", {})
         foreground_activity_data = data.pop("foreground_activity", {})
+        # working_hours was missing from this list until 2026-07-14, so it fell
+        # through to the **data splat below and was rebuilt as a plain dict. A
+        # dict has no attributes: update_from_server's `self.working_hours.
+        # enforced = ...` then raised AttributeError (swallowed as "invalid
+        # working_hours, ignoring") and _within_working_hours' `getattr(wh,
+        # "enforced", False)` read False. Net effect: on EVERY device that had
+        # ever written a config.json, working-hours enforcement was silently and
+        # permanently off, and restricted users were recorded around the clock.
+        working_hours_data = data.pop("working_hours", {})
         # Ignore any persisted foreground_activity.enabled — it's server-driven
         # and default-OFF. A device that ran a default-ON beta build already has
         # enabled=true on disk; honouring it would override the safe default on
@@ -555,6 +739,7 @@ class Config:
             fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
             foreground_activity=_safe(ForegroundActivitySettings, foreground_activity_data) if foreground_activity_data else ForegroundActivitySettings(),
+            working_hours=_safe(WorkingHoursConfig, working_hours_data) if working_hours_data else WorkingHoursConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -609,7 +794,17 @@ class Config:
             sync.sync_interval_seconds -> local interval_seconds
             sync.batch_size -> local batch_size
         """
-        if "privacy" in server_config:
+        # PRIVACY-EGRESS settings are deferred as a block behind
+        # DEFER_UNAPPLIED_SERVER_SETTINGS. The /config envelope fix means server
+        # config reaches the agent for the FIRST time on upgrade; without this
+        # gate a device row carrying e.g. collect_full_urls=1 or
+        # track_browser_domains=0 would silently start egressing full URLs the
+        # moment this build lands — a privacy behaviour change in the opposite
+        # direction from this release's intent. These stay off until the team
+        # audits the device rows and flips the flag in a deliberate release.
+        # (working_hours + operational sync tuning below are NOT gated — those
+        # are the intended live behaviours.)
+        if "privacy" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             privacy = server_config["privacy"]
             if "hash_window_titles" in privacy:
                 self.privacy.hash_titles = self._to_bool(privacy["hash_window_titles"])
@@ -621,7 +816,7 @@ class Config:
             if "collect_full_urls" in privacy:
                 self.privacy.collect_full_urls = self._to_bool(privacy["collect_full_urls"])
 
-        if "collection" in server_config:
+        if "collection" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
                 self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])
@@ -644,7 +839,7 @@ class Config:
                     merged.update(valid)
                     self.privacy.default_categories = merged
 
-        if "tracking" in server_config:
+        if "tracking" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             tracking = server_config["tracking"]
             if "afk_timeout_minutes" in tracking:
                 val = tracking["afk_timeout_minutes"]
@@ -653,16 +848,44 @@ class Config:
 
         if "working_hours" in server_config:
             wh = server_config["working_hours"]
+            # Build a fresh instance and swap it in only once it is fully parsed,
+            # so a half-applied payload can never leave a live schedule in a state
+            # that is neither the old one nor the new one. `known` is set LAST and
+            # only on success: a schedule we failed to parse is a schedule we do
+            # not know, and an unknown schedule records nothing (see .allows()).
+            #
+            # Do NOT widen this except to swallow AttributeError. That is what hid
+            # the dict-vs-dataclass bug for the whole life of the feature — the
+            # error fired on every sync, was logged as a shrug, and enforcement
+            # stayed off. If the shape is wrong we want to know loudly.
             try:
-                self.working_hours.enforced = bool(wh.get("enforced", False))
-                self.working_hours.work_start = str(wh.get("work_start", "00:00"))
-                self.working_hours.work_end = str(wh.get("work_end", "23:59"))
-                days = wh.get("working_days")
-                if isinstance(days, list) and days:
-                    self.working_hours.working_days = [int(d) for d in days]
-                self.working_hours.timezone = str(wh.get("timezone", "") or "")
-            except (TypeError, ValueError, AttributeError):
-                logger.warning("Invalid working_hours from server, ignoring")
+                enforced = self._to_bool(wh.get("enforced", False))
+                if enforced:
+                    # Only a RESTRICTED schedule needs a window. Validators raise on
+                    # anything malformed rather than widening the window to its
+                    # defaults, so a backend typo can never reopen the night.
+                    parsed = WorkingHoursConfig(
+                        enforced=True,
+                        work_start=_normalize_hhmm(wh.get("work_start")),
+                        work_end=_normalize_hhmm(wh.get("work_end")),
+                        working_days=_normalize_working_days(wh.get("working_days")),
+                        timezone=str(wh.get("timezone", "") or ""),
+                    )
+                else:
+                    # Unrestricted (B2B): 24/7, no window to validate.
+                    parsed = WorkingHoursConfig(enforced=False)
+                parsed.known = True
+                self.working_hours = parsed
+            except (TypeError, ValueError) as e:
+                # Keep whatever we already knew (possibly a cached schedule from
+                # disk). Never fall back to a permissive default.
+                logger.error(
+                    "Invalid working_hours from server (%s): %r — keeping previous "
+                    "schedule (known=%s)",
+                    e,
+                    wh,
+                    self.working_hours.known,
+                )
 
         if "sync" in server_config:
             sync = server_config["sync"]

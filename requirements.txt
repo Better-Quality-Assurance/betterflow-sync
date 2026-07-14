@@ -18,6 +18,11 @@ pyobjc-framework-ApplicationServices>=10.0,<13; sys_platform == "darwin"
 # uiautomation -> read the foreground browser's omnibox URL via UI Automation
 # (opt-in active-tab tracking, privacy.track_browser_urls). Fail-closed if absent.
 uiautomation>=2.0,<3; sys_platform == "win32"
+# Windows ships no IANA timezone database, so zoneinfo.ZoneInfo("Europe/Bucharest")
+# raises ZoneInfoNotFoundError there. WorkingHoursConfig.allows() would catch it and
+# fall back to the MACHINE's local timezone — i.e. evaluate an enforced working-hours
+# window in a timezone the employee themselves controls. Ship the tz database.
+tzdata>=2024.1; sys_platform == "win32"
 
 # Linux-only dependencies
 # PyGObject -> AppIndicator tray backend; python-xlib -> XOrg fallback backend;

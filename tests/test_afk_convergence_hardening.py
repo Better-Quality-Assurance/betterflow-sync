@@ -36,6 +36,9 @@ def _runnable_engine(in_process_afk: bool) -> SyncEngine:
     """A SyncEngine wired so a full sync() cycle runs to the AFK-decision point
     with no real buckets — exercises the real code path, not a stub of it."""
     cfg = Config()
+    # Capture is fail-closed on an unknown schedule; this suite is about AFK
+    # convergence, so declare it known-and-unrestricted (B2B 24/7).
+    cfg.working_hours.known = True
     cfg.sync.in_process_afk = in_process_afk
 
     aw = Mock()

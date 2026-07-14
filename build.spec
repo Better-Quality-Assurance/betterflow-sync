@@ -119,6 +119,11 @@ if is_mac:
     ]
 elif is_windows:
     platform_hiddenimports = [
+        # zoneinfo finds no IANA database on Windows and falls back to the machine's
+        # local timezone — which would let an employee shift their own enforced
+        # working-hours window by changing the PC clock. tzdata is a data-only
+        # package, so PyInstaller does not detect it by import analysis.
+        "tzdata",
         "pystray._win32",
         "keyring.backends.Windows",
     ]

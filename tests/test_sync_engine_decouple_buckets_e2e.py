@@ -120,7 +120,9 @@ def test_decouple_and_monotonic_checkpoints_end_to_end():
     tt = DailyTimeTracker(db_path=tmp / "t.db")
     aw, bf = _FakeAW(now), _FakeBF()
 
-    engine = SyncEngine(aw=aw, bf=bf, queue=q, config=Config(), time_tracker=tt)
+    cfg = Config()
+    cfg.working_hours.known = True  # known + unrestricted; capture is fail-closed otherwise
+    engine = SyncEngine(aw=aw, bf=bf, queue=q, config=cfg, time_tracker=tt)
     # Exercise the STEADY-STATE path: skip the one-time whole-day backlog replay.
     engine._backlog_reconciled = True
     # Suppress the stale-AFK synthesizer: on a genuinely-active CI/dev machine it

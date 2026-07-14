@@ -165,6 +165,17 @@ class SyncCoordinator:
         self.scheduler = BackgroundScheduler()
         self._last_tick: Optional[datetime] = None
 
+        # Working-hours capture policy, injected by BetterFlowApp (which owns the
+        # trackers) the same way _on_auth_error / on_private_auto_end are. Declared
+        # here with a None default ON PURPOSE: the first cut of this referenced
+        # BetterFlowApp._apply_capture_policy directly from _tick_60s, but _tick_60s
+        # lives on THIS class — so it raised AttributeError while building the
+        # sub-task tuple, i.e. before the loop, i.e. outside _run_tick_task's
+        # try/except. That killed the whole 60s tick every cycle: not just the
+        # capture policy but idle detection, hours refresh, permissions and
+        # reminders with it.
+        self.apply_capture_policy: Optional[Callable[[], None]] = None
+
         # Consecutive hard sync failures. Reported to the logs channel once it
         # crosses the threshold (transient blips are normal and not reported).
         # Only mutated inside _do_sync, which holds _sync_lock, so no extra lock.
@@ -876,8 +887,16 @@ class SyncCoordinator:
         """Dedicated fast sampler for the in-process window source. Gated no-op
         unless in_process_window is on and the frontmost-window probe is usable,
         so it costs nothing on the default path."""
+        now = datetime.now(timezone.utc)
+        # This runs every 5s straight off the scheduler, independently of the
+        # trackers, so stopping the tracker processes does NOT stop it: with
+        # in_process_window enabled it would keep sampling the frontmost app name
+        # and window title into a local buffer all night. Gate it on the same
+        # schedule as everything else.
+        if not self.config.working_hours.allows(now):
+            return
         try:
-            self.sync_engine.record_window_sample_if_active(datetime.now(timezone.utc))
+            self.sync_engine.record_window_sample_if_active(now)
         except Exception as e:
             logger.debug("window sample tick failed: %s", e)
 
@@ -892,8 +911,19 @@ class SyncCoordinator:
         once and stop re-scheduling, freezing the 60s tick entirely
         (idle detection, hours, permissions, reminders all silently dead).
         Several callees already self-guard but tray.tick_clock() does not.
+
+        NOTE the tuple below is built BEFORE the loop body runs, so anything that
+        raises while *constructing* it (a missing attribute, say) escapes
+        _run_tick_task entirely and kills the tick anyway — the exact failure the
+        try/except exists to prevent. Every entry must therefore be an attribute
+        that provably exists on THIS class. Hence apply_capture_policy is declared
+        in __init__ with a None default and filtered out here rather than being
+        reached for on another object.
         """
-        for fn, label in (
+        tasks = [
+            # First: a window that closed while the app was running must stop
+            # capture promptly, before any sub-task below reads from the trackers.
+            (self.apply_capture_policy, "capture_policy"),
             (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
@@ -903,7 +933,8 @@ class SyncCoordinator:
             (self._check_auth_warn, "auth_warn"),
             (self._check_idle_tracker_health, "idle_tracker_health"),
             (self._check_private_auto_end, "private_auto_end"),
-        ):
+        ]
+        for fn, label in [t for t in tasks if t[0] is not None]:
             self._run_tick_task(fn, label)
         if self.reminder_manager:
             self._run_tick_task(self.reminder_manager.check, "reminders")
@@ -1201,7 +1232,22 @@ class SyncCoordinator:
                     # not fail silently every cycle.
                     logger.warning("restart-loop escalation check failed", exc_info=True)
 
-            if not self.aw.is_running():
+            # Outside working hours the trackers are stopped ON PURPOSE, so
+            # aw.is_running() is False and the branch below would (a) escalate a
+            # deliberate silence to "ActivityWatch not responding" in the tray every
+            # single night, and (b) `return` before sync_engine.sync() — which is
+            # where the offline queue gets drained, the heartbeat is sent, AND
+            # fetch_server_config() retries. That last one is a trap: a device whose
+            # first config fetch failed has known=False, so capture is suppressed, so
+            # the tracker is down, so sync() is never reached, so the config is never
+            # re-fetched — suppressed forever, zero tracking, until someone restarts
+            # the app AND the network happens to be up. Fall through instead: sync()
+            # has its own suppressed path that skips the AW reads.
+            capture_suppressed = not self.config.working_hours.allows(
+                datetime.now(timezone.utc)
+            )
+
+            if not capture_suppressed and not self.aw.is_running():
                 # is_running() already reset+retried the HTTP session, so this
                 # is a real stall, not a stale-socket blip. Debounce before
                 # escalating: one missed cycle stays silent (it usually
@@ -1226,7 +1272,9 @@ class SyncCoordinator:
                     )
                 return
 
-            # Reachable — clear the streak.
+            # Reachable (or deliberately down) — clear the streak. A suppressed
+            # night must not leave a stale streak that escalates the moment the
+            # window reopens.
             self._aw_unreachable_streak = 0
 
             stats = self.sync_engine.sync()
@@ -1256,6 +1304,18 @@ class SyncCoordinator:
                     logger.warning(f"Offline queue at {pct}% capacity")
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
+                elif stats.capture_suppressed:
+                    # Outside the enforced window: nothing is being recorded, and the
+                    # tray says so. Someone whose machine has stopped being watched is
+                    # entitled to see that at a glance, without opening a menu — and
+                    # showing SYNCING here would be an outright lie.
+                    #
+                    # Set from the STATS rather than by short-circuiting _do_sync,
+                    # because sync() must still run while suppressed: it drains the
+                    # offline queue and, crucially, it is where fetch_server_config()
+                    # retries. Returning early here would recreate the lockout where an
+                    # agent that never learned its schedule could never learn it.
+                    self.tray.set_state(TrayState.PRIVATE_HOURS, "Private hours — not recording")
                 else:
                     if is_idle:
                         self.tray.set_state(TrayState.PAUSED, "Idle")
@@ -1484,17 +1544,16 @@ class BetterFlowApp:
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
         logger.info("Core clients initialized")
-        if self.config.privacy.track_display_info:
-            self.display_tracker = start_display_tracker()
-        else:
-            self.display_tracker = None
 
-        # Active browser-tab URL tracker (macOS). Off unless enabled; without it
-        # browser events carry no URL and collapse to generic "browsing".
-        if self.config.privacy.track_browser_urls:
-            self.browser_tracker = start_browser_tracker()
-        else:
-            self.browser_tracker = None
+        # Both of these used to be STARTED here — at process init, before login and
+        # before the working-hours schedule was known. The browser tracker polls the
+        # frontmost browser's active-tab URL (AppleScript on macOS, uiautomation
+        # omnibox on Windows); starting it before we know whether this person may be
+        # recorded at all is the same fail-open mistake as the old enforced=False
+        # default. They are now started by _start_watchers() under the capture
+        # policy, and stopped by _stop_watchers() when the window closes.
+        self.display_tracker = None
+        self.browser_tracker = None
 
         # In-process window watcher on macOS (inherits Accessibility permission)
         self.window_watcher = None
@@ -1570,6 +1629,10 @@ class BetterFlowApp:
         self.coordinator._on_auth_error = self._on_session_expired
         self.coordinator.on_private_auto_end = self._auto_end_private
         self.coordinator._input_watcher = self.input_watcher
+        # The 60s tick is what notices the window closing at 22:00 while the app is
+        # running. BetterFlowApp owns the trackers, so the coordinator gets a handle
+        # rather than reaching across to another object (see SyncCoordinator.__init__).
+        self.coordinator.apply_capture_policy = self._apply_capture_policy
         # The idle manager uses the same in-process watcher as an authoritative
         # override so a blind/stuck bf-idle-tracker can't paint live work as
         # Idle (it never consulted the input watcher before — only the health
@@ -1665,6 +1728,12 @@ class BetterFlowApp:
         self._startup_thread: Optional[threading.Thread] = None
         self._system_events_started = False
         self._system_events_lock = threading.Lock()
+        # Working-hours capture policy. None = not yet evaluated; the first
+        # _apply_capture_policy() call decides. Guarded by _capture_lock because
+        # the 60s tick, the post-config-fetch callback and the wake-from-sleep
+        # handler all drive it from different threads.
+        self._capture_lock = threading.RLock()
+        self._capture_allowed: Optional[bool] = None
 
         # Sub-handlers
         self.update_handler = UpdateHandler(self.tray, self.config, self.coordinator, _VERSION)
@@ -1705,6 +1774,140 @@ class BetterFlowApp:
                 self.input_source.start()
             except Exception as e:
                 logger.warning("In-process input source start failed: %s", e)
+
+        # The browser-tab URL reader and the display tracker are started HERE, under
+        # the capture policy — not in __init__, where they used to run from process
+        # start, before login and before any schedule was known. The browser tracker
+        # is the single most sensitive recorder we ship (it reads the frontmost
+        # browser's active-tab URL via AppleScript on macOS / the uiautomation
+        # omnibox on Windows), and it was left running all night by every earlier
+        # version of this fix.
+        if self.browser_tracker is None and self.config.privacy.track_browser_urls:
+            try:
+                self.browser_tracker = start_browser_tracker()
+            except Exception as e:
+                logger.warning("Browser tracker start failed: %s", e)
+        if self.display_tracker is None and self.config.privacy.track_display_info:
+            try:
+                self.display_tracker = start_display_tracker()
+            except Exception as e:
+                logger.warning("Display tracker start failed: %s", e)
+        # Hand the NEW objects to the engine through its setter. Assigning
+        # engine.browser_tracker directly writes an attribute nothing reads.
+        self.sync_engine.set_enrichment_trackers(
+            browser_tracker=self.browser_tracker,
+            display_tracker=self.display_tracker,
+        )
+
+    def _stop_watchers(self) -> None:
+        """Stop EVERY in-process recorder. Mirror of _start_watchers().
+
+        AWManager.stop() only reaches the processes IT spawned. Everything below
+        runs inside our own process and would otherwise keep recording after the
+        trackers were stopped:
+
+        - window_watcher  : foreground app + window title (macOS)
+        - input_watcher   : CGEventTap over every keystroke/click/scroll (macOS)
+        - input_source    : in-process input-count backend (macOS tap / Windows hook)
+        - browser_tracker : active-tab URL of the frontmost browser (both platforms)
+        - display_tracker : attached-display metadata
+
+        browser_tracker and display_tracker were missed by the first cut of this
+        fix, so a "suppressed" machine was still reading the employee's browser tabs
+        at midnight. On Windows window_watcher/input_watcher are None and
+        bf-window-tracker / bf-idle-tracker are covered by AWManager — but
+        browser_tracker is NOT, which is why it has to be handled here.
+
+        (The 5s window sampler has no stop(); it is gated instead, in
+        SyncCoordinator._sample_window.)
+        """
+        for watcher, label in (
+            (self.window_watcher, "window_watcher"),
+            (self.input_watcher, "input_watcher"),
+            (self.input_source, "input_source"),
+            (self.browser_tracker, "browser_tracker"),
+            (self.display_tracker, "display_tracker"),
+        ):
+            if watcher is None:
+                continue
+            try:
+                watcher.stop()
+            except Exception as e:
+                logger.warning("Failed to stop %s: %s", label, e)
+
+        # These two are re-created by _start_watchers() when the window reopens.
+        # Detach them from the engine through its setter too, so nothing that
+        # outlives the stop can poll a stale handle.
+        self.browser_tracker = None
+        self.display_tracker = None
+        self.sync_engine.set_enrichment_trackers(browser_tracker=None, display_tracker=None)
+
+    def _capture_currently_allowed(self) -> bool:
+        """Whether capture is permitted right now, per the working-hours schedule."""
+        return self.config.working_hours.allows(datetime.now(timezone.utc))
+
+    def _apply_capture_policy(self, reason: str = "tick") -> None:
+        """Start or stop ALL local capture according to the working-hours schedule.
+
+        This is the enforcement point. Outside the user's window — and while their
+        schedule is still unknown — nothing on this machine records them: the
+        tracker processes are down and every in-process recorder is stopped. Not
+        "recorded but not billed"; not recorded.
+
+        CONVERGES on the desired state; it does not latch on a transition. An
+        earlier cut returned early when `allowed` matched the last decision, which
+        meant anything that resurrected a recorder mid-state stayed up forever —
+        _on_idle_pause restarting the input watcher at 22:30 was a real instance,
+        and a tracker start that failed at window-open was never retried. Re-running
+        the desired end state every 60s costs a few no-op calls and closes both.
+        """
+        allowed = self._capture_currently_allowed()
+
+        # _capture_lock (not the AWManager lock) guards the transition, so the 60s
+        # tick, the post-config-fetch callback and the wake handler can't interleave
+        # into a half-applied start/stop. AWManager takes its own lock underneath and
+        # never calls back into here, so the ordering is safe.
+        with self._capture_lock:
+            changed = self._capture_allowed is not allowed
+            self._capture_allowed = allowed
+
+            if allowed:
+                if changed:
+                    # Jump the AW/in-process checkpoints over the suppressed gap
+                    # BEFORE anything reads from them again — the same thing
+                    # pause/resume and private-time already do for their gaps.
+                    # Without it the first cycle back sees a checkpoint from 21:59
+                    # and a `now` of 07:31 and synthesises ONE event spanning the
+                    # whole 9.5h suppressed night (an afk-inproc span; and, with
+                    # in_process_input on, a 9.5h input event stamped 21:59 carrying
+                    # this morning's keystrokes). We would have suppressed the night
+                    # and then manufactured a record of it anyway.
+                    try:
+                        self.sync_engine._advance_checkpoints_to_now("capture_resume")
+                    except Exception as e:
+                        logger.warning("Checkpoint advance on capture resume failed: %s", e)
+                self.aw_manager.set_capture_suppressed(False, reason)
+                self._start_watchers()
+                if changed:
+                    logger.info("Capture ENABLED (%s)", reason)
+            else:
+                self._stop_watchers()
+                # Stops the tracker processes and refuses every restart path until
+                # capture is allowed again.
+                self.aw_manager.set_capture_suppressed(True, reason)
+                if changed:
+                    wh = self.config.working_hours
+                    if not wh.known:
+                        logger.info(
+                            "Capture DISABLED (%s): working-hours schedule not known "
+                            "yet — refusing to record until the server sends it",
+                            reason,
+                        )
+                    else:
+                        logger.info(
+                            "Capture DISABLED (%s): outside working hours %s-%s (days %s)",
+                            reason, wh.work_start, wh.work_end, wh.working_days,
+                        )
 
     def _ensure_system_event_listener(self) -> None:
         """Start system event listeners once without blocking tray startup."""
@@ -1785,11 +1988,18 @@ class BetterFlowApp:
                 return
 
             self._set_startup_status("Starting trackers...")
-            self.aw_manager.start()
+            # Do NOT start the trackers unconditionally here. This runs BEFORE
+            # login and therefore before fetch_server_config(), so at this point we
+            # do not yet know whether this user may be recorded at all. Starting
+            # first and asking later is what let a restricted user's machine be
+            # recorded at 23:55 on a fresh launch. _apply_capture_policy() starts
+            # the trackers only if a KNOWN schedule allows it — which, on a cold
+            # start, means a cached schedule from disk; otherwise capture stays off
+            # until the config fetch lands and _on_config_updated re-evaluates.
+            self._apply_capture_policy("startup")
             if self._shutdown_event.is_set():
                 return
 
-            self._start_watchers()
             self._ensure_system_event_listener()
 
             self._apply_startup_login_state(state)
@@ -2376,10 +2586,17 @@ class BetterFlowApp:
                 # watcher after long idle periods has proven unreliable on some
                 # installs and can leave the sync engine with no input telemetry.
                 logger.info("Input watcher left running (user idle)")
-            else:
+            elif self._capture_currently_allowed():
                 if not self.input_watcher.is_running:
                     self.input_watcher.start()
                     logger.info("Input watcher resumed (user active)")
+            else:
+                # Do NOT resurrect the event tap outside working hours. This fires
+                # on every idle->active transition and also from tray Resume / end
+                # of Private Time — so a user touching the keyboard at 22:30 would
+                # have re-armed a CGEventTap on every keystroke and click, and it
+                # would have stayed armed until the app quit.
+                logger.info("Input watcher NOT resumed: capture suppressed")
         if self.window_watcher:
             self.window_watcher.set_poll_interval(5.0 if paused else 2.0)
         # Stop/start the break reminder timer so it doesn't fire during AFK
@@ -2422,6 +2639,11 @@ class BetterFlowApp:
     def _on_system_wake(self) -> None:
         if self._shutdown_event.is_set():
             return
+        # Re-evaluate the window BEFORE anything else touches the trackers. A laptop
+        # that slept at 21:00 (inside the window) and wakes at 23:00 (outside it)
+        # would otherwise come back with every recorder running and keep them up
+        # until the next 60s tick noticed.
+        self._apply_capture_policy("system wake")
         self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
@@ -2478,8 +2700,18 @@ class BetterFlowApp:
             logger.error(f"Failed to export logs: {e}")
 
     def _on_config_updated(self) -> None:
-        """Handle server config update — apply AFK timeout to AWManager."""
+        """Handle server config update — apply AFK timeout, then the working-hours
+        capture policy the server just told us about."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
+
+        # The schedule is already on disk by now: update_from_server() ends with
+        # self.save(), which is what lets the NEXT cold start know the window
+        # before it can reach the server. No second save here.
+
+        # Re-evaluate immediately rather than waiting up to 60s for the next tick:
+        # this is the moment a restricted user's agent first learns it is
+        # restricted, and it may already be outside their window.
+        self._apply_capture_policy("server config")
 
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""

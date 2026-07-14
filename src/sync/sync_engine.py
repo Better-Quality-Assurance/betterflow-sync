@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -132,6 +131,11 @@ class SyncStats:
     # failed — a half-hung bf-data-service. The coordinator escalates this to a
     # force_restart, which is_running() alone can't trigger.
     aw_bucket_fetch_failed: bool = False
+    # True when this cycle read nothing because capture is suppressed (outside the
+    # user's working hours, or their schedule isn't known yet). Distinguishes "we
+    # are deliberately not recording" from "the tracker broke" — without it the
+    # nightly silence looks identical to an outage.
+    capture_suppressed: bool = False
 
     @property
     def success(self) -> bool:
@@ -225,6 +229,7 @@ class SyncEngine:
         self._current_project: Optional[dict] = None
         self._session_active = False
         self._config_fetched = False
+        self._last_config_fetch_monotonic: float = 0.0
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
@@ -467,6 +472,26 @@ class SyncEngine:
         with self._state_lock:
             return self._paused
 
+    def set_enrichment_trackers(self, *, browser_tracker=None, display_tracker=None) -> None:
+        """Attach/detach the browser-URL and display trackers.
+
+        These used to be constructed in BetterFlowApp.__init__ and handed to this
+        ctor once. They are now created and destroyed by the working-hours capture
+        policy, so the engine needs a way to be told about the new objects.
+
+        An explicit setter, not a bare attribute assignment: the engine reads
+        `self._browser_tracker` (underscore), so `engine.browser_tracker = x` from
+        outside silently created a NEW, never-read attribute while `_browser_tracker`
+        stayed None for the whole process. Effect: browser events shipped with no
+        URL, collapsed to generic "browsing", and were counted productive — the
+        browser_domain-empty incident, reintroduced fleet-wide by the very fix that
+        was supposed to protect people. A Mock-based test asserted the wrong
+        attribute and passed.
+        """
+        with self._state_lock:
+            self._browser_tracker = browser_tracker
+            self._display_tracker = display_tracker
+
     def request_backlog_reconcile(self) -> None:
         """Re-arm the start-of-day backlog reconcile so the NEXT sync rewinds
         checkpoints and re-sends any locally-stored events the server never
@@ -594,12 +619,32 @@ class SyncEngine:
                 self._category_cache = self.queue.get_all_categories()
             return self._category_cache.get(app_name)
 
+    def _config_refetch_due(self, now: float) -> bool:
+        """True if server config should be (re)fetched this cycle: never fetched
+        yet, or the refetch interval has elapsed since the last successful fetch.
+
+        Periodic refetch is how a mid-session schedule change reaches a RUNNING
+        agent — config was otherwise fetched once per process, so a user marked
+        restricted after startup kept being recorded until the app restarted.
+        """
+        if not self._config_fetched:
+            return True
+        # Fetched, but no real fetch timestamp (0.0 = never stamped, e.g. the
+        # flag was set directly rather than via fetch_server_config): we can't
+        # measure staleness, so hold — no spurious refetch.
+        if self._last_config_fetch_monotonic <= 0:
+            return False
+        return (
+            now - self._last_config_fetch_monotonic
+        ) >= self._CONFIG_REFETCH_INTERVAL_SECONDS
+
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
         try:
             server_config = self.bf.get_config()
             self.config.update_from_server(server_config)
             self._config_fetched = True
+            self._last_config_fetch_monotonic = time.monotonic()
             self.invalidate_category_cache()
             logger.info("Server configuration applied")
 
@@ -615,6 +660,15 @@ class SyncEngine:
             raise
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
+            # Back off a FAILED refetch by the normal interval, else a /config
+            # route that 500s while the rest of the API is healthy would leave
+            # every already-configured agent "due" every cycle, burning the whole
+            # per-cycle network budget in get_config()'s retry chain and starving
+            # uploads (and brushing the "Sync hung" watchdog). Stamping here is
+            # safe for the INITIAL fetch too: _config_refetch_due short-circuits
+            # on `not _config_fetched`, so a brand-new agent still retries every
+            # cycle until it first succeeds (it must, to learn its schedule).
+            self._last_config_fetch_monotonic = time.monotonic()
 
     def sync(self) -> SyncStats:
         """Perform a sync cycle.
@@ -670,11 +724,34 @@ class SyncEngine:
         # after it — this fetch, start_session, the send loop, the queue drain —
         # shares one budget.
         if (
-            not self._config_fetched
+            self._config_refetch_due(time.monotonic())
             and not self._cycle_network_budget_exceeded(self._CYCLE_NETWORK_BUDGET_SECONDS)
             and self.bf.is_reachable()
         ):
             self.fetch_server_config()
+
+        # Outside the working-hours window the trackers are intentionally stopped
+        # (AppController._apply_capture_policy). A stopped tracker is the correct
+        # state here, not an outage: fall through to the AW check below and it
+        # would report "ActivityWatch is not running" every cycle all night, and —
+        # worse — return early, so in-hours work still sitting in the offline queue
+        # would not upload until the window reopened.
+        #
+        # So: fetch nothing, but still drain the queue and keep the heartbeat
+        # going, which is also what keeps the device visibly online rather than
+        # looking dead every evening.
+        if not self.config.working_hours.allows(datetime.now(timezone.utc)):
+            stats.capture_suppressed = True
+            if self.bf.is_reachable() and not self.queue.is_empty():
+                if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+                    self._process_queue(stats)
+            with self._state_lock:
+                self._heartbeat_count += 1
+                should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
+                if should_heartbeat:
+                    self._heartbeat_count = 0
+            stats._should_heartbeat = should_heartbeat
+            return stats
 
         # Check ActivityWatch
         if not self.aw.is_running():
@@ -1284,22 +1361,21 @@ class SyncEngine:
             )
 
     def _within_working_hours(self, event: AWEvent) -> bool:
-        """True if the event's start falls inside the server-enforced working-
-        hours window. When the schedule is not enforced (B2B / unrestricted)
-        this is always True. Evaluated in the schedule's timezone, falling back
-        to the machine's local timezone when none is provided."""
-        wh = self.config.working_hours
-        if not getattr(wh, "enforced", False):
-            return True
-        try:
-            tz = ZoneInfo(wh.timezone) if wh.timezone else None
-        except Exception:
-            tz = None
-        local = event.timestamp.astimezone(tz) if tz else event.timestamp.astimezone()
-        if wh.working_days and local.isoweekday() not in wh.working_days:
-            return False
-        hhmm = local.strftime("%H:%M")
-        return wh.work_start <= hhmm <= wh.work_end
+        """True if the event's start may be uploaded — i.e. it falls inside the
+        working-hours window (or the schedule is unrestricted).
+
+        This is now only the SECOND line of defence. Capture itself is suppressed
+        outside the window (AppController._apply_capture_policy stops the
+        trackers), so in the normal case no out-of-hours event exists to filter.
+        This gate still runs to catch anything already sitting in the local store
+        or the offline queue from before the window closed.
+
+        Delegates to WorkingHoursConfig.allows() so capture and upload can never
+        disagree about what "outside working hours" means. It deliberately does
+        NOT use getattr-with-a-default: reading a missing field as "unrestricted"
+        is precisely how this silently failed open.
+        """
+        return self.config.working_hours.allows(event.timestamp)
 
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats
@@ -2198,6 +2274,35 @@ class SyncEngine:
         """
         if end is None:
             end = datetime.now(timezone.utc)
+
+        # Status spans are pushed by IdleManager / BreakManager / SystemEventHandler,
+        # NOT from inside sync(), so they never met the working-hours gate applied to
+        # bucket events.
+        #
+        # Gating on the START alone is not enough, and an earlier version of this
+        # comment claimed a fix it did not implement. IdleManager polls the OS idle
+        # clock on the 60s tick, independently of every tracker we stop. So: user
+        # walks away 21:45; 22:00 capture is suppressed; 23:55 they touch the
+        # keyboard; clear_idle_pause() emits an idle span start=21:45 end=23:55.
+        # allows(21:45) is True, so it shipped — telling the server the employee
+        # became active at 23:55. Same shape for a sleep span (asleep 21:00, wake
+        # 23:00) and for the growing per-cycle private_time snapshot.
+        #
+        # Clamp the END to the window close instead of dropping: the 21:45-22:00
+        # portion is real, in-window, and ours to keep; everything past 22:00 is not.
+        if not self.config.working_hours.allows(start):
+            logger.debug("Dropping %s_time span starting %s: outside working hours",
+                         kind, start.isoformat())
+            return
+
+        close = self.config.working_hours.window_close_after(start)
+        if close is not None and end > close:
+            logger.debug(
+                "Clamping %s_time span end %s -> %s (working-hours close)",
+                kind, end.isoformat(), close.isoformat(),
+            )
+            end = close
+
         duration = (end - start).total_seconds()
         if duration < 1:
             # Distinguish "expected sub-second guard" (scheduler race / no-op)
@@ -2961,6 +3066,12 @@ class SyncEngine:
     # cycle makes forward progress. 50s + one ~94s chain stays under 150s with
     # margin. Both gates check it via `_cycle_network_budget_exceeded`.
     _CYCLE_NETWORK_BUDGET_SECONDS = 50  # seconds
+    # How often to re-pull /config while running. Config was previously fetched
+    # once per process, so a schedule change (e.g. HR marks an employee
+    # restricted at 14:00) never reached a running agent until it restarted —
+    # the restricted user kept being recorded for days. Re-pulling every 30 min
+    # closes that without meaningfully adding load (one budgeted GET).
+    _CONFIG_REFETCH_INTERVAL_SECONDS = 1800  # 30 min
     # Named aliases kept for the two call sites / their tests; both resolve to the
     # single source of truth above so the two gates can never drift apart.
     _QUEUE_SKIP_IF_CYCLE_ELAPSED = _CYCLE_NETWORK_BUDGET_SECONDS
