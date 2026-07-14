@@ -794,9 +794,19 @@ class Config:
             sync.sync_interval_seconds -> local interval_seconds
             sync.batch_size -> local batch_size
         """
-        if "privacy" in server_config:
+        # PRIVACY-EGRESS settings are deferred as a block behind
+        # DEFER_UNAPPLIED_SERVER_SETTINGS. The /config envelope fix means server
+        # config reaches the agent for the FIRST time on upgrade; without this
+        # gate a device row carrying e.g. collect_full_urls=1 or
+        # track_browser_domains=0 would silently start egressing full URLs the
+        # moment this build lands — a privacy behaviour change in the opposite
+        # direction from this release's intent. These stay off until the team
+        # audits the device rows and flips the flag in a deliberate release.
+        # (working_hours + operational sync tuning below are NOT gated — those
+        # are the intended live behaviours.)
+        if "privacy" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             privacy = server_config["privacy"]
-            if "hash_window_titles" in privacy and not DEFER_UNAPPLIED_SERVER_SETTINGS:
+            if "hash_window_titles" in privacy:
                 self.privacy.hash_titles = self._to_bool(privacy["hash_window_titles"])
             if "title_allowlist" in privacy:
                 self.privacy.title_allowlist = privacy["title_allowlist"]
@@ -806,7 +816,7 @@ class Config:
             if "collect_full_urls" in privacy:
                 self.privacy.collect_full_urls = self._to_bool(privacy["collect_full_urls"])
 
-        if "collection" in server_config:
+        if "collection" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             collection = server_config["collection"]
             if "collect_page_category" in collection:
                 self.privacy.collect_page_category = self._to_bool(collection["collect_page_category"])

@@ -509,7 +509,11 @@ class BetterFlowClient(BaseApiClient):
         response = self._request("GET", "config")
         if not isinstance(response, dict):
             return {}
-        return response.get("data", response)
+        # A wrapped body carrying data:null (or a non-dict data) must not reach
+        # Config.update_from_server, which indexes it with `"privacy" in payload`
+        # and would raise TypeError on None — surfacing as a failed sync cycle.
+        payload = response.get("data", response)
+        return payload if isinstance(payload, dict) else {}
 
     def get_projects(self) -> list[dict]:
         """Get list of projects for app mapping."""

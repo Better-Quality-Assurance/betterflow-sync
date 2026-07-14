@@ -229,6 +229,7 @@ class SyncEngine:
         self._current_project: Optional[dict] = None
         self._session_active = False
         self._config_fetched = False
+        self._last_config_fetch_monotonic: float = 0.0
         self._heartbeat_count = 0
         # Send heartbeat every 5 sync cycles (5 * 60s = 5 min default)
         self._heartbeat_interval = 5
@@ -618,12 +619,32 @@ class SyncEngine:
                 self._category_cache = self.queue.get_all_categories()
             return self._category_cache.get(app_name)
 
+    def _config_refetch_due(self, now: float) -> bool:
+        """True if server config should be (re)fetched this cycle: never fetched
+        yet, or the refetch interval has elapsed since the last successful fetch.
+
+        Periodic refetch is how a mid-session schedule change reaches a RUNNING
+        agent — config was otherwise fetched once per process, so a user marked
+        restricted after startup kept being recorded until the app restarted.
+        """
+        if not self._config_fetched:
+            return True
+        # Fetched, but no real fetch timestamp (0.0 = never stamped, e.g. the
+        # flag was set directly rather than via fetch_server_config): we can't
+        # measure staleness, so hold — no spurious refetch.
+        if self._last_config_fetch_monotonic <= 0:
+            return False
+        return (
+            now - self._last_config_fetch_monotonic
+        ) >= self._CONFIG_REFETCH_INTERVAL_SECONDS
+
     def fetch_server_config(self) -> None:
         """Fetch and apply server-side configuration."""
         try:
             server_config = self.bf.get_config()
             self.config.update_from_server(server_config)
             self._config_fetched = True
+            self._last_config_fetch_monotonic = time.monotonic()
             self.invalidate_category_cache()
             logger.info("Server configuration applied")
 
@@ -694,7 +715,7 @@ class SyncEngine:
         # after it — this fetch, start_session, the send loop, the queue drain —
         # shares one budget.
         if (
-            not self._config_fetched
+            self._config_refetch_due(time.monotonic())
             and not self._cycle_network_budget_exceeded(self._CYCLE_NETWORK_BUDGET_SECONDS)
             and self.bf.is_reachable()
         ):
@@ -3036,6 +3057,12 @@ class SyncEngine:
     # cycle makes forward progress. 50s + one ~94s chain stays under 150s with
     # margin. Both gates check it via `_cycle_network_budget_exceeded`.
     _CYCLE_NETWORK_BUDGET_SECONDS = 50  # seconds
+    # How often to re-pull /config while running. Config was previously fetched
+    # once per process, so a schedule change (e.g. HR marks an employee
+    # restricted at 14:00) never reached a running agent until it restarted —
+    # the restricted user kept being recorded for days. Re-pulling every 30 min
+    # closes that without meaningfully adding load (one budgeted GET).
+    _CONFIG_REFETCH_INTERVAL_SECONDS = 1800  # 30 min
     # Named aliases kept for the two call sites / their tests; both resolve to the
     # single source of truth above so the two gates can never drift apart.
     _QUEUE_SKIP_IF_CYCLE_ELAPSED = _CYCLE_NETWORK_BUDGET_SECONDS
