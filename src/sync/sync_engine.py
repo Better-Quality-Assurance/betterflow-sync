@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 try:
     from ..__init__ import __version__ as AGENT_VERSION
@@ -130,6 +129,11 @@ class SyncStats:
     # failed — a half-hung bf-data-service. The coordinator escalates this to a
     # force_restart, which is_running() alone can't trigger.
     aw_bucket_fetch_failed: bool = False
+    # True when this cycle read nothing because capture is suppressed (outside the
+    # user's working hours, or their schedule isn't known yet). Distinguishes "we
+    # are deliberately not recording" from "the tracker broke" — without it the
+    # nightly silence looks identical to an outage.
+    capture_suppressed: bool = False
 
     @property
     def success(self) -> bool:
@@ -660,6 +664,29 @@ class SyncEngine:
             and self.bf.is_reachable()
         ):
             self.fetch_server_config()
+
+        # Outside the working-hours window the trackers are intentionally stopped
+        # (AppController._apply_capture_policy). A stopped tracker is the correct
+        # state here, not an outage: fall through to the AW check below and it
+        # would report "ActivityWatch is not running" every cycle all night, and —
+        # worse — return early, so in-hours work still sitting in the offline queue
+        # would not upload until the window reopened.
+        #
+        # So: fetch nothing, but still drain the queue and keep the heartbeat
+        # going, which is also what keeps the device visibly online rather than
+        # looking dead every evening.
+        if not self.config.working_hours.allows(datetime.now(timezone.utc)):
+            stats.capture_suppressed = True
+            if self.bf.is_reachable() and not self.queue.is_empty():
+                if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+                    self._process_queue(stats)
+            with self._state_lock:
+                self._heartbeat_count += 1
+                should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
+                if should_heartbeat:
+                    self._heartbeat_count = 0
+            stats._should_heartbeat = should_heartbeat
+            return stats
 
         # Check ActivityWatch
         if not self.aw.is_running():
@@ -1269,22 +1296,21 @@ class SyncEngine:
             )
 
     def _within_working_hours(self, event: AWEvent) -> bool:
-        """True if the event's start falls inside the server-enforced working-
-        hours window. When the schedule is not enforced (B2B / unrestricted)
-        this is always True. Evaluated in the schedule's timezone, falling back
-        to the machine's local timezone when none is provided."""
-        wh = self.config.working_hours
-        if not getattr(wh, "enforced", False):
-            return True
-        try:
-            tz = ZoneInfo(wh.timezone) if wh.timezone else None
-        except Exception:
-            tz = None
-        local = event.timestamp.astimezone(tz) if tz else event.timestamp.astimezone()
-        if wh.working_days and local.isoweekday() not in wh.working_days:
-            return False
-        hhmm = local.strftime("%H:%M")
-        return wh.work_start <= hhmm <= wh.work_end
+        """True if the event's start may be uploaded — i.e. it falls inside the
+        working-hours window (or the schedule is unrestricted).
+
+        This is now only the SECOND line of defence. Capture itself is suppressed
+        outside the window (AppController._apply_capture_policy stops the
+        trackers), so in the normal case no out-of-hours event exists to filter.
+        This gate still runs to catch anything already sitting in the local store
+        or the offline queue from before the window closed.
+
+        Delegates to WorkingHoursConfig.allows() so capture and upload can never
+        disagree about what "outside working hours" means. It deliberately does
+        NOT use getattr-with-a-default: reading a missing field as "unrestricted"
+        is precisely how this silently failed open.
+        """
+        return self.config.working_hours.allows(event.timestamp)
 
     def _fetch_bucket_events(
         self, bucket_id: str, stats: SyncStats

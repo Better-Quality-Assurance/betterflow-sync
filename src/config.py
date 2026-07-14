@@ -10,9 +10,11 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from dataclasses import fields as dc_fields
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
@@ -25,6 +27,7 @@ __all__ = [
     "EngagementConfig",
     "FraudDetectionConfig",
     "CallDetectionSettings",
+    "WorkingHoursConfig",
     "setup_logging",
     "get_machine_uuid",
     "DEFAULT_API_URL",
@@ -422,18 +425,76 @@ class ReminderSettings:
     private_auto_end_hours: float = 4.0
 
 
+def _normalize_hhmm(value, fallback: str) -> str:
+    """Coerce a server-sent time to zero-padded HH:MM.
+
+    WorkingHoursConfig.allows() compares times as STRINGS, which is only correct
+    when both sides are zero-padded ("7:30" > "22:00" lexically, so an unpadded
+    start would let every hour of the night through). Anything unparseable falls
+    back rather than raising — the caller's `known` flag is what keeps an
+    unparseable schedule from being treated as permission to record.
+    """
+    text = str(value if value is not None else fallback).strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        logger.warning("Invalid working-hours time %r; using %s", value, fallback)
+        return fallback
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        logger.warning("Out-of-range working-hours time %r; using %s", value, fallback)
+        return fallback
+    return f"{hour:02d}:{minute:02d}"
+
+
 @dataclass
 class WorkingHoursConfig:
     """Server-enforced working-hours window. When ``enforced``, the agent must
-    NOT record/upload events outside [work_start, work_end] on working_days,
-    evaluated in ``timezone``. For B2E / Trainee-Intern this is 08:00-22:00
-    Mon-Fri; B2B and others are unrestricted (enforced=False)."""
+    NOT record a thing outside [work_start, work_end] on working_days, evaluated
+    in ``timezone``. For B2E / Trainee-Intern this is 07:30-22:00 Mon-Fri; B2B
+    and others are unrestricted (enforced=False).
+
+    ``known`` is the fail-closed guard and the reason this class exists rather
+    than a bare dict. Until the server has told us the schedule at least once, we
+    do NOT know whether this person may be recorded, and "don't know" must mean
+    "don't record" — not "record everything", which is what an ``enforced=False``
+    default silently meant before. It is persisted, so an offline cold start
+    reuses the last known schedule instead of falling back to permissive.
+    """
 
     enforced: bool = False
     work_start: str = "00:00"
     work_end: str = "23:59"
     working_days: list = field(default_factory=lambda: [1, 2, 3, 4, 5, 6, 7])
     timezone: str = ""
+    known: bool = False
+
+    def allows(self, when: "datetime") -> bool:
+        """True if this instant may be recorded at all — the single source of
+        truth for both capture suppression (main) and the upload gate (sync).
+
+        Fail-closed: an unknown schedule records nothing. Evaluated in the
+        schedule's timezone, falling back to the machine's local zone (the
+        employee's own clock is the right one for "don't watch my laptop at
+        night") when the server sends none.
+        """
+        if not self.known:
+            return False
+        if not self.enforced:
+            return True
+
+        try:
+            tz = ZoneInfo(self.timezone) if self.timezone else None
+        except Exception:
+            logger.warning(
+                "Unknown working-hours timezone %r; using machine-local time",
+                self.timezone,
+            )
+            tz = None
+
+        local = when.astimezone(tz) if tz else when.astimezone()
+        if self.working_days and local.isoweekday() not in self.working_days:
+            return False
+        return self.work_start <= local.strftime("%H:%M") <= self.work_end
 
 
 @dataclass
@@ -518,6 +579,15 @@ class Config:
         fraud_detection_data = data.pop("fraud_detection", {})
         call_detection_data = data.pop("call_detection", {})
         foreground_activity_data = data.pop("foreground_activity", {})
+        # working_hours was missing from this list until 2026-07-14, so it fell
+        # through to the **data splat below and was rebuilt as a plain dict. A
+        # dict has no attributes: update_from_server's `self.working_hours.
+        # enforced = ...` then raised AttributeError (swallowed as "invalid
+        # working_hours, ignoring") and _within_working_hours' `getattr(wh,
+        # "enforced", False)` read False. Net effect: on EVERY device that had
+        # ever written a config.json, working-hours enforcement was silently and
+        # permanently off, and restricted users were recorded around the clock.
+        working_hours_data = data.pop("working_hours", {})
         # Ignore any persisted foreground_activity.enabled — it's server-driven
         # and default-OFF. A device that ran a default-ON beta build already has
         # enabled=true on disk; honouring it would override the safe default on
@@ -555,6 +625,7 @@ class Config:
             fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
             foreground_activity=_safe(ForegroundActivitySettings, foreground_activity_data) if foreground_activity_data else ForegroundActivitySettings(),
+            working_hours=_safe(WorkingHoursConfig, working_hours_data) if working_hours_data else WorkingHoursConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
 
@@ -653,16 +724,38 @@ class Config:
 
         if "working_hours" in server_config:
             wh = server_config["working_hours"]
+            # Build a fresh instance and swap it in only once it is fully parsed,
+            # so a half-applied payload can never leave a live schedule in a state
+            # that is neither the old one nor the new one. `known` is set LAST and
+            # only on success: a schedule we failed to parse is a schedule we do
+            # not know, and an unknown schedule records nothing (see .allows()).
+            #
+            # Do NOT widen this except to swallow AttributeError. That is what hid
+            # the dict-vs-dataclass bug for the whole life of the feature — the
+            # error fired on every sync, was logged as a shrug, and enforcement
+            # stayed off. If the shape is wrong we want to know loudly.
             try:
-                self.working_hours.enforced = bool(wh.get("enforced", False))
-                self.working_hours.work_start = str(wh.get("work_start", "00:00"))
-                self.working_hours.work_end = str(wh.get("work_end", "23:59"))
+                parsed = WorkingHoursConfig(
+                    enforced=self._to_bool(wh.get("enforced", False)),
+                    work_start=_normalize_hhmm(wh.get("work_start"), "00:00"),
+                    work_end=_normalize_hhmm(wh.get("work_end"), "23:59"),
+                    timezone=str(wh.get("timezone", "") or ""),
+                )
                 days = wh.get("working_days")
                 if isinstance(days, list) and days:
-                    self.working_hours.working_days = [int(d) for d in days]
-                self.working_hours.timezone = str(wh.get("timezone", "") or "")
-            except (TypeError, ValueError, AttributeError):
-                logger.warning("Invalid working_hours from server, ignoring")
+                    parsed.working_days = [int(d) for d in days]
+                parsed.known = True
+                self.working_hours = parsed
+            except (TypeError, ValueError) as e:
+                # Keep whatever we already knew (possibly a cached schedule from
+                # disk). Never fall back to a permissive default.
+                logger.error(
+                    "Invalid working_hours from server (%s): %r — keeping previous "
+                    "schedule (known=%s)",
+                    e,
+                    wh,
+                    self.working_hours.known,
+                )
 
         if "sync" in server_config:
             sync = server_config["sync"]

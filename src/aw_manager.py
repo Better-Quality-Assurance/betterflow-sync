@@ -378,6 +378,14 @@ class AWManager:
         # grace; resetting this on (re)start also backs off blind re-probes).
         self._component_started_at: dict[str, float] = {}
         self._using_external = False
+        # Capture suppressed because we are outside the user's working hours (or
+        # their schedule is not known yet). While set, the trackers stay DOWN and
+        # every path that would bring them back up — start(), restart_if_needed(),
+        # force_restart() — is a no-op. Without this the health/stale-recovery
+        # checks would simply resurrect the watchers we just stopped and carry on
+        # recording the person's machine at midnight. Guarded by _lifecycle_lock
+        # alongside the other lifecycle state it gates.
+        self._capture_suppressed = False
         # Components intentionally disabled for this app session.
         self._disabled_components: set[str] = set()
         # Any-tracker force-restart count (window OR idle) — drives the
@@ -527,12 +535,46 @@ class AWManager:
         with self._lifecycle_lock:
             return bool(self._processes)
 
+    @property
+    def capture_suppressed(self) -> bool:
+        with self._lifecycle_lock:
+            return self._capture_suppressed
+
+    def set_capture_suppressed(self, suppressed: bool, reason: str = "") -> None:
+        """Suppress or resume ALL local capture.
+
+        Suppressing stops the tracker processes outright — this is the difference
+        between "we don't upload your evening" and "we don't watch your evening".
+        Filtering at upload time still left window titles and input activity being
+        written to a local store on the employee's machine around the clock; only
+        stopping the watchers actually stops the recording.
+
+        Idempotent, so the 60s policy tick can call it every cycle.
+        """
+        with self._lifecycle_lock:
+            if self._capture_suppressed == bool(suppressed):
+                return
+            self._capture_suppressed = bool(suppressed)
+            if self._capture_suppressed:
+                logger.info("Capture suppressed (%s) — stopping trackers", reason or "outside working hours")
+                self._stop_locked()
+            else:
+                logger.info("Capture resumed (%s) — starting trackers", reason or "inside working hours")
+                self._start_locked()
+
     def start(self) -> bool:
         """Start tracker components. Returns True if tracker is available."""
         with self._lifecycle_lock:
             return self._start_locked()
 
     def _start_locked(self) -> bool:
+        # Every route back to a running tracker funnels through here, so this one
+        # guard is enough to keep start()/restart_if_needed()/force_restart() from
+        # resurrecting capture while it is suppressed.
+        if self._capture_suppressed:
+            logger.debug("Tracker start refused: capture is suppressed")
+            return False
+
         server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
@@ -668,6 +710,9 @@ class AWManager:
         local server is unreachable for several consecutive cycles.
         """
         with self._lifecycle_lock:
+            if self._capture_suppressed:
+                logger.debug("Force-restart refused (%s): capture is suppressed", reason or "unspecified")
+                return False
             logger.warning("Force-restarting tracker stack (%s)", reason or "unspecified")
             self._stop_locked()
             binaries_dir = self._get_binaries_dir()
@@ -693,6 +738,8 @@ class AWManager:
         """
         name = "bf-idle-tracker"
         with self._lifecycle_lock:
+            if self._capture_suppressed:
+                return
             if name in self._disabled_components:
                 return
             binaries_dir = self._get_binaries_dir()
@@ -789,6 +836,13 @@ class AWManager:
             return self._restart_if_needed_locked()
 
     def _restart_if_needed_locked(self) -> bool:
+        # Trackers are meant to be down outside working hours; "down" is the
+        # healthy state, not a crash to recover from. Without this the staleness
+        # watchdog would read the silence as a stalled tracker and restart it,
+        # quietly undoing capture suppression a minute after it took effect.
+        if self._capture_suppressed:
+            return True
+
         # The SERVER may be external (a shared instance we didn't start); the
         # WATCHERS are always ours. Only the "external server vanished" case is
         # special — otherwise fall through to watcher health/stale recovery,

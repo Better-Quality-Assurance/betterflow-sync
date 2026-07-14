@@ -117,6 +117,9 @@ class TestFlickerSurvivesFilterEndToEnd:
         aw, bf, queue = Mock(), Mock(), Mock()
         queue.get_checkpoint.return_value = None
         config = Config()
+        # Capture is fail-closed on an unknown schedule; this suite is about the
+        # flicker filter, so declare it known-and-unrestricted (B2B 24/7).
+        config.working_hours.known = True
         assert config.sync.min_window_event_seconds == 5.0
         analyzer = Mock()
         analyzer.get_activity_state.return_value = "active"

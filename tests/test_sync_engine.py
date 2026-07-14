@@ -32,6 +32,10 @@ class TestSyncEngine:
             "real_loss_count": 0, "unstorable_count": 0,
         }
         self.config = Config()
+        # Capture is fail-closed on an unknown schedule (see
+        # test_working_hours_capture.py). These tests exercise sync mechanics, not
+        # scheduling, so declare the schedule known-and-unrestricted (B2B 24/7).
+        self.config.working_hours.known = True
 
         # Create mock activity analyzer and time tracker
         self.activity_analyzer = Mock(spec=ActivityAnalyzer)
@@ -297,6 +301,7 @@ class TestSyncEngine:
         outside [work_start, work_end] or on non-working days are rejected; when
         unenforced (B2B/others), everything passes."""
         wh = self.engine.config.working_hours
+        wh.known = True  # the server has told us the schedule
         wh.enforced = True
         wh.work_start = "08:00"
         wh.work_end = "22:00"
@@ -1325,6 +1330,10 @@ class TestSendEventsDecoupleBuckets:
         self.queue = Mock()
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
+        # Capture is fail-closed on an unknown schedule (see
+        # test_working_hours_capture.py). These tests exercise sync mechanics, not
+        # scheduling, so declare the schedule known-and-unrestricted (B2B 24/7).
+        self.config.working_hours.known = True
         self.engine = SyncEngine(
             aw=self.aw,
             bf=self.bf,
@@ -1445,6 +1454,10 @@ class TestStatusSpanEvents:
         self.queue = Mock()
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
+        # Capture is fail-closed on an unknown schedule (see
+        # test_working_hours_capture.py). These tests exercise sync mechanics, not
+        # scheduling, so declare the schedule known-and-unrestricted (B2B 24/7).
+        self.config.working_hours.known = True
         self.activity_analyzer = Mock(spec=ActivityAnalyzer)
         self.time_tracker = Mock(spec=DailyTimeTracker)
         self.engine = SyncEngine(
@@ -1581,8 +1594,10 @@ class TestFailedStatusSpanIsStorable:
         self.bf = Mock()
         # Force the offline path so the span is queued, not accepted.
         self.bf.send_events.return_value = SyncResult(success=False, error="offline")
+        cfg = Config()
+        cfg.working_hours.known = True  # known + unrestricted; capture is fail-closed otherwise
         self.engine = SyncEngine(
-            aw=self.aw, bf=self.bf, queue=self.queue, config=Config(),
+            aw=self.aw, bf=self.bf, queue=self.queue, config=cfg,
             activity_analyzer=Mock(spec=ActivityAnalyzer),
             time_tracker=Mock(spec=DailyTimeTracker),
         )
@@ -1641,6 +1656,10 @@ class TestPrivateOngoingSpanRefresh:
         self.queue = Mock()
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
+        # Capture is fail-closed on an unknown schedule (see
+        # test_working_hours_capture.py). These tests exercise sync mechanics, not
+        # scheduling, so declare the schedule known-and-unrestricted (B2B 24/7).
+        self.config.working_hours.known = True
         self.engine = SyncEngine(
             aw=self.aw, bf=self.bf, queue=self.queue, config=self.config,
             activity_analyzer=Mock(spec=ActivityAnalyzer),
@@ -1843,6 +1862,10 @@ class TestSyncCoordinatorBreak:
 
     def setup_method(self):
         self.config = Config()
+        # Capture is fail-closed on an unknown schedule (see
+        # test_working_hours_capture.py). These tests exercise sync mechanics, not
+        # scheduling, so declare the schedule known-and-unrestricted (B2B 24/7).
+        self.config.working_hours.known = True
         self.aw = Mock()
         self.bf = Mock()
         self.queue = Mock()

@@ -894,6 +894,9 @@ class SyncCoordinator:
         Several callees already self-guard but tray.tick_clock() does not.
         """
         for fn, label in (
+            # First: a window that closed while the app was running must stop
+            # capture promptly, before any sub-task below reads from the trackers.
+            (self._apply_capture_policy, "capture_policy"),
             (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
@@ -1665,6 +1668,12 @@ class BetterFlowApp:
         self._startup_thread: Optional[threading.Thread] = None
         self._system_events_started = False
         self._system_events_lock = threading.Lock()
+        # Working-hours capture policy. None = not yet evaluated; the first
+        # _apply_capture_policy() call decides. Guarded by _capture_lock because
+        # the 60s tick, the post-config-fetch callback and the wake-from-sleep
+        # handler all drive it from different threads.
+        self._capture_lock = threading.RLock()
+        self._capture_allowed: Optional[bool] = None
 
         # Sub-handlers
         self.update_handler = UpdateHandler(self.tray, self.config, self.coordinator, _VERSION)
@@ -1705,6 +1714,77 @@ class BetterFlowApp:
                 self.input_source.start()
             except Exception as e:
                 logger.warning("In-process input source start failed: %s", e)
+
+    def _stop_watchers(self) -> None:
+        """Stop the in-process watchers. Mirror of _start_watchers().
+
+        AWManager.stop() only reaches the processes IT spawned; on macOS the
+        window/input watchers run in-process (bf-window-tracker is deliberately
+        disabled in favour of MacOSWindowWatcher), so without this they would keep
+        reading the foreground window and the input stream after the trackers were
+        stopped — i.e. the exact recording we are here to stop.
+        """
+        for watcher, label in (
+            (self.window_watcher, "window_watcher"),
+            (self.input_watcher, "input_watcher"),
+            (self.input_source, "input_source"),
+        ):
+            if watcher is None:
+                continue
+            try:
+                watcher.stop()
+            except Exception as e:
+                logger.warning("Failed to stop %s: %s", label, e)
+
+    def _apply_capture_policy(self, reason: str = "tick") -> None:
+        """Start or stop ALL local capture according to the working-hours schedule.
+
+        This is the enforcement point. Outside the user's window — and while their
+        schedule is still unknown — nothing on this machine records them: the
+        tracker processes are down and the in-process watchers are stopped. Not
+        "recorded but not billed"; not recorded.
+
+        Idempotent and cheap, so it can run on every 60s tick, on wake-from-sleep,
+        and immediately after the server config lands.
+        """
+        allowed = self.config.working_hours.allows(datetime.now(timezone.utc))
+
+        # _capture_lock (not the AWManager lock) guards the transition itself, so
+        # the 60s tick, the post-config-fetch callback and the wake handler can't
+        # interleave into a half-applied start/stop. AWManager takes its own lock
+        # underneath and never calls back into here, so the ordering is safe.
+        with self._capture_lock:
+            if self._capture_allowed is allowed:
+                return
+            first = self._capture_allowed is None
+            self._capture_allowed = allowed
+
+            if allowed:
+                self.aw_manager.set_capture_suppressed(False, reason)
+                self._start_watchers()
+                logger.info("Capture ENABLED (%s)", reason)
+            else:
+                self._stop_watchers()
+                # Stops the tracker processes and refuses every restart path until
+                # capture is allowed again.
+                self.aw_manager.set_capture_suppressed(True, reason)
+                wh = self.config.working_hours
+                if not wh.known:
+                    logger.info(
+                        "Capture DISABLED (%s): working-hours schedule not known yet "
+                        "— refusing to record until the server tells us the window",
+                        reason,
+                    )
+                else:
+                    logger.info(
+                        "Capture DISABLED (%s): outside working hours %s-%s (days %s)",
+                        reason,
+                        wh.work_start,
+                        wh.work_end,
+                        wh.working_days,
+                    )
+            if first and not allowed:
+                logger.info("Trackers will start when the working-hours window opens")
 
     def _ensure_system_event_listener(self) -> None:
         """Start system event listeners once without blocking tray startup."""
@@ -1785,11 +1865,18 @@ class BetterFlowApp:
                 return
 
             self._set_startup_status("Starting trackers...")
-            self.aw_manager.start()
+            # Do NOT start the trackers unconditionally here. This runs BEFORE
+            # login and therefore before fetch_server_config(), so at this point we
+            # do not yet know whether this user may be recorded at all. Starting
+            # first and asking later is what let a restricted user's machine be
+            # recorded at 23:55 on a fresh launch. _apply_capture_policy() starts
+            # the trackers only if a KNOWN schedule allows it — which, on a cold
+            # start, means a cached schedule from disk; otherwise capture stays off
+            # until the config fetch lands and _on_config_updated re-evaluates.
+            self._apply_capture_policy("startup")
             if self._shutdown_event.is_set():
                 return
 
-            self._start_watchers()
             self._ensure_system_event_listener()
 
             self._apply_startup_login_state(state)
@@ -2478,8 +2565,22 @@ class BetterFlowApp:
             logger.error(f"Failed to export logs: {e}")
 
     def _on_config_updated(self) -> None:
-        """Handle server config update — apply AFK timeout to AWManager."""
+        """Handle server config update — apply AFK timeout, then the working-hours
+        capture policy the server just told us about."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
+
+        # Persist the schedule so the NEXT cold start knows the window before it
+        # can reach the server. Without this, `known` is False on every launch and
+        # an offline machine would never capture at all.
+        try:
+            self.config.save()
+        except Exception as e:
+            logger.warning("Failed to persist working-hours schedule: %s", e)
+
+        # Re-evaluate immediately rather than waiting up to 60s for the next tick:
+        # this is the moment a restricted user's agent first learns it is
+        # restricted, and it may already be outside their window.
+        self._apply_capture_policy("server config")
 
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""

@@ -24,11 +24,15 @@ from src.sync.sync_engine import SyncEngine
 
 def _build_engine() -> SyncEngine:
     tmp = Path(tempfile.mkdtemp())
+    cfg = Config()  # call_detection.enabled defaults True
+    # Capture is fail-closed on an unknown schedule; this suite is about AW
+    # outages, so declare it known-and-unrestricted (B2B 24/7).
+    cfg.working_hours.known = True
     engine = SyncEngine(
         aw=Mock(),
         bf=Mock(),
         queue=OfflineQueue(db_path=tmp / "q.db", max_size=1000),
-        config=Config(),  # call_detection.enabled defaults True
+        config=cfg,
         time_tracker=Mock(),
     )
     # Skip the first-sync server-config fetch (its Mock return isn't a dict).
