@@ -1822,6 +1822,21 @@ class TestSystemSleepWakeEmitsSleepSpan:
 
         sync_engine.set_private_mode.assert_not_called()
 
+    def test_wake_records_wake_time_on_coordinator_before_resume(self):
+        """on_system_wake must anchor idle detection to this wake instant.
+
+        Without this the idle subsystem has no wake awareness: bf-idle-tracker
+        resumes heartbeating its pre-suspend 'afk' event on wake, so the next
+        check_idle_status() would backdate idle_start to a keystroke before
+        the lid closed and re-carve real work time across the suspend. See
+        IdleManager.record_wake / _clamp_to_last_wake for the consuming side.
+        """
+        handler, sync_engine = self._make_handler()
+
+        handler.on_system_wake()
+
+        handler.coordinator.record_wake.assert_called_once()
+
 
 class TestSyncCoordinatorBreak:
     """Tests for SyncCoordinator break state management."""

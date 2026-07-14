@@ -313,6 +313,15 @@ class SyncCoordinator:
     def flush_idle_event(self) -> None:
         self.idle_mgr.flush_idle_event()
 
+    def record_wake(self, wake_ts: Optional[datetime] = None) -> None:
+        """Anchor idle detection to a fresh system-wake instant.
+
+        Called by SystemEventHandler.on_system_wake so a post-wake idle
+        pause can never backdate its idle_start before this timestamp.
+        See IdleManager.record_wake for the full rationale.
+        """
+        self.idle_mgr.record_wake(wake_ts)
+
     def start(self) -> None:
         """Start the scheduler and queue startup work without blocking UI."""
         # BackgroundScheduler.shutdown() is terminal -- create a fresh one

@@ -103,6 +103,13 @@ class SystemEventHandler:
         except ImportError:
             from ui.tray import TrayState
 
+        # Anchor idle detection to this wake instant BEFORE anything else
+        # runs. bf-idle-tracker resumes heartbeating its pre-suspend 'afk'
+        # event on wake without resetting its start time, so the next
+        # check_idle_status() would otherwise backdate idle_start to the
+        # last keystroke before the lid closed and re-carve real work time
+        # across the suspend. See IdleManager.record_wake.
+        self.coordinator.record_wake()
         self.bf.reset_session()
         self.aw.reset_session()
         # Emit the sleep_time event before any early-return paths so even
