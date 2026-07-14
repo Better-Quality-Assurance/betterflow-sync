@@ -132,22 +132,27 @@ def test_failed_refetch_backs_off_instead_of_retrying_every_cycle():
     # THE finding-1 regression guard: a /config route that 500s while the rest of
     # the API is healthy must not leave an already-configured agent "due" every
     # cycle (which would burn the whole per-cycle budget in the retry chain).
+    # Monotonic is pinned so the assertion is clock-independent (CI runners have
+    # low uptime, so real monotonic() can be < any hardcoded value).
+    from unittest.mock import patch as _patch
+
     from src.sync.bf_client import BetterFlowClientError
 
     tmp = Path(tempfile.mkdtemp())
     engine = _engine(tmp)
     engine._config_fetched = True
-    engine._last_config_fetch_monotonic = 100.0  # long ago → currently due
+    engine._last_config_fetch_monotonic = 1000.0  # old, relative to the pinned now
     engine.bf.get_config = Mock(side_effect=BetterFlowClientError("config route 500"))
 
-    engine.fetch_server_config()
+    with _patch("src.sync.sync_engine.time.monotonic", return_value=9000.0):
+        engine.fetch_server_config()
 
     assert engine._config_fetched is True, "a failed refetch must not lose configured state"
-    assert engine._last_config_fetch_monotonic > 100.0, (
+    assert engine._last_config_fetch_monotonic == 9000.0, (
         "a failed refetch must stamp the clock so it backs off, not retry every cycle"
     )
     # ...so it is NOT immediately due again.
-    assert engine._config_refetch_due(engine._last_config_fetch_monotonic + 1) is False
+    assert engine._config_refetch_due(9000.0 + 1) is False
 
 
 def test_failed_initial_fetch_keeps_retrying_every_cycle():
@@ -168,10 +173,13 @@ def test_failed_initial_fetch_keeps_retrying_every_cycle():
     )
 
 
-def test_sync_refetches_config_once_the_interval_elapses():
-    # Wiring test: prove sync() actually consults _config_refetch_due (not the old
-    # `not self._config_fetched`). Reverting the gate makes this fail.
-    import time as _time
+def test_sync_gates_config_fetch_on_config_refetch_due():
+    # Wiring test: prove sync() gates the fetch on _config_refetch_due(), not the
+    # old `not self._config_fetched`. With _config_fetched=True, reverting the
+    # gate would stop consulting the method and this would fail. Patching the
+    # decision (rather than the clock) keeps it deterministic and avoids poking
+    # the drain loop's monotonic-based deadline.
+    from unittest.mock import patch as _patch
 
     aw, bf, queue = Mock(), Mock(), Mock()
     bf.is_reachable.return_value = True
@@ -179,17 +187,14 @@ def test_sync_refetches_config_once_the_interval_elapses():
     aw.get_buckets.return_value = {}
     engine = SyncEngine(aw=aw, bf=bf, queue=queue, config=Config(), time_tracker=Mock())
     engine._backlog_reconciled = True
-    engine._config_fetched = True
+    engine._config_fetched = True  # already configured → old gate would never fetch
     bf.get_config = Mock(return_value={})
 
-    # Recent fetch → not due → sync() must NOT re-fetch.
-    engine._last_config_fetch_monotonic = _time.monotonic()
-    engine.sync()
-    assert not bf.get_config.called, "a fresh config must not be re-fetched"
+    with _patch.object(engine, "_config_refetch_due", return_value=False):
+        engine.sync()
+        assert not bf.get_config.called, "not due → sync() must NOT re-fetch"
 
-    # Stale fetch (> interval) → due → sync() must re-fetch.
-    engine._last_config_fetch_monotonic = _time.monotonic() - (
-        SyncEngine._CONFIG_REFETCH_INTERVAL_SECONDS + 60
-    )
-    engine.sync()
-    assert bf.get_config.called, "sync() must re-fetch config once the interval elapsed"
+    bf.get_config.reset_mock()
+    with _patch.object(engine, "_config_refetch_due", return_value=True):
+        engine.sync()
+        assert bf.get_config.called, "due → sync() must re-fetch (proves the gate is wired)"
