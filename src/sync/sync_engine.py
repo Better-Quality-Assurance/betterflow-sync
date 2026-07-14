@@ -32,6 +32,7 @@ try:
     from .call_detector import CallDetector, CallEvent
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .os_idle import get_system_idle_seconds
+    from .queue import is_event_storable
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -43,6 +44,7 @@ except ImportError:
     from sync.call_detector import CallDetector, CallEvent
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.os_idle import get_system_idle_seconds
+    from sync.queue import is_event_storable
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +339,19 @@ class SyncEngine:
         # Clock skew: track server-vs-local time offset (seconds, positive = server ahead)
         self._server_time_offset: Optional[float] = None
         self._hostname = socket.gethostname()
+
+        # One-time upgrade migration: legacy status spans (idle/break/private/
+        # sleep) queued by <=1.5.95 carry no bucket_id, so the queue's
+        # storability classifier would evict them on the first cycle even though
+        # the server accepts them — a lost billing carve-out. Give them the same
+        # bf-status_<host> id current spans use, BEFORE the sync loop starts.
+        # Idempotent and best-effort: a migration hiccup must never block startup.
+        try:
+            backfill = getattr(self.queue, "backfill_status_bucket_ids", None)
+            if callable(backfill):
+                backfill(self._hostname)
+        except Exception as e:  # pragma: no cover - defensive; never fatal
+            logger.warning("Legacy status-span bucket_id backfill skipped: %s", e)
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates —
@@ -3178,30 +3193,17 @@ class SyncEngine:
     def _batch_has_storable_activity(
         self, events: list, *, now: Optional[datetime] = None
     ) -> bool:
-        """True if any event in the batch is STORABLE — has a bucket to route to
-        AND a timestamp within the server's retention window. A batch with no
-        storable event (all stale past retention or bucketless) is one the server
-        would reject anyway, so it's safe to shed when it blocks the queue head.
-        Mirrors OfflineQueue.failed_event_summary's real-loss classification, so a
-        stuck head holding genuine recent activity is held, never dropped."""
+        """True if any event in the batch is STORABLE — has a bucket to route to,
+        a timestamp within the server's retention window, and a duration inside
+        the server's accepted bounds. A batch with no storable event (all stale,
+        bucketless, or over-long) is one the server would reject anyway, so it's
+        safe to shed when it blocks the queue head. Uses the shared
+        ``is_event_storable`` classifier so this can never drift from the queue's
+        eviction/real-loss verdict — a stuck head holding genuine recent activity
+        is held, never dropped."""
         now = now or datetime.now(timezone.utc)
         cutoff = now - timedelta(days=7)  # matches the queue's stale_after_days
-        for ev in events:
-            if not isinstance(ev, dict):
-                continue
-            bid = ev.get("bucket_id")
-            ts = ev.get("timestamp")
-            if not bid or not ts:
-                continue
-            try:
-                parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            except (ValueError, TypeError):
-                continue
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            if parsed >= cutoff:
-                return True
-        return False
+        return any(is_event_storable(ev, stale_cutoff=cutoff) for ev in events)
 
     def _apply_queue_backoff(self) -> None:
         """Apply exponential backoff for queue processing failures."""

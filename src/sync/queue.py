@@ -16,9 +16,71 @@ try:
 except ImportError:
     from config import Config, MAX_QUEUE_SIZE
 
-__all__ = ["OfflineQueue", "QueuedEvent"]
+__all__ = [
+    "OfflineQueue",
+    "QueuedEvent",
+    "is_event_storable",
+    "MAX_EVENT_DURATION_SECONDS",
+]
 
 logger = logging.getLogger(__name__)
+
+# The server (internal-tool2 AgentEventController) accepts a single event only
+# when its duration is within [0, MAX_EVENT_DURATION_SECONDS]. A longer span — a
+# >24h weekend lid-close sleep, or a Private-Time session left on across a
+# weekend — 4xx-rejects the WHOLE batch it rides in, and _process_queue's
+# whole-batch retry bump then drags its storable neighbours to the drop ceiling
+# in lockstep. Evicting the over-long span first keeps every batch clean.
+MAX_EVENT_DURATION_SECONDS = 86400  # 24h, mirrors the server-side validator
+
+
+def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
+    """True when ``ts`` (ISO-8601) parses and is at/after ``cutoff``. A missing
+    or unparseable timestamp is treated as NOT within (unstorable)."""
+    if not ts:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed >= cutoff
+
+
+def is_event_storable(ev: object, *, stale_cutoff: datetime) -> bool:
+    """True when the server would accept this event once online, so the offline
+    queue must HOLD it for retry rather than evict it as unstorable poison.
+
+    The single source of truth for "storable", shared by ``evict_unstorable``,
+    ``failed_event_summary`` and ``SyncEngine._batch_has_storable_activity`` (so
+    the three can never drift). Storable requires ALL of:
+
+    - a ``bucket_id`` to route it. A bucketless span was the 2026-06
+      "buckets=unknown" drop; every emitted span now carries one, and legacy
+      bucketless status spans queued by <=1.5.95 are given theirs at startup
+      (see ``OfflineQueue.backfill_status_bucket_ids``). Keeping the bucket_id
+      requirement preserves the prod-proven poison-drop protection rather than
+      loosening the rule the fleet already relies on.
+    - a ``timestamp`` present, parseable, and within the retention window.
+    - a ``duration`` within the server's accepted 0..MAX bounds. An over-long
+      span 4xx-rejects the whole batch (the weekend-suspend poison); a
+      missing/non-numeric duration is left to the server, not evicted here.
+    """
+    if not isinstance(ev, dict):
+        return False
+    if not ev.get("bucket_id"):
+        return False
+    if not _timestamp_within(ev.get("timestamp"), stale_cutoff):
+        return False
+    duration = ev.get("duration")
+    # bool is an int subclass but is never a valid duration.
+    if isinstance(duration, bool):
+        return False
+    if isinstance(duration, (int, float)):
+        return 0 <= duration <= MAX_EVENT_DURATION_SECONDS
+    # Missing/non-numeric duration: not our call to evict — leave it to the server.
+    return True
 
 
 @dataclass
@@ -461,10 +523,9 @@ class OfflineQueue:
             ts = ev.get("timestamp")
             if ts:
                 timestamps.append(str(ts))
-            # A drop is real loss only if it was actually storable: it has a
-            # bucket to route to AND its timestamp is within the retention window.
-            recent = bid and self._timestamp_within(ts, stale_cutoff)
-            if recent:
+            # A drop is real loss only if the event was actually storable — same
+            # classifier the eviction path uses, so the two never disagree.
+            if is_event_storable(ev, stale_cutoff=stale_cutoff):
                 real_loss += 1
             else:
                 unstorable += 1
@@ -480,17 +541,9 @@ class OfflineQueue:
 
     @staticmethod
     def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
-        """True when ``ts`` (ISO-8601) parses and is at/after ``cutoff``. A
-        missing or unparseable timestamp is treated as NOT within (unstorable)."""
-        if not ts:
-            return False
-        try:
-            parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed >= cutoff
+        """Retained thin wrapper over the module-level ``_timestamp_within`` for
+        callers/tests that reach for it on the class."""
+        return _timestamp_within(ts, cutoff)
 
     def remove_failed(
         self, max_retries: int = 5, *, last_error: Optional[str] = None
@@ -584,12 +637,14 @@ class OfflineQueue:
         """Move events the server can NEVER accept out of the active queue and
         into ``dead_letter_events`` BEFORE they are batched with storable events.
 
-        "Unstorable" is the SAME classification ``failed_event_summary`` and
-        ``SyncEngine._batch_has_storable_activity`` already use: an event with no
-        ``bucket_id`` (nowhere to route it) or a ``timestamp`` already past the
-        server's retention window (``stale_after_days``). The only change is
-        WHEN it's applied — proactively, up front — instead of only at the retry
-        ceiling after the damage is done.
+        "Unstorable" is the SAME classification (``is_event_storable``) that
+        ``failed_event_summary`` and ``SyncEngine._batch_has_storable_activity``
+        use: an event with no ``bucket_id`` (nowhere to route it), a ``timestamp``
+        already past the server's retention window (``stale_after_days``), or a
+        ``duration`` outside the server's accepted 0..MAX bounds (an over-long
+        weekend-suspend span 4xx's the whole batch). The only change is WHEN it's
+        applied — proactively, up front — instead of only at the retry ceiling
+        after the damage is done.
 
         Why up front: ``dequeue`` returns events oldest-first, so an unstorable
         event sits at the queue head and is batched with storable events behind
@@ -608,8 +663,11 @@ class OfflineQueue:
 
         Returns a summary shaped like ``failed_event_summary`` so the caller can
         report it through the same path: ``{count, bucket_ids, oldest, newest,
-        real_loss_count (always 0), unstorable_count}`` — all zero/empty when the
-        queue holds nothing unstorable.
+        real_loss_count, unstorable_count}``. Bucketless / past-retention
+        evictions are benign flushes (``unstorable``); a recent, routable event
+        evicted here can only be over-long-duration — real activity the server
+        rejected for size — so it counts as ``real_loss`` and the caller warns.
+        All zero/empty when the queue holds nothing unstorable.
 
         ``now`` is injectable for deterministic tests (defaults to UTC now).
         """
@@ -638,26 +696,37 @@ class OfflineQueue:
             evict_ids: list[int] = []
             bucket_ids: set[str] = set()
             timestamps: list[str] = []
+            real_loss = 0
+            unstorable = 0
             for row in rows:
                 rid, raw, created_at, retry_count = row[0], row[1], row[2], row[3]
-                bucket_id = None
-                ts = None
+                ev = None
                 try:
-                    ev = json.loads(raw)
-                    if isinstance(ev, dict):
-                        bucket_id = ev.get("bucket_id")
-                        ts = ev.get("timestamp")
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        ev = parsed
                 except (json.JSONDecodeError, TypeError):
                     # Unparseable payload → can never be stored → evict it.
-                    pass
-                storable = bool(bucket_id) and self._timestamp_within(ts, stale_cutoff)
-                if storable:
+                    ev = None
+                if is_event_storable(ev, stale_cutoff=stale_cutoff):
                     continue
+                bucket_id = ev.get("bucket_id") if ev else None
+                ts = ev.get("timestamp") if ev else None
                 evict_ids.append(rid)
                 if bucket_id:
                     bucket_ids.add(str(bucket_id))
                 if ts:
                     timestamps.append(str(ts))
+                # A recent, routable event reaching eviction can ONLY be failing
+                # the duration bound (bucketless / past-retention are the benign
+                # flushes). That's real recent activity the server rejected purely
+                # for size — e.g. a >24h private_time span whose loss overbills the
+                # window via trailing-grace — so surface it as loss (warning),
+                # never a quiet "benign flush" info log.
+                if bool(bucket_id) and _timestamp_within(ts, stale_cutoff):
+                    real_loss += 1
+                else:
+                    unstorable += 1
                 dead_rows.append(
                     (rid, raw, bucket_id, created_at, retry_count, last_error, dropped_at)
                 )
@@ -684,7 +753,7 @@ class OfflineQueue:
         if count > 0:
             logger.info(
                 "Evicted %d unstorable queued event(s) (no bucket / past "
-                "retention) to dead_letter before batching",
+                "retention / over-long duration) to dead_letter before batching",
                 count,
             )
         timestamps.sort()
@@ -693,9 +762,61 @@ class OfflineQueue:
             "bucket_ids": sorted(bucket_ids),
             "oldest": timestamps[0] if timestamps else None,
             "newest": timestamps[-1] if timestamps else None,
-            "real_loss_count": 0,
-            "unstorable_count": count,
+            "real_loss_count": real_loss,
+            "unstorable_count": unstorable,
         }
+
+    def backfill_status_bucket_ids(self, hostname: str) -> int:
+        """One-time migration: give legacy status spans (idle/break/private/
+        sleep) queued by <=1.5.95 a ``bucket_id`` so they stay storable under
+        the bucket-keyed classifier instead of being evicted to dead-letter on
+        the first post-upgrade cycle.
+
+        Before betterflow-sync #129 these spans were emitted WITHOUT a
+        ``bucket_id``. ``is_event_storable`` requires one, so a legacy span
+        sitting in the queue at upgrade time would be classified unstorable and
+        evicted — yet the server accepts it (it types the event off
+        ``bucket_type``), so that eviction is a lost billing carve-out. This
+        rewrites their ``event_data`` to carry the same ``bf-status_<host>`` id
+        every current span already gets, making them first-class and
+        deliverable.
+
+        Idempotent and narrow: only touches events that have NO ``bucket_id``
+        AND whose ``bucket_type`` ends in ``_time`` (the status-span signature),
+        so real bucketed activity and anything unparseable is left untouched.
+        Must run at startup BEFORE the first ``evict_unstorable``.
+
+        Returns the number of events backfilled.
+        """
+        bucket_id = f"bf-status_{hostname}"
+        with self._cursor() as cursor:
+            cursor.execute("SELECT id, event_data FROM queued_events")
+            rows = cursor.fetchall()
+            updates: list[tuple[str, int]] = []
+            for rid, raw in rows:
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(ev, dict) or ev.get("bucket_id"):
+                    continue
+                bucket_type = ev.get("bucket_type")
+                if not (isinstance(bucket_type, str) and bucket_type.endswith("_time")):
+                    continue
+                ev["bucket_id"] = bucket_id
+                updates.append((json.dumps(ev), rid))
+            if updates:
+                cursor.executemany(
+                    "UPDATE queued_events SET event_data = ? WHERE id = ?",
+                    updates,
+                )
+        if updates:
+            logger.info(
+                "Backfilled bucket_id on %d legacy bucketless status span(s) so "
+                "they deliver instead of being evicted on upgrade",
+                len(updates),
+            )
+        return len(updates)
 
     def dead_letter_count(self) -> int:
         """Number of events currently held in the dead-letter table."""
