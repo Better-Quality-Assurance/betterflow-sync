@@ -116,3 +116,80 @@ def test_fetch_server_config_stamps_the_refetch_clock():
     engine.fetch_server_config()
     assert engine._config_fetched is True
     assert engine._last_config_fetch_monotonic > 0.0
+
+
+def test_config_refetch_due_holds_when_flag_set_without_a_real_timestamp():
+    # The guard branch: _config_fetched forced True (e.g. in other tests) but no
+    # real fetch ever stamped the clock → must NOT refetch (0.0 is not "stale").
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine._config_fetched = True
+    engine._last_config_fetch_monotonic = 0.0
+    assert engine._config_refetch_due(1_000_000.0) is False
+
+
+def test_failed_refetch_backs_off_instead_of_retrying_every_cycle():
+    # THE finding-1 regression guard: a /config route that 500s while the rest of
+    # the API is healthy must not leave an already-configured agent "due" every
+    # cycle (which would burn the whole per-cycle budget in the retry chain).
+    from src.sync.bf_client import BetterFlowClientError
+
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine._config_fetched = True
+    engine._last_config_fetch_monotonic = 100.0  # long ago → currently due
+    engine.bf.get_config = Mock(side_effect=BetterFlowClientError("config route 500"))
+
+    engine.fetch_server_config()
+
+    assert engine._config_fetched is True, "a failed refetch must not lose configured state"
+    assert engine._last_config_fetch_monotonic > 100.0, (
+        "a failed refetch must stamp the clock so it backs off, not retry every cycle"
+    )
+    # ...so it is NOT immediately due again.
+    assert engine._config_refetch_due(engine._last_config_fetch_monotonic + 1) is False
+
+
+def test_failed_initial_fetch_keeps_retrying_every_cycle():
+    # The other direction: a brand-new agent that has never succeeded must keep
+    # retrying fast (it must learn its fail-closed schedule ASAP), not back off.
+    from src.sync.bf_client import BetterFlowClientError
+
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    assert engine._config_fetched is False
+    engine.bf.get_config = Mock(side_effect=BetterFlowClientError("down"))
+
+    engine.fetch_server_config()
+
+    assert engine._config_fetched is False
+    assert engine._config_refetch_due(1_000_000.0) is True, (
+        "an agent that never fetched must keep retrying, not back off"
+    )
+
+
+def test_sync_refetches_config_once_the_interval_elapses():
+    # Wiring test: prove sync() actually consults _config_refetch_due (not the old
+    # `not self._config_fetched`). Reverting the gate makes this fail.
+    import time as _time
+
+    aw, bf, queue = Mock(), Mock(), Mock()
+    bf.is_reachable.return_value = True
+    queue.is_empty.return_value = True
+    aw.get_buckets.return_value = {}
+    engine = SyncEngine(aw=aw, bf=bf, queue=queue, config=Config(), time_tracker=Mock())
+    engine._backlog_reconciled = True
+    engine._config_fetched = True
+    bf.get_config = Mock(return_value={})
+
+    # Recent fetch → not due → sync() must NOT re-fetch.
+    engine._last_config_fetch_monotonic = _time.monotonic()
+    engine.sync()
+    assert not bf.get_config.called, "a fresh config must not be re-fetched"
+
+    # Stale fetch (> interval) → due → sync() must re-fetch.
+    engine._last_config_fetch_monotonic = _time.monotonic() - (
+        SyncEngine._CONFIG_REFETCH_INTERVAL_SECONDS + 60
+    )
+    engine.sync()
+    assert bf.get_config.called, "sync() must re-fetch config once the interval elapsed"

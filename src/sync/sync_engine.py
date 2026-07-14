@@ -660,6 +660,15 @@ class SyncEngine:
             raise
         except BetterFlowClientError as e:
             logger.warning(f"Failed to fetch server config: {e}")
+            # Back off a FAILED refetch by the normal interval, else a /config
+            # route that 500s while the rest of the API is healthy would leave
+            # every already-configured agent "due" every cycle, burning the whole
+            # per-cycle network budget in get_config()'s retry chain and starving
+            # uploads (and brushing the "Sync hung" watchdog). Stamping here is
+            # safe for the INITIAL fetch too: _config_refetch_due short-circuits
+            # on `not _config_fetched`, so a brand-new agent still retries every
+            # cycle until it first succeeds (it must, to learn its schedule).
+            self._last_config_fetch_monotonic = time.monotonic()
 
     def sync(self) -> SyncStats:
         """Perform a sync cycle.
