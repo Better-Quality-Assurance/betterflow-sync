@@ -10,7 +10,8 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from dataclasses import fields as dc_fields
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -440,13 +441,42 @@ def _normalize_hhmm(value) -> str:
     keep the schedule it already trusted (or none at all).
     """
     text = str(value).strip() if value is not None else ""
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    # Seconds are tolerated but ignored: agent_work_schedules.work_start is a
+    # string(5) today, so the wire carries "07:30" — but if that column is ever
+    # migrated to TIME, Eloquent starts emitting "07:30:00", this would raise, known
+    # would stay False, and EVERY restricted user would go dark. Cheap insurance.
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", text)
     if not match:
         raise ValueError(f"working-hours time is not HH:MM: {value!r}")
     hour, minute = int(match.group(1)), int(match.group(2))
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError(f"working-hours time out of range: {value!r}")
     return f"{hour:02d}:{minute:02d}"
+
+
+@lru_cache(maxsize=8)
+def _resolve_schedule_tz(name: str):
+    """Resolve a schedule timezone, logging an unresolvable one ONCE.
+
+    allows() runs per event, so logging inside it flooded the log on a single
+    misconfigured timezone. lru_cache makes the body — and therefore the log line —
+    run once per distinct name for the life of the process.
+    """
+    if not name:
+        return None  # normal: production sends no timezone; use machine-local.
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        # SET but unresolvable means the tz database is missing (Windows without
+        # tzdata, which we now bundle). The machine-local fallback then evaluates the
+        # window in a clock the employee can change, so say so — but keep the
+        # fallback: failing closed here would silently stop tracking a whole platform.
+        logger.error(
+            "Working-hours timezone %r could not be resolved (missing tz database?) "
+            "— falling back to machine-local time, which the user can change",
+            name,
+        )
+        return None
 
 
 def _normalize_working_days(value) -> list:
@@ -500,46 +530,66 @@ class WorkingHoursConfig:
         if not self.enforced:
             return True
 
-        try:
-            tz = ZoneInfo(self.timezone) if self.timezone else None
-        except Exception:
-            # An EMPTY timezone is the normal path — production genuinely sends none,
-            # and the employee's own clock is the right one for "don't watch my
-            # laptop at night". A timezone that is SET but unresolvable is not
-            # normal: it means the tz database is missing (Windows without tzdata,
-            # which we now bundle), and the machine-local fallback then evaluates the
-            # window in a timezone the employee themselves can change. Keep the
-            # fallback — failing closed here would silently stop tracking a whole
-            # platform — but make it loud rather than a shrug.
-            logger.error(
-                "Working-hours timezone %r could not be resolved (missing tz database?) "
-                "— falling back to machine-local time, which the user can change",
-                self.timezone,
-            )
-            tz = None
-
+        tz = _resolve_schedule_tz(self.timezone)
         local = when.astimezone(tz) if tz else when.astimezone()
+        hhmm = local.strftime("%H:%M")
 
         # An empty working_days is treated as "no working day at all", not "every
-        # day". _normalize_working_days already rejects [] from the server, so
-        # this only bites a hand-edited config — and the safe reading of "no days
+        # day". _normalize_working_days already rejects [] from the server, so this
+        # only bites a hand-edited config — and the safe reading of "no days
         # configured" is to record nothing.
-        if local.isoweekday() not in self.working_days:
-            return False
 
-        hhmm = local.strftime("%H:%M")
         if self.work_start <= self.work_end:
+            # Normal daytime window: the shift belongs to the day it falls on.
+            if local.isoweekday() not in self.working_days:
+                return False
             return self.work_start <= hhmm <= self.work_end
 
         # Overnight window (e.g. a 22:00-06:00 night shift). A plain
-        # start <= hhmm <= end is EMPTY when start > end, which would have
-        # recorded such a user for exactly zero seconds a day, with nothing in the
-        # log to say why. The day-of-week test above is applied to the instant's
-        # own local day, so a shift starting Friday 22:00 keeps recording into
-        # Saturday only if Saturday is itself a working day — deliberately
-        # conservative: we would rather under-record than record someone on a day
-        # their schedule says they do not work.
-        return hhmm >= self.work_start or hhmm <= self.work_end
+        # start <= hhmm <= end is EMPTY when start > end, which recorded such a user
+        # for exactly zero seconds a day.
+        #
+        # The shift is named for the day it STARTS on, so the day-of-week test has to
+        # be applied to that day — not to the instant's own local day. Testing the
+        # instant's day gets it wrong in BOTH directions:
+        #   - Sat 02:00 (the real tail of Friday's shift) would be denied, and
+        #   - Mon 02:00 (the tail of a SUNDAY NIGHT the user does not work) would be
+        #     ALLOWED and recorded. That second one is over-collection — precisely
+        #     what this feature exists to prevent.
+        if hhmm >= self.work_start:
+            shift_day = local.isoweekday()               # evening half: today's shift
+        elif hhmm <= self.work_end:
+            shift_day = (local - timedelta(days=1)).isoweekday()  # morning half: yesterday's
+        else:
+            return False                                  # the daylight gap between shifts
+        return shift_day in self.working_days
+
+    def window_close_after(self, start: "datetime") -> "Optional[datetime]":
+        """The instant the working-hours window containing ``start`` closes, in UTC.
+
+        Used to CLAMP the end of a status span (idle/break/sleep/private) that began
+        inside the window and ran past it. Gating those spans on their start alone was
+        not enough: an idle span beginning 21:45 and ending 23:55 passed the gate and
+        told the server the employee became active at 23:55 — the exact fact we are
+        here not to collect. Clamping to 22:00 keeps the true in-window portion and
+        leaks nothing about the evening.
+
+        Returns None when there is no window to clamp to (unknown or unrestricted).
+        """
+        if not self.known or not self.enforced:
+            return None
+
+        tz = _resolve_schedule_tz(self.timezone)
+        local = start.astimezone(tz) if tz else start.astimezone()
+        end_h, end_m = (int(p) for p in self.work_end.split(":"))
+        close = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+
+        # For an overnight window the close belongs to the NEXT local day whenever
+        # `start` is in the evening half.
+        if self.work_start > self.work_end and local.strftime("%H:%M") >= self.work_start:
+            close += timedelta(days=1)
+
+        return close.astimezone(timezone.utc)
 
 
 @dataclass

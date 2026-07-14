@@ -113,10 +113,28 @@ class MacOSWindowWatcher:
             logger.error("Cannot start MacOSWindowWatcher: pyobjc-framework-ApplicationServices not installed")
             return False
 
+        # Idempotent: the working-hours capture policy re-asserts the desired state
+        # on every 60s tick, so start() is now called repeatedly while running.
+        # Without this guard each call span a fresh AX-polling thread — one a
+        # minute, forever — each one hammering the Accessibility API and posting
+        # heartbeats into the local tracker server.
+        if self.is_running:
+            return True
+
         try:
             self._aw.create_bucket(self._bucket_id, "currentwindow", self._hostname)
         except Exception as e:
             logger.warning(f"Failed to create window bucket (will retry on heartbeat): {e}")
+
+        # Reset the stop signal so a restarted thread doesn't exit immediately.
+        # stop() sets this and nothing ever cleared it, so after the first capture
+        # suppression (22:00) every later start() spawned a thread that fell out of
+        # `while not self._stop_event.wait(...)` on its first iteration — window
+        # tracking was silently dead for the rest of the process's life, with no
+        # bf-window-tracker fallback on macOS to cover it. MacOSInputWatcher has
+        # always done this; this watcher never did, because until now it was only
+        # ever started once.
+        self._stop_event.clear()
 
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="macos-window-watcher",
@@ -124,6 +142,10 @@ class MacOSWindowWatcher:
         self._thread.start()
         logger.info(f"MacOSWindowWatcher started (bucket={self._bucket_id}, poll={self._poll_interval}s)")
         return True
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
 
     def set_poll_interval(self, interval: float) -> None:
         """Adjust poll rate (e.g. slower when AFK)."""

@@ -456,6 +456,26 @@ class SyncEngine:
         with self._state_lock:
             return self._paused
 
+    def set_enrichment_trackers(self, *, browser_tracker=None, display_tracker=None) -> None:
+        """Attach/detach the browser-URL and display trackers.
+
+        These used to be constructed in BetterFlowApp.__init__ and handed to this
+        ctor once. They are now created and destroyed by the working-hours capture
+        policy, so the engine needs a way to be told about the new objects.
+
+        An explicit setter, not a bare attribute assignment: the engine reads
+        `self._browser_tracker` (underscore), so `engine.browser_tracker = x` from
+        outside silently created a NEW, never-read attribute while `_browser_tracker`
+        stayed None for the whole process. Effect: browser events shipped with no
+        URL, collapsed to generic "browsing", and were counted productive — the
+        browser_domain-empty incident, reintroduced fleet-wide by the very fix that
+        was supposed to protect people. A Mock-based test asserted the wrong
+        attribute and passed.
+        """
+        with self._state_lock:
+            self._browser_tracker = browser_tracker
+            self._display_tracker = display_tracker
+
     def request_backlog_reconcile(self) -> None:
         """Re-arm the start-of-day backlog reconcile so the NEXT sync rewinds
         checkpoints and re-sends any locally-stored events the server never
@@ -2212,14 +2232,31 @@ class SyncEngine:
 
         # Status spans are pushed by IdleManager / BreakManager / SystemEventHandler,
         # NOT from inside sync(), so they never met the working-hours gate applied to
-        # bucket events. An idle span ending at 23:40 still told the server the
-        # employee became active at 23:40 — which is precisely the fact this feature
-        # exists not to collect. Gate on the span's START: a span that began inside
-        # the window is legitimately ours to record, even if it ends after it closed.
+        # bucket events.
+        #
+        # Gating on the START alone is not enough, and an earlier version of this
+        # comment claimed a fix it did not implement. IdleManager polls the OS idle
+        # clock on the 60s tick, independently of every tracker we stop. So: user
+        # walks away 21:45; 22:00 capture is suppressed; 23:55 they touch the
+        # keyboard; clear_idle_pause() emits an idle span start=21:45 end=23:55.
+        # allows(21:45) is True, so it shipped — telling the server the employee
+        # became active at 23:55. Same shape for a sleep span (asleep 21:00, wake
+        # 23:00) and for the growing per-cycle private_time snapshot.
+        #
+        # Clamp the END to the window close instead of dropping: the 21:45-22:00
+        # portion is real, in-window, and ours to keep; everything past 22:00 is not.
         if not self.config.working_hours.allows(start):
             logger.debug("Dropping %s_time span starting %s: outside working hours",
                          kind, start.isoformat())
             return
+
+        close = self.config.working_hours.window_close_after(start)
+        if close is not None and end > close:
+            logger.debug(
+                "Clamping %s_time span end %s -> %s (working-hours close)",
+                kind, end.isoformat(), close.isoformat(),
+            )
+            end = close
 
         duration = (end - start).total_seconds()
         if duration < 1:

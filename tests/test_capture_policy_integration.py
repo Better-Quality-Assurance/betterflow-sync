@@ -118,7 +118,14 @@ class TestCapturePolicyStopsEverything:
 
     def test_out_of_hours_stops_the_browser_tracker(self):
         """The browser tracker reads the frontmost tab's URL. It is the most
-        sensitive thing we run, and the first cut of this fix never stopped it."""
+        sensitive thing we run, and the first cut of this fix never stopped it.
+
+        NOTE this deliberately does NOT assert `app.sync_engine.browser_tracker is
+        None`. sync_engine is a Mock here, and a Mock accepts and returns any
+        attribute you invent — that assertion passed while the real engine (which
+        reads `_browser_tracker`) was never wired at all. Assert the CALL instead,
+        and see test_capture_lifecycle_real.py for the real-object contract.
+        """
         app = self._app(self._restricted_cfg())
         browser = app.browser_tracker
 
@@ -128,7 +135,9 @@ class TestCapturePolicyStopsEverything:
 
         browser.stop.assert_called_once()
         assert app.browser_tracker is None
-        assert app.sync_engine.browser_tracker is None
+        app.sync_engine.set_enrichment_trackers.assert_called_with(
+            browser_tracker=None, display_tracker=None
+        )
 
     def test_out_of_hours_stops_every_in_process_recorder(self):
         app = self._app(self._restricted_cfg())

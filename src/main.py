@@ -1773,15 +1773,19 @@ class BetterFlowApp:
         if self.browser_tracker is None and self.config.privacy.track_browser_urls:
             try:
                 self.browser_tracker = start_browser_tracker()
-                self.sync_engine.browser_tracker = self.browser_tracker
             except Exception as e:
                 logger.warning("Browser tracker start failed: %s", e)
         if self.display_tracker is None and self.config.privacy.track_display_info:
             try:
                 self.display_tracker = start_display_tracker()
-                self.sync_engine.display_tracker = self.display_tracker
             except Exception as e:
                 logger.warning("Display tracker start failed: %s", e)
+        # Hand the NEW objects to the engine through its setter. Assigning
+        # engine.browser_tracker directly writes an attribute nothing reads.
+        self.sync_engine.set_enrichment_trackers(
+            browser_tracker=self.browser_tracker,
+            display_tracker=self.display_tracker,
+        )
 
     def _stop_watchers(self) -> None:
         """Stop EVERY in-process recorder. Mirror of _start_watchers().
@@ -1820,12 +1824,11 @@ class BetterFlowApp:
                 logger.warning("Failed to stop %s: %s", label, e)
 
         # These two are re-created by _start_watchers() when the window reopens.
-        # Dropping the references also detaches them from the sync engine, so a
-        # stale handle can't be polled by anything that outlives the stop.
+        # Detach them from the engine through its setter too, so nothing that
+        # outlives the stop can poll a stale handle.
         self.browser_tracker = None
         self.display_tracker = None
-        self.sync_engine.browser_tracker = None
-        self.sync_engine.display_tracker = None
+        self.sync_engine.set_enrichment_trackers(browser_tracker=None, display_tracker=None)
 
     def _capture_currently_allowed(self) -> bool:
         """Whether capture is permitted right now, per the working-hours schedule."""
@@ -1857,6 +1860,20 @@ class BetterFlowApp:
             self._capture_allowed = allowed
 
             if allowed:
+                if changed:
+                    # Jump the AW/in-process checkpoints over the suppressed gap
+                    # BEFORE anything reads from them again — the same thing
+                    # pause/resume and private-time already do for their gaps.
+                    # Without it the first cycle back sees a checkpoint from 21:59
+                    # and a `now` of 07:31 and synthesises ONE event spanning the
+                    # whole 9.5h suppressed night (an afk-inproc span; and, with
+                    # in_process_input on, a 9.5h input event stamped 21:59 carrying
+                    # this morning's keystrokes). We would have suppressed the night
+                    # and then manufactured a record of it anyway.
+                    try:
+                        self.sync_engine._advance_checkpoints_to_now("capture_resume")
+                    except Exception as e:
+                        logger.warning("Checkpoint advance on capture resume failed: %s", e)
                 self.aw_manager.set_capture_suppressed(False, reason)
                 self._start_watchers()
                 if changed:
