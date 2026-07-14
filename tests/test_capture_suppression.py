@@ -200,3 +200,44 @@ class TestSyncLoopHonoursSuppression:
 
         assert stats.capture_suppressed is True
         aw.get_events.assert_not_called()
+
+
+class TestTrayShowsPrivateHours:
+    """A person whose machine has stopped being watched should see that in the tray,
+    not have to take it on faith. Showing SYNCING while suppressed would be a lie."""
+
+    def test_private_hours_state_exists_and_is_grey(self):
+        from src.ui.tray import STATE_COLORS, TrayState
+
+        assert TrayState.PRIVATE_HOURS in STATE_COLORS
+        colour = STATE_COLORS[TrayState.PRIVATE_HOURS].lstrip("#")
+        r, g, b = (int(colour[i:i + 2], 16) for i in (0, 2, 4))
+        # Grey-ish: the three channels sit close together (no colour cast).
+        assert max(r, g, b) - min(r, g, b) < 40, f"{colour} is not grey"
+
+    def test_it_is_distinct_from_user_declared_private_time(self):
+        """Same effect (nothing recorded), different cause: PRIVATE is a choice the
+        user made, PRIVATE_HOURS is their contracted hours ending. The tooltip has to
+        be able to tell them apart."""
+        from src.ui.tray import STATE_COLORS, TrayState
+
+        assert STATE_COLORS[TrayState.PRIVATE_HOURS] != STATE_COLORS[TrayState.PRIVATE]
+        assert STATE_COLORS[TrayState.PRIVATE_HOURS] != STATE_COLORS[TrayState.PAUSED]
+
+    def test_sync_still_runs_while_suppressed(self):
+        """Guards the trap: the tray state is set from stats.capture_suppressed AFTER
+        sync() runs, never by short-circuiting _do_sync. sync() is where the offline
+        queue drains and where fetch_server_config() retries — skipping it would
+        recreate the lockout where an agent that never learned its schedule never can."""
+        import inspect
+
+        import src.main as main
+
+        src = inspect.getsource(main.SyncCoordinator._do_sync)
+        assert "stats.capture_suppressed" in src, "tray state must come from the sync stats"
+        # The suppression check must not appear before sync() as an early return.
+        before_sync = src.split("self.sync_engine.sync()")[0]
+        assert "PRIVATE_HOURS" not in before_sync, (
+            "_do_sync short-circuits on suppression — that skips the queue drain and "
+            "the config re-fetch"
+        )

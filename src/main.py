@@ -1304,6 +1304,18 @@ class SyncCoordinator:
                     logger.warning(f"Offline queue at {pct}% capacity")
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
+                elif stats.capture_suppressed:
+                    # Outside the enforced window: nothing is being recorded, and the
+                    # tray says so. Someone whose machine has stopped being watched is
+                    # entitled to see that at a glance, without opening a menu — and
+                    # showing SYNCING here would be an outright lie.
+                    #
+                    # Set from the STATS rather than by short-circuiting _do_sync,
+                    # because sync() must still run while suppressed: it drains the
+                    # offline queue and, crucially, it is where fetch_server_config()
+                    # retries. Returning early here would recreate the lockout where an
+                    # agent that never learned its schedule could never learn it.
+                    self.tray.set_state(TrayState.PRIVATE_HOURS, "Private hours — not recording")
                 else:
                     if is_idle:
                         self.tray.set_state(TrayState.PAUSED, "Idle")
