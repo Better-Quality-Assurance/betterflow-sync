@@ -86,15 +86,23 @@ class TestTheWireResponseActuallyConfiguresTheAgent:
         assert config.working_hours.work_start == "07:30"
 
     def test_other_server_settings_arrive_too(self):
-        """afk_timeout has been silently ignored for the life of the feature."""
+        """The unwrap must feed the WHOLE payload, not just working_hours — proven with
+        a setting that is not behind the deferral gate.
+
+        (afk_timeout would be the obvious one, but it is deliberately deferred: see
+        TestDeferredSettingsDoNotRideAlong. It has been silently ignored for the life of
+        the feature, and un-ignoring it moves billed hours on 37 devices.)"""
         client = BetterFlowClient(api_url="https://example.test/api/agent")
         config = Config()
-        assert config.aw.afk_timeout_minutes != 20  # not already the server's value
 
-        with patch.object(BetterFlowClient, "_request", return_value=WIRE_RESPONSE):
+        payload = dict(WIRE_RESPONSE["data"])
+        payload["sync"] = {"batch_size": 250, "sync_interval_seconds": 90}
+        with patch.object(BetterFlowClient, "_request",
+                          return_value={"success": True, "data": payload}):
             config.update_from_server(client.get_config())
 
-        assert config.aw.afk_timeout_minutes == 20
+        assert config.sync.batch_size == 250
+        assert config.sync.interval_seconds == 90
 
     def test_the_raw_envelope_configures_NOTHING(self):
         """Pins the bug itself, so nobody 'simplifies' the unwrap back out."""
@@ -103,6 +111,47 @@ class TestTheWireResponseActuallyConfiguresTheAgent:
 
         assert config.working_hours.known is False
         assert config.aw.afk_timeout_minutes != 20
+
+
+class TestDeferredSettingsDoNotRideAlong:
+    """The envelope fix makes EVERY server setting apply for the first time ever. Two of
+    them change the real world and have nothing to do with working hours, so they are
+    gated behind DEFER_UNAPPLIED_SERVER_SETTINGS until each is rolled out on purpose:
+
+      afk_timeout_minutes  37/44 prod devices say 20, agents have run 10 -> moves HOURS
+      hash_window_titles   41/44 say ON -> window titles become hashes, admins lose them
+
+    The privacy release must change exactly one thing: we stop recording out of hours.
+    """
+
+    def _applied(self):
+        client = BetterFlowClient(api_url="https://example.test/api/agent")
+        config = Config()
+        before = (config.aw.afk_timeout_minutes, config.privacy.hash_titles)
+        payload = dict(WIRE_RESPONSE["data"])
+        payload["privacy"] = {"hash_window_titles": True, "track_browser_domains": True}
+        with patch.object(BetterFlowClient, "_request",
+                          return_value={"success": True, "data": payload}):
+            config.update_from_server(client.get_config())
+        return config, before
+
+    def test_the_schedule_still_applies(self):
+        config, _ = self._applied()
+        assert config.working_hours.known is True
+        assert config.working_hours.enforced is True
+        assert config.working_hours.work_start == "07:30"
+
+    def test_the_afk_timeout_does_not_move(self):
+        config, before = self._applied()
+        assert config.aw.afk_timeout_minutes == before[0], (
+            "AFK timeout moved: this silently changes billed hours on 37 devices"
+        )
+
+    def test_window_titles_do_not_start_hashing(self):
+        config, before = self._applied()
+        assert config.privacy.hash_titles == before[1], (
+            "hash_window_titles applied: admins would silently lose readable titles"
+        )
 
 
 class TestSyncEngineFetchPath:

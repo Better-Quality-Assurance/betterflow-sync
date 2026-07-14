@@ -454,6 +454,25 @@ def _normalize_hhmm(value) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+# Fixing the /config envelope unwrap (bf_client.get_config) means server settings reach
+# the agent for the FIRST TIME EVER — none of them have ever applied. Two of those move
+# real-world behaviour and have nothing to do with working-hours enforcement, so they
+# must land as their own deliberate change rather than as a side effect of a privacy fix:
+#
+#   tracking.afk_timeout_minutes  — 37 of 44 prod devices are set to 20 while every agent
+#                                   has run the client default of 10. Applying it lengthens
+#                                   the idle grace, i.e. it CHANGES BILLED HOURS.
+#   privacy.hash_window_titles    — 41 of 44 are set to ON. Applying it turns window titles
+#                                   into hashes, so admins lose readable titles.
+#
+# Both are what the DB has always said and what someone intended; they have simply never
+# taken effect. Each needs its own release, with the affected people told first. Flip this
+# to False (one setting at a time) to roll them out.
+#
+# working_hours is deliberately NOT gated by this: it is the whole point of the release.
+DEFER_UNAPPLIED_SERVER_SETTINGS = True
+
+
 @lru_cache(maxsize=8)
 def _resolve_schedule_tz(name: str):
     """Resolve a schedule timezone, logging an unresolvable one ONCE.
@@ -777,7 +796,7 @@ class Config:
         """
         if "privacy" in server_config:
             privacy = server_config["privacy"]
-            if "hash_window_titles" in privacy:
+            if "hash_window_titles" in privacy and not DEFER_UNAPPLIED_SERVER_SETTINGS:
                 self.privacy.hash_titles = self._to_bool(privacy["hash_window_titles"])
             if "title_allowlist" in privacy:
                 self.privacy.title_allowlist = privacy["title_allowlist"]
@@ -810,7 +829,7 @@ class Config:
                     merged.update(valid)
                     self.privacy.default_categories = merged
 
-        if "tracking" in server_config:
+        if "tracking" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             tracking = server_config["tracking"]
             if "afk_timeout_minutes" in tracking:
                 val = tracking["afk_timeout_minutes"]
