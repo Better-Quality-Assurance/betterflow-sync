@@ -33,6 +33,11 @@ class IdleManager:
         self._idle_paused = False
         self._idle_start: Optional[datetime] = None
         self._idle_pause_threshold = config.sync.idle_pause_minutes * 60
+        # Most recent system-wake instant, set via record_wake() (called by
+        # SystemEventHandler.on_system_wake). Used to clamp idle_start so a
+        # post-wake idle pause can never reach back before the machine woke
+        # up. See _clamp_to_last_wake for why this matters.
+        self._last_wake_ts: Optional[datetime] = None
         self._IDLE_SYNC_INTERVAL = 300
         # A healthy AFK watcher heartbeats its current event continuously, so the
         # event's end-time tracks "now". If the latest AFK event ended more than
@@ -67,6 +72,41 @@ class IdleManager:
             self.sync_engine.send_idle_event(idle_start)
         if was_paused and self._on_idle_pause:
             self._on_idle_pause(False)
+
+    def record_wake(self, wake_ts: Optional[datetime] = None) -> None:
+        """Record the most recent system-wake instant.
+
+        Called by SystemEventHandler.on_system_wake as soon as wake fires.
+        The idle subsystem otherwise has no wake awareness: after a laptop
+        lid-open, if the user doesn't type immediately, bf-idle-tracker
+        resumes heartbeating the SAME 'afk' event it had before the suspend
+        (its start time never moved), so `aw.get_latest_afk_event()` reports
+        an event whose `timestamp` is the last keystroke BEFORE the lid
+        closed while its `duration` stretches to cover ~now. Without a wake
+        anchor, `check_idle_status` would backdate the resulting idle_start
+        to that pre-suspend keystroke, and the idle_time event sent on
+        resume would then reach back across the suspend — re-carving real
+        work the user logged before closing the lid (undoing the
+        server-side sleep-time grace bridge). `_clamp_to_last_wake` uses
+        this timestamp to prevent that.
+        """
+        with self._state_lock:
+            self._last_wake_ts = wake_ts or datetime.now(timezone.utc)
+
+    def _clamp_to_last_wake(self, idle_start: datetime) -> datetime:
+        """Never let an idle span start before the most recent system wake.
+
+        A no-op for ordinary at-desk idle (no intervening suspend): either no
+        wake has ever been recorded, or the idle_start being computed already
+        falls after the last wake, so `max()` returns it unchanged. It only
+        moves idle_start forward for a pause entered shortly after a resume,
+        clamping it to the wake instant instead of a pre-suspend timestamp.
+        """
+        with self._state_lock:
+            last_wake = self._last_wake_ts
+        if last_wake is not None and idle_start < last_wake:
+            return last_wake
+        return idle_start
 
     def flush_idle_event(self) -> None:
         """Send idle_time event for current idle period (e.g. on shutdown)."""
@@ -270,6 +310,15 @@ class IdleManager:
                         return
                     if idle_start is None:
                         idle_start = datetime.now(timezone.utc)
+                    clamped_idle_start = self._clamp_to_last_wake(idle_start)
+                    if clamped_idle_start != idle_start:
+                        logger.info(
+                            "idle_start %s clamped to last wake %s — post-suspend idle "
+                            "must not reach back across the sleep",
+                            idle_start.isoformat(),
+                            clamped_idle_start.isoformat(),
+                        )
+                    idle_start = clamped_idle_start
                     logger.info(
                         f"User idle for {int(afk_duration)}s (>= {self._idle_pause_threshold}s) "
                         f"- backing off sync to {self._IDLE_SYNC_INTERVAL}s"

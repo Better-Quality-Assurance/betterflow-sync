@@ -369,6 +369,162 @@ def test_afk_event_with_none_duration_falls_back_not_crash():
     sysidle.assert_called()
 
 
+def test_idle_start_clamped_to_wake_after_suspend():
+    """The suspend-carving bug: bf-idle-tracker resumes heartbeating its
+    pre-suspend 'afk' event on wake WITHOUT resetting its start time, so the
+    "current" AFK event's timestamp is a keystroke from BEFORE the lid
+    closed even though its duration now reaches ~now. Pre-fix, check_idle_
+    status backdates idle_start to that pre-suspend timestamp; the idle_time
+    event sent on resume then reaches back across the suspend and re-carves
+    real work the user logged before closing the lid.
+
+    Fix: record_wake() anchors the wake instant; idle_start must clamp to it.
+    """
+    now = datetime.now(timezone.utc)
+    wake_ts = now - timedelta(minutes=2)  # woke 2 minutes ago
+    pre_suspend_keystroke = now - timedelta(hours=3)  # last input before lid close
+
+    # AFK event "current" (heartbeating through to ~now) but anchored to the
+    # pre-suspend keystroke — exactly what a resumed tracker reports.
+    afk_event = types.SimpleNamespace(
+        status="afk",
+        duration=(now - pre_suspend_keystroke).total_seconds(),
+        timestamp=pre_suspend_keystroke,
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(afk_event)
+    idle_mgr.record_wake(wake_ts)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True
+    assert idle_mgr._idle_start is not None
+    assert idle_mgr._idle_start >= wake_ts, (
+        "idle_start must never reach back before the recorded wake instant"
+    )
+    assert idle_mgr._idle_start != pre_suspend_keystroke, (
+        "idle_start must not stay pinned to the pre-suspend keystroke"
+    )
+
+
+def test_idle_start_clamped_to_wake_via_os_idle_clock_fallback():
+    """Same suspend-carving risk on the OS-idle-clock fallback path (Windows/
+    no in-process watcher scenario, or a stale-AFK fallback): the OS idle
+    clock can also report elapsed time stretching back before a suspend.
+    idle_start must still clamp to the last recorded wake."""
+    now = datetime.now(timezone.utc)
+    wake_ts = now - timedelta(minutes=1)
+    # No AFK bucket signal at all -> falls back to the OS idle clock, which
+    # (pre-fix) would compute idle_start = now - system_idle, reaching back
+    # to well before the wake.
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(None)
+    idle_mgr.aw.get_latest_afk_event.return_value = None
+    idle_mgr.record_wake(wake_ts)
+
+    system_idle_seconds = 3 * 3600.0  # 3h "idle" per OS clock, from before sleep
+    with patch.object(
+        IdleManager, "_get_system_idle_seconds", return_value=system_idle_seconds
+    ):
+        idle_mgr.check_idle_status(
+            logged_in=True,
+            is_on_break=False,
+            reschedule=reschedule,
+            trigger_sync=trigger_sync,
+        )
+
+    assert idle_mgr.idle_paused is True
+    assert idle_mgr._idle_start >= wake_ts, (
+        "OS-idle-clock-derived idle_start must also clamp to the last wake"
+    )
+
+
+def test_at_desk_idle_unchanged_without_a_wake_recorded():
+    """Control: no suspend/wake happened (record_wake never called) — idle_start
+    is exactly the AFK event's own timestamp, unclamped, as before this fix."""
+    now = datetime.now(timezone.utc)
+    afk_start = now - timedelta(minutes=25)
+    afk_event = types.SimpleNamespace(
+        status="afk",
+        duration=25 * 60.0,
+        timestamp=afk_start,
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(afk_event)
+    assert idle_mgr._last_wake_ts is None  # no wake recorded this session
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True
+    assert idle_mgr._idle_start == afk_start, (
+        "at-desk idle with no intervening suspend must be unaffected by the clamp"
+    )
+
+
+def test_at_desk_idle_unchanged_when_idle_start_is_after_an_old_wake():
+    """A wake recorded much earlier in the session must not distort a later,
+    unrelated at-desk idle stretch — the clamp is a max(), a no-op once
+    idle_start already falls after the last wake."""
+    now = datetime.now(timezone.utc)
+    old_wake = now - timedelta(hours=5)  # woke up 5h ago, long since active
+    afk_start = now - timedelta(minutes=25)  # genuine idle stretch, much later
+    afk_event = types.SimpleNamespace(
+        status="afk",
+        duration=25 * 60.0,
+        timestamp=afk_start,
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(afk_event)
+    idle_mgr.record_wake(old_wake)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+
+    assert idle_mgr.idle_paused is True
+    assert idle_mgr._idle_start == afk_start, (
+        "idle_start already after the last wake must pass through unclamped"
+    )
+
+
+def test_clamped_idle_start_is_what_gets_sent_on_resume():
+    """End-to-end: the idle_time event actually emitted to the server (via
+    clear_idle_pause -> send_idle_event) carries the CLAMPED start, not the
+    pre-suspend keystroke — this is the payroll-facing half of the fix."""
+    now = datetime.now(timezone.utc)
+    wake_ts = now - timedelta(minutes=2)
+    pre_suspend_keystroke = now - timedelta(hours=3)
+    afk_event = types.SimpleNamespace(
+        status="afk",
+        duration=(now - pre_suspend_keystroke).total_seconds(),
+        timestamp=pre_suspend_keystroke,
+    )
+    idle_mgr, reschedule, trigger_sync, tray = _make_with_afk_event(afk_event)
+    idle_mgr.record_wake(wake_ts)
+
+    idle_mgr.check_idle_status(
+        logged_in=True,
+        is_on_break=False,
+        reschedule=reschedule,
+        trigger_sync=trigger_sync,
+    )
+    idle_mgr.clear_idle_pause(send_event=True)
+
+    idle_mgr.sync_engine.send_idle_event.assert_called_once()
+    sent_start = idle_mgr.sync_engine.send_idle_event.call_args[0][0]
+    assert sent_start >= wake_ts
+    assert sent_start != pre_suspend_keystroke
+
+
 def test_stale_afk_with_no_os_idle_signal_does_not_pause():
     """Stale AFK + no OS idle clock (Linux, or a Windows API failure -> None):
     is_afk stays False and the user is not paused. Guards the None-fallback
