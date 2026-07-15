@@ -222,6 +222,15 @@ class SyncCoordinator:
         # boundary job until the 30-min refetch. Mirrors _apply_capture_policy's
         # _capture_lock, which guards this exact class of transition.
         self._boundary_lock = threading.Lock()
+        # True once an arm resolved to "no boundary" for a schedule the 60s self-heal
+        # still considers restricted (known+enforced but EDGELESS — allows() never
+        # flips within the 8-day walk cap, e.g. a full 00:00-23:59 all-days window or a
+        # hand-edited working_days=[]). Without this, the self-heal would see
+        # get_job()==None every tick and re-arm+log forever (~1440 lines/day + an 8-day
+        # allows() re-walk each time). Set under _boundary_lock in arm_capture_boundary:
+        # True when boundary is None, False when a boundary IS armed. Config updates
+        # flow through arm, so the flag self-corrects when the schedule changes.
+        self._boundary_edgeless = False
         # Wedge self-recovery (Cristian Dragota / sync:67a77a43-787, 2026-06-25):
         # a _do_sync that hangs past the watchdog holds _sync_lock forever, so
         # every later cycle skips and sync freezes while the heartbeat keeps
@@ -473,8 +482,14 @@ class SyncCoordinator:
                 return
             try:
                 if boundary is None:
-                    # Unknown or unrestricted schedule: allows() is constant, so there
-                    # is no edge. Drop any job left over from a previous restricted one.
+                    # No edge to align to: either allows() is constant (unknown or
+                    # unrestricted) OR the schedule is known+enforced but EDGELESS —
+                    # allows() never flips within the 8-day walk (full all-day window,
+                    # or hand-edited working_days=[]). Drop any job left from a previous
+                    # restricted schedule, and remember the edgeless state so the 60s
+                    # self-heal doesn't re-arm+log every tick against a schedule that
+                    # legitimately arms nothing.
+                    self._boundary_edgeless = True
                     self._disarm_capture_boundary()
                     return
                 self.scheduler.add_job(
@@ -493,6 +508,9 @@ class SyncCoordinator:
                     # live. The 60s tick self-heal is the second backstop.
                     misfire_grace_time=None,
                 )
+                # A real edge exists: clear any prior edgeless state so the self-heal
+                # resumes re-arming a genuinely missing (misfire-discarded) job.
+                self._boundary_edgeless = False
                 logger.info("Capture boundary armed for %s", boundary.isoformat())
             except Exception:
                 # The remove/add is now inside the try too: the scheduler can be shut
@@ -525,6 +543,14 @@ class SyncCoordinator:
         # "Restricted" ⟺ next_boundary_after would return a boundary ⟺ known+enforced
         # (unknown/unrestricted schedules have no edge and legitimately arm nothing).
         if not (wh.known and wh.enforced):
+            return
+        # A known+enforced schedule can still be EDGELESS (allows() never flips within
+        # the 8-day walk: a full 00:00-23:59 all-days window, or a hand-edited
+        # working_days=[]). Such a schedule legitimately arms no job, so re-arming here
+        # would churn — an 8-day allows() re-walk plus a misleading "job missing" log —
+        # every 60s forever. arm_capture_boundary records that state; skip both the
+        # re-arm and the log while it holds.
+        if getattr(self, "_boundary_edgeless", False):
             return
         if self.scheduler.get_job("capture_boundary") is None:
             logger.info("Capture boundary job missing — re-arming (60s self-heal)")
@@ -1293,7 +1319,12 @@ class SyncCoordinator:
         NOT stats.events_queued, which only counts events (re)queued THIS cycle."""
         if stats.capture_suppressed:
             detail = "Private hours — not recording"
-            if stats.events_queued > 0:
+            # Gate on queue_size (the ACTUAL depth we display), NOT stats.events_queued
+            # (this cycle's requeues). They disagree at both edges: a suppressed user
+            # with a standing backlog but no requeue THIS cycle would otherwise see no
+            # drain detail, and a cycle that fully drained an existing backlog would
+            # render the nonsensical "(draining 0 queued)".
+            if queue_size > 0:
                 detail = f"{detail} (draining {queue_size} queued)"
             if near_capacity:
                 detail = f"{detail} — queue {capacity_pct}% full"

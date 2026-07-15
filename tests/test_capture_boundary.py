@@ -28,6 +28,20 @@ RESTRICTED = {
     }
 }
 
+# Known + enforced but EDGELESS: a full 00:00-23:59 window on every day means
+# allows() is constant-True, so next_boundary_after finds no flip in its 8-day walk
+# and returns None — the same None an unknown/unrestricted schedule yields, but here
+# the self-heal still treats the schedule as restricted (known+enforced).
+FULL_WINDOW = {
+    "working_hours": {
+        "enforced": True,
+        "work_start": "00:00",
+        "work_end": "23:59",
+        "working_days": [1, 2, 3, 4, 5, 6, 7],
+        "timezone": "Europe/Bucharest",
+    }
+}
+
 # 2026-07-13 is a Monday; Europe/Bucharest is UTC+3 (EEST) in July.
 IN_HOURS_UTC = datetime(2026, 7, 13, 18, 0, tzinfo=timezone.utc)        # 21:00 Bucharest
 # allows() is inclusive of 22:00, so it flips False at 22:01 Bucharest = 19:01 UTC.
@@ -66,6 +80,15 @@ class TestNextBoundaryAfter:
         wh = _wh({"working_hours": {"enforced": False}})
         assert wh.next_boundary_after(IN_HOURS_UTC) is None
 
+    def test_edgeless_enforced_schedule_has_no_boundary(self):
+        # A full 00:00-23:59 all-days window is known+enforced yet allows() never
+        # flips, so the 8-day walk finds no edge and returns None — the root cause of
+        # the self-heal churn the coordinator guard fixes.
+        wh = _wh(FULL_WINDOW)
+        assert wh.known is True and wh.enforced is True
+        assert wh.allows(IN_HOURS_UTC) is True
+        assert wh.next_boundary_after(IN_HOURS_UTC) is None
+
 
 class _FakeScheduler:
     """Records add/remove so the boundary job can be inspected without a real
@@ -101,6 +124,12 @@ def _coordinator(cfg, running=True):
 def _restricted_cfg():
     cfg = Config()
     cfg.update_from_server(RESTRICTED)
+    return cfg
+
+
+def _edgeless_cfg():
+    cfg = Config()
+    cfg.update_from_server(FULL_WINDOW)
     return cfg
 
 
@@ -246,6 +275,60 @@ class TestBoundarySelfHeal:
             c._self_heal_capture_boundary()
 
         assert "capture_boundary" not in c.scheduler.jobs
+
+    def test_tick_does_not_churn_or_log_for_an_edgeless_enforced_schedule(self):
+        """Round-2 (MEDIUM): a known+enforced but EDGELESS schedule (full all-day
+        window) legitimately arms no boundary. The self-heal must NOT re-arm+log every
+        tick — that was ~1440 misleading 'job missing' lines/day plus an 8-day allows()
+        re-walk under _boundary_lock each tick, forever."""
+        c = _coordinator(_edgeless_cfg())
+
+        # The real arm resolves to no boundary and records the edgeless state.
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()
+        assert "capture_boundary" not in c.scheduler.jobs
+        assert c._boundary_edgeless is True
+
+        # Now hammer the tick: it passes the known+enforced gate but must stop at the
+        # edgeless guard — no re-arm attempt, no "job missing" log.
+        c.arm_capture_boundary = Mock()
+        with patch("src.main.datetime") as dt, patch("src.main.logger") as log:
+            dt.now.return_value = IN_HOURS_UTC
+            for _ in range(5):
+                c._self_heal_capture_boundary()
+
+        c.arm_capture_boundary.assert_not_called()
+        missing_logs = [
+            call for call in log.info.call_args_list if "missing" in str(call)
+        ]
+        assert not missing_logs, f"self-heal churned a log while edgeless: {missing_logs}"
+
+    def test_tick_resumes_rearming_after_schedule_gains_an_edge(self):
+        """The edgeless latch must clear when the schedule regains a real edge, so a
+        genuinely misfire-discarded job is still re-armed. Arm edgeless first (latch
+        set), then swap in a restricted schedule and arm (latch cleared), then let a
+        misfire discard the job — the next tick must re-arm."""
+        c = _coordinator(_edgeless_cfg())
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()
+        assert c._boundary_edgeless is True
+
+        # Schedule changes to a bounded window; arm clears the latch and arms a job.
+        c.config = _restricted_cfg()
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()
+        assert c._boundary_edgeless is False
+        assert "capture_boundary" in c.scheduler.jobs
+
+        # Simulate a misfire discarding the job; the tick must re-arm it now.
+        c._disarm_capture_boundary()
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._self_heal_capture_boundary()
+        assert "capture_boundary" in c.scheduler.jobs
 
 
 class TestArmPathIsFailSafe:
