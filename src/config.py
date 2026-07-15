@@ -619,6 +619,40 @@ class WorkingHoursConfig:
 
         return close.astimezone(timezone.utc)
 
+    def next_boundary_after(self, when: "datetime") -> "Optional[datetime]":
+        """The next UTC instant strictly after ``when`` at which ``allows()`` flips.
+
+        Used to arm a one-shot capture stop/start EXACTLY at the window edge rather
+        than waiting up to a full 60s enforcement tick — sync() already stops
+        uploading at the boundary via a live now() read, but local recording had a
+        tail of up to a tick past e.g. 22:00.
+
+        Returns None when the schedule has no boundaries — an unknown schedule
+        (``allows`` is always False) or an unrestricted one (always True). In both
+        cases there is nothing for a one-shot trigger to align to.
+
+        Computed by walking allows() at minute resolution (its own granularity —
+        work_start/work_end are HH:MM and seconds are ignored), so the boundary is
+        by construction consistent with the suppression and upload gates that read
+        the same allows(). Capped at 8 days so a degenerate schedule (e.g. a
+        hand-edited empty working_days, where allows() is always False) yields None
+        instead of looping.
+        """
+        if not self.known or not self.enforced:
+            return None
+
+        current = self.allows(when)
+        # Boundaries land on HH:MM:00 in the schedule's zone; stepping in UTC by
+        # whole minutes from the next minute still lands on every local flip
+        # (including across a DST change, which only shifts the wall-clock offset).
+        probe = when.astimezone(timezone.utc).replace(second=0, microsecond=0) + timedelta(minutes=1)
+        limit = probe + timedelta(days=8)
+        while probe <= limit:
+            if self.allows(probe) != current:
+                return probe
+            probe += timedelta(minutes=1)
+        return None
+
 
 @dataclass
 class Config:

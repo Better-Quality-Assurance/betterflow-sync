@@ -234,3 +234,30 @@ def test_foreground_enabled_is_not_persisted(tmp_path, monkeypatch):
     cfg_file.write_text(json.dumps(written))
     reloaded = Config._from_dict(json.loads(cfg_file.read_text()))
     assert reloaded.foreground_activity.enabled is False
+
+
+class TestMachineUuidIsIsolatedByConftest:
+    """Regression guard for the autouse conftest fixture.
+
+    get_machine_uuid() and _load_dotenv() call the module-level `user_config_dir`
+    directly, bypassing Config's get_config_dir/get_data_dir classmethods. Before
+    the fixture was extended, it patched only those classmethods — so a test that
+    triggered get_machine_uuid (several exchange_code paths in test_bf_client do)
+    read/wrote the developer's REAL ~/.../BetterFlow/.machine_id and leaked the
+    cached value across the session.
+
+    This test relies ONLY on the autouse fixture (no per-test monkeypatch), so it
+    fails if that module-level redirect is ever dropped again."""
+
+    def test_uuid_is_written_into_the_isolated_config_dir(self):
+        from src.config import Config, get_machine_uuid
+
+        result = get_machine_uuid()
+        uuid.UUID(result, version=4)  # must be a valid uuid4
+
+        machine_id_file = Config.get_config_dir() / ".machine_id"
+        assert machine_id_file.exists(), (
+            "get_machine_uuid wrote OUTSIDE the isolated temp config dir — the "
+            "conftest fixture is not redirecting module-level user_config_dir"
+        )
+        assert machine_id_file.read_text().strip() == result
