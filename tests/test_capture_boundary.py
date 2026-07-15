@@ -6,12 +6,13 @@ window closing at 22:00 kept every in-process recorder running for up to a full 
 exact instant via a live now() read, so nothing left the machine — but local
 RECORDING had a tail, which the enforcement docstrings say must not happen.
 
-These tests pin the one-shot DateTrigger (SyncCoordinator._arm_capture_boundary /
+These tests pin the one-shot DateTrigger (SyncCoordinator.arm_capture_boundary /
 _fire_capture_boundary) that lands the hard stop/start ON the edge and re-arms for
 the next one, and the WorkingHoursConfig.next_boundary_after helper that computes it.
 """
 
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import src.main as main
@@ -76,7 +77,7 @@ class _FakeScheduler:
         self.removed = []
 
     def add_job(self, fn, trigger=None, id=None, replace_existing=False, **kw):
-        self.jobs[id] = {"fn": fn, "trigger": trigger}
+        self.jobs[id] = {"fn": fn, "trigger": trigger, "kwargs": kw}
 
     def remove_job(self, id):
         if id not in self.jobs:
@@ -84,12 +85,16 @@ class _FakeScheduler:
         del self.jobs[id]
         self.removed.append(id)
 
+    def get_job(self, id):
+        return self.jobs.get(id)
+
 
 def _coordinator(cfg, running=True):
     c = object.__new__(main.SyncCoordinator)
     c.config = cfg
     c.scheduler = _FakeScheduler(running=running)
     c.apply_capture_policy = Mock()
+    c._boundary_lock = threading.Lock()
     return c
 
 
@@ -108,7 +113,7 @@ class TestArmCaptureBoundary:
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
-            c._arm_capture_boundary()
+            c.arm_capture_boundary()
 
         assert "capture_boundary" in c.scheduler.jobs
         trig = c.scheduler.jobs["capture_boundary"]["trigger"]
@@ -134,7 +139,7 @@ class TestArmCaptureBoundary:
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
-            c._arm_capture_boundary()
+            c.arm_capture_boundary()
 
         assert "capture_boundary" not in c.scheduler.jobs
         assert "capture_boundary" in c.scheduler.removed
@@ -152,7 +157,7 @@ class TestArmCaptureBoundary:
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
-            c._arm_capture_boundary()  # must NOT raise
+            c.arm_capture_boundary()  # must NOT raise
 
         assert "capture_boundary" not in c.scheduler.jobs
         assert "capture_boundary" in c.scheduler.removed
@@ -163,7 +168,7 @@ class TestArmCaptureBoundary:
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
-            c._arm_capture_boundary()
+            c.arm_capture_boundary()
 
         assert "capture_boundary" not in c.scheduler.jobs
 
@@ -172,6 +177,235 @@ class TestArmCaptureBoundary:
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
-            c._arm_capture_boundary()
+            c.arm_capture_boundary()
 
         assert "capture_boundary" not in c.scheduler.jobs
+
+
+class TestMisfireSafeArming:
+    """Finding 1 (HIGH): a >1s stall across the run date must NOT let APScheduler
+    silently DISCARD the one-shot (the default misfire_grace_time=1 does), because
+    the re-arm lives only in _fire_capture_boundary's finally — which never runs for
+    a discarded job."""
+
+    def test_boundary_add_job_uses_none_misfire_grace_time(self):
+        c = _coordinator(_restricted_cfg())
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()
+
+        # None = "fire however late"; a late fire is safe because
+        # _fire_capture_boundary re-reads allows(now) live at fire time.
+        assert c.scheduler.jobs["capture_boundary"]["kwargs"]["misfire_grace_time"] is None
+
+
+class TestBoundarySelfHeal:
+    """Finding 1: the 60s tick re-arms a boundary that a misfire discarded, so a
+    restricted user is never left with the recording tail until the next refetch."""
+
+    def test_tick_rearms_a_missing_boundary_when_restricted(self):
+        c = _coordinator(_restricted_cfg())
+        assert c.scheduler.get_job("capture_boundary") is None  # discarded by a misfire
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._self_heal_capture_boundary()
+
+        assert "capture_boundary" in c.scheduler.jobs
+        assert c.scheduler.jobs["capture_boundary"]["trigger"].run_date == WINDOW_CLOSE_UTC
+
+    def test_tick_leaves_an_already_armed_boundary_untouched(self):
+        c = _coordinator(_restricted_cfg())
+        sentinel = {"fn": None, "trigger": None}
+        c.scheduler.jobs["capture_boundary"] = sentinel
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._self_heal_capture_boundary()
+
+        # No re-arm churn when the job is present.
+        assert c.scheduler.jobs["capture_boundary"] is sentinel
+
+    def test_tick_arms_nothing_for_an_unrestricted_schedule(self):
+        cfg = Config()
+        cfg.update_from_server({"working_hours": {"enforced": False}})
+        c = _coordinator(cfg)
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._self_heal_capture_boundary()
+
+        assert "capture_boundary" not in c.scheduler.jobs
+
+    def test_tick_arms_nothing_for_an_unknown_schedule(self):
+        c = _coordinator(Config())  # never talked to the server → known=False
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._self_heal_capture_boundary()
+
+        assert "capture_boundary" not in c.scheduler.jobs
+
+
+class TestArmPathIsFailSafe:
+    """Finding 3 (MEDIUM): the remove/add now sits INSIDE the try. A scheduler shut
+    down between the .running check and the add (a real TOCTOU) — or a jobstore
+    error — must be swallowed, not escape into _fire_capture_boundary's finally
+    (which would kill re-arm) or into fetch_server_config (whose except only catches
+    auth/client errors)."""
+
+    def test_add_job_failure_does_not_escape(self):
+        c = _coordinator(_restricted_cfg())
+        c.scheduler.add_job = Mock(side_effect=RuntimeError("scheduler shut down"))
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()  # must NOT raise
+
+    def test_fire_boundary_rearm_failure_does_not_escape(self):
+        c = _coordinator(_restricted_cfg())
+        c.scheduler.add_job = Mock(side_effect=RuntimeError("boom"))
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = WINDOW_CLOSE_UTC
+            c._fire_capture_boundary()  # must NOT raise
+
+        # Enforcement at the edge still ran even though the re-arm failed.
+        c.apply_capture_policy.assert_called_once_with("boundary")
+
+
+class TestArmPathLocking:
+    """Finding 2 (MEDIUM): arm_capture_boundary is called from three threads (boundary
+    worker, sync thread via _on_config_updated, wake handler); its compute→remove→add
+    must run under _boundary_lock so an interleaving can't leave a restricted user with
+    no boundary job."""
+
+    def test_arm_body_runs_under_the_boundary_lock(self):
+        c = _coordinator(_restricted_cfg())
+        events = []
+
+        class TrackingLock:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, *a):
+                events.append("exit")
+                return False
+
+        c._boundary_lock = TrackingLock()
+
+        # add_job must be observed WHILE the lock is held (between enter and exit).
+        def _record_add(*a, **kw):
+            events.append("add_job")
+
+        c.scheduler.add_job = _record_add
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c.arm_capture_boundary()
+
+        assert events == ["enter", "add_job", "exit"]
+
+    def test_concurrent_arms_leave_a_boundary_armed(self):
+        # Hammer arm from several threads at once against a real lock; the invariant
+        # is that a restricted schedule ALWAYS ends with a boundary job present.
+        c = _coordinator(_restricted_cfg())
+
+        def _worker():
+            with patch("src.main.datetime") as dt:
+                dt.now.return_value = IN_HOURS_UTC
+                for _ in range(20):
+                    c.arm_capture_boundary()
+
+        threads = [threading.Thread(target=_worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert "capture_boundary" in c.scheduler.jobs
+
+
+OVERNIGHT = {
+    "working_hours": {
+        "enforced": True,
+        "work_start": "22:00",
+        "work_end": "06:00",
+        "working_days": [1, 2, 3, 4, 5],
+        "timezone": "Europe/Bucharest",
+    }
+}
+
+
+class TestBoundaryAcrossDstAndOvernight:
+    """Findings 5/6: the minute-walk boundary must land on the right UTC instant
+    across a Bucharest DST transition (the wall-clock edge holds; the offset moves)
+    and for an overnight (start > end) shift."""
+
+    def test_boundary_spans_bucharest_dst_fall_back(self):
+        # Fall-back is Sun 2026-10-25 (EEST UTC+3 → EET UTC+2). From a weekend instant
+        # before it, the next OPEN is Mon 2026-10-26 07:30 LOCAL — by then EET, so
+        # 05:30 UTC (not 04:30, which would be the pre-change offset).
+        wh = _wh()
+        when = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)  # Sat, outside hours
+        b = wh.next_boundary_after(when)
+        assert b == datetime(2026, 10, 26, 5, 30, tzinfo=timezone.utc)
+        assert wh.allows(b) is True
+        assert wh.allows(b - timedelta(minutes=1)) is False
+
+    def test_boundary_spans_bucharest_spring_forward(self):
+        # Spring-forward is Sun 2026-03-29 (EET UTC+2 → EEST UTC+3). Next open Mon
+        # 2026-03-30 07:30 LOCAL is EEST → 04:30 UTC.
+        wh = _wh()
+        when = datetime(2026, 3, 28, 12, 0, tzinfo=timezone.utc)  # Sat, outside hours
+        b = wh.next_boundary_after(when)
+        assert b == datetime(2026, 3, 30, 4, 30, tzinfo=timezone.utc)
+        assert wh.allows(b) is True
+        assert wh.allows(b - timedelta(minutes=1)) is False
+
+    def test_overnight_shift_close_boundary(self):
+        wh = _wh(OVERNIGHT)
+        # Tue 01:00 Bucharest (= the tail of Monday's 22:00–06:00 shift) = Mon 22:00 UTC.
+        mid = datetime(2026, 7, 13, 22, 0, tzinfo=timezone.utc)
+        assert wh.allows(mid) is True
+        b = wh.next_boundary_after(mid)
+        # allows is inclusive through 06:00, so it flips at 06:01 local = 03:01 UTC.
+        assert b == datetime(2026, 7, 14, 3, 1, tzinfo=timezone.utc)
+        assert wh.allows(b) is False
+
+    def test_overnight_shift_open_boundary(self):
+        wh = _wh(OVERNIGHT)
+        # Tue 12:00 Bucharest — the daylight gap between shifts = 09:00 UTC.
+        gap = datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc)
+        assert wh.allows(gap) is False
+        b = wh.next_boundary_after(gap)
+        # Next open: Tue 22:00 local = 19:00 UTC.
+        assert b == datetime(2026, 7, 14, 19, 0, tzinfo=timezone.utc)
+        assert wh.allows(b) is True
+
+
+class TestRealSchedulerMisfire:
+    """Finding 6/1: an integration proof against a REAL BackgroundScheduler that a
+    one-shot whose run_date is already in the past (a stall past the edge) STILL
+    fires with misfire_grace_time=None. Under the default grace=1 it is discarded."""
+
+    def test_near_past_run_date_still_fires_with_none_grace(self):
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.date import DateTrigger
+
+        fired = threading.Event()
+        sched = BackgroundScheduler()
+        sched.start()
+        try:
+            run_date = datetime.now(timezone.utc) - timedelta(seconds=3)
+            sched.add_job(
+                fired.set,
+                trigger=DateTrigger(run_date=run_date),
+                id="capture_boundary",
+                misfire_grace_time=None,
+            )
+            assert fired.wait(timeout=5), "past-dated one-shot was discarded despite grace=None"
+        finally:
+            sched.shutdown(wait=False)
