@@ -427,6 +427,31 @@ class TestSelectTrayState:
         assert state == TrayState.PRIVATE_HOURS
         assert detail == "Private hours — not recording"
 
+    def test_standing_backlog_with_no_requeue_this_cycle_still_shows_drain(self):
+        """Round-2 (LOW): the drain detail must gate on the value it DISPLAYS
+        (queue_size), not on this cycle's requeues (events_queued). A suppressed user
+        with a standing backlog that had no requeue this cycle (events_queued=0,
+        queue_size>0) previously saw NO drain detail — the depth was hidden."""
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(suppressed=True, queued=0), near=False, pct=0, is_idle=False, qsize=7
+        )
+        assert state == TrayState.PRIVATE_HOURS
+        assert "draining 7 queued" in detail
+
+    def test_backlog_fully_drained_this_cycle_shows_no_nonsense_zero_detail(self):
+        """The reverse edge: a cycle that requeued events but drained the backlog to
+        empty (events_queued>0, queue_size=0) must NOT render '(draining 0 queued)'."""
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(suppressed=True, queued=4), near=False, pct=0, is_idle=False, qsize=0
+        )
+        assert state == TrayState.PRIVATE_HOURS
+        assert detail == "Private hours — not recording"
+        assert "draining" not in detail
+
     def test_near_capacity_beats_queued_and_idle(self):
         from src.ui.tray import TrayState
 
