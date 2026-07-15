@@ -437,6 +437,16 @@ class SyncCoordinator:
             )
         except Exception:
             logger.exception("Failed to compute next working-hours boundary")
+            # Drop any boundary job left armed from an EARLIER (successful)
+            # computation: it was scheduled against a now-superseded schedule and
+            # could otherwise fire at a stale instant. Leaving the 60s tick as the
+            # sole enforcement authority until the next successful arm is the
+            # fail-safe reading. (_fire_capture_boundary re-reads allows(now) live,
+            # so a stray fire is harmless today — but a stale job should not linger.)
+            try:
+                self.scheduler.remove_job("capture_boundary")
+            except JobLookupError:
+                pass
             return
         if boundary is None:
             # Unknown or unrestricted schedule: allows() is constant, so there is no
@@ -1353,6 +1363,19 @@ class SyncCoordinator:
                 if stats.errors:
                     for err in stats.errors:
                         logger.warning(f"Partial sync: {err}")
+                # Near-capacity is evaluated and LOGGED independently of which
+                # state wins the tray below. Suppression correctly owns the tray
+                # headline during private hours, but a backlog stuck near the cap
+                # overnight (e.g. the network is down while suppressed) still has to
+                # surface in fleet monitoring — folding the warning into the tray
+                # if/elif hid it whenever suppression won, losing that visibility.
+                near_capacity = self.queue.is_near_capacity()
+                capacity_pct = (
+                    int(self.queue.capacity_percent() * 100) if near_capacity else 0
+                )
+                if near_capacity:
+                    logger.warning(f"Offline queue at {capacity_pct}% capacity")
+
                 if stats.capture_suppressed:
                     # Outside the enforced window: nothing is being recorded, and the
                     # tray says so. Someone whose machine has stopped being watched is
@@ -1374,11 +1397,13 @@ class SyncCoordinator:
                     detail = "Private hours — not recording"
                     if stats.events_queued > 0:
                         detail = f"{detail} (draining {stats.events_queued} queued)"
+                    if near_capacity:
+                        detail = f"{detail} — queue {capacity_pct}% full"
                     self.tray.set_state(TrayState.PRIVATE_HOURS, detail)
-                elif self.queue.is_near_capacity():
-                    pct = int(self.queue.capacity_percent() * 100)
-                    self.tray.set_state(TrayState.QUEUE_WARNING, f"Queue {pct}% full")
-                    logger.warning(f"Offline queue at {pct}% capacity")
+                elif near_capacity:
+                    self.tray.set_state(
+                        TrayState.QUEUE_WARNING, f"Queue {capacity_pct}% full"
+                    )
                 elif stats.events_queued > 0:
                     self.tray.set_state(TrayState.QUEUED)
                 else:

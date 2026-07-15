@@ -610,6 +610,14 @@ class WorkingHoursConfig:
         tz = _resolve_schedule_tz(self.timezone)
         local = start.astimezone(tz) if tz else start.astimezone()
         end_h, end_m = (int(p) for p in self.work_end.split(":"))
+        # NB: this clamps to work_end:00 exactly, which is ONE MINUTE EARLIER than
+        # the instant allows() stops permitting recording. allows() compares HH:MM
+        # strings inclusively (`hhmm <= work_end`), so it stays True through
+        # work_end:59 and only flips False at work_end+1 min — and
+        # next_boundary_after() mirrors that inclusive edge. window_close_after()
+        # deliberately does NOT mirror it: clamping a span slightly earlier can only
+        # discard in-window data, never leak the minute after close, so the
+        # one-minute disagreement is the safe direction and intentional.
         close = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
 
         # For an overnight window the close belongs to the NEXT local day whenever

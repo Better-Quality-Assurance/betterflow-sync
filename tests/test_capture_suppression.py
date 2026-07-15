@@ -325,3 +325,45 @@ class TestSuppressionWinsOverQueueBacklog:
         # The residual drain is a secondary detail, not the headline state.
         detail = call.args[1] if len(call.args) > 1 else ""
         assert "5 queued" in detail
+
+    def test_near_capacity_still_logs_when_suppressed(self):
+        """Regression: after the round-1 reorder the near-capacity logger.warning
+        sat in an `elif` under the suppression branch, so a backlog stuck near the
+        cap during private hours (e.g. the network is down overnight) was never
+        logged — losing fleet-monitoring visibility. The warning must fire
+        independent of which state wins the tray. Suppression still wins the tray."""
+        from src.sync.sync_engine import SyncStats
+        from src.ui.tray import TrayState
+
+        stats = SyncStats()
+        stats.capture_suppressed = True
+        stats.events_queued = 900
+
+        c = self._coordinator(stats)
+        c.queue.is_near_capacity.return_value = True
+        c.queue.capacity_percent.return_value = 0.9  # 90% full
+
+        with patch("src.main.datetime") as dt, \
+             patch("src.main.logger") as log:
+            dt.now.return_value = OUT_OF_HOURS
+            c._do_sync()
+
+        # Suppression still owns the tray headline.
+        state = c.tray.set_state.call_args.args[0]
+        assert state == TrayState.PRIVATE_HOURS, (
+            f"suppression must still win the tray, got {state}"
+        )
+
+        # The near-capacity warning fired despite suppression winning the tray.
+        capacity_warnings = [
+            call for call in log.warning.call_args_list if "capacity" in str(call)
+        ]
+        assert capacity_warnings, (
+            "near-capacity backlog must still be logged while suppressed — "
+            "fleet monitoring depends on it"
+        )
+        assert "90%" in str(capacity_warnings[0])
+
+        # And the percentage is folded into the private-hours detail.
+        detail = c.tray.set_state.call_args.args[1]
+        assert "90%" in detail
