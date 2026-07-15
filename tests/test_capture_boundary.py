@@ -139,6 +139,24 @@ class TestArmCaptureBoundary:
         assert "capture_boundary" not in c.scheduler.jobs
         assert "capture_boundary" in c.scheduler.removed
 
+    def test_boundary_computation_error_clears_a_stale_job(self):
+        # next_boundary_after raises (e.g. schedule superseded mid-computation).
+        # A boundary job left armed from an EARLIER successful compute was scheduled
+        # against a now-stale instant; it must be dropped so the 60s tick is the sole
+        # enforcement authority until the next successful arm. No exception may escape.
+        c = _coordinator(_restricted_cfg())
+        c.config.working_hours.next_boundary_after = Mock(
+            side_effect=RuntimeError("schedule superseded")
+        )
+        c.scheduler.jobs["capture_boundary"] = {"fn": None, "trigger": None}  # stale
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            c._arm_capture_boundary()  # must NOT raise
+
+        assert "capture_boundary" not in c.scheduler.jobs
+        assert "capture_boundary" in c.scheduler.removed
+
     def test_no_arming_when_policy_is_unwired(self):
         c = _coordinator(_restricted_cfg())
         c.apply_capture_policy = None
