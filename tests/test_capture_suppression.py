@@ -241,3 +241,129 @@ class TestTrayShowsPrivateHours:
             "_do_sync short-circuits on suppression — that skips the queue drain and "
             "the config re-fetch"
         )
+
+
+# 2026-07-13 is a Monday; Europe/Bucharest is UTC+3 (EEST) in July.
+OUT_OF_HOURS = datetime(2026, 7, 13, 20, 55, tzinfo=timezone.utc)  # 23:55 Bucharest
+
+
+class TestSuppressionWinsOverQueueBacklog:
+    """The offline queue keeps draining while suppressed, so a user who crosses into
+    private hours with a leftover backlog used to see 'Queued' instead of 'Private
+    hours — not recording'. Suppression is the more important fact and must win.
+
+    Drives the real _do_sync tray-state selection end-to-end (not a source grep), so
+    the ordering bug is observable in the state actually set on the tray."""
+
+    def _coordinator(self, stats):
+        import threading
+
+        import src.main as main
+
+        c = object.__new__(main.SyncCoordinator)
+        cfg = Config()
+        cfg.update_from_server(RESTRICTED)
+        c.config = cfg
+
+        lock = threading.Lock()
+        lock.acquire()
+        c._acquire_sync_slot = Mock(return_value=lock)
+        c._sync_takeover_lock = threading.Lock()
+        c._sync_holder = lock
+        c._sync_started_at = 0.0
+        c._DO_SYNC_DEADLINE = 60
+        c._state_lock = threading.Lock()
+        c._paused_by_network = False
+
+        c.error_reporter = None
+        c.bf = Mock()
+        c.aw = Mock()
+        c.aw.is_running.return_value = True
+        c.aw_manager = Mock()
+        c.aw_manager.is_managing = False
+        c.sync_engine = Mock()
+        c.sync_engine.is_private = False
+        c.sync_engine.sync.return_value = stats
+        c.sync_engine.send_heartbeat_if_due.return_value = None
+        c.break_mgr = Mock()
+        c.break_mgr.is_on_break = False
+        c.idle_mgr = Mock()
+        c.idle_mgr.idle_paused = False
+        c.queue = Mock()
+        c.queue.is_near_capacity.return_value = False
+        c.queue.size.return_value = 5
+        c.tray = Mock()
+        c._aw_unreachable_streak = 0
+        c._aw_buckets_failed_streak = 0
+        c._consecutive_sync_failures = 0
+        c._consecutive_auth_failures = 0
+        c._last_successful_sync = None
+        c._fetch_hours_today = Mock(return_value="1h 0m")
+        return c
+
+    def test_private_hours_wins_when_suppressed_and_queue_still_draining(self):
+        from src.sync.sync_engine import SyncStats
+        from src.ui.tray import TrayState
+
+        # Suppressed outside working hours, but a backlog is still draining.
+        stats = SyncStats()
+        stats.capture_suppressed = True
+        stats.events_queued = 5
+
+        c = self._coordinator(stats)
+
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = OUT_OF_HOURS
+            c._do_sync()
+
+        c.tray.set_state.assert_called_once()
+        call = c.tray.set_state.call_args
+        state = call.args[0]
+        assert state == TrayState.PRIVATE_HOURS, (
+            f"suppression must win over the queue backlog, got {state}"
+        )
+        # The residual drain is a secondary detail, not the headline state.
+        detail = call.args[1] if len(call.args) > 1 else ""
+        assert "5 queued" in detail
+
+    def test_near_capacity_still_logs_when_suppressed(self):
+        """Regression: after the round-1 reorder the near-capacity logger.warning
+        sat in an `elif` under the suppression branch, so a backlog stuck near the
+        cap during private hours (e.g. the network is down overnight) was never
+        logged — losing fleet-monitoring visibility. The warning must fire
+        independent of which state wins the tray. Suppression still wins the tray."""
+        from src.sync.sync_engine import SyncStats
+        from src.ui.tray import TrayState
+
+        stats = SyncStats()
+        stats.capture_suppressed = True
+        stats.events_queued = 900
+
+        c = self._coordinator(stats)
+        c.queue.is_near_capacity.return_value = True
+        c.queue.capacity_percent.return_value = 0.9  # 90% full
+
+        with patch("src.main.datetime") as dt, \
+             patch("src.main.logger") as log:
+            dt.now.return_value = OUT_OF_HOURS
+            c._do_sync()
+
+        # Suppression still owns the tray headline.
+        state = c.tray.set_state.call_args.args[0]
+        assert state == TrayState.PRIVATE_HOURS, (
+            f"suppression must still win the tray, got {state}"
+        )
+
+        # The near-capacity warning fired despite suppression winning the tray.
+        capacity_warnings = [
+            call for call in log.warning.call_args_list if "capacity" in str(call)
+        ]
+        assert capacity_warnings, (
+            "near-capacity backlog must still be logged while suppressed — "
+            "fleet monitoring depends on it"
+        )
+        assert "90%" in str(capacity_warnings[0])
+
+        # And the percentage is folded into the private-hours detail.
+        detail = c.tray.set_state.call_args.args[1]
+        assert "90%" in detail

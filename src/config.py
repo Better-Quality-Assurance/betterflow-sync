@@ -610,6 +610,14 @@ class WorkingHoursConfig:
         tz = _resolve_schedule_tz(self.timezone)
         local = start.astimezone(tz) if tz else start.astimezone()
         end_h, end_m = (int(p) for p in self.work_end.split(":"))
+        # NB: this clamps to work_end:00 exactly, which is ONE MINUTE EARLIER than
+        # the instant allows() stops permitting recording. allows() compares HH:MM
+        # strings inclusively (`hhmm <= work_end`), so it stays True through
+        # work_end:59 and only flips False at work_end+1 min — and
+        # next_boundary_after() mirrors that inclusive edge. window_close_after()
+        # deliberately does NOT mirror it: clamping a span slightly earlier can only
+        # discard in-window data, never leak the minute after close, so the
+        # one-minute disagreement is the safe direction and intentional.
         close = local.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
 
         # For an overnight window the close belongs to the NEXT local day whenever
@@ -618,6 +626,40 @@ class WorkingHoursConfig:
             close += timedelta(days=1)
 
         return close.astimezone(timezone.utc)
+
+    def next_boundary_after(self, when: "datetime") -> "Optional[datetime]":
+        """The next UTC instant strictly after ``when`` at which ``allows()`` flips.
+
+        Used to arm a one-shot capture stop/start EXACTLY at the window edge rather
+        than waiting up to a full 60s enforcement tick — sync() already stops
+        uploading at the boundary via a live now() read, but local recording had a
+        tail of up to a tick past e.g. 22:00.
+
+        Returns None when the schedule has no boundaries — an unknown schedule
+        (``allows`` is always False) or an unrestricted one (always True). In both
+        cases there is nothing for a one-shot trigger to align to.
+
+        Computed by walking allows() at minute resolution (its own granularity —
+        work_start/work_end are HH:MM and seconds are ignored), so the boundary is
+        by construction consistent with the suppression and upload gates that read
+        the same allows(). Capped at 8 days so a degenerate schedule (e.g. a
+        hand-edited empty working_days, where allows() is always False) yields None
+        instead of looping.
+        """
+        if not self.known or not self.enforced:
+            return None
+
+        current = self.allows(when)
+        # Boundaries land on HH:MM:00 in the schedule's zone; stepping in UTC by
+        # whole minutes from the next minute still lands on every local flip
+        # (including across a DST change, which only shifts the wall-clock offset).
+        probe = when.astimezone(timezone.utc).replace(second=0, microsecond=0) + timedelta(minutes=1)
+        limit = probe + timedelta(days=8)
+        while probe <= limit:
+            if self.allows(probe) != current:
+                return probe
+            probe += timedelta(minutes=1)
+        return None
 
 
 @dataclass

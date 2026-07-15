@@ -16,6 +16,7 @@ session, so no individual test has to remember to monkeypatch it.
 
 import pytest
 
+import src.config as config_module
 from src.config import Config
 
 
@@ -33,4 +34,18 @@ def _isolate_agent_config(tmp_path, monkeypatch):
     monkeypatch.setattr(
         Config, "get_config_file", classmethod(lambda cls: cfg_dir / "config.json")
     )
+
+    # Config's classmethods above are not the only readers of the real
+    # platformdirs location. get_machine_uuid() and _load_dotenv() call the
+    # module-level `user_config_dir` directly, bypassing Config — so a test that
+    # exercises them (e.g. exchange_code -> get_machine_uuid in test_bf_client)
+    # would read/write the developer's REAL ~/.../BetterFlow/.machine_id and leak
+    # the cached value across the session. Redirect the module-level function too,
+    # and clear the process-wide UUID cache before and after each test so no real
+    # machine id can bleed in or out.
+    monkeypatch.setattr(
+        config_module, "user_config_dir", lambda *a, **k: str(cfg_dir)
+    )
+    config_module._machine_uuid_cache = None
     yield
+    config_module._machine_uuid_cache = None
