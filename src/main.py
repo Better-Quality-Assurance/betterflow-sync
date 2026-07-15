@@ -214,6 +214,14 @@ class SyncCoordinator:
         self._paused_by_network = False
         self._state_lock = threading.Lock()
         self._sync_lock = threading.Lock()
+        # Serialises the capture-boundary arm path. arm_capture_boundary() is called
+        # from three threads — the boundary worker (re-arm), the sync thread
+        # (fetch_server_config → _on_config_updated), and the wake handler — and its
+        # compute → remove_job → add_job sequence is non-atomic against the shared
+        # mutable config, so an interleaving could leave a restricted user with NO
+        # boundary job until the 30-min refetch. Mirrors _apply_capture_policy's
+        # _capture_lock, which guards this exact class of transition.
+        self._boundary_lock = threading.Lock()
         # Wedge self-recovery (Cristian Dragota / sync:67a77a43-787, 2026-06-25):
         # a _do_sync that hangs past the watchdog holds _sync_lock forever, so
         # every later cycle skips and sync freezes while the heartbeat keeps
@@ -413,9 +421,20 @@ class SyncCoordinator:
 
         # Arm the one-shot boundary trigger so capture stops/starts exactly at the
         # next work_start/work_end edge, not up to 60s late on the interval tick.
-        self._arm_capture_boundary()
+        self.arm_capture_boundary()
 
-    def _arm_capture_boundary(self) -> None:
+    def _disarm_capture_boundary(self) -> None:
+        """Remove the one-shot boundary job if one is armed. Idempotent — a missing
+        job is the normal case (unknown/unrestricted schedule) and not an error.
+
+        Extracted so the several remove/JobLookupError sites read the same. Callers
+        that need atomicity against a concurrent arm hold _boundary_lock themselves."""
+        try:
+            self.scheduler.remove_job("capture_boundary")
+        except JobLookupError:
+            pass
+
+    def arm_capture_boundary(self) -> None:
         """Schedule a one-shot job at the next working-hours boundary.
 
         The 60s tick converges capture toward the schedule, but only every 60s, so
@@ -427,42 +446,62 @@ class SyncCoordinator:
         re-arms for the following one. Fleet-friendly: one extra wakeup per boundary
         crossing, not a fast poll across the whole fleet.
 
-        Re-armed by _fire_capture_boundary after each edge, and by the app whenever
-        the schedule changes or first resolves (server config / system wake)."""
+        Public because BetterFlowApp re-arms across the object boundary (server
+        config / system wake). Re-armed by _fire_capture_boundary after each edge,
+        and self-healed by the 60s tick if a misfire discarded the job.
+
+        Thread-safe: the compute → remove → add sequence runs under _boundary_lock
+        because three threads call this (boundary worker, sync thread, wake handler)
+        and an interleaving could otherwise leave a restricted user with no armed
+        boundary until the 30-min refetch."""
         if self.apply_capture_policy is None or not self.scheduler.running:
             return
-        try:
-            boundary = self.config.working_hours.next_boundary_after(
-                datetime.now(timezone.utc)
-            )
-        except Exception:
-            logger.exception("Failed to compute next working-hours boundary")
-            # Drop any boundary job left armed from an EARLIER (successful)
-            # computation: it was scheduled against a now-superseded schedule and
-            # could otherwise fire at a stale instant. Leaving the 60s tick as the
-            # sole enforcement authority until the next successful arm is the
-            # fail-safe reading. (_fire_capture_boundary re-reads allows(now) live,
-            # so a stray fire is harmless today — but a stale job should not linger.)
+        with self._boundary_lock:
             try:
-                self.scheduler.remove_job("capture_boundary")
-            except JobLookupError:
-                pass
-            return
-        if boundary is None:
-            # Unknown or unrestricted schedule: allows() is constant, so there is no
-            # edge. Drop any boundary job left over from a previous restricted one.
+                boundary = self.config.working_hours.next_boundary_after(
+                    datetime.now(timezone.utc)
+                )
+            except Exception:
+                logger.exception("Failed to compute next working-hours boundary")
+                # Drop any boundary job left armed from an EARLIER (successful)
+                # computation: it was scheduled against a now-superseded schedule and
+                # could otherwise fire at a stale instant. Leaving the 60s tick as the
+                # sole enforcement authority until the next successful arm is the
+                # fail-safe reading. (_fire_capture_boundary re-reads allows(now) live,
+                # so a stray fire is harmless — but a stale job should not linger.)
+                self._disarm_capture_boundary()
+                return
             try:
-                self.scheduler.remove_job("capture_boundary")
-            except JobLookupError:
-                pass
-            return
-        self.scheduler.add_job(
-            self._fire_capture_boundary,
-            trigger=DateTrigger(run_date=boundary),
-            id="capture_boundary",
-            replace_existing=True,
-        )
-        logger.info("Capture boundary armed for %s", boundary.isoformat())
+                if boundary is None:
+                    # Unknown or unrestricted schedule: allows() is constant, so there
+                    # is no edge. Drop any job left over from a previous restricted one.
+                    self._disarm_capture_boundary()
+                    return
+                self.scheduler.add_job(
+                    self._fire_capture_boundary,
+                    trigger=DateTrigger(run_date=boundary),
+                    id="capture_boundary",
+                    replace_existing=True,
+                    # Default misfire_grace_time=1 makes APScheduler DISCARD this
+                    # one-shot if the process stalls >1s across the run date (a GIL
+                    # pause, App Nap, a missed wake) — it logs once and never fires,
+                    # so _fire_capture_boundary's finally never runs and the boundary
+                    # stays disarmed until the next config refetch (30 min online,
+                    # unbounded offline), silently reverting to the ~60s recording
+                    # tail this job exists to kill. None = "fire however late"; a late
+                    # fire is safe because _fire_capture_boundary re-reads allows(now)
+                    # live. The 60s tick self-heal is the second backstop.
+                    misfire_grace_time=None,
+                )
+                logger.info("Capture boundary armed for %s", boundary.isoformat())
+            except Exception:
+                # The remove/add is now inside the try too: the scheduler can be shut
+                # down between the .running check above and here (a real TOCTOU), or a
+                # jobstore op can fail. Such an exception must NOT escape — it would
+                # land in _fire_capture_boundary's finally (killing re-arm) and in
+                # _on_config_updated → fetch_server_config (whose except only catches
+                # auth/client errors). Log and return; the 60s tick re-arms.
+                logger.exception("Failed to arm capture boundary")
 
     def _fire_capture_boundary(self) -> None:
         """One-shot boundary job: enforce the policy AT the edge, then re-arm.
@@ -473,7 +512,23 @@ class SyncCoordinator:
             if self.apply_capture_policy is not None:
                 self.apply_capture_policy("boundary")
         finally:
-            self._arm_capture_boundary()
+            self.arm_capture_boundary()
+
+    def _self_heal_capture_boundary(self) -> None:
+        """60s-tick backstop for a boundary job APScheduler discarded on a misfire
+        (a >1s stall across the run date). If the schedule is restricted (an edge
+        exists to align to) but no boundary job is armed, re-arm it. arm is
+        idempotent (replace_existing), so racing a concurrent arm is harmless."""
+        if self.apply_capture_policy is None or not self.scheduler.running:
+            return
+        wh = self.config.working_hours
+        # "Restricted" ⟺ next_boundary_after would return a boundary ⟺ known+enforced
+        # (unknown/unrestricted schedules have no edge and legitimately arm nothing).
+        if not (wh.known and wh.enforced):
+            return
+        if self.scheduler.get_job("capture_boundary") is None:
+            logger.info("Capture boundary job missing — re-arming (60s self-heal)")
+            self.arm_capture_boundary()
 
     def stop(self, wait: bool = False) -> None:
         """Shut down the scheduler if running.
@@ -989,6 +1044,10 @@ class SyncCoordinator:
             # First: a window that closed while the app was running must stop
             # capture promptly, before any sub-task below reads from the trackers.
             (self.apply_capture_policy, "capture_policy"),
+            # Re-arm the one-shot boundary if a misfire discarded it (see
+            # _self_heal_capture_boundary). Runs right after the policy so a healed
+            # boundary re-aligns before the tick's other trackers read state.
+            (self._self_heal_capture_boundary, "boundary_selfheal"),
             (self._reconcile_inproc_afk_flag, "inproc_afk_reconcile"),
             (self.tray.tick_clock, "tick_clock"),
             (self._check_idle_status, "idle_check"),
@@ -1213,6 +1272,40 @@ class SyncCoordinator:
             self._sync_holder = fresh
             return fresh
 
+    def _select_tray_state(
+        self,
+        stats,
+        near_capacity: bool,
+        capacity_pct: int,
+        is_idle: bool,
+        queue_size: int,
+    ) -> "tuple[TrayState, Optional[str]]":
+        """Pure decision for the post-sync tray headline — no side effects, so the
+        precedence is unit-testable without driving a whole sync. The caller applies
+        the result via tray.set_state (None detail is equivalent to omitting it).
+
+        Precedence: suppression > near-capacity > queued > idle > syncing.
+
+        Suppression wins on purpose: the offline queue keeps DRAINING while
+        suppressed, so a user who crosses into private hours with leftover backlog
+        must still see the headline fact (nothing is being recorded), with the drain
+        as a tooltip detail. The drain count is queue_size — the ACTUAL queue depth —
+        NOT stats.events_queued, which only counts events (re)queued THIS cycle."""
+        if stats.capture_suppressed:
+            detail = "Private hours — not recording"
+            if stats.events_queued > 0:
+                detail = f"{detail} (draining {queue_size} queued)"
+            if near_capacity:
+                detail = f"{detail} — queue {capacity_pct}% full"
+            return TrayState.PRIVATE_HOURS, detail
+        if near_capacity:
+            return TrayState.QUEUE_WARNING, f"Queue {capacity_pct}% full"
+        if stats.events_queued > 0:
+            return TrayState.QUEUED, None
+        if is_idle:
+            return TrayState.PAUSED, "Idle"
+        return TrayState.SYNCING, None
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         my_lock = self._acquire_sync_slot()
@@ -1376,41 +1469,12 @@ class SyncCoordinator:
                 if near_capacity:
                     logger.warning(f"Offline queue at {capacity_pct}% capacity")
 
-                if stats.capture_suppressed:
-                    # Outside the enforced window: nothing is being recorded, and the
-                    # tray says so. Someone whose machine has stopped being watched is
-                    # entitled to see that at a glance, without opening a menu — and
-                    # showing SYNCING (or QUEUED) here would be an outright lie.
-                    #
-                    # Suppression is checked BEFORE the queue branches on purpose:
-                    # the offline queue keeps DRAINING while suppressed, so a user who
-                    # crosses into private hours with leftover backlog would otherwise
-                    # see "Queued" and miss the more important fact — nothing is being
-                    # recorded. Suppression wins; the residual drain is a tooltip
-                    # detail, not the headline state.
-                    #
-                    # Set from the STATS rather than by short-circuiting _do_sync,
-                    # because sync() must still run while suppressed: it drains the
-                    # offline queue and, crucially, it is where fetch_server_config()
-                    # retries. Returning early here would recreate the lockout where an
-                    # agent that never learned its schedule could never learn it.
-                    detail = "Private hours — not recording"
-                    if stats.events_queued > 0:
-                        detail = f"{detail} (draining {stats.events_queued} queued)"
-                    if near_capacity:
-                        detail = f"{detail} — queue {capacity_pct}% full"
-                    self.tray.set_state(TrayState.PRIVATE_HOURS, detail)
-                elif near_capacity:
-                    self.tray.set_state(
-                        TrayState.QUEUE_WARNING, f"Queue {capacity_pct}% full"
-                    )
-                elif stats.events_queued > 0:
-                    self.tray.set_state(TrayState.QUEUED)
-                else:
-                    if is_idle:
-                        self.tray.set_state(TrayState.PAUSED, "Idle")
-                    else:
-                        self.tray.set_state(TrayState.SYNCING)
+                state, detail = self._select_tray_state(
+                    stats, near_capacity, capacity_pct, is_idle, self.queue.size()
+                )
+                # set_state(state, None) is identical to set_state(state), so passing
+                # the (possibly None) detail through preserves the prior behaviour.
+                self.tray.set_state(state, detail)
                 if stats.events_sent > 0:
                     logger.info(f"Sync complete: {stats.events_sent} events synced")
             else:
@@ -2736,7 +2800,7 @@ class BetterFlowApp:
         self._apply_capture_policy("system wake")
         # A wake can land on the far side of a boundary the sleeping process
         # slept through — recompute the next edge from the new now().
-        self.coordinator._arm_capture_boundary()
+        self.coordinator.arm_capture_boundary()
         self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
@@ -2807,7 +2871,7 @@ class BetterFlowApp:
         self._apply_capture_policy("server config")
         # The schedule may have just changed or first resolved — re-align the
         # one-shot boundary trigger to the new next edge.
-        self.coordinator._arm_capture_boundary()
+        self.coordinator.arm_capture_boundary()
 
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""

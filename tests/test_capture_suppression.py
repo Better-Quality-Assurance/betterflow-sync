@@ -225,21 +225,35 @@ class TestTrayShowsPrivateHours:
         assert STATE_COLORS[TrayState.PRIVATE_HOURS] != STATE_COLORS[TrayState.PAUSED]
 
     def test_sync_still_runs_while_suppressed(self):
-        """Guards the trap: the tray state is set from stats.capture_suppressed AFTER
-        sync() runs, never by short-circuiting _do_sync. sync() is where the offline
-        queue drains and where fetch_server_config() retries — skipping it would
-        recreate the lockout where an agent that never learned its schedule never can."""
+        """Guards the trap: the tray state is decided from stats.capture_suppressed
+        AFTER sync() runs, never by short-circuiting _do_sync. sync() is where the
+        offline queue drains and where fetch_server_config() retries — skipping it
+        would recreate the lockout where an agent that never learned its schedule
+        never can.
+
+        The decision now lives in the pure _select_tray_state helper, so the guard
+        splits across both: the helper reads stats.capture_suppressed, and _do_sync
+        must NOT short-circuit on suppression before sync()."""
         import inspect
 
         import src.main as main
 
-        src = inspect.getsource(main.SyncCoordinator._do_sync)
-        assert "stats.capture_suppressed" in src, "tray state must come from the sync stats"
+        select_src = inspect.getsource(main.SyncCoordinator._select_tray_state)
+        assert "stats.capture_suppressed" in select_src, (
+            "tray state must come from the sync stats"
+        )
+        do_sync_src = inspect.getsource(main.SyncCoordinator._do_sync)
         # The suppression check must not appear before sync() as an early return.
-        before_sync = src.split("self.sync_engine.sync()")[0]
+        before_sync = do_sync_src.split("self.sync_engine.sync()")[0]
         assert "PRIVATE_HOURS" not in before_sync, (
             "_do_sync short-circuits on suppression — that skips the queue drain and "
             "the config re-fetch"
+        )
+        # NB: `capture_suppressed = not ...allows(...)` legitimately appears before
+        # sync() — it is the INPUT handed to the sync engine, not a tray decision.
+        # The invariant is that the tray SELECTION happens after sync(), with the stats.
+        assert "_select_tray_state" not in before_sync, (
+            "tray state selected before sync() — the stats aren't known yet"
         )
 
 
@@ -305,12 +319,15 @@ class TestSuppressionWinsOverQueueBacklog:
         from src.sync.sync_engine import SyncStats
         from src.ui.tray import TrayState
 
-        # Suppressed outside working hours, but a backlog is still draining.
+        # Suppressed outside working hours, but a backlog is still draining. Set the
+        # per-cycle requeue count (events_queued) DIFFERENT from the actual queue
+        # depth so the detail can only match if it uses queue.size() (finding 8).
         stats = SyncStats()
         stats.capture_suppressed = True
         stats.events_queued = 5
 
         c = self._coordinator(stats)
+        c.queue.size.return_value = 12  # real backlog depth, not the 5 requeued now
 
         with patch("src.main.datetime") as dt:
             dt.now.return_value = OUT_OF_HOURS
@@ -322,9 +339,11 @@ class TestSuppressionWinsOverQueueBacklog:
         assert state == TrayState.PRIVATE_HOURS, (
             f"suppression must win over the queue backlog, got {state}"
         )
-        # The residual drain is a secondary detail, not the headline state.
+        # The residual drain is a secondary detail, not the headline state — and it
+        # reports the ACTUAL depth (12), not the per-cycle requeue count (5).
         detail = call.args[1] if len(call.args) > 1 else ""
-        assert "5 queued" in detail
+        assert "12 queued" in detail
+        assert "5 queued" not in detail
 
     def test_near_capacity_still_logs_when_suppressed(self):
         """Regression: after the round-1 reorder the near-capacity logger.warning
@@ -367,3 +386,79 @@ class TestSuppressionWinsOverQueueBacklog:
         # And the percentage is folded into the private-hours detail.
         detail = c.tray.set_state.call_args.args[1]
         assert "90%" in detail
+
+
+class TestSelectTrayState:
+    """Finding 4/8: the post-sync tray headline is a PURE function, unit-tested
+    directly (no coordinator, no live sync). Precedence: suppression > near-capacity
+    > queued > idle > syncing. Finding 8: the drain detail shows the ACTUAL queue
+    depth (queue_size), not stats.events_queued (only this cycle's requeues)."""
+
+    def _sel(self, stats, near, pct, is_idle, qsize):
+        import src.main as main
+
+        c = object.__new__(main.SyncCoordinator)  # pure method — no deps needed
+        return c._select_tray_state(stats, near, pct, is_idle, qsize)
+
+    def _stats(self, suppressed=False, queued=0):
+        from src.sync.sync_engine import SyncStats
+
+        s = SyncStats()
+        s.capture_suppressed = suppressed
+        s.events_queued = queued
+        return s
+
+    def test_suppression_wins_and_detail_uses_queue_depth_not_cycle_count(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(suppressed=True, queued=3), near=True, pct=90, is_idle=True, qsize=42
+        )
+        assert state == TrayState.PRIVATE_HOURS
+        assert "draining 42 queued" in detail   # queue_size, not the 3 requeued now
+        assert "90% full" in detail
+
+    def test_suppressed_without_backlog_has_no_drain_detail(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(suppressed=True, queued=0), near=False, pct=0, is_idle=False, qsize=0
+        )
+        assert state == TrayState.PRIVATE_HOURS
+        assert detail == "Private hours — not recording"
+
+    def test_near_capacity_beats_queued_and_idle(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(queued=5), near=True, pct=85, is_idle=True, qsize=5
+        )
+        assert state == TrayState.QUEUE_WARNING
+        assert detail == "Queue 85% full"
+
+    def test_queued_beats_idle(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(queued=5), near=False, pct=0, is_idle=True, qsize=5
+        )
+        assert state == TrayState.QUEUED
+        assert detail is None
+
+    def test_idle_when_nothing_queued(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(), near=False, pct=0, is_idle=True, qsize=0
+        )
+        assert state == TrayState.PAUSED
+        assert detail == "Idle"
+
+    def test_syncing_is_the_default(self):
+        from src.ui.tray import TrayState
+
+        state, detail = self._sel(
+            self._stats(), near=False, pct=0, is_idle=False, qsize=0
+        )
+        assert state == TrayState.SYNCING
+        assert detail is None
