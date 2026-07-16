@@ -432,11 +432,32 @@ class TestGetLastActiveAt:
         now = _ts(30)
         assert detector.get_last_active_at(_ts(-60), now) == now
 
-    def test_none_after_call_ends(self):
+    def test_credit_freezes_at_end_after_call_ends(self):
+        # After a call ends the user WAS engaged until its end — credit must
+        # freeze there (not vanish, not keep tracking now). This also bridges
+        # the AW-outage/shutdown flush: the AFK sample taken next cycle still
+        # sees the engagement up to the flushed call's end.
         detector = CallDetector()
         self._start_zoom_call(detector)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(20), 60)
         detector.flush()
-        assert detector.get_last_active_at(None, _ts(30)) is None
+        assert detector.get_last_active_at(None, _ts(30)) == _ts(20)
+
+    def test_ended_call_credit_respects_cap(self):
+        detector = CallDetector(max_credit_seconds=600.0)  # 10min cap
+        self._start_zoom_call(detector)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(20), 60)
+        detector.flush()
+        assert detector.get_last_active_at(None, _ts(30)) == _ts(10)
+
+    def test_short_discarded_call_still_credits_engagement(self):
+        # min_duration discards the EVENT, but the engagement was real — the
+        # credit memory must still cover it.
+        detector = CallDetector(min_duration=300)
+        self._start_zoom_call(detector)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(1), 60)
+        assert detector.flush() is None  # too short: no event emitted
+        assert detector.get_last_active_at(None, _ts(5)) == _ts(1)
 
     def test_grace_window_credits_only_up_to_leave_instant(self):
         # User switched to a non-call window at t=10 — they produced real input
@@ -491,6 +512,40 @@ class TestGetLastActiveAt:
         assert sum(e["duration"] for e in events) == 49 * 60
 
 
+class TestSnapshot:
+    """snapshot(): live emission of an ongoing call without ending it."""
+
+    def test_none_when_no_call(self):
+        assert CallDetector().snapshot() is None
+
+    def test_none_while_below_min_duration(self):
+        detector = CallDetector(min_duration=30)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 10)
+        assert detector.snapshot() is None
+
+    def test_emits_growing_span_with_stable_identity(self):
+        detector = CallDetector(min_duration=30)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 60)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(2), 60)
+        first = detector.snapshot()
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(5), 60)
+        second = detector.snapshot()
+
+        # Same (app, start) → _make_call_bf_event derives the same id, so the
+        # server upserts one growing row instead of per-cycle fragments.
+        assert (first.app, first.start) == (second.app, second.start)
+        assert second.duration > first.duration
+        # Snapshot must NOT end the call.
+        assert detector.is_in_call()
+
+    def test_snapshot_during_grace_ends_at_leave_instant(self):
+        detector = CallDetector(min_duration=30, grace_period=60.0)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 60)
+        detector.process_event("Finder", "Documents", None, _ts(5), 5)
+        snap = detector.snapshot()
+        assert snap.end == _ts(5)
+
+
 class TestWindowsNativeAppNames:
     """Native call apps report different process names on Windows than macOS.
 
@@ -515,3 +570,79 @@ class TestWindowsNativeAppNames:
 
     def test_zoom_windows_home_still_no_match(self):
         assert _match_native("Zoom", "Zoom - Home") is None
+
+
+class TestCallPersistsAcrossSyncCycles:
+    """A meeting must survive the sync boundary: snapshot-not-flush keeps
+    is_in_call() True between cycles (so the idle suppression actually works)
+    and uploads one growing call row instead of per-cycle fragments."""
+
+    def _build_engine(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from src.sync.queue import OfflineQueue
+        from src.sync.sync_engine import SyncEngine
+
+        tmp = Path(tempfile.mkdtemp())
+        cfg = Config()
+        cfg.working_hours.known = True  # capture is fail-closed on unknown
+        engine = SyncEngine(
+            aw=Mock(),
+            bf=Mock(),
+            queue=OfflineQueue(db_path=tmp / "q.db", max_size=1000),
+            config=cfg,
+            time_tracker=Mock(),
+        )
+        engine._config_fetched = True
+        engine._backlog_reconciled = True
+        engine.aw.is_running.return_value = True
+        for getter in ("get_window_buckets", "get_web_buckets",
+                       "get_afk_buckets", "get_input_buckets"):
+            getattr(engine.aw, getter).return_value = []
+        engine.bf.is_reachable.return_value = True
+        engine.bf.send_events.return_value = SimpleNamespace(
+            success=True, events_synced=1, accepted_ids=[], error=None
+        )
+        return engine
+
+    def _sent_call_events(self, engine):
+        return [
+            ev
+            for call in engine.bf.send_events.call_args_list
+            for ev in call.args[0]
+            if ev.get("bucket_type") == "call"
+        ]
+
+    def test_call_stays_open_and_snapshots_upsert_one_row(self):
+        engine = self._build_engine()
+        t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
+        engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
+        engine._call_detector.process_event(
+            "Slack", "Huddle", None, t0 + timedelta(minutes=2), 60
+        )
+
+        engine.sync()
+        assert engine.is_in_call(), (
+            "sync boundary must NOT end an ongoing call anymore"
+        )
+        engine._call_detector.process_event(
+            "Slack", "Huddle", None, t0 + timedelta(minutes=4), 60
+        )
+        engine.sync()
+        assert engine.is_in_call()
+
+        snaps = self._sent_call_events(engine)
+        assert len(snaps) == 2, "one live snapshot per cycle"
+        assert snaps[0]["id"] == snaps[1]["id"], (
+            "stable id → the server upserts one growing row per meeting"
+        )
+        assert snaps[1]["duration"] > snaps[0]["duration"]
+
+    def test_shutdown_closes_open_call(self):
+        engine = self._build_engine()
+        t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
+        engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
+        engine.shutdown()
+        assert engine.is_in_call() is False

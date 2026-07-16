@@ -152,6 +152,12 @@ class CallDetector:
         self._call_last_seen: Optional[datetime] = None
         # Timestamp when user first left the call app (for grace tracking)
         self._left_at: Optional[datetime] = None
+        # Span of the most recently ENDED call (kept across _reset). AFK credit
+        # (get_last_active_at) stays truthful after a call ends or is flushed:
+        # the user was engaged until that end instant, so credit freezes there
+        # instead of vanishing the moment the state machine resets.
+        self._last_call_start: Optional[datetime] = None
+        self._last_call_end: Optional[datetime] = None
 
     def process_event(
         self,
@@ -206,11 +212,39 @@ class CallDetector:
             return None
 
     def flush(self) -> Optional[CallEvent]:
-        """Force-end any active call. Call at sync boundaries."""
+        """Force-end any active call (shutdown / AW-outage boundaries)."""
         with self._lock:
             if self._call_app is not None:
                 return self._end_call()
             return None
+
+    def snapshot(self) -> Optional[CallEvent]:
+        """Emit the currently-active call as a CallEvent WITHOUT ending it.
+
+        Uploaded each sync cycle for live server-side visibility: the event id
+        derives from (app, start), so the server upserts one growing row across
+        cycles — mirroring ``ForegroundActivityDetector.snapshot``. The old
+        per-cycle ``flush()`` at the sync boundary instead ENDED the call every
+        cycle, which fragmented one meeting into per-cycle call rows, dropped
+        ``is_in_call()`` to False between cycles (the idle-pause suppression
+        raced and mostly never engaged), and reset the state the AFK activity
+        source needs. None when no call is active or it is still shorter than
+        ``min_duration``.
+        """
+        with self._lock:
+            if self._call_app is None or self._call_start is None:
+                return None
+            end = self._left_at or self._call_last_seen or self._call_start
+            duration = (end - self._call_start).total_seconds()
+            if duration < self._min_duration:
+                return None
+            return CallEvent(
+                app=self._call_app,
+                start=self._call_start,
+                end=end,
+                duration=round(duration, 2),
+                call_type=self._call_type or "native",
+            )
 
     def is_in_call(self) -> bool:
         """True while a call/meeting is currently active (incl. grace period).
@@ -238,19 +272,25 @@ class CallDetector:
         49-minute huddle, 2026-07-15).
 
         Credit rules:
-          * None when no call is active — never fabricates activity.
+          * None when no call was ever observed — never fabricates activity.
           * During the leave-grace window, credit stops at the instant the user
             left the call window (they produced real input to switch anyway).
+          * After a call ends (or is flushed at an AW-outage/shutdown
+            boundary), credit freezes at that call's END — the user was
+            engaged until then, and that stays true forever after.
           * Capped at ``max_credit_seconds`` past call start, so a stuck title
             can't keep the stream not-afk forever. AfkSource additionally
             clamps any source's answer to ``now``.
         """
         with self._lock:
-            if self._call_start is None:
-                return None
-            engaged_until = self._left_at or now
-            cap_end = self._call_start + timedelta(seconds=self._max_credit_seconds)
-            return min(engaged_until, cap_end, now)
+            if self._call_start is not None:
+                engaged_until = self._left_at or now
+                cap_end = self._call_start + timedelta(seconds=self._max_credit_seconds)
+                return min(engaged_until, cap_end, now)
+            if self._last_call_start is not None and self._last_call_end is not None:
+                cap_end = self._last_call_start + timedelta(seconds=self._max_credit_seconds)
+                return min(self._last_call_end, cap_end, now)
+            return None
 
     def _start_call(
         self, name: str, call_type: Optional[str], timestamp: datetime
@@ -277,6 +317,10 @@ class CallDetector:
         if end is None:
             end = self._call_start
         duration = (end - self._call_start).total_seconds()
+        # Remember the span for AFK credit even when the event itself is
+        # discarded as too short — the engagement was real either way.
+        self._last_call_start = self._call_start
+        self._last_call_end = end
 
         app = self._call_app or "Unknown"
         call_type = self._call_type or "native"

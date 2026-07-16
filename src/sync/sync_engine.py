@@ -759,13 +759,15 @@ class SyncEngine:
         # Check ActivityWatch
         if not self.aw.is_running():
             stats.errors.append("ActivityWatch is not running")
-            # Finalize any in-progress call before bailing. Otherwise is_in_call()
-            # stays True for the whole outage (sync returns here every cycle, so
-            # the end-of-sync flush at line ~522 never runs), and the idle guard
-            # in IdleManager keeps suppressing idle long after the call ended —
-            # painting the post-call AFK stretch as worked time. The observed call
-            # portion is still recorded if the backend is reachable; if AW comes
-            # back mid-call a fresh call starts cleanly.
+            # Finalize any in-progress call before bailing. Without window
+            # events the detector can never observe the call ending, so
+            # is_in_call() would stay True for the whole outage and the idle
+            # guard in IdleManager would keep suppressing idle long after the
+            # call ended — painting the post-call AFK stretch as worked time.
+            # (AFK credit is safe either way: get_last_active_at freezes at the
+            # flushed call's END, never tracks `now` for an ended call.) The
+            # observed call portion is still recorded if the backend is
+            # reachable; if AW comes back mid-call a fresh call starts cleanly.
             #
             # That recovery can emit a SECOND event for the same meeting (the
             # continuation is picked up from the un-advanced checkpoint). Both
@@ -969,11 +971,19 @@ class SyncEngine:
             if input_event is not None:
                 all_events.append(input_event)
 
-        # Flush any ongoing call at sync boundary
+        # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
+        # from (app, start), so the server upserts one growing row per meeting.
+        # The old per-cycle flush() here ended the call at every sync boundary:
+        # one meeting fragmented into per-cycle call rows, is_in_call() dropped
+        # to False between cycles (IdleManager's in-call idle suppression raced
+        # a sub-second window and mostly never engaged — Ecaterina's huddle
+        # billed Idle, 2026-07-15), and the AFK activity source found flushed
+        # state at record_sample time. The call now stays open until its real
+        # end (grace expiry), an AW outage, or shutdown.
         if self._call_detector:
-            remaining = self._call_detector.flush()
-            if remaining:
-                call_events.append(self._make_call_bf_event(remaining))
+            snap = self._call_detector.snapshot()
+            if snap:
+                all_events.append(self._make_call_bf_event(snap))
         if call_events:
             stats.calls_detected += len(call_events)
             all_events.extend(call_events)
@@ -3712,5 +3722,13 @@ class SyncEngine:
                 self._foreground_detector.flush()
             except Exception as e:
                 logger.debug("foreground detector flush on shutdown failed: %s", e)
+        # Same for any open call: calls stay open across sync boundaries now
+        # (per-cycle snapshot, not flush), so close it here or is_in_call()
+        # survives the logout. The last snapshot already uploaded the span.
+        if self._call_detector is not None:
+            try:
+                self._call_detector.flush()
+            except Exception as e:
+                logger.debug("call detector flush on shutdown failed: %s", e)
         # Close time tracker
         self._time_tracker.close()
