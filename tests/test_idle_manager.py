@@ -546,3 +546,39 @@ def test_stale_afk_with_no_os_idle_signal_does_not_pause():
             trigger_sync=trigger_sync,
         )
     assert idle_mgr.idle_paused is False
+
+
+def test_idle_start_clamped_to_last_engagement():
+    """A pause entered right after a hands-off meeting must not backdate
+    idle_start into the meeting: the AFK stream credited that hour as active,
+    and the idle_time span sent on resume would carve the same hour back out."""
+    config = Config()
+    meeting_end = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    sync_engine = Mock()
+    sync_engine.is_paused = False
+    sync_engine.is_private = False
+    sync_engine.is_in_call.return_value = False
+    sync_engine.is_active_dev_session.return_value = False
+    sync_engine.is_mic_meeting_active.return_value = False
+    mgr = IdleManager(sync_engine, Mock(), Mock(), config)
+
+    # Engagement observed until meeting_end…
+    with mgr._state_lock:
+        mgr._last_engaged_ts = meeting_end
+    # …then an idle pause whose AFK evidence reaches back before it.
+    idle_start = meeting_end - timedelta(minutes=45)
+    assert mgr._clamp_to_last_engagement(idle_start) == meeting_end
+    # At-desk idle after the engagement is untouched.
+    later = meeting_end + timedelta(minutes=10)
+    assert mgr._clamp_to_last_engagement(later) == later
+
+
+def test_engaged_check_stamps_last_engaged_ts():
+    config = Config()
+    sync_engine = Mock()
+    sync_engine.is_in_call.return_value = True
+    mgr = IdleManager(sync_engine, Mock(), Mock(), config)
+    assert mgr._last_engaged_ts is None
+    assert mgr._is_engaged_without_input() is True
+    assert mgr._last_engaged_ts is not None

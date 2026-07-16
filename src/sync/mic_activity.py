@@ -43,6 +43,7 @@ Platform probes:
 """
 
 import logging
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -50,10 +51,10 @@ from datetime import datetime, timedelta
 from typing import Optional, Protocol
 
 try:
-    from .aw_client import BUCKET_TYPE_CALL
+    from .aw_client import BUCKET_TYPE_CALL, CALL_STATUS_COMPLETED, CALL_STATUS_ONGOING
     from .engagement_credit import capped_credit
 except ImportError:  # PyInstaller bundle (src/ is import root)
-    from sync.aw_client import BUCKET_TYPE_CALL
+    from sync.aw_client import BUCKET_TYPE_CALL, CALL_STATUS_COMPLETED, CALL_STATUS_ONGOING
     from sync.engagement_credit import capped_credit
 
 logger = logging.getLogger(__name__)
@@ -79,9 +80,13 @@ class MicProbe(Protocol):
     def sample(self) -> MicSample: ...
 
 
-# Substring tokens identifying conferencing-capable apps. Browsers are
-# included: a mic-hot browser is almost always a web meeting (Meet, browser
-# Zoom/Teams). Matched case-insensitively against process/exe names.
+# Tokens identifying conferencing-capable apps. Browsers are included: a
+# mic-hot browser is almost always a web meeting (Meet, browser Zoom/Teams).
+# Matched case-insensitively ON A WORD BOUNDARY against process/exe names —
+# bare substrings bleed into unrelated apps ("arc" in "SearchApp"/"archive",
+# "edge" in "ledger"), the exact lesson call_detector's app aliases already
+# encode. Compound process names that a boundary would break get their own
+# token (msedge).
 _CONFERENCING_TOKENS = (
     "zoom",
     "teams",
@@ -93,10 +98,16 @@ _CONFERENCING_TOKENS = (
     "safari",
     "firefox",
     "edge",
+    "msedge",
     "brave",
     "arc",
     "opera",
     "vivaldi",
+)
+
+_CONFERENCING_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in _CONFERENCING_TOKENS) + r")\b",
+    re.IGNORECASE,
 )
 
 # Keep a session open across brief mic drops (device switch, app re-grabbing
@@ -105,8 +116,7 @@ _MIC_OFF_GRACE_SECONDS = 90.0
 
 
 def _matches_conferencing(name: str) -> bool:
-    lowered = name.lower()
-    return any(tok in lowered for tok in _CONFERENCING_TOKENS)
+    return _CONFERENCING_RE.search(name) is not None
 
 
 class MicActivityDetector:
@@ -146,6 +156,12 @@ class MicActivityDetector:
         # the meeting ends (freezes at its end), mirroring CallDetector.
         self._last_session_start: Optional[datetime] = None
         self._last_session_end: Optional[datetime] = None
+        # Latched after a force-close at the credit cap: a mic that never goes
+        # cold must NOT reopen a fresh session every cycle (each one would
+        # suppress the idle pause for another full cap and mint another 4h
+        # audit row — a wedged mic looping forever). Cleared by the first
+        # genuinely cold observation.
+        self._cap_latched = False
 
     # -- Sampling ----------------------------------------------------------
 
@@ -168,6 +184,11 @@ class MicActivityDetector:
 
         with self._lock:
             if hot:
+                if self._cap_latched:
+                    # A cap-force-closed session must not reopen while the mic
+                    # never went cold — that loop would suppress the idle
+                    # pause for a fresh cap period every reopen, forever.
+                    return None
                 if self._session_start is not None and (
                     (now - self._session_start).total_seconds()
                     >= self._max_credit_seconds
@@ -176,9 +197,9 @@ class MicActivityDetector:
                     # the cap the session earns nothing, its growing snapshot
                     # would eventually exceed the server's max event duration
                     # (batch poison), and is_active() would suppress the local
-                    # idle pause indefinitely. A still-live meeting reopens as
-                    # a new session next cycle — the input-anchored cap means
-                    # the new session grants no fresh credit on its own.
+                    # idle pause indefinitely. Latched: reopening requires the
+                    # mic to genuinely go cold first.
+                    self._cap_latched = True
                     return self._close_session_locked()
                 if self._session_start is None:
                     self._session_start = now
@@ -189,6 +210,7 @@ class MicActivityDetector:
                 self._session_last_hot = now
                 return None
 
+            self._cap_latched = False  # a cold read re-arms cap force-close
             if self._session_start is None:
                 return None
             last_hot = self._session_last_hot or self._session_start
@@ -239,7 +261,7 @@ class MicActivityDetector:
         duration = min((end - start).total_seconds(), self._max_credit_seconds)
         if duration < self._min_session_seconds:
             return None
-        return self._make_event(app, start, duration, status="ongoing")
+        return self._make_event(app, start, duration, status=CALL_STATUS_ONGOING)
 
     def flush(self) -> Optional[dict]:
         """Force-close any open session (shutdown / AW-outage boundaries)."""
@@ -275,10 +297,10 @@ class MicActivityDetector:
                 )
                 return capped_credit(
                     engaged_until,
-                    base_last_input,
-                    self._session_start,
-                    self._max_credit_seconds,
-                    now,
+                    anchor=base_last_input,
+                    engagement_start=self._session_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
                 )
             if (
                 self._last_session_start is not None
@@ -286,10 +308,10 @@ class MicActivityDetector:
             ):
                 return capped_credit(
                     self._last_session_end,
-                    base_last_input,
-                    self._last_session_start,
-                    self._max_credit_seconds,
-                    now,
+                    anchor=base_last_input,
+                    engagement_start=self._last_session_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
                 )
             return None
 
@@ -316,7 +338,7 @@ class MicActivityDetector:
             )
             return None
         logger.info("Mic meeting session ended: %s duration=%.0fs", app, duration)
-        return self._make_event(app, start, duration, status="completed")
+        return self._make_event(app, start, duration, status=CALL_STATUS_COMPLETED)
 
     def _make_event(
         self, app: str, start: datetime, duration: float, *, status: str
@@ -347,7 +369,16 @@ class MicActivityDetector:
 
 
 class MacosMicProbe:
-    """Default-input-device "running somewhere" via CoreAudio (ctypes)."""
+    """Default-input-device "running somewhere" via CoreAudio (ctypes).
+
+    Known caveat: ``kAudioDevicePropertyDeviceIsRunningSomewhere`` is
+    DEVICE-level, not input-stream-level. On single-device input+output
+    hardware (USB/BT headsets, audio interfaces) playback alone can mark the
+    default input device "running" — music through such a headset reads as a
+    hot mic. The conferencing gate, the input-anchored credit cap, and the
+    cap latch bound the resulting over-credit; per-process stream attribution
+    (macOS 14+ tap APIs) is the eventual fix if this shows up in the field.
+    """
 
     _SYSTEM_OBJECT = 1  # kAudioObjectSystemObject
 
@@ -441,9 +472,18 @@ class WindowsMicProbe:
                                 stop, _ = winreg.QueryValueEx(
                                     sub_key, "LastUsedTimeStop"
                                 )
+                                start, _ = winreg.QueryValueEx(
+                                    sub_key, "LastUsedTimeStart"
+                                )
                         except OSError:
                             continue
-                        if stop == 0:
+                        # In use right now = a real usage started (Start != 0)
+                        # and hasn't stopped (Stop == 0). Start==0 entries are
+                        # granted-but-never-used — not "in use". Known residual:
+                        # an app that CRASHED holding the mic leaves Stop==0
+                        # until its next clean release; the conferencing gate,
+                        # input-anchored cap, and cap latch bound the damage.
+                        if stop == 0 and start != 0:
                             # NonPackaged keys encode the exe path with '#'
                             # separators; the last segment is the exe name.
                             apps.append(sub.rsplit("#", 1)[-1])

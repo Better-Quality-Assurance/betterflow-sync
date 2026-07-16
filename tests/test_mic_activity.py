@@ -166,9 +166,11 @@ class TestAfkCredit:
         det.observe(_ts(0))
         assert det.get_last_active_at(None, _ts(30)) == _ts(0) + timedelta(seconds=90)
 
-    def test_force_closes_at_credit_cap(self):
+    def test_force_closes_at_credit_cap_and_latches(self):
         # Past the cap the session earns nothing and its snapshot would grow
-        # unboundedly — it must force-close even while the mic stays hot.
+        # unboundedly — it must force-close even while the mic stays hot, and
+        # LATCH: reopening every cycle would suppress the idle pause for a
+        # fresh cap period forever (a wedged mic looping 4h sessions).
         probe = FakeProbe(MicSample(True))
         det = _detector(probe, max_credit_seconds=3600.0)
         det.observe(_ts(0))
@@ -176,8 +178,15 @@ class TestAfkCredit:
         ended = det.observe(_ts(60))  # 1h since start → cap reached
         assert ended is not None and ended["duration"] == 30 * 60.0
         assert not det.is_active()
-        # A genuinely still-live meeting reopens as a NEW session next cycle…
+        # Still hot → latched, no reopen…
         det.observe(_ts(61))
+        assert not det.is_active()
+        # …until the mic genuinely goes cold once, then hot again (a real
+        # new meeting) reopens.
+        probe.current = MicSample(False)
+        det.observe(_ts(62))
+        probe.current = MicSample(True)
+        det.observe(_ts(63))
         assert det.is_active()
 
     def test_cap_anchored_on_real_input_not_session_start(self):
@@ -478,7 +487,10 @@ class TestOutageAndShutdownDurability:
         engine.sync()
         assert len(engine.afk_source.samples) == 1
 
-    def test_shutdown_queues_final_mic_event(self):
+    def test_shutdown_sends_final_mic_event_immediately(self):
+        # Shutdown runs on logout: the final span must be SENT under the
+        # owner's token, not left in the account-agnostic queue for whoever
+        # logs in next on a shared machine.
         harness = TestSyncEngineMicIntegration()
         engine = harness._build_engine()
         probe = FakeProbe(MicSample(True, ("zoom.exe",)))
@@ -488,7 +500,55 @@ class TestOutageAndShutdownDurability:
         det.observe(now - timedelta(minutes=1))
 
         engine.shutdown()
-        assert not engine.queue.is_empty(), (
-            "the final mic span (tail since the last snapshot, plus its "
-            "'completed' status) must be queued at shutdown, not discarded"
+        finals = [
+            ev
+            for ev in harness._sent_mic_events(engine)
+            if ev["data"]["status"] == "completed"
+        ]
+        assert len(finals) == 1, "final mic span sent at shutdown"
+        assert engine.queue.is_empty(), "sent, so nothing left for the next user"
+
+    def test_shutdown_queues_final_mic_event_when_send_fails(self):
+        from types import SimpleNamespace
+
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        engine.bf.send_events.return_value = SimpleNamespace(
+            success=False, events_synced=0, accepted_ids=[], error="boom",
+            transient=True,
         )
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = harness._inject_detector(engine, probe)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+
+        engine.shutdown()
+        assert not engine.queue.is_empty(), (
+            "send failed → the final span falls back to the queue"
+        )
+
+
+class TestMicKillSwitch:
+    def test_server_mic_signal_off_closes_session_without_restart(self):
+        # The detector is built at startup, but a server-pushed
+        # mic_signal=false must stop the privacy-sensitive probe NOW.
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = harness._inject_detector(engine, probe)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+        assert engine.is_mic_meeting_active()
+
+        engine.config.call_detection.mic_signal = False
+        engine.sync()
+
+        assert engine.is_mic_meeting_active() is False
+        finals = [
+            ev
+            for ev in harness._sent_mic_events(engine)
+            if ev["data"]["status"] == "completed"
+        ]
+        assert len(finals) == 1, "the truthful pre-kill span still ships"

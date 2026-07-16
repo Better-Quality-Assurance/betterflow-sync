@@ -1849,13 +1849,7 @@ class BetterFlowApp:
         # Inert on Linux, where the OS idle clock — and thus this whole
         # in-process AFK source — is unreadable; there the uploaded call /
         # dev-session spans carry the credit.
-        activity_sources = [
-            src for src in (
-                self.coordinator.sync_engine._call_detector,
-                self.coordinator.sync_engine._mic_detector,
-                self.coordinator.sync_engine._foreground_detector,
-            ) if src is not None
-        ]
+        activity_sources = self.coordinator.sync_engine.engagement_activity_sources()
         afk_source = AfkSource(
             afk_timeout_seconds=self.config.aw.afk_timeout_minutes * 60,
             hostname=self.coordinator.sync_engine._hostname,

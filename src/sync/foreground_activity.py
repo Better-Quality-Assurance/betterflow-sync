@@ -204,8 +204,19 @@ class ForegroundActivityDetector:
         self, base_last_input: Optional[datetime], now: datetime
     ) -> Optional[datetime]:
         """Most recent credit-eligible instant, for ``AfkSource`` to fold into
-        its last-input reconciliation. Signature matches the activity-source
-        contract (base last-input + now) used by ``AfkSource``."""
+        its last-input reconciliation.
+
+        ``base_last_input`` is DELIBERATELY unused here, unlike call/mic
+        (which cap through ``engagement_credit.capped_credit`` with it):
+        this detector anchors credit at ``observe()`` time to the freshest
+        real-input signal the ENGINE has — the max of the input-bucket events
+        and the OS idle clock — which can be fresher than AfkSource's
+        sample-time anchor (a blind OS idle clock with a live input watcher is
+        exactly the failure foreground credit was built around). Re-capping
+        here with the staler anchor would veto credit the observe-time anchor
+        legitimately granted. ``_last_active_at`` is input-anchored by
+        construction; every observe() re-checks eligibility against
+        ``max_credit_seconds``."""
         with self._lock:
             return self._last_active_at
 

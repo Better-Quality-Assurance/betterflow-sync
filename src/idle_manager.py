@@ -38,6 +38,13 @@ class IdleManager:
         # post-wake idle pause can never reach back before the machine woke
         # up. See _clamp_to_last_wake for why this matters.
         self._last_wake_ts: Optional[datetime] = None
+        # Most recent instant an engagement context (call / mic meeting / dev
+        # session) was observed active. The AFK stream backdates idle to the
+        # last real INPUT, so a pause entered right after a hands-off meeting
+        # would otherwise send an idle_time span reaching back INTO the
+        # meeting the uploaded AFK stream just credited as active — the two
+        # records contradict, and idle_time spans exist to carve tracked time.
+        self._last_engaged_ts: Optional[datetime] = None
         self._IDLE_SYNC_INTERVAL = 300
         # A healthy AFK watcher heartbeats its current event continuously, so the
         # event's end-time tracks "now". If the latest AFK event ended more than
@@ -185,19 +192,47 @@ class IdleManager:
         session (Claude Code / build / render in the focused window). Any of
         them suppresses the idle pause: the user is engaged even without
         keyboard/mouse input. Defensive: any error means 'not engaged' so idle
-        detection still works."""
+        detection still works.
+
+        A True answer also stamps ``_last_engaged_ts`` so a later idle pause
+        can never backdate its idle_start into the engaged span (see
+        ``_clamp_to_last_engagement``)."""
+        engaged = False
         if self._is_in_call():
-            return True
-        try:
-            if bool(self.sync_engine.is_mic_meeting_active()):
-                return True
-        except Exception as e:
-            logger.debug("_is_engaged_without_input: mic check failed: %s", e)
-        try:
-            return bool(self.sync_engine.is_active_dev_session())
-        except Exception as e:
-            logger.debug("_is_engaged_without_input: dev-session check failed: %s", e)
-            return False
+            engaged = True
+        if not engaged:
+            try:
+                engaged = bool(self.sync_engine.is_mic_meeting_active())
+            except Exception as e:
+                logger.debug("_is_engaged_without_input: mic check failed: %s", e)
+        if not engaged:
+            try:
+                engaged = bool(self.sync_engine.is_active_dev_session())
+            except Exception as e:
+                logger.debug(
+                    "_is_engaged_without_input: dev-session check failed: %s", e
+                )
+        if engaged:
+            with self._state_lock:
+                self._last_engaged_ts = datetime.now(timezone.utc)
+        return engaged
+
+    def _clamp_to_last_engagement(self, idle_start: datetime) -> datetime:
+        """Never let an idle span start before the most recent observed
+        engagement (call / mic meeting / dev session).
+
+        The AFK stream backdates idle to the last real INPUT, so a pause
+        entered right after a hands-off meeting computes idle_start at the
+        meeting's first minute. Sending that idle_time span would carve the
+        very hour the uploaded AFK stream just credited as active — two
+        directly contradictory records for the meeting. A no-op when no
+        engagement was ever observed or the idle_start is already later
+        (mirrors ``_clamp_to_last_wake``)."""
+        with self._state_lock:
+            last_engaged = self._last_engaged_ts
+        if last_engaged is not None and idle_start < last_engaged:
+            return last_engaged
+        return idle_start
 
     def check_idle_status(
         self,
@@ -323,6 +358,16 @@ class IdleManager:
                         logger.info(
                             "idle_start %s clamped to last wake %s — post-suspend idle "
                             "must not reach back across the sleep",
+                            idle_start.isoformat(),
+                            clamped_idle_start.isoformat(),
+                        )
+                    idle_start = clamped_idle_start
+                    clamped_idle_start = self._clamp_to_last_engagement(idle_start)
+                    if clamped_idle_start != idle_start:
+                        logger.info(
+                            "idle_start %s clamped to last engagement %s — "
+                            "post-meeting idle must not reach back into the "
+                            "credited meeting",
                             idle_start.isoformat(),
                             clamped_idle_start.isoformat(),
                         )

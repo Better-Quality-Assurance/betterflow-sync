@@ -684,13 +684,126 @@ class TestCallPersistsAcrossSyncCycles:
         )
         assert snaps[1]["duration"] > snaps[0]["duration"]
 
-    def test_shutdown_closes_open_call_and_queues_final_event(self):
+    def test_shutdown_closes_open_call_and_sends_final_event(self):
+        # Shutdown runs on logout: the final span is SENT under the owner's
+        # token (queue only as fallback — the queue is account-agnostic and a
+        # leftover row would deliver under the next login on a shared machine).
         engine = self._build_engine()
         t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
         engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
         engine.shutdown()
         assert engine.is_in_call() is False
-        assert not engine.queue.is_empty(), (
-            "the final call span (tail since the last snapshot, plus its "
-            "'completed' status) must be queued at shutdown, not discarded"
+        finals = [
+            ev for ev in self._sent_call_events(engine)
+            if ev["data"]["status"] == "completed"
+        ]
+        assert len(finals) == 1, "final call span sent at shutdown"
+        assert engine.queue.is_empty()
+
+
+class TestCaptureBoundariesCloseSessions:
+    """Open call/mic sessions must not bridge not-recorded periods (private
+    time, manual pause, working-hours suppression) into one uploaded span."""
+
+    def _engine_in_call(self):
+        harness = TestCallPersistsAcrossSyncCycles()
+        engine = harness._build_engine()
+        t0 = datetime(2026, 7, 15, 14, 0, 0, tzinfo=timezone.utc)
+        engine._call_detector.process_event("zoom.us", "Zoom Meeting", None, t0, 60)
+        engine._call_detector.process_event(
+            "zoom.us", "Zoom Meeting", None, t0 + timedelta(minutes=10), 60
         )
+        assert engine.is_in_call()
+        return engine, t0
+
+    def _queued_completed_calls(self, engine):
+        rows = engine.queue.dequeue(100)
+        return [
+            q.event_data
+            for q in rows
+            if q.event_data.get("bucket_type") == "call"
+            and q.event_data["data"]["status"] == "completed"
+        ]
+
+    def test_private_time_closes_call_at_boundary(self):
+        engine, t0 = self._engine_in_call()
+        engine.set_private_mode(True)
+        assert engine.is_in_call() is False, (
+            "a call left open across Private Time would later upload one span "
+            "covering the whole private period"
+        )
+        finals = self._queued_completed_calls(engine)
+        assert len(finals) == 1
+        # The queued span ends at the last pre-private evidence, ~14:11.
+        assert finals[0]["duration"] <= 11 * 60 + 1
+
+    def test_pause_closes_call_at_boundary(self):
+        engine, _ = self._engine_in_call()
+        engine.pause()
+        assert engine.is_in_call() is False
+        assert len(self._queued_completed_calls(engine)) == 1
+
+    def test_capture_suppression_closes_call_at_boundary(self):
+        from types import SimpleNamespace
+
+        engine, _ = self._engine_in_call()
+        engine.config.working_hours = SimpleNamespace(
+            known=True, allows=lambda ts: False
+        )
+        stats = engine.sync()
+        assert stats.capture_suppressed is True
+        assert engine.is_in_call() is False, (
+            "a call title still matching when capture stops must not stay "
+            "open all night and manufacture a span over the suppressed hours"
+        )
+        # The suppressed branch drains the queue right after the flush, so the
+        # final span is already SENT (queued only when offline).
+        sent_finals = [
+            ev
+            for call in engine.bf.send_events.call_args_list
+            for ev in call.args[0]
+            if ev.get("bucket_type") == "call"
+            and ev["data"]["status"] == "completed"
+        ]
+        assert len(sent_finals) == 1
+
+
+class TestStaleOngoingSnapshotsNeverReplay:
+    def test_process_queue_drops_ongoing_call_rows(self):
+        harness = TestCallPersistsAcrossSyncCycles()
+        engine = harness._build_engine()
+        t0 = datetime(2026, 7, 15, 17, 0, 0, tzinfo=timezone.utc)
+        stale_snapshot = {
+            "id": "call_Zoom_1784000000",
+            "timestamp": t0.isoformat(),
+            "duration": 120.0,
+            "bucket_id": "bf-call-detector_h",
+            "bucket_type": "call",
+            "data": {"app": "Zoom", "call_type": "native", "status": "ongoing"},
+        }
+        final_event = {
+            "id": "call_Zoom_1784000000",
+            "timestamp": t0.isoformat(),
+            "duration": 600.0,
+            "bucket_id": "bf-call-detector_h",
+            "bucket_type": "call",
+            "data": {"app": "Zoom", "call_type": "native", "status": "completed"},
+        }
+        engine.queue.enqueue([stale_snapshot, final_event])
+
+        from src.sync.sync_engine import SyncStats
+        engine._process_queue(SyncStats())
+
+        sent = [
+            ev
+            for call in engine.bf.send_events.call_args_list
+            for ev in call.args[0]
+        ]
+        statuses = [ev["data"]["status"] for ev in sent]
+        assert "ongoing" not in statuses, (
+            "a stale queued 'ongoing' snapshot replayed after the final "
+            "'completed' event would upsert the row back to a shorter, "
+            "forever-ongoing span"
+        )
+        assert "completed" in statuses
+        assert engine.queue.is_empty(), "stale snapshot removed, not retried"

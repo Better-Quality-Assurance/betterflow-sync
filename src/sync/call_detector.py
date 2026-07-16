@@ -209,7 +209,13 @@ class CallDetector:
                 # fixed, duration growing), so timestamp alone would freeze
                 # last_seen at call start for a single-window meeting — starving
                 # both the snapshot duration and the evidence-freshness bound.
-                self._call_last_seen = self._event_end(timestamp, duration)
+                # Monotonic: buckets are fed sequentially and only sorted within
+                # themselves, so an older event from a second bucket must not
+                # REWIND last_seen (shrinking the ongoing snapshot and the
+                # staleness/cap math).
+                event_end = self._event_end(timestamp, duration)
+                if self._call_last_seen is None or event_end > self._call_last_seen:
+                    self._call_last_seen = event_end
                 self._left_at = None
                 return None
 
@@ -231,8 +237,17 @@ class CallDetector:
                 self._left_at = timestamp
                 return None
 
-            # Check if grace period expired (guard against out-of-order timestamps)
-            gap = max(0.0, (timestamp - self._left_at).total_seconds())
+            # Check if grace period expired (guard against out-of-order
+            # timestamps). Measured against the non-call event's END, not its
+            # timestamp: a single unchanged non-call window is heartbeated as
+            # ONE growing event (timestamp fixed at _left_at), so a
+            # timestamp-based gap stays 0 forever and the call never ends —
+            # is_in_call() then suppresses the idle pause all afternoon while
+            # the billed stream (correctly) froze at _left_at.
+            gap = max(
+                0.0,
+                (self._event_end(timestamp, duration) - self._left_at).total_seconds(),
+            )
             if gap >= self._grace_period:
                 # Grace expired: end the call (end time = when user left)
                 return self._end_call()
@@ -305,6 +320,12 @@ class CallDetector:
         LOCAL idle guard must not keep suppressing the pause past that — the
         tray showing "tracking" while the server bills idle is exactly the
         local-vs-uploaded disagreement this feature exists to kill.
+
+        Note the local bound is SESSION-anchored (call span vs cap) while the
+        billed credit is INPUT-anchored (``get_last_active_at``): a zero-input
+        auto-joined call can exhaust its billed credit before this returns
+        False. Approximate on purpose — this method has no access to the
+        real-input anchor, and the divergence is bounded by one cap.
         """
         with self._lock:
             if self._call_app is None:
@@ -361,18 +382,18 @@ class CallDetector:
                     )
                 return capped_credit(
                     engaged_until,
-                    base_last_input,
-                    self._call_start,
-                    self._max_credit_seconds,
-                    now,
+                    anchor=base_last_input,
+                    engagement_start=self._call_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
                 )
             if self._last_call_start is not None and self._last_call_end is not None:
                 return capped_credit(
                     self._last_call_end,
-                    base_last_input,
-                    self._last_call_start,
-                    self._max_credit_seconds,
-                    now,
+                    anchor=base_last_input,
+                    engagement_start=self._last_call_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
                 )
             return None
 
