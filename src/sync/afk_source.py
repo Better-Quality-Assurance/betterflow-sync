@@ -117,13 +117,17 @@ class AfkSource:
             return
         self._consecutive_clock_failures = 0
         last_input_at = self._apply_input_watcher(now - timedelta(seconds=idle))
-        # Fold in supplementary activity sources (foreground-CPU, etc.). They are
-        # passed the current last_input_at as their human-presence anchor and may
-        # only advance it toward `now` — clamped here as a hard backstop so no
-        # source can ever push activity into the future.
+        # Fold in supplementary activity sources (call, mic, foreground-CPU).
+        # Every source receives the same REAL input anchor — the pre-fold
+        # keyboard/mouse instant, never another source's credit — so one
+        # detector's no-input credit can't become the next one's cap anchor
+        # (credit chaining). Each answer may only advance last_input_at toward
+        # `now`, clamped here as a hard backstop so no source can ever push
+        # activity into the future.
+        real_input_anchor = last_input_at
         for src in self._activity_sources:
             try:
-                a = src.get_last_active_at(last_input_at, now)
+                a = src.get_last_active_at(real_input_anchor, now)
             except Exception as e:
                 logger.debug("AfkSource activity source failed: %s", e)
                 a = None

@@ -125,13 +125,16 @@ class TestConferencingGate:
         det.observe(_ts(0))
         assert not det.is_active()
 
-    def test_macos_gate_error_fails_open(self):
+    def test_macos_gate_error_fails_closed(self):
+        # This signal feeds billing: a gate error must never become an
+        # unconditional pass (a reproducible gate crash would be a free
+        # bypass). Cost is one delayed cycle — the mic is still hot next time.
         def boom():
             raise RuntimeError("psutil hiccup")
 
         det = _detector(FakeProbe(MicSample(True)), conferencing_gate=boom)
         det.observe(_ts(0))
-        assert det.is_active(), "losing a real meeting to a gate error is the worse failure"
+        assert not det.is_active()
 
     def test_attributed_app_used_as_session_label(self):
         probe = FakeProbe(MicSample(True, ("ms-teams.exe",)))
@@ -150,16 +153,43 @@ class TestAfkCredit:
     def test_none_when_never_observed(self):
         assert _detector().get_last_active_at(None, _ts(0)) is None
 
-    def test_now_while_session_open(self):
+    def test_tracks_now_within_off_grace_of_last_hot(self):
         det = _detector(FakeProbe(MicSample(True)))
         det.observe(_ts(0))
-        assert det.get_last_active_at(_ts(-60), _ts(30)) == _ts(30)
+        assert det.get_last_active_at(_ts(-60), _ts(1)) == _ts(1)
 
-    def test_credit_capped_past_max_credit(self):
+    def test_credit_stops_growing_past_off_grace_of_last_hot(self):
+        # After the last HOT observation, credit may extend at most the
+        # off-grace allowance — an open session must not keep answering `now`
+        # indefinitely between observations.
+        det = _detector(FakeProbe(MicSample(True)), off_grace_seconds=90.0)
+        det.observe(_ts(0))
+        assert det.get_last_active_at(None, _ts(30)) == _ts(0) + timedelta(seconds=90)
+
+    def test_force_closes_at_credit_cap(self):
+        # Past the cap the session earns nothing and its snapshot would grow
+        # unboundedly — it must force-close even while the mic stays hot.
+        probe = FakeProbe(MicSample(True))
+        det = _detector(probe, max_credit_seconds=3600.0)
+        det.observe(_ts(0))
+        det.observe(_ts(30))
+        ended = det.observe(_ts(60))  # 1h since start → cap reached
+        assert ended is not None and ended["duration"] == 30 * 60.0
+        assert not det.is_active()
+        # A genuinely still-live meeting reopens as a NEW session next cycle…
+        det.observe(_ts(61))
+        assert det.is_active()
+
+    def test_cap_anchored_on_real_input_not_session_start(self):
+        # …but the reopened session grants no fresh credit on its own: the cap
+        # anchors on the real-input instant AfkSource passes in, so cycling
+        # the mic can't re-arm it.
         det = _detector(FakeProbe(MicSample(True)), max_credit_seconds=3600.0)
         det.observe(_ts(0))
-        det.observe(_ts(120))
-        assert det.get_last_active_at(None, _ts(120)) == _ts(60)
+        det.observe(_ts(30))
+        # Real input was at _ts(-31) → cap end _ts(29), despite the session
+        # being open and hot at _ts(30).
+        assert det.get_last_active_at(_ts(-31), _ts(30)) == _ts(29)
 
     def test_credit_freezes_at_session_end_after_close(self):
         probe = FakeProbe(MicSample(True))
@@ -407,3 +437,58 @@ class TestIdleManagerMicSuppression:
         eng.is_mic_meeting_active.return_value = False
         eng.is_active_dev_session.return_value = False
         assert self._manager(eng)._is_engaged_without_input() is False
+
+
+class TestOutageAndShutdownDurability:
+    """Ended sessions must survive full-offline outages and shutdown."""
+
+    def test_offline_outage_queues_ended_session(self):
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = harness._inject_detector(engine, probe, off_grace_seconds=0.0)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+
+        engine.aw.is_running.return_value = False   # AW outage…
+        engine.bf.is_reachable.return_value = False  # …and fully offline
+        probe.current = MicSample(False)
+        engine.sync()
+
+        assert engine.is_mic_meeting_active() is False
+        assert not engine.queue.is_empty(), (
+            "an ended mic span while fully offline must be QUEUED — the "
+            "session state is already reset, it can never be re-emitted"
+        )
+
+    def test_afk_samples_keep_flowing_during_aw_outage(self):
+        # AfkSource needs only the OS idle clock, not AW. Without outage-branch
+        # sampling, an AW hiccup spanning a hands-off meeting leaves a >timeout
+        # hole in the sample log that reconstructs as afk — the exact
+        # billed-idle-during-meeting failure this feature fixes.
+        from src.sync.afk_source import AfkSource
+
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        engine.afk_source = AfkSource(
+            afk_timeout_seconds=600.0, hostname="h", idle_clock=lambda: 5.0
+        )
+        engine.aw.is_running.return_value = False
+        engine.sync()
+        assert len(engine.afk_source.samples) == 1
+
+    def test_shutdown_queues_final_mic_event(self):
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = harness._inject_detector(engine, probe)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+
+        engine.shutdown()
+        assert not engine.queue.is_empty(), (
+            "the final mic span (tail since the last snapshot, plus its "
+            "'completed' status) must be queued at shutdown, not discarded"
+        )

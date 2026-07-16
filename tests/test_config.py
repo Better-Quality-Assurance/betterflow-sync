@@ -295,3 +295,13 @@ class TestCallDetectionCreditCap:
 
         cfg.update_from_server({"call_detection": {"max_credit_minutes": "nope"}})
         assert cfg.call_detection.max_credit_minutes == 90, "invalid value ignored"
+
+    def test_min_call_duration_clamped_when_rolled_out(self, monkeypatch):
+        # A huge server value would suppress every call/mic EVENT while
+        # short-session AFK credit still flows — credited time with no
+        # auditable span. Clamped to 10 minutes.
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+        cfg.update_from_server({"call_detection": {"min_call_duration": 999999}})
+        assert cfg.call_detection.min_call_duration == 600

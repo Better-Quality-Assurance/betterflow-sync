@@ -609,9 +609,30 @@ class SyncEngine:
             return
         span = ended or live
         if span:
-            all_events.append(span)
+            all_events.append(self._stamp_project(span))
             if ended is not None:
                 stats.calls_detected += 1
+
+    def _stamp_project(self, event: dict) -> dict:
+        """Attach the active project to a detector-built event, exactly as
+        _make_call_bf_event does for window-detected calls — the same meeting
+        must not upsert a projected call row next to an unprojected mic row."""
+        with self._state_lock:
+            project = self._current_project
+        if project:
+            event["project_id"] = project["id"]
+        return event
+
+    def _enqueue_events_best_effort(self, events: list, context: str) -> None:
+        """Queue events for later delivery when they can't be sent now (fully
+        offline paths that bypass _send_events' own queue-on-failure). Best
+        effort: a queue error is logged, never raised into the sync cycle."""
+        try:
+            self.queue.enqueue(events)
+        except Exception as e:
+            logger.warning(
+                "Failed to queue %d event(s) (%s): %s", len(events), context, e
+            )
 
     def _observe_foreground_activity(
         self, all_events: list, stats: "SyncStats", cycle: "_SyncCycleContext"
@@ -822,28 +843,55 @@ class SyncEngine:
             # supersedes this flushed one rather than double-billing.
             if self._call_detector:
                 remaining = self._call_detector.flush()
-                if remaining and self.bf.is_reachable():
-                    # _send_events may set stats.queued_bucket_ids on failure; we
-                    # return immediately and intentionally don't act on it — call
-                    # events go to the synthetic call bucket, not a checkpointed AW
-                    # bucket, so there is no checkpoint to withhold.
-                    self._send_events([self._make_call_bf_event(remaining)], stats)
+                if remaining:
                     stats.calls_detected += 1
+                    ev = self._make_call_bf_event(remaining)
+                    if self.bf.is_reachable():
+                        # _send_events may set stats.queued_bucket_ids on failure;
+                        # we return immediately and intentionally don't act on it —
+                        # call events go to the synthetic call bucket, not a
+                        # checkpointed AW bucket, so there is no checkpoint to
+                        # withhold.
+                        self._send_events([ev], stats)
+                    else:
+                        # Fully offline (AW down AND backend unreachable, e.g. a
+                        # resume off-network): the flush already reset the
+                        # detector, so this event can never be re-emitted — queue
+                        # it or the observed call span is silently lost.
+                        self._enqueue_events_best_effort([ev], "AW-outage call flush")
             # The mic probe doesn't depend on AW — keep observing during the
             # outage so a meeting that ends mid-outage closes its session.
             # Unlike the window-title detector above, no flush is needed: the
             # mic going cold is observable without window events, and a still-
             # hot mic is a still-running meeting that SHOULD keep suppressing
-            # idle. An ended span is still recorded if the backend is reachable.
+            # idle. An ended span is recorded (or queued when offline).
             if self._mic_detector:
                 try:
                     ended = self._mic_detector.observe(datetime.now(timezone.utc))
                 except Exception as e:
                     logger.debug("mic activity observe (AW outage) failed: %s", e)
                     ended = None
-                if ended and self.bf.is_reachable():
-                    self._send_events([ended], stats)
+                if ended:
                     stats.calls_detected += 1
+                    ended = self._stamp_project(ended)
+                    if self.bf.is_reachable():
+                        self._send_events([ended], stats)
+                    else:
+                        self._enqueue_events_best_effort([ended], "AW-outage mic close")
+            # The AFK sample log doesn't depend on AW either (OS idle clock +
+            # in-process sources). Without this, an outage spanning a hands-off
+            # meeting records NO samples, and after recovery the >timeout gap
+            # in the sample log is reconstructed as afk — re-creating the exact
+            # billed-idle-during-meeting failure this feature exists to fix,
+            # any time AW hiccups mid-meeting.
+            if self.afk_source is not None:
+                try:
+                    self.afk_source.record_sample(
+                        datetime.now(timezone.utc),
+                        protect_since=self._afk_inproc_checkpoint,
+                    )
+                except Exception as e:
+                    logger.debug("afk_source.record_sample (AW outage) failed: %s", e)
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU).
@@ -1051,7 +1099,7 @@ class SyncEngine:
         if self._call_detector:
             snap = self._call_detector.snapshot()
             if snap:
-                all_events.append(self._make_call_bf_event(snap))
+                all_events.append(self._make_call_bf_event(snap, status="ongoing"))
         if call_events:
             stats.calls_detected += len(call_events)
             all_events.extend(call_events)
@@ -2472,7 +2520,9 @@ class SyncEngine:
             return
         self._send_status_span(kind="private", start=start)
 
-    def _make_call_bf_event(self, call_event: "CallEvent") -> dict:
+    def _make_call_bf_event(
+        self, call_event: "CallEvent", status: str = "completed"
+    ) -> dict:
         """Convert a CallEvent into a BetterFlow event dict.
 
         Includes a deterministic id so the server can dedupe and so the
@@ -2480,6 +2530,11 @@ class SyncEngine:
         event against the server's accepted_ids list. Without an id, a
         partial server reply that omits this event would otherwise be
         ambiguous between "accepted" and "not yet acknowledged".
+
+        ``status`` is "completed" for a call that actually ended (grace
+        expiry, outage flush, shutdown) and "ongoing" for the per-cycle live
+        snapshot of a still-open call — the server must be able to tell a
+        growing live row from a final one.
         """
         hostname = self._hostname
         call_id = f"call_{call_event.app}_{int(call_event.start.timestamp())}"
@@ -2492,7 +2547,7 @@ class SyncEngine:
             "data": {
                 "app": call_event.app,
                 "call_type": call_event.call_type,
-                "status": "completed",
+                "status": status,
             },
         }
         with self._state_lock:
@@ -3790,18 +3845,29 @@ class SyncEngine:
                 self._foreground_detector.flush()
             except Exception as e:
                 logger.debug("foreground detector flush on shutdown failed: %s", e)
-        # Same for any open call: calls stay open across sync boundaries now
-        # (per-cycle snapshot, not flush), so close it here or is_in_call()
-        # survives the logout. The last snapshot already uploaded the span.
+        # Same for any open call / mic session: both stay open across sync
+        # boundaries now (per-cycle snapshot, not flush), so close them here or
+        # is_in_call()/is_mic_meeting_active() survives the logout. The final
+        # event is QUEUED, not discarded: the tail between the last uploaded
+        # snapshot and shutdown (plus its "completed" status) would otherwise
+        # be lost from the audit trail; the next launch delivers it, and the
+        # deterministic id makes the replay an upsert, never a duplicate.
         if self._call_detector is not None:
             try:
-                self._call_detector.flush()
+                remaining = self._call_detector.flush()
+                if remaining:
+                    self._enqueue_events_best_effort(
+                        [self._make_call_bf_event(remaining)], "shutdown call flush"
+                    )
             except Exception as e:
                 logger.debug("call detector flush on shutdown failed: %s", e)
-        # And any open mic-meeting session, for the same reason.
         if self._mic_detector is not None:
             try:
-                self._mic_detector.flush()
+                ended = self._mic_detector.flush()
+                if ended:
+                    self._enqueue_events_best_effort(
+                        [self._stamp_project(ended)], "shutdown mic flush"
+                    )
             except Exception as e:
                 logger.debug("mic detector flush on shutdown failed: %s", e)
         # Close time tracker

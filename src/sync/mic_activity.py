@@ -51,8 +51,10 @@ from typing import Optional, Protocol
 
 try:
     from .aw_client import BUCKET_TYPE_CALL
+    from .engagement_credit import capped_credit
 except ImportError:  # PyInstaller bundle (src/ is import root)
     from sync.aw_client import BUCKET_TYPE_CALL
+    from sync.engagement_credit import capped_credit
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +168,18 @@ class MicActivityDetector:
 
         with self._lock:
             if hot:
+                if self._session_start is not None and (
+                    (now - self._session_start).total_seconds()
+                    >= self._max_credit_seconds
+                ):
+                    # Force-close at the credit cap even while still hot: past
+                    # the cap the session earns nothing, its growing snapshot
+                    # would eventually exceed the server's max event duration
+                    # (batch poison), and is_active() would suppress the local
+                    # idle pause indefinitely. A still-live meeting reopens as
+                    # a new session next cycle — the input-anchored cap means
+                    # the new session grants no fresh credit on its own.
+                    return self._close_session_locked()
                 if self._session_start is None:
                     self._session_start = now
                     self._session_app = self._attributed_app(sample)
@@ -187,9 +201,12 @@ class MicActivityDetector:
 
         Windows attributes the mic per app — require a conferencing match.
         macOS can't attribute (``apps`` empty), so fall back to "a conferencing
-        app is running" via the injected gate; a gate ERROR fails open (the hot
-        mic itself is the strong signal — losing a real meeting to a psutil
-        hiccup is the worse failure), but a gate answering False is respected.
+        app is running" via the injected gate. A gate ERROR fails CLOSED: this
+        signal feeds billing, so an error must never become an unconditional
+        pass (a reproducible gate crash would otherwise be a free bypass). The
+        cost is bounded — a transient error delays session open by one cycle
+        (the mic is still hot next cycle) and a mid-session blip is absorbed by
+        the off-grace window.
         """
         if sample.apps:
             return any(_matches_conferencing(app) for app in sample.apps)
@@ -198,8 +215,8 @@ class MicActivityDetector:
         try:
             return bool(self._conferencing_gate())
         except Exception as e:
-            logger.debug("conferencing gate failed (failing open): %s", e)
-            return True
+            logger.warning("mic conferencing gate failed (failing closed): %s", e)
+            return False
 
     @staticmethod
     def _attributed_app(sample: MicSample) -> str:
@@ -219,10 +236,10 @@ class MicActivityDetector:
             start = self._session_start
             end = self._session_last_hot or start
             app = self._session_app
-        duration = (end - start).total_seconds()
+        duration = min((end - start).total_seconds(), self._max_credit_seconds)
         if duration < self._min_session_seconds:
             return None
-        return self._make_event(app, start, duration)
+        return self._make_event(app, start, duration, status="ongoing")
 
     def flush(self) -> Optional[dict]:
         """Force-close any open session (shutdown / AW-outage boundaries)."""
@@ -241,22 +258,39 @@ class MicActivityDetector:
         self, base_last_input: Optional[datetime], now: datetime
     ) -> Optional[datetime]:
         """Most recent mic-engaged instant for ``AfkSource`` (activity-source
-        contract). ``now`` while a session is open, frozen at the session end
-        after it closes; both capped at ``max_credit_seconds`` past start."""
+        contract).
+
+        While a session is open, credit tracks the last HOT observation plus
+        the off-grace allowance (not bare ``now`` — after the mic actually
+        goes cold, credit must stop growing during the grace window, mirroring
+        CallDetector's leave-instant rule). After close it freezes at the
+        session end. Both are capped at ``max_credit_seconds`` past
+        ``base_last_input`` — the real-input anchor — so cycling the mic
+        off/on can't re-arm the cap (see ``engagement_credit``)."""
         with self._lock:
             if self._session_start is not None:
-                cap_end = self._session_start + timedelta(
-                    seconds=self._max_credit_seconds
+                last_hot = self._session_last_hot or self._session_start
+                engaged_until = min(
+                    now, last_hot + timedelta(seconds=self._off_grace_seconds)
                 )
-                return min(now, cap_end)
+                return capped_credit(
+                    engaged_until,
+                    base_last_input,
+                    self._session_start,
+                    self._max_credit_seconds,
+                    now,
+                )
             if (
                 self._last_session_start is not None
                 and self._last_session_end is not None
             ):
-                cap_end = self._last_session_start + timedelta(
-                    seconds=self._max_credit_seconds
+                return capped_credit(
+                    self._last_session_end,
+                    base_last_input,
+                    self._last_session_start,
+                    self._max_credit_seconds,
+                    now,
                 )
-                return min(self._last_session_end, cap_end, now)
             return None
 
     # -- Internals ---------------------------------------------------------
@@ -273,7 +307,7 @@ class MicActivityDetector:
         self._last_session_start = start
         self._last_session_end = end
 
-        duration = (end - start).total_seconds()
+        duration = min((end - start).total_seconds(), self._max_credit_seconds)
         if duration < self._min_session_seconds:
             logger.debug(
                 "Mic session too short (%.0fs < %.0fs), discarding",
@@ -282,9 +316,11 @@ class MicActivityDetector:
             )
             return None
         logger.info("Mic meeting session ended: %s duration=%.0fs", app, duration)
-        return self._make_event(app, start, duration)
+        return self._make_event(app, start, duration, status="completed")
 
-    def _make_event(self, app: str, start: datetime, duration: float) -> dict:
+    def _make_event(
+        self, app: str, start: datetime, duration: float, *, status: str
+    ) -> dict:
         return {
             # Deterministic id → the server upserts one row per session across
             # per-cycle snapshots and the final close, mirroring call events.
@@ -296,7 +332,12 @@ class MicActivityDetector:
             "data": {
                 "app": app,
                 "call_type": "mic",
-                "status": "completed",
+                # "ongoing" on live snapshots, "completed" on close/flush: the
+                # server must be able to tell a growing live row from a final
+                # one (a queued stale snapshot replayed after the final event
+                # must not masquerade as completed), and monotonic-growth
+                # enforcement server-side needs the distinction.
+                "status": status,
                 "synthetic": True,
             },
         }

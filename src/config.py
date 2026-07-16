@@ -1048,7 +1048,13 @@ class Config:
                 self.call_detection.enabled = self._to_bool(cd["enabled"])
             if "min_call_duration" in cd:
                 try:
-                    self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
+                    # Upper clamp: a huge server value would suppress every
+                    # call/mic EVENT while short-session AFK credit still
+                    # flows — credited time with no auditable span. 10 min is
+                    # far above any sane "skip accidental opens" threshold.
+                    self.call_detection.min_call_duration = min(
+                        max(0, int(cd["min_call_duration"])), 600
+                    )
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_call_duration from server, ignoring")
             if "max_credit_minutes" in cd:

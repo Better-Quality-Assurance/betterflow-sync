@@ -426,38 +426,65 @@ class TestGetLastActiveAt:
         detector = CallDetector()
         assert detector.get_last_active_at(None, _ts(0)) is None
 
-    def test_returns_now_while_in_call(self):
+    def test_tracks_now_while_evidence_fresh(self):
+        # The starting event covers [_ts(0), _ts(1)); at now=_ts(2) evidence is
+        # well within the staleness allowance → credit tracks now.
         detector = CallDetector()
         self._start_zoom_call(detector)
-        now = _ts(30)
+        now = _ts(2)
         assert detector.get_last_active_at(_ts(-60), now) == now
+
+    def test_credit_freezes_when_window_evidence_goes_stale(self):
+        # Hung window watcher: nothing confirms the call after its last event
+        # (end _ts(1)) → credit must freeze a staleness-allowance later, NOT
+        # keep tracking now for the full credit cap on zero evidence.
+        detector = CallDetector()
+        self._start_zoom_call(detector)
+        got = detector.get_last_active_at(None, _ts(30))
+        assert got == _ts(1) + timedelta(seconds=180)
+
+    def test_cap_anchored_on_real_input_not_call_start(self):
+        # Ending one call and starting another must not re-arm the cap: the
+        # anchor is the REAL input instant AfkSource passes in, so chained
+        # sessions share one bounded window.
+        detector = CallDetector(max_credit_seconds=3600.0)
+        self._start_zoom_call(detector)
+        # Switch to a different call app at _ts(50): ends Zoom, starts Slack.
+        detector.process_event("Slack", "Huddle", None, _ts(50), 60)
+        detector.process_event("Slack", "Huddle", None, _ts(54), 60)
+        # Real input was at _ts(-10) → cap end _ts(50), regardless of the
+        # fresh Slack call (whose own start would re-arm to _ts(110)).
+        got = detector.get_last_active_at(_ts(-10), _ts(55))
+        assert got == _ts(50)
 
     def test_credit_freezes_at_end_after_call_ends(self):
         # After a call ends the user WAS engaged until its end — credit must
         # freeze there (not vanish, not keep tracking now). This also bridges
         # the AW-outage/shutdown flush: the AFK sample taken next cycle still
-        # sees the engagement up to the flushed call's end.
+        # sees the engagement up to the flushed call's end. The last event
+        # covers [_ts(20), _ts(21)) so the call end is _ts(21).
         detector = CallDetector()
         self._start_zoom_call(detector)
         detector.process_event("zoom.us", "Zoom Meeting", None, _ts(20), 60)
         detector.flush()
-        assert detector.get_last_active_at(None, _ts(30)) == _ts(20)
+        assert detector.get_last_active_at(None, _ts(30)) == _ts(21)
 
     def test_ended_call_credit_respects_cap(self):
         detector = CallDetector(max_credit_seconds=600.0)  # 10min cap
         self._start_zoom_call(detector)
         detector.process_event("zoom.us", "Zoom Meeting", None, _ts(20), 60)
         detector.flush()
+        # No real-input anchor → falls back to call start _ts(0) + 10min.
         assert detector.get_last_active_at(None, _ts(30)) == _ts(10)
 
     def test_short_discarded_call_still_credits_engagement(self):
         # min_duration discards the EVENT, but the engagement was real — the
-        # credit memory must still cover it.
+        # credit memory must still cover it (up to the last event's end).
         detector = CallDetector(min_duration=300)
         self._start_zoom_call(detector)
         detector.process_event("zoom.us", "Zoom Meeting", None, _ts(1), 60)
         assert detector.flush() is None  # too short: no event emitted
-        assert detector.get_last_active_at(None, _ts(5)) == _ts(1)
+        assert detector.get_last_active_at(None, _ts(5)) == _ts(2)
 
     def test_grace_window_credits_only_up_to_leave_instant(self):
         # User switched to a non-call window at t=10 — they produced real input
@@ -469,13 +496,23 @@ class TestGetLastActiveAt:
 
     def test_credit_capped_past_max_credit_seconds(self):
         # A stuck call title must not keep the AFK stream not-afk forever:
-        # credit freezes at call_start + max_credit even while "in call".
+        # with no real-input anchor, credit freezes at call_start + max_credit
+        # even while the call keeps being confirmed by fresh events.
         detector = CallDetector(max_credit_seconds=3600.0)  # 1h cap
         self._start_zoom_call(detector)
-        # Keep the call alive well past the cap.
-        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(120), 60)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(60), 60)
+        assert detector.get_last_active_at(None, _ts(61)) == _ts(60)
+
+    def test_is_in_call_bounded_by_credit_cap(self):
+        # The LOCAL idle guard must not outlive the billing cap: a wedged
+        # call-matching title would otherwise suppress the idle pause forever
+        # while the server bills idle.
+        detector = CallDetector(max_credit_seconds=3600.0)
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 60)
         assert detector.is_in_call()
-        assert detector.get_last_active_at(None, _ts(120)) == _ts(60)
+        # Heartbeat grows the confirmed span past the cap.
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 4000)
+        assert detector.is_in_call() is False
 
     def test_never_returns_future_instant(self):
         detector = CallDetector()
@@ -501,9 +538,16 @@ class TestGetLastActiveAt:
             activity_sources=[detector],
             idle_clock=lambda: (clock_now["now"] - base).total_seconds(),
         )
-        # Sample every minute across a 49-minute hands-off meeting.
+        # Sample every minute across a 49-minute hands-off meeting. The window
+        # watcher heartbeats one growing event per unchanged window (same
+        # timestamp, growing duration) — the detector must keep treating that
+        # as fresh evidence.
         for m in range(0, 50):
             clock_now["now"] = _ts(m)
+            if m > 0:
+                detector.process_event(
+                    "zoom.us", "Zoom Meeting", None, _ts(0), m * 60.0
+                )
             afk.record_sample(_ts(m))
 
         events = afk.build_afk_events(_ts(0), _ts(49))
@@ -640,9 +684,13 @@ class TestCallPersistsAcrossSyncCycles:
         )
         assert snaps[1]["duration"] > snaps[0]["duration"]
 
-    def test_shutdown_closes_open_call(self):
+    def test_shutdown_closes_open_call_and_queues_final_event(self):
         engine = self._build_engine()
         t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
         engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
         engine.shutdown()
         assert engine.is_in_call() is False
+        assert not engine.queue.is_empty(), (
+            "the final call span (tail since the last snapshot, plus its "
+            "'completed' status) must be queued at shutdown, not discarded"
+        )
