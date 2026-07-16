@@ -179,16 +179,24 @@ class IdleManager:
             return False
 
     def _is_engaged_without_input(self) -> bool:
-        """Whether a non-input engagement context is active — a call/meeting OR
-        an active foreground-CPU session (Claude Code / build / render in the
-        focused window). Either suppresses the idle pause: the user is engaged
-        even without keyboard/mouse input. Defensive: any error means 'not
-        engaged' so idle detection still works."""
+        """Whether a non-input engagement context is active — a call/meeting
+        (window-title detector), a mic-in-use meeting (system-level signal that
+        survives the call window losing focus), OR an active foreground-CPU
+        session (Claude Code / build / render in the focused window). Any of
+        them suppresses the idle pause: the user is engaged even without
+        keyboard/mouse input. Defensive: any error means 'not engaged' so idle
+        detection still works."""
         if self._is_in_call():
             return True
         try:
+            if bool(self.sync_engine.is_mic_meeting_active()):
+                return True
+        except Exception as e:
+            logger.debug("_is_engaged_without_input: mic check failed: %s", e)
+        try:
             return bool(self.sync_engine.is_active_dev_session())
-        except Exception:
+        except Exception as e:
+            logger.debug("_is_engaged_without_input: dev-session check failed: %s", e)
             return False
 
     def check_idle_status(

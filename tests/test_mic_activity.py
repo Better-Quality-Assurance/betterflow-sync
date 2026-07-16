@@ -265,3 +265,145 @@ class TestFactory:
 
         monkeypatch.setattr(mod.sys, "platform", "linux")
         assert create_mic_detector(Config(), "h") is None
+
+
+class TestSyncEngineMicIntegration:
+    """Engine wiring: per-cycle observe/snapshot, outage behavior, shutdown."""
+
+    def _build_engine(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from src.sync.queue import OfflineQueue
+        from src.sync.sync_engine import SyncEngine
+
+        tmp = Path(tempfile.mkdtemp())
+        cfg = Config()
+        cfg.working_hours.known = True  # capture is fail-closed on unknown
+        engine = SyncEngine(
+            aw=Mock(),
+            bf=Mock(),
+            queue=OfflineQueue(db_path=tmp / "q.db", max_size=1000),
+            config=cfg,
+            time_tracker=Mock(),
+        )
+        engine._config_fetched = True
+        engine._backlog_reconciled = True
+        engine.aw.is_running.return_value = True
+        for getter in ("get_window_buckets", "get_web_buckets",
+                       "get_afk_buckets", "get_input_buckets"):
+            getattr(engine.aw, getter).return_value = []
+        engine.bf.is_reachable.return_value = True
+        engine.bf.send_events.return_value = SimpleNamespace(
+            success=True, events_synced=1, accepted_ids=[], error=None
+        )
+        return engine
+
+    def _inject_detector(self, engine, probe, **kwargs):
+        defaults = {
+            "hostname": "testhost",
+            "probe": probe,
+            "min_session_seconds": 30.0,
+            "max_credit_seconds": 14400.0,
+        }
+        defaults.update(kwargs)
+        engine._mic_detector = MicActivityDetector(**defaults)
+        return engine._mic_detector
+
+    def _sent_mic_events(self, engine):
+        return [
+            ev
+            for call in engine.bf.send_events.call_args_list
+            for ev in call.args[0]
+            if ev.get("data", {}).get("call_type") == "mic"
+        ]
+
+    def test_snapshot_uploaded_and_session_persists_across_cycles(self):
+        from datetime import datetime, timezone
+
+        engine = self._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = self._inject_detector(engine, probe)
+        # Meeting has been running for 10 minutes when the first cycle fires.
+        det.observe(datetime.now(timezone.utc) - timedelta(minutes=10))
+
+        engine.sync()
+        assert engine.is_mic_meeting_active()
+        engine.sync()
+        assert engine.is_mic_meeting_active()
+
+        snaps = self._sent_mic_events(engine)
+        assert len(snaps) == 2, "one live mic snapshot per cycle"
+        assert snaps[0]["id"] == snaps[1]["id"], "server upserts one growing row"
+        assert snaps[1]["duration"] >= snaps[0]["duration"]
+
+    def test_session_closes_during_aw_outage(self):
+        from datetime import datetime, timezone
+
+        engine = self._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = self._inject_detector(engine, probe, off_grace_seconds=0.0)
+        det.observe(datetime.now(timezone.utc) - timedelta(minutes=10))
+        det.observe(datetime.now(timezone.utc) - timedelta(minutes=1))
+        assert engine.is_mic_meeting_active()
+
+        engine.aw.is_running.return_value = False  # AW outage
+        probe.current = MicSample(False)  # meeting ended mid-outage
+        stats = engine.sync()
+
+        assert engine.is_mic_meeting_active() is False, (
+            "the mic probe doesn't need AW — the session must close mid-outage "
+            "so idle isn't suppressed for the rest of the outage"
+        )
+        assert stats.calls_detected == 1, "the ended mic span is still recorded"
+        assert len(self._sent_mic_events(engine)) == 1
+
+    def test_shutdown_closes_open_mic_session(self):
+        from datetime import datetime, timezone
+
+        engine = self._build_engine()
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = self._inject_detector(engine, probe)
+        det.observe(datetime.now(timezone.utc) - timedelta(minutes=10))
+        assert engine.is_mic_meeting_active()
+        engine.shutdown()
+        assert engine.is_mic_meeting_active() is False
+
+
+class TestIdleManagerMicSuppression:
+    """A mic meeting suppresses the idle pause like a window-detected call."""
+
+    def _manager(self, sync_engine):
+        from unittest.mock import Mock
+
+        from src.idle_manager import IdleManager
+
+        return IdleManager(sync_engine, tray=Mock(), aw=Mock(), config=Config())
+
+    def test_mic_meeting_counts_as_engaged(self):
+        from unittest.mock import Mock
+
+        eng = Mock()
+        eng.is_in_call.return_value = False
+        eng.is_mic_meeting_active.return_value = True
+        assert self._manager(eng)._is_engaged_without_input() is True
+
+    def test_mic_check_error_falls_through(self):
+        from unittest.mock import Mock
+
+        eng = Mock()
+        eng.is_in_call.return_value = False
+        eng.is_mic_meeting_active.side_effect = RuntimeError("boom")
+        eng.is_active_dev_session.return_value = False
+        assert self._manager(eng)._is_engaged_without_input() is False
+
+    def test_not_engaged_when_all_signals_false(self):
+        from unittest.mock import Mock
+
+        eng = Mock()
+        eng.is_in_call.return_value = False
+        eng.is_mic_meeting_active.return_value = False
+        eng.is_active_dev_session.return_value = False
+        assert self._manager(eng)._is_engaged_without_input() is False

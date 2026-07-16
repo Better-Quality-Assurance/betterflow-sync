@@ -31,6 +31,7 @@ try:
     from .daily_time_tracker import DailyTimeTracker
     from .call_detector import CallDetector, CallEvent
     from .foreground_activity import ForegroundActivityDetector, create_detector
+    from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
     from .queue import is_event_storable
 except ImportError:
@@ -43,6 +44,7 @@ except ImportError:
     from sync.daily_time_tracker import DailyTimeTracker
     from sync.call_detector import CallDetector, CallEvent
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
+    from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
     from sync.queue import is_event_storable
 
@@ -409,6 +411,16 @@ class SyncEngine:
             else None
         )
 
+        # Microphone-in-use meeting detection: the system-level companion to
+        # the window-title CallDetector above — it keeps seeing a meeting when
+        # the call window is NOT frontmost (background huddle while reading
+        # docs). None when disabled (call_detection.enabled or mic_signal off)
+        # or unsupported (Linux). Wired into AfkSource as an activity source by
+        # main.py; sessions upload as auditable call events (call_type "mic").
+        self._mic_detector: Optional[MicActivityDetector] = create_mic_detector(
+            config, self._hostname
+        )
+
         # Foreground-CPU activity detection: credits engaged-but-no-input work
         # (an active Claude Code / build / render in the focused window) that the
         # AFK timeout would otherwise mark idle. None when disabled or
@@ -566,6 +578,40 @@ class SyncEngine:
         """
         detector = self._foreground_detector
         return bool(detector and detector.is_active())
+
+    def is_mic_meeting_active(self) -> bool:
+        """True while the mic-in-use detector reports an open meeting session.
+
+        Consulted by idle detection alongside ``is_in_call`` — the mic keeps
+        seeing a meeting the window-title detector loses the moment the call
+        window stops being frontmost. False when disabled or unsupported.
+        """
+        detector = self._mic_detector
+        return bool(detector and detector.is_active())
+
+    def _observe_mic_activity(self, all_events: list, stats: "SyncStats") -> None:
+        """Sample the microphone and append any mic-meeting span.
+
+        Mirrors ``_observe_foreground_activity``: the session stays OPEN across
+        cycles (so ``is_mic_meeting_active`` doesn't flap), a live snapshot is
+        uploaded each cycle under a deterministic id (server upserts one row),
+        and the final span is emitted when the mic goes cold past the grace.
+        """
+        detector = self._mic_detector
+        if detector is None:
+            return
+        now = datetime.now(timezone.utc)
+        try:
+            ended = detector.observe(now)
+            live = detector.snapshot() if ended is None else None
+        except Exception as e:
+            logger.debug("mic activity observe failed: %s", e)
+            return
+        span = ended or live
+        if span:
+            all_events.append(span)
+            if ended is not None:
+                stats.calls_detected += 1
 
     def _observe_foreground_activity(
         self, all_events: list, stats: "SyncStats", cycle: "_SyncCycleContext"
@@ -783,6 +829,21 @@ class SyncEngine:
                     # bucket, so there is no checkpoint to withhold.
                     self._send_events([self._make_call_bf_event(remaining)], stats)
                     stats.calls_detected += 1
+            # The mic probe doesn't depend on AW — keep observing during the
+            # outage so a meeting that ends mid-outage closes its session.
+            # Unlike the window-title detector above, no flush is needed: the
+            # mic going cold is observable without window events, and a still-
+            # hot mic is a still-running meeting that SHOULD keep suppressing
+            # idle. An ended span is still recorded if the backend is reachable.
+            if self._mic_detector:
+                try:
+                    ended = self._mic_detector.observe(datetime.now(timezone.utc))
+                except Exception as e:
+                    logger.debug("mic activity observe (AW outage) failed: %s", e)
+                    ended = None
+                if ended and self.bf.is_reachable():
+                    self._send_events([ended], stats)
+                    stats.calls_detected += 1
             return stats
 
         # Start session if needed (attempt directly; no pre-check to avoid TOCTOU).
@@ -900,6 +961,13 @@ class SyncEngine:
         # the AFK activity-source credit (folded by next cycle's record_sample),
         # and emits an auditable dev-session span when a session ends.
         self._observe_foreground_activity(all_events, stats, cycle)
+
+        # Microphone-in-use meeting detection: the system-level companion to the
+        # window-title call detector — sees a meeting even when the call window
+        # isn't frontmost. Keeps is_mic_meeting_active() current for the idle
+        # guard, advances the AFK activity-source credit, and uploads a live
+        # snapshot / final span (call_type "mic") for server-side audit.
+        self._observe_mic_activity(all_events, stats)
 
         # Clear window-specific AFK context before processing non-window buckets
         # so AFK events from one window bucket don't leak into unrelated buckets.
@@ -3730,5 +3798,11 @@ class SyncEngine:
                 self._call_detector.flush()
             except Exception as e:
                 logger.debug("call detector flush on shutdown failed: %s", e)
+        # And any open mic-meeting session, for the same reason.
+        if self._mic_detector is not None:
+            try:
+                self._mic_detector.flush()
+            except Exception as e:
+                logger.debug("mic detector flush on shutdown failed: %s", e)
         # Close time tracker
         self._time_tracker.close()

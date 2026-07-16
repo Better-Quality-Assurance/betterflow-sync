@@ -1843,6 +1843,8 @@ class BetterFlowApp:
         #     to upload 'afk' after the timeout and paint the whole call Idle
         #     on the dashboard; only the LOCAL pause was suppressed before
         #     (Ecaterina's 49-minute huddle, 2026-07-15).
+        #   * mic detector — the system-level meeting signal: still sees the
+        #     huddle when its window isn't frontmost (title detection drops).
         #   * foreground-CPU detector — active build/Claude/render in focus.
         # Inert on Linux, where the OS idle clock — and thus this whole
         # in-process AFK source — is unreadable; there the uploaded call /
@@ -1850,6 +1852,7 @@ class BetterFlowApp:
         activity_sources = [
             src for src in (
                 self.coordinator.sync_engine._call_detector,
+                self.coordinator.sync_engine._mic_detector,
                 self.coordinator.sync_engine._foreground_detector,
             ) if src is not None
         ]

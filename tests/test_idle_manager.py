@@ -64,6 +64,7 @@ def _make(idle_in_call: bool):
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = idle_in_call
     sync_engine.is_active_dev_session.return_value = False
+    sync_engine.is_mic_meeting_active.return_value = False
 
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
@@ -239,6 +240,7 @@ def test_stale_afk_bucket_does_not_pause_when_latest_betterflow_bucket_is_active
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = False
     sync_engine.is_active_dev_session.return_value = False
+    sync_engine.is_mic_meeting_active.return_value = False
 
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
@@ -266,6 +268,7 @@ def _make_with_afk_event(afk_event, *, in_call=False):
     sync_engine.is_private = False
     sync_engine.is_in_call.return_value = in_call
     sync_engine.is_active_dev_session.return_value = False
+    sync_engine.is_mic_meeting_active.return_value = False
     tray = Mock()
     idle_mgr = IdleManager(sync_engine, tray, aw, config)
     return idle_mgr, Mock(), Mock(), tray
