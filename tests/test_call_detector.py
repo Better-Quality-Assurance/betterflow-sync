@@ -401,6 +401,82 @@ def test_is_in_call_reflects_active_call_state():
     assert det.is_in_call() is False
 
 
+class TestGetLastActiveAt:
+    """Activity-source contract: call engagement folded into the uploaded AFK
+    stream (AfkSource) so a hands-off meeting bills as active, not idle."""
+
+    def _start_zoom_call(self, detector, at_minutes=0.0):
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(at_minutes), 60)
+
+    def test_none_when_no_call_active(self):
+        detector = CallDetector()
+        assert detector.get_last_active_at(None, _ts(0)) is None
+
+    def test_returns_now_while_in_call(self):
+        detector = CallDetector()
+        self._start_zoom_call(detector)
+        now = _ts(30)
+        assert detector.get_last_active_at(_ts(-60), now) == now
+
+    def test_none_after_call_ends(self):
+        detector = CallDetector()
+        self._start_zoom_call(detector)
+        detector.flush()
+        assert detector.get_last_active_at(None, _ts(30)) is None
+
+    def test_grace_window_credits_only_up_to_leave_instant(self):
+        # User switched to a non-call window at t=10 — they produced real input
+        # to do that, so call credit must stop there, not keep tracking `now`.
+        detector = CallDetector(grace_period=30.0)
+        self._start_zoom_call(detector)
+        detector.process_event("Finder", "Documents", None, _ts(10), 5)
+        assert detector.get_last_active_at(None, _ts(10.2)) == _ts(10)
+
+    def test_credit_capped_past_max_credit_seconds(self):
+        # A stuck call title must not keep the AFK stream not-afk forever:
+        # credit freezes at call_start + max_credit even while "in call".
+        detector = CallDetector(max_credit_seconds=3600.0)  # 1h cap
+        self._start_zoom_call(detector)
+        # Keep the call alive well past the cap.
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(120), 60)
+        assert detector.is_in_call()
+        assert detector.get_last_active_at(None, _ts(120)) == _ts(60)
+
+    def test_never_returns_future_instant(self):
+        detector = CallDetector()
+        self._start_zoom_call(detector)
+        now = _ts(5)
+        result = detector.get_last_active_at(None, now)
+        assert result is not None and result <= now
+
+    def test_afk_source_folds_call_credit_into_samples(self):
+        # End-to-end with AfkSource: a call with zero keyboard/mouse input must
+        # keep the reconstructed (uploaded) AFK stream not-afk for its duration.
+        from src.sync.afk_source import AfkSource
+
+        detector = CallDetector()
+        self._start_zoom_call(detector)
+
+        # OS idle clock: last real input was at t=0 and only ages from there.
+        base = _ts(0)
+        clock_now = {"now": base}
+        afk = AfkSource(
+            afk_timeout_seconds=600.0,
+            hostname="testhost",
+            activity_sources=[detector],
+            idle_clock=lambda: (clock_now["now"] - base).total_seconds(),
+        )
+        # Sample every minute across a 49-minute hands-off meeting.
+        for m in range(0, 50):
+            clock_now["now"] = _ts(m)
+            afk.record_sample(_ts(m))
+
+        events = afk.build_afk_events(_ts(0), _ts(49))
+        statuses = {e["data"]["status"] for e in events}
+        assert statuses == {"not-afk"}, events
+        assert sum(e["duration"] for e in events) == 49 * 60
+
+
 class TestWindowsNativeAppNames:
     """Native call apps report different process names on Windows than macOS.
 

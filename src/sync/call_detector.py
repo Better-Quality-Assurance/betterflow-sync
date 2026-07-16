@@ -8,8 +8,9 @@ avoid splitting a single call when the user briefly switches apps.
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -129,9 +130,20 @@ class CallDetector:
         self,
         min_duration: int = 30,
         grace_period: float = _DEFAULT_GRACE_PERIOD,
+        max_credit_seconds: float = 14400.0,
     ):
         self._min_duration = min_duration
         self._grace_period = grace_period
+        # Hard ceiling on AFK credit per call (get_last_active_at). A window
+        # title stuck matching a call pattern must not keep the uploaded AFK
+        # stream not-afk indefinitely — credit stops max_credit_seconds after
+        # the call started, even if the "call" never ends.
+        self._max_credit_seconds = float(max_credit_seconds)
+
+        # State is mutated on the sync thread (process_event/flush) but read
+        # from the idle thread (is_in_call) and inside AfkSource.record_sample
+        # (get_last_active_at) — guard every access.
+        self._lock = threading.Lock()
 
         # Active call state
         self._call_app: Optional[str] = None
@@ -157,46 +169,48 @@ class CallDetector:
             matched_name = _match_browser(url)
             call_type = "browser" if matched_name else None
 
-        if self._call_app is None:
-            # IDLE state
-            if matched_name:
+        with self._lock:
+            if self._call_app is None:
+                # IDLE state
+                if matched_name:
+                    self._start_call(matched_name, call_type, timestamp)
+                return None
+
+            # IN_CALL state
+            if matched_name and matched_name == self._call_app:
+                # Same call continues
+                self._call_last_seen = timestamp
+                self._left_at = None
+                return None
+
+            if matched_name and matched_name != self._call_app:
+                # Switched to a different call app - end the current call
+                # at the switch timestamp, start a new one
+                ended = self._end_call(end_override=timestamp)
                 self._start_call(matched_name, call_type, timestamp)
+                return ended
+
+            # Non-call event while in a call
+            if self._left_at is None:
+                # First non-call event: start grace timer
+                self._left_at = timestamp
+                return None
+
+            # Check if grace period expired (guard against out-of-order timestamps)
+            gap = max(0.0, (timestamp - self._left_at).total_seconds())
+            if gap >= self._grace_period:
+                # Grace expired: end the call (end time = when user left)
+                return self._end_call()
+
+            # Still within grace period
             return None
-
-        # IN_CALL state
-        if matched_name and matched_name == self._call_app:
-            # Same call continues
-            self._call_last_seen = timestamp
-            self._left_at = None
-            return None
-
-        if matched_name and matched_name != self._call_app:
-            # Switched to a different call app - end the current call
-            # at the switch timestamp, start a new one
-            ended = self._end_call(end_override=timestamp)
-            self._start_call(matched_name, call_type, timestamp)
-            return ended
-
-        # Non-call event while in a call
-        if self._left_at is None:
-            # First non-call event: start grace timer
-            self._left_at = timestamp
-            return None
-
-        # Check if grace period expired (guard against out-of-order timestamps)
-        gap = max(0.0, (timestamp - self._left_at).total_seconds())
-        if gap >= self._grace_period:
-            # Grace expired: end the call (end time = when user left)
-            return self._end_call()
-
-        # Still within grace period
-        return None
 
     def flush(self) -> Optional[CallEvent]:
         """Force-end any active call. Call at sync boundaries."""
-        if self._call_app is not None:
-            return self._end_call()
-        return None
+        with self._lock:
+            if self._call_app is not None:
+                return self._end_call()
+            return None
 
     def is_in_call(self) -> bool:
         """True while a call/meeting is currently active (incl. grace period).
@@ -206,7 +220,37 @@ class CallDetector:
         keyboard/mouse input, which would otherwise trip the AFK-only idle
         pause — especially on Windows, which has no in-process input watcher.
         """
-        return self._call_app is not None
+        with self._lock:
+            return self._call_app is not None
+
+    def get_last_active_at(
+        self, base_last_input: Optional[datetime], now: datetime
+    ) -> Optional[datetime]:
+        """Most recent call-engaged instant, for ``AfkSource`` to fold into its
+        last-input reconciliation (activity-source contract, same as
+        ``ForegroundActivityDetector.get_last_active_at``).
+
+        While a call is active the user is engaged (listening/watching) even
+        with no keyboard/mouse input, so the *uploaded* AFK stream — which the
+        server bills active-vs-idle from — must stay not-afk. Suppressing only
+        the local idle pause (``is_in_call``) never reached that stream, so a
+        long hands-off meeting still painted Idle on the dashboard (Ecaterina's
+        49-minute huddle, 2026-07-15).
+
+        Credit rules:
+          * None when no call is active — never fabricates activity.
+          * During the leave-grace window, credit stops at the instant the user
+            left the call window (they produced real input to switch anyway).
+          * Capped at ``max_credit_seconds`` past call start, so a stuck title
+            can't keep the stream not-afk forever. AfkSource additionally
+            clamps any source's answer to ``now``.
+        """
+        with self._lock:
+            if self._call_start is None:
+                return None
+            engaged_until = self._left_at or now
+            cap_end = self._call_start + timedelta(seconds=self._max_credit_seconds)
+            return min(engaged_until, cap_end, now)
 
     def _start_call(
         self, name: str, call_type: Optional[str], timestamp: datetime
