@@ -669,8 +669,9 @@ class SyncEngine:
 
     def _deliver_final_event(self, event: dict, context: str) -> None:
         """Deliver a final detector event at shutdown: one immediate direct
-        send, queueing only on TRANSIENT failure. Never raises — shutdown must
-        complete regardless.
+        send, queueing on any non-auth failure (a definitive rejection ages
+        out via the queue's retry dead-lettering). Never raises — shutdown
+        must complete regardless.
 
         Deliberately bypasses _send_events: its auth-error path enqueues the
         batch before raising, and an expired token is the LIKELIEST failure at
@@ -4023,9 +4024,10 @@ class SyncEngine:
         # is_in_call()/is_mic_meeting_active() survives the logout. The final
         # event is SENT NOW when possible: shutdown runs on logout, and a row
         # left in the (account-agnostic) offline queue would be delivered
-        # under whoever logs in NEXT on a shared machine. _send_events falls
-        # back to the queue itself only when the send genuinely fails, and the
-        # deterministic id makes any replay an upsert, never a duplicate.
+        # under whoever logs in NEXT on a shared machine. _deliver_final_event
+        # queues only on non-auth send failure (auth errors DROP — see its
+        # docstring), and the deterministic id makes any replay an upsert,
+        # never a duplicate.
         if self._call_detector is not None:
             try:
                 remaining = self._call_detector.flush()
