@@ -379,6 +379,11 @@ class CallDetectionSettings:
     # cap only bites when there is ALSO zero keyboard/mouse input for its whole
     # length — any real input keeps the stream not-afk on its own.
     max_credit_minutes: int = 240
+    # Microphone-in-use meeting detection (mic_activity.py): the system-level
+    # signal that catches a meeting even when the call window isn't frontmost
+    # (a background Slack huddle while reading docs). Conferencing-gated and
+    # capped by max_credit_minutes; sessions upload as auditable call events.
+    mic_signal: bool = True
 
 
 @dataclass
@@ -1056,6 +1061,8 @@ class Config:
                     )
                 except (TypeError, ValueError):
                     logger.warning("Invalid call max_credit_minutes from server, ignoring")
+            if "mic_signal" in cd:
+                self.call_detection.mic_signal = self._to_bool(cd["mic_signal"])
 
         if "foreground_activity" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             fa = server_config["foreground_activity"]
