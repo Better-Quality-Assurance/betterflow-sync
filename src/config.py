@@ -1042,6 +1042,17 @@ class Config:
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid fraud_detection config from server: {e}")
 
+        if "call_detection" in server_config and DEFER_UNAPPLIED_SERVER_SETTINGS:
+            cd = server_config["call_detection"]
+            # Disable-only exemption from the deferral gate: mic_signal=false
+            # is the PRIVACY KILL SWITCH for the mic probe, and a remote
+            # off-switch must work without waiting for the staged rollout (or
+            # an app release). Enabling stays deferred like everything else —
+            # only "off" passes through.
+            if "mic_signal" in cd and not self._to_bool(cd["mic_signal"]):
+                self.call_detection.mic_signal = False
+                logger.info("Server disabled mic_signal (deferral-exempt kill switch)")
+
         if "call_detection" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             cd = server_config["call_detection"]
             if "enabled" in cd:

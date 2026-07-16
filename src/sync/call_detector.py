@@ -256,7 +256,8 @@ class CallDetector:
             return None
 
     def flush(self) -> Optional[CallEvent]:
-        """Force-end any active call (shutdown / AW-outage boundaries)."""
+        """Force-end any active call — shutdown, AW-outage, and capture
+        boundaries (pause / private time / working-hours suppression)."""
         with self._lock:
             if self._call_app is not None:
                 return self._end_call()
@@ -337,6 +338,29 @@ class CallDetector:
                 > self._max_credit_seconds
             )
             return not past_cap
+
+    def has_fresh_evidence(self, now: datetime) -> bool:
+        """True when the current call state is backed by RECENT window events.
+
+        Consumed by SyncEngine.is_in_call() next to the state machine's own
+        answer: with AW up but only the window watcher hung mid-call, no event
+        will ever arrive to end the call — the state machine stays IN_CALL
+        forever on evidence nothing confirms, and the local idle guard would
+        stay suppressed indefinitely while the billed stream (already bounded
+        by the staleness rule in get_last_active_at) shows idle. Bounded by
+        the same staleness allowance plus the leave-grace, so a healthy
+        heartbeating watcher never trips it. False when no call is active.
+        """
+        with self._lock:
+            if self._call_app is None:
+                return False
+            ref = self._call_last_seen or self._call_start
+            if self._left_at is not None and (ref is None or self._left_at > ref):
+                ref = self._left_at
+            if ref is None:
+                return False
+            age = (now - ref).total_seconds()
+            return age <= _EVIDENCE_STALENESS_SECONDS + self._grace_period
 
     def get_last_active_at(
         self, base_last_input: Optional[datetime], now: datetime

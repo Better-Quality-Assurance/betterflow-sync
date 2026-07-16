@@ -397,16 +397,23 @@ class TestArmPathLocking:
         c = _coordinator(_restricted_cfg())
 
         def _worker():
-            with patch("src.main.datetime") as dt:
-                dt.now.return_value = IN_HOURS_UTC
-                for _ in range(20):
-                    c.arm_capture_boundary()
+            for _ in range(20):
+                c.arm_capture_boundary()
 
-        threads = [threading.Thread(target=_worker) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        # ONE patch around all threads. mock.patch enter/exit is NOT
+        # thread-safe against itself for the same target: two threads
+        # patching concurrently can save the other thread's MOCK as the
+        # "original", leaving src.main.datetime a leaked frozen MagicMock for
+        # the rest of the pytest process — which made the idle-tracker-health
+        # freshness gate compute a negative input age and flake
+        # test_silent_when_input_is_stale suite-wide.
+        with patch("src.main.datetime") as dt:
+            dt.now.return_value = IN_HOURS_UTC
+            threads = [threading.Thread(target=_worker) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
         assert "capture_boundary" in c.scheduler.jobs
 

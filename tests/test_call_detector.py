@@ -661,19 +661,16 @@ class TestCallPersistsAcrossSyncCycles:
 
     def test_call_stays_open_and_snapshots_upsert_one_row(self):
         engine = self._build_engine()
-        t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=10)
         engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
-        engine._call_detector.process_event(
-            "Slack", "Huddle", None, t0 + timedelta(minutes=2), 60
-        )
+        # Heartbeated growing event: end ≈ now-2min (fresh evidence).
+        engine._call_detector.process_event("Slack", "Huddle", None, t0, 8 * 60)
 
         engine.sync()
         assert engine.is_in_call(), (
             "sync boundary must NOT end an ongoing call anymore"
         )
-        engine._call_detector.process_event(
-            "Slack", "Huddle", None, t0 + timedelta(minutes=4), 60
-        )
+        engine._call_detector.process_event("Slack", "Huddle", None, t0, 9 * 60)
         engine.sync()
         assert engine.is_in_call()
 
@@ -689,7 +686,7 @@ class TestCallPersistsAcrossSyncCycles:
         # token (queue only as fallback — the queue is account-agnostic and a
         # leftover row would deliver under the next login on a shared machine).
         engine = self._build_engine()
-        t0 = datetime(2026, 7, 15, 17, 7, 0, tzinfo=timezone.utc)
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=2)
         engine._call_detector.process_event("Slack", "Huddle", None, t0, 60)
         engine.shutdown()
         assert engine.is_in_call() is False
@@ -708,11 +705,10 @@ class TestCaptureBoundariesCloseSessions:
     def _engine_in_call(self):
         harness = TestCallPersistsAcrossSyncCycles()
         engine = harness._build_engine()
-        t0 = datetime(2026, 7, 15, 14, 0, 0, tzinfo=timezone.utc)
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=10)
         engine._call_detector.process_event("zoom.us", "Zoom Meeting", None, t0, 60)
-        engine._call_detector.process_event(
-            "zoom.us", "Zoom Meeting", None, t0 + timedelta(minutes=10), 60
-        )
+        # Heartbeat: end ≈ now-1min → fresh evidence for is_in_call().
+        engine._call_detector.process_event("zoom.us", "Zoom Meeting", None, t0, 9 * 60)
         assert engine.is_in_call()
         return engine, t0
 
@@ -807,3 +803,87 @@ class TestStaleOngoingSnapshotsNeverReplay:
         )
         assert "completed" in statuses
         assert engine.queue.is_empty(), "stale snapshot removed, not retried"
+
+
+class TestBoundaryFlushRaceAndForeground:
+    def test_paused_cycle_reflushes_call_reopened_by_inflight_sync(self):
+        # pause()/set_private_mode() run on the tray thread; a sync cycle
+        # already in flight keeps feeding pre-boundary window events AFTER the
+        # boundary flush and re-opens the call. Every paused/private cycle
+        # must re-flush (idempotent), or the reopened call bridges the whole
+        # not-recorded period.
+        harness = TestCallPersistsAcrossSyncCycles()
+        engine = harness._build_engine()
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=1)
+        engine.set_private_mode(True)
+        # In-flight cycle delivers a pre-boundary call event after the flush:
+        engine._call_detector.process_event("zoom.us", "Zoom Meeting", None, t0, 60)
+        assert engine.is_in_call(), "precondition: the race re-opened the call"
+
+        engine.sync()  # paused/private early-return branch
+        assert engine.is_in_call() is False, (
+            "the paused/private branch must re-flush like the suppressed one"
+        )
+
+    def test_boundary_flush_closes_foreground_session_too(self):
+        from src.sync.foreground_activity import (
+            ForegroundActivityDetector,
+            ForegroundSample,
+        )
+
+        class HotProbe:
+            def sample(self):
+                return ForegroundSample(pid=1, app="Terminal", cpu_percent=80.0)
+
+        harness = TestCallPersistsAcrossSyncCycles()
+        engine = harness._build_engine()
+        det = ForegroundActivityDetector(
+            hostname="h", probe=HotProbe(), min_session_seconds=30.0
+        )
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10), now - timedelta(minutes=10))
+        det.observe(now, now)
+        engine._foreground_detector = det
+        assert det.is_active()
+
+        engine.set_private_mode(True)
+        assert det.is_active() is False, (
+            "an open dev-session would bridge the private period the same way "
+            "a call would — and on Linux it IS the billing path"
+        )
+        assert not engine.queue.is_empty(), "the pre-boundary span is queued"
+
+
+class TestEvidenceFreshness:
+    """has_fresh_evidence / engine is_in_call: a hung window watcher must not
+    suppress the idle pause forever on state nothing confirms."""
+
+    def test_fresh_heartbeat_is_fresh(self):
+        detector = CallDetector()
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 10 * 60)
+        # Evidence ends _ts(10); asking at _ts(11) is within staleness+grace.
+        assert detector.has_fresh_evidence(_ts(11)) is True
+
+    def test_stale_evidence_is_not_fresh(self):
+        detector = CallDetector()
+        detector.process_event("zoom.us", "Zoom Meeting", None, _ts(0), 60)
+        # Last evidence ends _ts(1); at _ts(10) the watcher has been silent
+        # for 9 minutes — nothing confirms this call anymore.
+        assert detector.has_fresh_evidence(_ts(10)) is False
+
+    def test_no_call_is_not_fresh(self):
+        assert CallDetector().has_fresh_evidence(_ts(0)) is False
+
+    def test_engine_is_in_call_false_on_stale_evidence(self):
+        harness = TestCallPersistsAcrossSyncCycles()
+        engine = harness._build_engine()
+        stale_t0 = datetime.now(timezone.utc) - timedelta(hours=2)
+        engine._call_detector.process_event(
+            "zoom.us", "Zoom Meeting", None, stale_t0, 60
+        )
+        assert engine._call_detector.is_in_call(), (
+            "state machine itself still says in-call"
+        )
+        assert engine.is_in_call() is False, (
+            "the engine must not suppress idle on 2h-stale evidence"
+        )

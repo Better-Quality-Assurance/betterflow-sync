@@ -552,3 +552,98 @@ class TestMicKillSwitch:
             if ev["data"]["status"] == "completed"
         ]
         assert len(finals) == 1, "the truthful pre-kill span still ships"
+
+
+class TestCapLatchRobustness:
+    def test_probe_error_does_not_clear_cap_latch(self):
+        # A wedged-hot mic hits the cap and latches; a transient probe error
+        # (in_use=None) must NOT unlatch — only a definite cold read proves
+        # the mic released. Otherwise every flap re-opens a fresh cap period.
+        probe = FakeProbe(MicSample(True))
+        det = _detector(probe, max_credit_seconds=3600.0)
+        det.observe(_ts(0))
+        det.observe(_ts(30))
+        det.observe(_ts(60))  # cap force-close + latch
+        assert not det.is_active()
+
+        probe.current = MicSample(None)  # probe error
+        det.observe(_ts(61))
+        probe.current = MicSample(True)  # wedged mic still "hot"
+        det.observe(_ts(62))
+        assert not det.is_active(), "latch must survive a probe error"
+
+        probe.current = MicSample(False)  # definite cold read
+        det.observe(_ts(63))
+        probe.current = MicSample(True)
+        det.observe(_ts(64))
+        assert det.is_active(), "a real cold-then-hot transition reopens"
+
+
+class TestShutdownAuthPolicy:
+    def test_auth_error_at_shutdown_drops_instead_of_queueing(self):
+        # An expired token is the likeliest failure at logout. The offline
+        # queue is account-agnostic: a queued row would be delivered under
+        # whoever logs in NEXT on this machine. Drop, matching
+        # _send_status_span's policy.
+        from src.sync.bf_client import BetterFlowAuthError
+
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+        engine.bf.send_events.side_effect = BetterFlowAuthError("token expired")
+        probe = FakeProbe(MicSample(True, ("zoom.exe",)))
+        det = harness._inject_detector(engine, probe)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+
+        engine.shutdown()
+        assert engine.queue.is_empty(), (
+            "auth failure at shutdown must DROP the final span, not queue it "
+            "for the next login"
+        )
+
+
+class TestKillSwitchDeferralExemption:
+    def test_mic_signal_false_applies_despite_deferral_gate(self):
+        # mic_signal=false is the privacy kill switch — it must not wait for
+        # the staged rollout of the call_detection block.
+        cfg = Config()
+        assert cfg.call_detection.mic_signal is True
+        cfg.update_from_server({"call_detection": {"mic_signal": False}})
+        assert cfg.call_detection.mic_signal is False
+
+    def test_mic_signal_true_stays_deferred(self):
+        # Only "off" passes through the gate; enabling is a rollout decision.
+        cfg = Config()
+        cfg.call_detection.mic_signal = False
+        cfg.update_from_server({"call_detection": {"mic_signal": True}})
+        assert cfg.call_detection.mic_signal is False
+
+    def test_kill_switch_applies_during_aw_outage_too(self):
+        harness = TestSyncEngineMicIntegration()
+        engine = harness._build_engine()
+
+        class CountingProbe:
+            def __init__(self):
+                self.samples = 0
+
+            def sample(self):
+                self.samples += 1
+                return MicSample(True, ("zoom.exe",))
+
+        probe = CountingProbe()
+        det = harness._inject_detector(engine, probe)
+        now = datetime.now(timezone.utc)
+        det.observe(now - timedelta(minutes=10))
+        det.observe(now - timedelta(minutes=1))
+        sampled_before = probe.samples
+
+        engine.config.call_detection.mic_signal = False
+        engine.aw.is_running.return_value = False  # AW outage
+        engine.sync()
+
+        assert probe.samples == sampled_before, (
+            "a server-disabled mic probe must not keep sampling during an "
+            "AW outage"
+        )
+        assert engine.is_mic_meeting_active() is False, "open session flushed"

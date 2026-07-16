@@ -574,7 +574,18 @@ class SyncEngine:
         ends, so it stays True for the duration of a meeting.
         """
         detector = self._call_detector
-        return bool(detector and detector.is_in_call())
+        if not (detector and detector.is_in_call()):
+            return False
+        # Evidence freshness: with AW up but the window watcher hung mid-call,
+        # no event will ever end the call — the raw state machine stays
+        # IN_CALL forever. Don't suppress the idle pause on state nothing has
+        # confirmed for minutes (the billed credit already froze via the same
+        # staleness rule; local and uploaded must agree).
+        try:
+            return detector.has_fresh_evidence(datetime.now(timezone.utc))
+        except Exception as e:
+            logger.debug("is_in_call freshness check failed: %s", e)
+            return True  # defensive: never break the idle guard on a helper error
 
     def is_active_dev_session(self) -> bool:
         """True while the foreground-CPU detector reports an active session.
@@ -657,15 +668,30 @@ class SyncEngine:
             )
 
     def _deliver_final_event(self, event: dict, context: str) -> None:
-        """Deliver a final detector event at shutdown: one immediate send
-        attempt (with _send_events' own queue-on-failure as the fallback).
-        Never raises — shutdown must complete regardless."""
+        """Deliver a final detector event at shutdown: one immediate direct
+        send, queueing only on TRANSIENT failure. Never raises — shutdown must
+        complete regardless.
+
+        Deliberately bypasses _send_events: its auth-error path enqueues the
+        batch before raising, and an expired token is the LIKELIEST failure at
+        logout — the queued row would then be delivered under whoever logs in
+        next on this machine (the queue is account-agnostic). On auth failure
+        the event is dropped with a log line instead, matching
+        _send_status_span's policy for exactly this reason.
+        """
         try:
-            self._send_events([event], SyncStats())
+            result = self.bf.send_events([event])
+            if getattr(result, "success", False):
+                return
+            self._enqueue_events_best_effort([event], context)
+        except BetterFlowAuthError as e:
+            logger.warning(
+                "final event dropped (%s): auth error at shutdown — not queued "
+                "(would deliver under the next login): %s",
+                context,
+                e,
+            )
         except Exception as e:
-            # BetterFlowAuthError re-raises AFTER queueing; anything else may
-            # not have queued — enqueue as last resort (the deterministic id
-            # makes a double-queue converge server-side).
             logger.warning("final event send failed (%s): %s — queueing", context, e)
             self._enqueue_events_best_effort([event], context)
 
@@ -716,6 +742,17 @@ class SyncEngine:
                     )
             except Exception as e:
                 logger.warning("mic detector flush (%s) failed: %s", context, e)
+        # The foreground/dev-session detector too: its upserted span would
+        # otherwise bridge the boundary the same way (session_start pre-pause,
+        # first post-resume observe() extends it across the not-recorded
+        # period) — and on Linux the dev-session span IS the billing path.
+        if self._foreground_detector is not None:
+            try:
+                span = self._foreground_detector.flush()
+                if span:
+                    self._enqueue_events_best_effort([span], context)
+            except Exception as e:
+                logger.warning("foreground detector flush (%s) failed: %s", context, e)
 
     def _observe_foreground_activity(
         self, all_events: list, stats: "SyncStats", cycle: "_SyncCycleContext"
@@ -850,6 +887,17 @@ class SyncEngine:
             private_mode = self._private_mode
             private_start = self._private_start
         if paused or private_mode:
+            # Re-flush the engagement detectors every paused/private cycle
+            # (idempotent — no-op when nothing is open). The boundary flush in
+            # pause()/set_private_mode() runs on the TRAY thread and can race
+            # a sync cycle already in flight: that cycle passed the paused
+            # check before the toggle and keeps feeding pre-boundary window
+            # events into the call detector AFTER the flush, re-opening the
+            # call. Without this, the reopened call stays open across the
+            # whole private period and the first post-resume event closes it
+            # with an end that BRIDGES it — exactly the privacy bug the
+            # boundary flush exists to prevent. Mirrors the suppressed branch.
+            self.flush_engagement_detectors("paused_or_private")
             # While Private Time is on, nothing is synced — so the backend
             # cannot tell an ongoing private session from a network gap, and
             # its tracked-hours trailing grace painted the window as counted
@@ -954,10 +1002,16 @@ class SyncEngine:
             # Unlike the window-title detector above, no flush is needed: the
             # mic going cold is observable without window events, and a still-
             # hot mic is a still-running meeting that SHOULD keep suppressing
-            # idle. An ended span is recorded (or queued when offline).
+            # idle. An ended span is recorded (or queued when offline). The
+            # kill switch applies here exactly as on the normal path — an AW
+            # outage must not keep a server-disabled mic probe sampling.
             if self._mic_detector:
+                cd_cfg = self.config.call_detection
                 try:
-                    ended = self._mic_detector.observe(datetime.now(timezone.utc))
+                    if not (cd_cfg.enabled and cd_cfg.mic_signal):
+                        ended = self._mic_detector.flush()
+                    else:
+                        ended = self._mic_detector.observe(datetime.now(timezone.utc))
                 except Exception as e:
                     logger.debug("mic activity observe (AW outage) failed: %s", e)
                     ended = None
@@ -3373,7 +3427,13 @@ class SyncEngine:
             # 'completed' event landed would upsert the same deterministic id
             # back to a shorter, forever-'ongoing' span. A newer snapshot or
             # the final event always supersedes a stale snapshot, so dropping
-            # them at drain time loses nothing.
+            # them at drain time loses nothing for any meeting that closes
+            # normally. ACCEPTED LOSS: a mic session whose every snapshot was
+            # queued (offline for the whole meeting) AND whose process crashed
+            # before the mic went cold has no other record — unlike window
+            # calls, which re-derive from the un-advanced AW checkpoint after
+            # a crash. Chosen over the alternative (replaying stale snapshots
+            # regresses completed rows forever).
             stale_snapshot_ids = [
                 q.id
                 for q in queued

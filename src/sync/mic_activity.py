@@ -210,7 +210,13 @@ class MicActivityDetector:
                 self._session_last_hot = now
                 return None
 
-            self._cap_latched = False  # a cold read re-arms cap force-close
+            # Only a DEFINITE cold read clears the latch. A probe error
+            # (in_use=None) or a gate failure also lands here with hot=False,
+            # but neither proves the mic released — unlatching on those would
+            # let a wedged-hot mic reopen a fresh cap period off every
+            # transient flap, the exact loop the latch exists to stop.
+            if sample.in_use is False:
+                self._cap_latched = False
             if self._session_start is None:
                 return None
             last_hot = self._session_last_hot or self._session_start
@@ -264,7 +270,8 @@ class MicActivityDetector:
         return self._make_event(app, start, duration, status=CALL_STATUS_ONGOING)
 
     def flush(self) -> Optional[dict]:
-        """Force-close any open session (shutdown / AW-outage boundaries)."""
+        """Force-close any open session — shutdown, kill-switch, and capture
+        boundaries (pause / private time / working-hours suppression)."""
         with self._lock:
             if self._session_start is None:
                 return None
