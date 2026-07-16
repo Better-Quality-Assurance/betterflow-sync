@@ -401,7 +401,10 @@ class SyncEngine:
 
         # Call/meeting detection
         self._call_detector: Optional[CallDetector] = (
-            CallDetector(min_duration=config.call_detection.min_call_duration)
+            CallDetector(
+                min_duration=config.call_detection.min_call_duration,
+                max_credit_seconds=config.call_detection.max_credit_minutes * 60,
+            )
             if config.call_detection.enabled
             else None
         )

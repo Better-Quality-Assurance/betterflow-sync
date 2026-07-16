@@ -344,6 +344,20 @@ class TestSyncEngineCallIntegration:
     def test_call_detector_initialized_when_enabled(self):
         assert self.engine._call_detector is not None
 
+    def test_call_detector_credit_cap_plumbed_from_config(self):
+        from src.sync.sync_engine import SyncEngine
+        config = Config()
+        config.call_detection.enabled = True
+        config.call_detection.max_credit_minutes = 60
+
+        engine = SyncEngine(
+            aw=self.aw, bf=self.bf, queue=self.queue,
+            config=config,
+            activity_analyzer=self.activity_analyzer,
+            time_tracker=self.time_tracker,
+        )
+        assert engine._call_detector._max_credit_seconds == 3600.0
+
     def test_call_detector_none_when_disabled(self):
         from src.sync.sync_engine import SyncEngine
         config = Config()

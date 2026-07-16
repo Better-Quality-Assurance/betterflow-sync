@@ -373,6 +373,12 @@ class CallDetectionSettings:
 
     enabled: bool = True
     min_call_duration: int = 30  # Seconds; skip accidental opens
+    # Hard ceiling on the AFK credit a single call can inject into the uploaded
+    # AFK stream (a stuck call-matching window title must not keep the stream
+    # not-afk forever). Generous by design: real all-day meetings exist, and the
+    # cap only bites when there is ALSO zero keyboard/mouse input for its whole
+    # length — any real input keeps the stream not-afk on its own.
+    max_credit_minutes: int = 240
 
 
 @dataclass
@@ -1040,6 +1046,16 @@ class Config:
                     self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_call_duration from server, ignoring")
+            if "max_credit_minutes" in cd:
+                try:
+                    # Bound the farm window: a call injects AFK credit into the
+                    # billed stream, so never let a server value push the cap
+                    # past 8h (nor below 1min) regardless of what it sends.
+                    self.call_detection.max_credit_minutes = min(
+                        max(int(cd["max_credit_minutes"]), 1), 480
+                    )
+                except (TypeError, ValueError):
+                    logger.warning("Invalid call max_credit_minutes from server, ignoring")
 
         if "foreground_activity" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             fa = server_config["foreground_activity"]
