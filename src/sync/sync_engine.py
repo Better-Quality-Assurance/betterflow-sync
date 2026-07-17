@@ -654,11 +654,15 @@ class SyncEngine:
         return project["id"] if project else None
 
     def _stamp_project(self, event: dict) -> dict:
-        """Attach the active project id to a detector/synth-built event. The one
-        place that writes project_id onto an event dict, so call, mic, window,
-        status-span and synthetic-AFK rows can't drift in how they are tagged
-        (the same meeting must never upsert a projected row next to an
-        unprojected one)."""
+        """Stamp the active project onto a SyncEngine-built event dict (call,
+        mic, window, status-span, synthetic-active-AFK). The single place the
+        engine reads-and-writes the project, so these rows can't drift in how
+        they are tagged (the same meeting must never upsert a projected row
+        next to an unprojected one). AfkSource-built AFK events don't pass
+        through here: they receive the id as a parameter (from
+        _current_project_id()) and assign it in AfkSource._event() — so the
+        project DECISION is still single-sourced (_current_project_id), even
+        though the dict write happens in two modules."""
         pid = self._current_project_id()
         if pid is not None:
             event["project_id"] = pid
