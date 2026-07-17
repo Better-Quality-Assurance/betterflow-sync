@@ -314,7 +314,6 @@ class SyncEngine:
         # NB: the per-cycle "pending" checkpoint is a LOCAL in sync() (threaded
         # build -> commit), not an instance field — see _build_inproc_window for
         # why (wedge re-arm can run two sync()s concurrently).
-
         # Optional in-process INPUT source (set by the SyncCoordinator), the
         # keystroke/click/scroll-count analogue of window_source. When present,
         # enabled by config, and an in-process counting backend is usable

@@ -2903,7 +2903,6 @@ class BetterFlowApp:
         # The schedule is already on disk by now: update_from_server() ends with
         # self.save(), which is what lets the NEXT cold start know the window
         # before it can reach the server. No second save here.
-
         # Re-evaluate immediately rather than waiting up to 60s for the next tick:
         # this is the moment a restricted user's agent first learns it is
         # restricted, and it may already be outside their window.
