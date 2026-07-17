@@ -289,8 +289,10 @@ class TestFactory:
     def test_cap_and_min_duration_plumbed(self, monkeypatch):
         import src.sync.mic_activity as mod
 
-        monkeypatch.setattr(mod.sys, "platform", "darwin")
-        monkeypatch.setattr(mod, "MacosMicProbe", lambda: FakeProbe())
+        # Windows is the supported platform for mic credit (see
+        # test_macos_returns_none_until_per_process_taps for why macOS is off).
+        monkeypatch.setattr(mod.sys, "platform", "win32")
+        monkeypatch.setattr(mod, "WindowsMicProbe", lambda: FakeProbe())
         cfg = Config()
         cfg.call_detection.max_credit_minutes = 60
         cfg.call_detection.min_call_duration = 45
@@ -298,6 +300,21 @@ class TestFactory:
         assert det is not None
         assert det._max_credit_seconds == 3600.0
         assert det._min_session_seconds == 45.0
+
+    def test_macos_returns_none_until_per_process_taps(self, monkeypatch):
+        """macOS mic credit is disabled: the CoreAudio device-level
+        'running somewhere' signal can't tell mic capture from playback on a
+        combined-device headset, and the conferencing gate is satisfied by any
+        running browser process — together an over-billing path (idle media
+        playback billed as active). Windows attributes the mic per app and is
+        unaffected. Re-enable when per-process CoreAudio taps (macOS 14+) land."""
+        import src.sync.mic_activity as mod
+
+        monkeypatch.setattr(mod.sys, "platform", "darwin")
+        # Even with a constructible probe, macOS must not build a detector.
+        monkeypatch.setattr(mod, "MacosMicProbe", lambda: FakeProbe())
+        cfg = Config()  # enabled + mic_signal default True
+        assert create_mic_detector(cfg, "h") is None
 
     def test_unsupported_platform_returns_none(self, monkeypatch):
         import src.sync.mic_activity as mod

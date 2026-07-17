@@ -217,6 +217,40 @@ def test_base_last_input_at_excludes_activity_sources():
     assert src.base_last_input_at(T0) == T0 - timedelta(seconds=30)
 
 
+def test_second_activity_source_gets_the_real_input_anchor_not_the_first_ones_credit():
+    """Credit-chaining guard: with two engagement sources folded in one cycle,
+    the SECOND must be anchored on the real keyboard/mouse instant, never on the
+    FIRST source's no-input credit. Otherwise one detector's credit re-arms the
+    next detector's cap (the exact failure engagement_credit / afk_source's
+    real_input_anchor fix prevents). The production wiring
+    (engagement_activity_sources: call + mic + foreground) always folds 2+
+    sources; every other test uses a single source, so only this exercises the
+    fix. Break it by reverting afk_source to pass the mutating `last_input_at`
+    and this fails; the single-source tests stay green."""
+    seen = {}
+
+    class Advancer:
+        """Source A: grants no-input credit, advancing last_input_at to T0."""
+
+        def get_last_active_at(self, base, now):
+            return now  # == T0; > the idle-clock anchor, so it folds in
+
+    class Spy:
+        """Source B: records the anchor it was handed, credits nothing."""
+
+        def get_last_active_at(self, base, now):
+            seen["base"] = base
+            return None
+
+    src = AfkSource(
+        afk_timeout_seconds=600, hostname="host",
+        idle_clock=lambda: 30.0, activity_sources=[Advancer(), Spy()],
+    )
+    src.record_sample(T0)
+    # B must see the pre-fold real-input anchor (T0 - 30s), NOT A's credit (T0).
+    assert seen["base"] == T0 - timedelta(seconds=30)
+
+
 def test_base_last_input_at_none_on_linux_like_clock():
     src = AfkSource(afk_timeout_seconds=600, hostname="host", idle_clock=lambda: None)
     assert src.base_last_input_at(T0) is None

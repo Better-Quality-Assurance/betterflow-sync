@@ -516,35 +516,34 @@ def _conferencing_process_running() -> bool:
 
 
 def create_mic_detector(config, hostname: str) -> Optional[MicActivityDetector]:
-    """Build a mic detector from config, or None when disabled or unsupported
-    (Linux, or a platform probe that can't be constructed)."""
+    """Build a mic detector from config, or None when disabled or unsupported.
+
+    Mic credit is WINDOWS-ONLY. macOS and Linux return None — see the platform
+    gate below for why macOS is off (over-billing via CoreAudio's device-level
+    signal + process-scan gate)."""
     cd = config.call_detection
     if not (getattr(cd, "enabled", False) and getattr(cd, "mic_signal", False)):
         return None
 
-    probe: Optional[MicProbe] = None
-    gate = None
-    if sys.platform == "darwin":
-        try:
-            probe = MacosMicProbe()
-        except Exception as e:
-            logger.warning("Mic detection unavailable (CoreAudio load failed): %s", e)
-            return None
-        try:
-            import psutil  # noqa: F401
-
-            gate = _conferencing_process_running
-        except ImportError:
-            gate = None  # no attribution AND no process scan: mic-hot only
-    elif sys.platform == "win32":
-        probe = WindowsMicProbe()
-    else:
+    if sys.platform != "win32":
+        # macOS (and every non-win32 platform) is intentionally OFF. On macOS
+        # the only available signals over-credit: CoreAudio's
+        # kAudioDevicePropertyDeviceIsRunningSomewhere is DEVICE-level, so
+        # playback through a combined input+output device (AirPods, most USB/BT
+        # headsets) marks the *input* device "running" even with no capture;
+        # and the conferencing gate can only fall back to a process-existence
+        # scan (no per-app mic attribution on macOS), which nearly any running
+        # browser/Slack process satisfies. Together those bill idle media
+        # playback as active work. Windows attributes the mic per app and is
+        # safe. Re-enable macOS via per-process CoreAudio taps (macOS 14+);
+        # MacosMicProbe / _conferencing_process_running are kept for that. See
+        # workspace memory macos-mic-credit-overbilling-killswitch.
         return None
 
     return MicActivityDetector(
         hostname=hostname,
-        probe=probe,
-        conferencing_gate=gate,
+        probe=WindowsMicProbe(),
+        conferencing_gate=None,
         min_session_seconds=cd.min_call_duration,
         max_credit_seconds=cd.max_credit_minutes * 60,
     )
