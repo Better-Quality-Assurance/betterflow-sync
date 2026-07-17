@@ -65,7 +65,6 @@ def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
     before = (
         cfg.foreground_activity.enabled,
         cfg.call_detection.enabled,
-        cfg.sync.in_process_input,
         cfg.engagement.window_minutes,
         cfg.fraud_detection.min_app_diversity,
     )
@@ -81,12 +80,31 @@ def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
     assert (
         cfg.foreground_activity.enabled,
         cfg.call_detection.enabled,
-        cfg.sync.in_process_input,
         cfg.engagement.window_minutes,
         cfg.fraud_detection.min_app_diversity,
     ) == before, "capture/billing/engagement/fraud blocks must be deferred on upgrade"
     # ...but benign sync tuning in the same payload still applies:
     assert cfg.sync.batch_size == 250
+    # ...and so does in_process_input — UN-DEFERRED on purpose (2026-07-17): it is
+    # the shipped remediation for Windows devices whose external input watcher is
+    # hook-blocked and who report zero keystrokes all month (fraud false
+    # positives). Still opt-in: only an explicit server true enables it.
+    assert cfg.sync.in_process_input is True
+
+
+def test_in_process_input_server_flag_round_trip():
+    # Un-deferred but still strictly server-driven and string-safe.
+    cfg = Config()
+    assert cfg.sync.in_process_input is False, "ships dormant"
+
+    cfg.update_from_server({"sync": {"in_process_input": "false"}})
+    assert cfg.sync.in_process_input is False, 'STRING "false" must not enable'
+
+    cfg.update_from_server({"sync": {"in_process_input": True}})
+    assert cfg.sync.in_process_input is True
+
+    cfg.update_from_server({"sync": {"in_process_input": False}})
+    assert cfg.sync.in_process_input is False, "server can also switch it back off"
 
 
 def test_working_hours_and_sync_tuning_still_apply():
