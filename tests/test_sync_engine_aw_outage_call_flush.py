@@ -45,11 +45,13 @@ def _build_engine() -> SyncEngine:
 
 
 def _enter_call(engine: SyncEngine) -> None:
-    """Drive the detector into an active 2-minute Teams call."""
-    t0 = datetime(2026, 6, 17, 13, 0, 0, tzinfo=timezone.utc)
+    """Drive the detector into an active ~10-minute Teams call whose latest
+    evidence ends ~now (engine.is_in_call() requires FRESH window evidence —
+    a stale call no longer suppresses the idle guard)."""
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=10)
     engine._call_detector.process_event("Microsoft Teams", "Meeting with X", None, t0, 60)
     engine._call_detector.process_event(
-        "Microsoft Teams", "Meeting with X", None, t0 + timedelta(minutes=2), 60
+        "Microsoft Teams", "Meeting with X", None, t0, 9 * 60  # heartbeat: end ≈ now-1min
     )
     assert engine.is_in_call(), "precondition: detector should report in-call"
 

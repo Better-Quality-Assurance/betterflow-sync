@@ -24,6 +24,13 @@ BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud det
 BUCKET_TYPE_CALL = "call"
 BUCKET_TYPE_DEV_SESSION = "dev-session"  # Foreground-CPU activity (engaged, no input)
 
+# data.status values on call-bucket events (window calls AND mic sessions) —
+# a server contract: "ongoing" = per-cycle live snapshot of a still-open
+# meeting (same deterministic id keeps upserting one growing row); "completed"
+# = the meeting really ended. Constants so a rename can't miss a producer.
+CALL_STATUS_ONGOING = "ongoing"
+CALL_STATUS_COMPLETED = "completed"
+
 
 @dataclass(frozen=True)
 class AWEvent:

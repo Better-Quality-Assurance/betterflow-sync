@@ -49,3 +49,21 @@ def _isolate_agent_config(tmp_path, monkeypatch):
     config_module._machine_uuid_cache = None
     yield
     config_module._machine_uuid_cache = None
+
+
+@pytest.fixture(autouse=True)
+def _no_real_mic_probe(monkeypatch):
+    """Never let a test-constructed SyncEngine talk to the REAL microphone.
+
+    call_detection.mic_signal defaults on, so on a macOS/Windows dev machine
+    every `SyncEngine(...)` in the suite would build a live CoreAudio/registry
+    probe — and a developer running the tests while in a meeting (hot mic)
+    would flip mic-session state inside unrelated engine tests. CI (Linux)
+    never constructs one, so this also keeps local runs equal to CI. Tests
+    that want a mic detector inject one with a fake probe.
+    """
+    import src.sync.sync_engine as sync_engine_module
+
+    monkeypatch.setattr(
+        sync_engine_module, "create_mic_detector", lambda *a, **k: None
+    )

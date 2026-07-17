@@ -1836,17 +1836,25 @@ class BetterFlowApp:
             from .sync.afk_source import AfkSource
         except ImportError:
             from sync.afk_source import AfkSource
-        # Register the foreground-CPU detector (created by the sync engine) as a
-        # supplementary AFK activity source so an engaged no-input session keeps
-        # the uploaded AFK stream not-afk (macOS/Windows). Inert on Linux, where
-        # the OS idle clock — and thus this whole in-process AFK source — is
-        # unreadable; there the uploaded dev-session span carries the credit.
-        foreground_detector = self.coordinator.sync_engine._foreground_detector
+        # Register the engagement detectors (created by the sync engine) as
+        # supplementary AFK activity sources so an engaged no-input span keeps
+        # the uploaded AFK stream not-afk (macOS/Windows):
+        #   * call detector — a meeting/huddle with hands off the keyboard used
+        #     to upload 'afk' after the timeout and paint the whole call Idle
+        #     on the dashboard; only the LOCAL pause was suppressed before
+        #     (Ecaterina's 49-minute huddle, 2026-07-15).
+        #   * mic detector — the system-level meeting signal: still sees the
+        #     huddle when its window isn't frontmost (title detection drops).
+        #   * foreground-CPU detector — active build/Claude/render in focus.
+        # Inert on Linux, where the OS idle clock — and thus this whole
+        # in-process AFK source — is unreadable; there the uploaded call /
+        # dev-session spans carry the credit.
+        activity_sources = self.coordinator.sync_engine.engagement_activity_sources()
         afk_source = AfkSource(
             afk_timeout_seconds=self.config.aw.afk_timeout_minutes * 60,
             hostname=self.coordinator.sync_engine._hostname,
             input_watcher=self.input_watcher,
-            activity_sources=[foreground_detector] if foreground_detector else None,
+            activity_sources=activity_sources or None,
         )
         self.coordinator.sync_engine.afk_source = afk_source
         self.coordinator.aw_manager.set_inproc_afk_active(

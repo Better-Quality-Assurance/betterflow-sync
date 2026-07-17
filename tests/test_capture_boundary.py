@@ -407,7 +407,7 @@ class TestArmPathLocking:
         # the rest of the pytest process — which made the idle-tracker-health
         # freshness gate compute a negative input age and flake
         # test_silent_when_input_is_stale suite-wide (reproduced and proven
-        # by instrumentation; same fix as on feat/meeting-afk-credit).
+        # by instrumentation).
         with patch("src.main.datetime") as dt:
             dt.now.return_value = IN_HOURS_UTC
             threads = [threading.Thread(target=_worker) for _ in range(4)]

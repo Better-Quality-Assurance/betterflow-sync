@@ -261,3 +261,47 @@ class TestMachineUuidIsIsolatedByConftest:
             "conftest fixture is not redirecting module-level user_config_dir"
         )
         assert machine_id_file.read_text().strip() == result
+
+
+class TestCallDetectionCreditCap:
+    """max_credit_minutes: the ceiling on per-call AFK credit (billing-adjacent,
+    so server values are clamped and the whole block stays deferral-gated)."""
+
+    def test_default_is_240_minutes(self):
+        from src.config import Config
+        assert Config().call_detection.max_credit_minutes == 240
+
+    def test_deferred_on_first_delivery(self):
+        # call_detection is a capture/billing block: gated behind
+        # DEFER_UNAPPLIED_SERVER_SETTINGS like the rest of it.
+        from src.config import Config
+        cfg = Config()
+        cfg.update_from_server({"call_detection": {"max_credit_minutes": 5}})
+        assert cfg.call_detection.max_credit_minutes == 240
+
+    def test_server_value_clamped_when_rolled_out(self, monkeypatch):
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+
+        cfg.update_from_server({"call_detection": {"max_credit_minutes": 100000}})
+        assert cfg.call_detection.max_credit_minutes == 480, "cap must never exceed 8h"
+
+        cfg.update_from_server({"call_detection": {"max_credit_minutes": 0}})
+        assert cfg.call_detection.max_credit_minutes == 1, "cap floor is 1 minute"
+
+        cfg.update_from_server({"call_detection": {"max_credit_minutes": 90}})
+        assert cfg.call_detection.max_credit_minutes == 90
+
+        cfg.update_from_server({"call_detection": {"max_credit_minutes": "nope"}})
+        assert cfg.call_detection.max_credit_minutes == 90, "invalid value ignored"
+
+    def test_min_call_duration_clamped_when_rolled_out(self, monkeypatch):
+        # A huge server value would suppress every call/mic EVENT while
+        # short-session AFK credit still flows — credited time with no
+        # auditable span. Clamped to 10 minutes.
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+        cfg.update_from_server({"call_detection": {"min_call_duration": 999999}})
+        assert cfg.call_detection.min_call_duration == 600

@@ -8,9 +8,15 @@ avoid splitting a single call when the user briefly switches apps.
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+
+try:
+    from .engagement_credit import capped_credit
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from sync.engagement_credit import capped_credit
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,16 @@ _BROWSER_PATTERNS: list[tuple[str, Optional[re.Pattern], str]] = [
 # Default grace period: if user switches away for less than this many
 # seconds, treat it as still in the same call.
 _DEFAULT_GRACE_PERIOD = 30.0
+
+# AFK credit requires FRESH evidence: the last confirming window event's end
+# must be within this many seconds of `now`, or credit freezes at that end. A
+# healthy window watcher heartbeats the frontmost window every cycle (the AW
+# range fetch re-returns the growing event), so a live call keeps last_seen
+# tracking `now`; a HUNG watcher stops confirming, and without this bound an
+# open call would keep answering `now` — billing up to the full credit cap of
+# zero-input time on no evidence at all (reviewer finding, round 1). Sized to
+# a few sync cycles so a slow cycle can't flap credit off.
+_EVIDENCE_STALENESS_SECONDS = 180.0
 
 
 # Bare aliases matched on a WORD BOUNDARY rather than as a substring, so they
@@ -129,9 +145,20 @@ class CallDetector:
         self,
         min_duration: int = 30,
         grace_period: float = _DEFAULT_GRACE_PERIOD,
+        max_credit_seconds: float = 14400.0,
     ):
         self._min_duration = min_duration
         self._grace_period = grace_period
+        # Hard ceiling on AFK credit per call (get_last_active_at). A window
+        # title stuck matching a call pattern must not keep the uploaded AFK
+        # stream not-afk indefinitely — credit stops max_credit_seconds after
+        # the call started, even if the "call" never ends.
+        self._max_credit_seconds = float(max_credit_seconds)
+
+        # State is mutated on the sync thread (process_event/flush) but read
+        # from the idle thread (is_in_call) and inside AfkSource.record_sample
+        # (get_last_active_at) — guard every access.
+        self._lock = threading.Lock()
 
         # Active call state
         self._call_app: Optional[str] = None
@@ -140,6 +167,12 @@ class CallDetector:
         self._call_last_seen: Optional[datetime] = None
         # Timestamp when user first left the call app (for grace tracking)
         self._left_at: Optional[datetime] = None
+        # Span of the most recently ENDED call (kept across _reset). AFK credit
+        # (get_last_active_at) stays truthful after a call ends or is flushed:
+        # the user was engaged until that end instant, so credit freezes there
+        # instead of vanishing the moment the state machine resets.
+        self._last_call_start: Optional[datetime] = None
+        self._last_call_end: Optional[datetime] = None
 
     def process_event(
         self,
@@ -157,46 +190,123 @@ class CallDetector:
             matched_name = _match_browser(url)
             call_type = "browser" if matched_name else None
 
-        if self._call_app is None:
-            # IDLE state
-            if matched_name:
-                self._start_call(matched_name, call_type, timestamp)
+        with self._lock:
+            if self._call_app is None:
+                # IDLE state
+                if matched_name:
+                    self._start_call(
+                        matched_name,
+                        call_type,
+                        timestamp,
+                        last_seen=self._event_end(timestamp, duration),
+                    )
+                return None
+
+            # IN_CALL state
+            if matched_name and matched_name == self._call_app:
+                # Same call continues. Track the event's END: the window watcher
+                # heartbeats one growing event per unchanged window (timestamp
+                # fixed, duration growing), so timestamp alone would freeze
+                # last_seen at call start for a single-window meeting — starving
+                # both the snapshot duration and the evidence-freshness bound.
+                # Monotonic: buckets are fed sequentially and only sorted within
+                # themselves, so an older event from a second bucket must not
+                # REWIND last_seen (shrinking the ongoing snapshot and the
+                # staleness/cap math).
+                event_end = self._event_end(timestamp, duration)
+                if self._call_last_seen is None or event_end > self._call_last_seen:
+                    self._call_last_seen = event_end
+                self._left_at = None
+                return None
+
+            if matched_name and matched_name != self._call_app:
+                # Switched to a different call app - end the current call
+                # at the switch timestamp, start a new one
+                ended = self._end_call(end_override=timestamp)
+                self._start_call(
+                    matched_name,
+                    call_type,
+                    timestamp,
+                    last_seen=self._event_end(timestamp, duration),
+                )
+                return ended
+
+            # Non-call event while in a call
+            if self._left_at is None:
+                # First non-call event: start grace timer
+                self._left_at = timestamp
+                return None
+
+            # Check if grace period expired (guard against out-of-order
+            # timestamps). Measured against the non-call event's END, not its
+            # timestamp: a single unchanged non-call window is heartbeated as
+            # ONE growing event (timestamp fixed at _left_at), so a
+            # timestamp-based gap stays 0 forever and the call never ends —
+            # is_in_call() then suppresses the idle pause all afternoon while
+            # the billed stream (correctly) froze at _left_at.
+            gap = max(
+                0.0,
+                (self._event_end(timestamp, duration) - self._left_at).total_seconds(),
+            )
+            if gap >= self._grace_period:
+                # Grace expired: end the call (end time = when user left)
+                return self._end_call()
+
+            # Still within grace period
             return None
-
-        # IN_CALL state
-        if matched_name and matched_name == self._call_app:
-            # Same call continues
-            self._call_last_seen = timestamp
-            self._left_at = None
-            return None
-
-        if matched_name and matched_name != self._call_app:
-            # Switched to a different call app - end the current call
-            # at the switch timestamp, start a new one
-            ended = self._end_call(end_override=timestamp)
-            self._start_call(matched_name, call_type, timestamp)
-            return ended
-
-        # Non-call event while in a call
-        if self._left_at is None:
-            # First non-call event: start grace timer
-            self._left_at = timestamp
-            return None
-
-        # Check if grace period expired (guard against out-of-order timestamps)
-        gap = max(0.0, (timestamp - self._left_at).total_seconds())
-        if gap >= self._grace_period:
-            # Grace expired: end the call (end time = when user left)
-            return self._end_call()
-
-        # Still within grace period
-        return None
 
     def flush(self) -> Optional[CallEvent]:
-        """Force-end any active call. Call at sync boundaries."""
-        if self._call_app is not None:
-            return self._end_call()
-        return None
+        """Force-end any active call — shutdown, AW-outage, and capture
+        boundaries (pause / private time / working-hours suppression)."""
+        with self._lock:
+            if self._call_app is not None:
+                return self._end_call()
+            return None
+
+    def snapshot(self) -> Optional[CallEvent]:
+        """Emit the currently-active call as a CallEvent WITHOUT ending it.
+
+        Uploaded each sync cycle for live server-side visibility: the event id
+        derives from (app, start), so the server upserts one growing row across
+        cycles — mirroring ``ForegroundActivityDetector.snapshot``. The old
+        per-cycle ``flush()`` at the sync boundary instead ENDED the call every
+        cycle, which fragmented one meeting into per-cycle call rows, dropped
+        ``is_in_call()`` to False between cycles (the idle-pause suppression
+        raced and mostly never engaged), and reset the state the AFK activity
+        source needs. None when no call is active or it is still shorter than
+        ``min_duration``.
+        """
+        with self._lock:
+            if self._call_app is None or self._call_start is None:
+                return None
+            end = self._left_at or self._call_last_seen or self._call_start
+            # Clamp the emitted span to the credit cap: an uncapped growing
+            # snapshot from a stuck call title would eventually exceed the
+            # server's max event duration and 4xx-poison the whole batch it
+            # rides in, every cycle. Credit past the cap is zero anyway, so a
+            # longer event has no audit value.
+            duration = min(
+                (end - self._call_start).total_seconds(), self._max_credit_seconds
+            )
+            if duration < self._min_duration:
+                return None
+            return CallEvent(
+                app=self._call_app,
+                start=self._call_start,
+                end=end,
+                duration=round(duration, 2),
+                call_type=self._call_type or "native",
+            )
+
+    @staticmethod
+    def _event_end(timestamp: datetime, duration: float) -> datetime:
+        """End instant of a window event; a missing/negative duration counts
+        as a point event rather than raising or reaching into the past."""
+        try:
+            seconds = max(0.0, float(duration))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        return timestamp + timedelta(seconds=seconds)
 
     def is_in_call(self) -> bool:
         """True while a call/meeting is currently active (incl. grace period).
@@ -205,16 +315,125 @@ class CallDetector:
         in a meeting they're engaged (listening/watching) even with no
         keyboard/mouse input, which would otherwise trip the AFK-only idle
         pause — especially on Windows, which has no in-process input watcher.
+
+        Bounded by the credit cap: once the confirmed span exceeds
+        ``max_credit_seconds`` the billed stream stops crediting, and the
+        LOCAL idle guard must not keep suppressing the pause past that — the
+        tray showing "tracking" while the server bills idle is exactly the
+        local-vs-uploaded disagreement this feature exists to kill.
+
+        Note the local bound is SESSION-anchored (call span vs cap) while the
+        billed credit is INPUT-anchored (``get_last_active_at``): a zero-input
+        auto-joined call can exhaust its billed credit before this returns
+        False. Approximate on purpose — this method has no access to the
+        real-input anchor, and the divergence is bounded by one cap.
         """
-        return self._call_app is not None
+        with self._lock:
+            if self._call_app is None:
+                return False
+            past_cap = (
+                self._call_start is not None
+                and self._call_last_seen is not None
+                and (self._call_last_seen - self._call_start).total_seconds()
+                > self._max_credit_seconds
+            )
+            return not past_cap
+
+    def has_fresh_evidence(self, now: datetime) -> bool:
+        """True when the current call state is backed by RECENT window events.
+
+        Consumed by SyncEngine.is_in_call() next to the state machine's own
+        answer: with AW up but only the window watcher hung mid-call, no event
+        will ever arrive to end the call — the state machine stays IN_CALL
+        forever on evidence nothing confirms, and the local idle guard would
+        stay suppressed indefinitely while the billed stream (already bounded
+        by the staleness rule in get_last_active_at) shows idle. Bounded by
+        the same staleness allowance plus the leave-grace, so a healthy
+        heartbeating watcher never trips it. False when no call is active.
+        """
+        with self._lock:
+            if self._call_app is None:
+                return False
+            ref = self._call_last_seen or self._call_start
+            if self._left_at is not None and (ref is None or self._left_at > ref):
+                ref = self._left_at
+            if ref is None:
+                return False
+            age = (now - ref).total_seconds()
+            return age <= _EVIDENCE_STALENESS_SECONDS + self._grace_period
+
+    def get_last_active_at(
+        self, base_last_input: Optional[datetime], now: datetime
+    ) -> Optional[datetime]:
+        """Most recent call-engaged instant, for ``AfkSource`` to fold into its
+        last-input reconciliation (activity-source contract, same as
+        ``ForegroundActivityDetector.get_last_active_at``).
+
+        While a call is active the user is engaged (listening/watching) even
+        with no keyboard/mouse input, so the *uploaded* AFK stream — which the
+        server bills active-vs-idle from — must stay not-afk. Suppressing only
+        the local idle pause (``is_in_call``) never reached that stream, so a
+        long hands-off meeting still painted Idle on the dashboard (Ecaterina's
+        49-minute huddle, 2026-07-15).
+
+        Credit rules:
+          * None when no call was ever observed — never fabricates activity.
+          * Credit requires FRESH evidence: at most
+            ``_EVIDENCE_STALENESS_SECONDS`` past the last confirming window
+            event's end. A healthy watcher heartbeats the call window every
+            cycle so a live call tracks ``now``; a hung watcher stops
+            confirming and credit freezes instead of running open-ended.
+          * During the leave-grace window, credit stops at the instant the user
+            left the call window (they produced real input to switch anyway).
+          * After a call ends (or is flushed at an AW-outage/shutdown
+            boundary), credit freezes at that call's END — the user was
+            engaged until then, and that stays true forever after.
+          * Capped at ``max_credit_seconds`` past ``base_last_input`` — the
+            real keyboard/mouse anchor AfkSource passes in — NOT past call
+            start, which would let session cycling re-arm the cap (see
+            ``engagement_credit``). AfkSource additionally clamps any answer
+            to ``now``.
+        """
+        with self._lock:
+            if self._call_start is not None:
+                if self._left_at is not None:
+                    engaged_until = self._left_at
+                else:
+                    last_seen = self._call_last_seen or self._call_start
+                    engaged_until = min(
+                        now,
+                        last_seen + timedelta(seconds=_EVIDENCE_STALENESS_SECONDS),
+                    )
+                return capped_credit(
+                    engaged_until,
+                    anchor=base_last_input,
+                    engagement_start=self._call_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
+                )
+            if self._last_call_start is not None and self._last_call_end is not None:
+                return capped_credit(
+                    self._last_call_end,
+                    anchor=base_last_input,
+                    engagement_start=self._last_call_start,
+                    cap_seconds=self._max_credit_seconds,
+                    now=now,
+                )
+            return None
 
     def _start_call(
-        self, name: str, call_type: Optional[str], timestamp: datetime
+        self,
+        name: str,
+        call_type: Optional[str],
+        timestamp: datetime,
+        last_seen: Optional[datetime] = None,
     ) -> None:
         self._call_app = name
         self._call_type = call_type or "native"
         self._call_start = timestamp
-        self._call_last_seen = timestamp
+        # Like the continuation path, last_seen tracks the confirming event's
+        # END (evidence freshness / snapshot growth both key off it).
+        self._call_last_seen = last_seen or timestamp
         self._left_at = None
         logger.info(f"Call started: {name} ({call_type}) at {timestamp.isoformat()}")
 
@@ -232,7 +451,15 @@ class CallDetector:
         end = end_override or (self._left_at if self._left_at else self._call_last_seen)
         if end is None:
             end = self._call_start
-        duration = (end - self._call_start).total_seconds()
+        # Same clamp as snapshot(): the emitted span must never exceed the
+        # credit cap (server max-duration batch-poison protection).
+        duration = min(
+            (end - self._call_start).total_seconds(), self._max_credit_seconds
+        )
+        # Remember the span for AFK credit even when the event itself is
+        # discarded as too short — the engagement was real either way.
+        self._last_call_start = self._call_start
+        self._last_call_end = end
 
         app = self._call_app or "Unknown"
         call_type = self._call_type or "native"

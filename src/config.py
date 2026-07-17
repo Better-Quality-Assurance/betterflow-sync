@@ -373,6 +373,17 @@ class CallDetectionSettings:
 
     enabled: bool = True
     min_call_duration: int = 30  # Seconds; skip accidental opens
+    # Hard ceiling on the AFK credit a single call can inject into the uploaded
+    # AFK stream (a stuck call-matching window title must not keep the stream
+    # not-afk forever). Generous by design: real all-day meetings exist, and the
+    # cap only bites when there is ALSO zero keyboard/mouse input for its whole
+    # length — any real input keeps the stream not-afk on its own.
+    max_credit_minutes: int = 240
+    # Microphone-in-use meeting detection (mic_activity.py): the system-level
+    # signal that catches a meeting even when the call window isn't frontmost
+    # (a background Slack huddle while reading docs). Conferencing-gated and
+    # capped by max_credit_minutes; sessions upload as auditable call events.
+    mic_signal: bool = True
 
 
 @dataclass
@@ -1047,15 +1058,44 @@ class Config:
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid fraud_detection config from server: {e}")
 
+        if "call_detection" in server_config and DEFER_UNAPPLIED_SERVER_SETTINGS:
+            cd = server_config["call_detection"]
+            # Disable-only exemption from the deferral gate: mic_signal=false
+            # is the PRIVACY KILL SWITCH for the mic probe, and a remote
+            # off-switch must work without waiting for the staged rollout (or
+            # an app release). Enabling stays deferred like everything else —
+            # only "off" passes through.
+            if "mic_signal" in cd and not self._to_bool(cd["mic_signal"]):
+                self.call_detection.mic_signal = False
+                logger.info("Server disabled mic_signal (deferral-exempt kill switch)")
+
         if "call_detection" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             cd = server_config["call_detection"]
             if "enabled" in cd:
                 self.call_detection.enabled = self._to_bool(cd["enabled"])
             if "min_call_duration" in cd:
                 try:
-                    self.call_detection.min_call_duration = max(0, int(cd["min_call_duration"]))
+                    # Upper clamp: a huge server value would suppress every
+                    # call/mic EVENT while short-session AFK credit still
+                    # flows — credited time with no auditable span. 10 min is
+                    # far above any sane "skip accidental opens" threshold.
+                    self.call_detection.min_call_duration = min(
+                        max(0, int(cd["min_call_duration"])), 600
+                    )
                 except (TypeError, ValueError):
                     logger.warning("Invalid min_call_duration from server, ignoring")
+            if "max_credit_minutes" in cd:
+                try:
+                    # Bound the farm window: a call injects AFK credit into the
+                    # billed stream, so never let a server value push the cap
+                    # past 8h (nor below 1min) regardless of what it sends.
+                    self.call_detection.max_credit_minutes = min(
+                        max(int(cd["max_credit_minutes"]), 1), 480
+                    )
+                except (TypeError, ValueError):
+                    logger.warning("Invalid call max_credit_minutes from server, ignoring")
+            if "mic_signal" in cd:
+                self.call_detection.mic_signal = self._to_bool(cd["mic_signal"])
 
         if "foreground_activity" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             fa = server_config["foreground_activity"]
