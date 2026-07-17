@@ -247,7 +247,6 @@ class BaseApiClient:
         self._throttle_lock = threading.Lock()
 
     # ---- Global rate-limit backoff -------------------------------------------
-
     # Default backoff when a 429 carries no usable Retry-After header.
     _DEFAULT_THROTTLE_SECONDS = 30.0
     # Cap so a hostile/buggy Retry-After can't park the agent for minutes.

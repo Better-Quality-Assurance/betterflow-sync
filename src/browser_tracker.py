@@ -126,7 +126,6 @@ class BrowserURLTracker:
 # ---------------------------------------------------------------------------
 # macOS implementation
 # ---------------------------------------------------------------------------
-
 # Resolve the frontmost app once, then read the URL from the matching browser.
 # `System Events` gives the frontmost process name; we only script a browser we
 # recognise so we never send Apple Events to unrelated apps.
@@ -237,7 +236,6 @@ def _start_macos_tracker(
 #
 # Everything is fail-closed: missing UIA libs, no permission, or any traversal
 # error returns None. Opt-in via privacy.track_browser_urls, same as macOS.
-
 # Foreground process basenames (lowercased) we treat as Chromium browsers.
 _WINDOWS_BROWSER_PROCS = {
     "chrome.exe",
