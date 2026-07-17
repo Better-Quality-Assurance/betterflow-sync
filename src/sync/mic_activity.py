@@ -1,10 +1,15 @@
 """Microphone-in-use meeting detection.
 
-STATUS: WINDOWS-ONLY. ``create_mic_detector`` returns None on macOS/Linux — the
-macOS signals below (CoreAudio device-level "running somewhere" + a
-process-existence conferencing gate) over-credit idle media playback as active
-work, so macOS mic credit is disabled until per-process CoreAudio taps land.
-The macOS probe/gate are kept for that re-enable. See ``create_mic_detector``.
+STATUS: WINDOWS-ONLY, and mic detection is USAGE-ONLY by policy — the agent
+reads whether the mic is IN USE (a hardware/consent-store flag), never the
+audio itself. ``create_mic_detector`` returns None on macOS/Linux: the macOS
+signals below (CoreAudio device-level "running somewhere" + a process-existence
+conferencing gate) over-credit idle media playback as active work. macOS is NOT
+to be re-enabled via per-process CoreAudio tap APIs — those reach into the audio
+stream, which the usage-only policy forbids (decision 2026-07-17). macOS stays
+on window-title ``CallDetector`` for meeting credit. The macOS probe/gate are
+kept only as usage-only reference. See ``create_mic_detector`` and workspace
+memory macos-mic-credit-overbilling-killswitch.
 
 The window-title path (``CallDetector``) only sees a meeting while the call
 window is FRONTMOST and titled like a call. In real usage the huddle runs in
@@ -388,9 +393,11 @@ class MacosMicProbe:
     DEVICE-level, not input-stream-level. On single-device input+output
     hardware (USB/BT headsets, audio interfaces) playback alone can mark the
     default input device "running" — music through such a headset reads as a
-    hot mic. The conferencing gate, the input-anchored credit cap, and the
-    cap latch bound the resulting over-credit; per-process stream attribution
-    (macOS 14+ tap APIs) is the eventual fix if this shows up in the field.
+    hot mic. This device-level inaccuracy is why macOS mic credit is disabled
+    (``create_mic_detector`` returns None). It is NOT fixed by macOS 14+ tap
+    APIs: those attribute the stream by reaching into the audio itself, which
+    the usage-only policy forbids. This probe is usage-only (a hardware flag,
+    no audio) and kept for reference only.
     """
 
     _SYSTEM_OBJECT = 1  # kAudioObjectSystemObject
@@ -541,9 +548,13 @@ def create_mic_detector(config, hostname: str) -> Optional[MicActivityDetector]:
         # scan (no per-app mic attribution on macOS), which nearly any running
         # browser/Slack process satisfies. Together those bill idle media
         # playback as active work. Windows attributes the mic per app and is
-        # safe. Re-enable macOS via per-process CoreAudio taps (macOS 14+);
-        # MacosMicProbe / _conferencing_process_running are kept for that. See
-        # workspace memory macos-mic-credit-overbilling-killswitch.
+        # safe. Do NOT re-enable macOS via per-process CoreAudio tap APIs
+        # (macOS 14+): taps attribute the mic by reaching into the audio stream,
+        # and mic detection is usage-only by policy (no audio path) — decision
+        # 2026-07-17. macOS meeting credit stays on the window-title
+        # CallDetector. MacosMicProbe / _conferencing_process_running are kept
+        # as usage-only reference. See workspace memory
+        # macos-mic-credit-overbilling-killswitch.
         return None
 
     return MicActivityDetector(
