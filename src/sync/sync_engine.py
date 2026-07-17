@@ -645,14 +645,23 @@ class SyncEngine:
             if ended is not None:
                 stats.calls_detected += 1
 
-    def _stamp_project(self, event: dict) -> dict:
-        """Attach the active project to a detector-built event, exactly as
-        _make_call_bf_event does for window-detected calls — the same meeting
-        must not upsert a projected call row next to an unprojected mic row."""
+    def _current_project_id(self):
+        """The active project's id, or None. The single locked read of
+        _current_project that every event-stamping path shares, so the
+        lock+read rule can't drift between call sites."""
         with self._state_lock:
             project = self._current_project
-        if project:
-            event["project_id"] = project["id"]
+        return project["id"] if project else None
+
+    def _stamp_project(self, event: dict) -> dict:
+        """Attach the active project id to a detector/synth-built event. The one
+        place that writes project_id onto an event dict, so call, mic, window,
+        status-span and synthetic-AFK rows can't drift in how they are tagged
+        (the same meeting must never upsert a projected row next to an
+        unprojected one)."""
+        pid = self._current_project_id()
+        if pid is not None:
+            event["project_id"] = pid
         return event
 
     def _enqueue_events_best_effort(self, events: list, context: str) -> None:
@@ -2307,10 +2316,7 @@ class SyncEngine:
         }
 
         # Tag with current project if set
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            result["project_id"] = project["id"]
+        result = self._stamp_project(result)
 
         # Add activity classification + counted time for window events
         # (fraud assessment is batched per cycle in _transform_and_checkpoint)
@@ -2611,10 +2617,7 @@ class SyncEngine:
             "bucket_type": bucket_type,
             "data": {"status": kind},
         }
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            event["project_id"] = project["id"]
+        event = self._stamp_project(event)
         # bf.send_events() returns SyncResult(success=False) on network errors —
         # it does NOT raise BetterFlowClientError — so the previous `except`
         # block was unreachable and break/idle/private events were silently
@@ -2696,11 +2699,7 @@ class SyncEngine:
                 "status": status,
             },
         }
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            result["project_id"] = project["id"]
-        return result
+        return self._stamp_project(result)
 
     def _synthesize_active_afk_event(
         self, latest_afk, afk_bucket_id: str, now: Optional[datetime] = None
@@ -2761,11 +2760,7 @@ class SyncEngine:
             "bucket_type": BUCKET_TYPE_AFK,
             "data": {"status": "not-afk", "synthetic": True},
         }
-        with self._state_lock:
-            project = self._current_project
-        if project:
-            result["project_id"] = project["id"]
-        return result
+        return self._stamp_project(result)
 
     @staticmethod
     def _get_system_idle_seconds() -> Optional[float]:
@@ -2875,11 +2870,9 @@ class SyncEngine:
             # the unobserved window uncovered, exactly as before) and re-seed
             # past it. Emitted one-shot: the queue is the durability layer, and
             # the checkpoint is reset to `now` so nothing is rebuilt.
-            with self._state_lock:
-                project = self._current_project
             salvaged = self.afk_source.build_afk_events(
                 cp, self.afk_source.finalize_point(now),
-                project_id=project["id"] if project else None,
+                project_id=self._current_project_id(),
                 cover_unsampled=False,
             )
             logger.info(
@@ -2917,11 +2910,9 @@ class SyncEngine:
         finalize_to = self.afk_source.finalize_point(now)
         if finalize_to <= cp:
             return []
-        with self._state_lock:
-            project = self._current_project
         events = self.afk_source.build_afk_events(
             cp, finalize_to,
-            project_id=project["id"] if project else None,
+            project_id=self._current_project_id(),
         )
         # Defer the checkpoint advance to _commit_inproc_afk_checkpoint (finding B).
         self._afk_inproc_pending = finalize_to
