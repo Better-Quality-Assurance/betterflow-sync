@@ -484,10 +484,13 @@ def _normalize_hhmm(value) -> str:
 # ever (the whole fleet has run on local defaults), this gate now covers EVERY block that
 # changes capture / billing / privacy behaviour, so this first delivery is behaviour-neutral
 # except for the working-hours schedule: privacy, collection, engagement, fraud_detection,
-# call_detection, foreground_activity, and sync.in_process_input are all deferred. Only
-# working_hours (the feature) and benign sync tuning (interval, batch_size, idle_pause,
-# min_window_event_seconds, in_process_window) go live. Roll the rest out deliberately, one
-# block at a time, after confirming the device rows and telling the affected people.
+# call_detection, and foreground_activity are all deferred. Only working_hours (the
+# feature), benign sync tuning (interval, batch_size, idle_pause,
+# min_window_event_seconds, in_process_window), and sync.in_process_input (un-deferred
+# 2026-07-17: it is the shipped remediation for Windows' zero-input fraud false
+# positives, stays opt-in per device, and counts carry no content — see its handler)
+# go live. Roll the rest out deliberately, one block at a time, after confirming the
+# device rows and telling the affected people.
 #
 # working_hours is deliberately NOT gated by this: it is the whole point of the release.
 DEFER_UNAPPLIED_SERVER_SETTINGS = True
@@ -984,13 +987,26 @@ class Config:
                 logger.info(
                     "Server config: in_process_window=%s", self.sync.in_process_window
                 )
-            if "in_process_input" in sync and not DEFER_UNAPPLIED_SERVER_SETTINGS:
+            if "in_process_input" in sync:
                 # Opt-in remote enable of the in-process input source (ships
-                # dormant). Deferred with the other capture/billing flags: a stale
-                # device row must not silently activate input capture on the
-                # first-ever config delivery. Use _to_bool (not bool()) like every
-                # sibling flag: a server payload of the STRING "false"/"0" must
-                # stay off — bool("false") is True and would silently enable it.
+                # dormant). UN-DEFERRED deliberately (2026-07-17): Windows
+                # devices have NO working external input watcher (the bundle
+                # launches only window+idle trackers, and where aw-watcher-input
+                # does run its low-level hook gets blocked by UIPI/AV), so every
+                # Windows agent reports zero keystrokes/clicks all month and the
+                # fraud engine flags every worked day as suspicious (Sachi 23,
+                # Claudia 26 false suspicious days, Fraud Risk 95). This flag IS
+                # the shipped remediation, and it stays opt-in per device: the
+                # server must still send in_process_input=true explicitly, so
+                # the deliberate one-device-at-a-time rollout is preserved — the
+                # deferral gate only made the remediation unreachable. The
+                # original deferral concern (a stale device row silently
+                # activating input capture) is acceptable here: input COUNTS
+                # (presses/clicks/scrolls per window) carry no content, unlike
+                # the still-deferred privacy/title flags. Use _to_bool (not
+                # bool()) like every sibling flag: a server payload of the
+                # STRING "false"/"0" must stay off — bool("false") is True and
+                # would silently enable it.
                 self.sync.in_process_input = self._to_bool(sync["in_process_input"])
                 logger.info(
                     "Server config: in_process_input=%s", self.sync.in_process_input
