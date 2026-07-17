@@ -1,5 +1,11 @@
 """Microphone-in-use meeting detection.
 
+STATUS: WINDOWS-ONLY. ``create_mic_detector`` returns None on macOS/Linux — the
+macOS signals below (CoreAudio device-level "running somewhere" + a
+process-existence conferencing gate) over-credit idle media playback as active
+work, so macOS mic credit is disabled until per-process CoreAudio taps land.
+The macOS probe/gate are kept for that re-enable. See ``create_mic_detector``.
+
 The window-title path (``CallDetector``) only sees a meeting while the call
 window is FRONTMOST and titled like a call. In real usage the huddle runs in
 the background — the user reads docs, or just listens with some other window
