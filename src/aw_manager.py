@@ -658,19 +658,13 @@ class AWManager:
     def _report_download_failure(self) -> None:
         """Notify the user and the ops ingest that tracker components could not
         be installed (so tracking is unavailable). Runs off _lifecycle_lock;
-        throttling is done by _dispatch_download_failure_report."""
-        try:
-            try:
-                from .notifications import send_notification
-            except ImportError:
-                from notifications import send_notification
-            send_notification(
-                "BetterFlow tracking unavailable",
-                "Tracker components could not be installed, so activity is not "
-                "being recorded. Please contact support.",
-            )
-        except Exception:
-            logger.warning("Failed to notify about tracker download failure", exc_info=True)
+        throttling is done by _dispatch_download_failure_report.
+
+        Ops ingest FIRST, user toast last: this failure happens during startup,
+        and the macOS notification path (NSUserNotificationCenter) is documented
+        in main.py to deadlock when driven off the main thread before the Cocoa
+        run loop is up. If it hangs, the ops signal must already be away.
+        """
         reporter = self.error_reporter
         if reporter is not None:
             try:
@@ -683,6 +677,18 @@ class AWManager:
                 )
             except Exception:
                 logger.warning("Failed to report tracker download failure", exc_info=True)
+        try:
+            try:
+                from .notifications import send_notification
+            except ImportError:
+                from notifications import send_notification
+            send_notification(
+                "BetterFlow tracking unavailable",
+                "Tracker components could not be installed, so activity is not "
+                "being recorded. Please contact support.",
+            )
+        except Exception:
+            logger.warning("Failed to notify about tracker download failure", exc_info=True)
 
     def _start_locked(self) -> bool:
         # Every route back to a running tracker funnels through here, so this one
