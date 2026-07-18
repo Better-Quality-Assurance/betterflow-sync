@@ -66,11 +66,11 @@ class UpdateHandler:
         try:
             self.coordinator.flush_idle_event()
         except Exception:
-            pass
+            logger.warning("flush_idle_event() during update exit failed", exc_info=True)
         try:
             self.coordinator.sync_engine.shutdown()
         except Exception:
-            pass
+            logger.warning("sync_engine.shutdown() during update exit failed", exc_info=True)
         self.coordinator.stop()
         # Terminate the bundled trackers BEFORE the updater's hard os._exit(0).
         # coordinator.stop() only stops the scheduler; without this the
