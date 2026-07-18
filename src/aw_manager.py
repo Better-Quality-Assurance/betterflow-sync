@@ -991,6 +991,9 @@ class AWManager:
             window_blind = self._window_tracker_blind
             inproc = self._inproc_afk_active
             managed_unavailable = self._managed_components_unavailable
+            # Written under this same lock in _start_locked, so read under it too
+            # instead of racing a concurrent start/restart.
+            download_failed = self.tracker_download_failed
 
         window_age = self._get_latest_window_event_age()
         # When the agent owns the AFK stream in-process, the external
@@ -1019,7 +1022,7 @@ class AWManager:
             # True => the tracker binaries could not be installed (fail-closed
             # integrity check or a bad archive), so this device is capturing
             # NOTHING even though the agent looks alive.
-            "tracker_download_failed": self.tracker_download_failed,
+            "tracker_download_failed": download_failed,
             # True => we have no managed watchers of our own. Capture may still
             # be flowing via an external server on the port, but nothing here can
             # restart or self-heal it, so an outage will not recover on its own.
