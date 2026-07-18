@@ -9,8 +9,10 @@ import requests
 
 try:
     from .sync.http_client import resolve_ca_bundle
+    from .url_safety import assert_safe_final_url
 except ImportError:  # PyInstaller bundle (src/ is import root)
     from sync.http_client import resolve_ca_bundle
+    from url_safety import assert_safe_final_url
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +141,10 @@ def check_for_update(
                     timeout=10,
                     verify=resolve_ca_bundle(),
                 )
+                # requests follows redirects transparently; this response is what
+                # produces the download_url the updater's allowlist later guards,
+                # so re-check the host we actually landed on before trusting it.
+                assert_safe_final_url(resp.url, "Update check")
                 if resp.status_code != 200:
                     logger.debug(f"Update check: GitHub API returned {resp.status_code}")
                     return
@@ -156,6 +162,7 @@ def check_for_update(
                     timeout=10,
                     verify=resolve_ca_bundle(),
                 )
+                assert_safe_final_url(resp.url, "Update check")
                 if resp.status_code != 200:
                     logger.debug(f"Update check: GitHub API returned {resp.status_code}")
                     return
@@ -206,6 +213,11 @@ def check_for_update(
             if callback:
                 callback(latest_tag.lstrip("v"), html_url, asset_url)
 
+        except ValueError as e:
+            # The only ValueError that reaches here is the off-allowlist redirect
+            # guard (json/version parsing is caught locally), so log it loudly
+            # rather than burying a hijacked update check at debug level.
+            logger.warning(f"Update check aborted: {e}")
         except Exception as e:
             logger.debug(f"Update check failed: {e}")
 

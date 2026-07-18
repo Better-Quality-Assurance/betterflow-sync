@@ -235,9 +235,9 @@ def _download_aw_binaries(install_dir: str) -> bool:
     url = f"{RELEASE_BASE}/{asset}"
     # Defense-in-depth: only ever fetch tracker binaries over HTTPS from GitHub.
     try:
-        from .url_safety import is_safe_fetch_url
+        from .url_safety import assert_safe_final_url, is_safe_fetch_url
     except ImportError:
-        from url_safety import is_safe_fetch_url
+        from url_safety import assert_safe_final_url, is_safe_fetch_url
     if not is_safe_fetch_url(url):
         logger.error(f"Refusing unsafe tracker download URL (must be HTTPS from GitHub): {url}")
         return False
@@ -254,11 +254,7 @@ def _download_aw_binaries(install_dir: str) -> bool:
             # only covers the FIRST hop. GitHub legitimately redirects assets to
             # objects.githubusercontent.com; anywhere else means the download was
             # steered off-allowlist, so abort before reading/writing the body.
-            final_url = response.geturl()
-            if not is_safe_fetch_url(final_url):
-                raise ValueError(
-                    f"Tracker download redirected to a disallowed host: {final_url}"
-                )
+            assert_safe_final_url(response.geturl(), "Tracker download")
             try:
                 total = int(response.headers.get("Content-Length") or 0)
             except (ValueError, TypeError):

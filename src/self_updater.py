@@ -184,9 +184,9 @@ def _download_to_file(
     # own fix. resolve_ca_bundle() returns None only when no bundle exists, in
     # which case verify=None falls back to the requests default (logged loudly).
     try:
-        from .url_safety import is_safe_fetch_url
+        from .url_safety import assert_safe_final_url
     except ImportError:
-        from url_safety import is_safe_fetch_url
+        from url_safety import assert_safe_final_url
 
     with requests.get(
         download_url, stream=True, timeout=120, verify=resolve_ca_bundle()
@@ -196,8 +196,7 @@ def _download_to_file(
         # only gated the first hop. Re-validate the URL we actually landed on
         # (GitHub redirects assets to objects.githubusercontent.com) before
         # reading a byte of the body.
-        if not is_safe_fetch_url(resp.url):
-            raise ValueError("Download redirected to a disallowed host")
+        assert_safe_final_url(resp.url, "Update download")
         try:
             # `or 0` guards an empty-string header; the except guards garbage.
             total = int(resp.headers.get("content-length", 0) or 0)
