@@ -108,6 +108,10 @@ WINDOW_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
 # CONSECUTIVE healthy health-checks (~30s each) before trusting recovery and
 # unlatching, so a flapping source stays backed off instead of churning per flap.
 WINDOW_BLIND_CLEAR_HEALTHY_CYCLES = 3
+# Min gap between "tracker components could not be installed" notifications /
+# error reports. start() is retried from the health-check tick, so without this
+# a fail-closed download would toast the user every cycle.
+DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
 
 
 def _get_platform_key() -> str:
@@ -462,6 +466,16 @@ class AWManager:
         # bf-idle-tracker bucket is ignored — don't restart it or raise blind
         # alerts about a tracker we no longer consume.
         self._inproc_afk_active: bool = False
+        # Optional ops-ingest reporter, assigned by the app after construction
+        # (same pattern as sync_engine.error_reporter). A tracker download that
+        # fails closed means ZERO capture, so it must not be log-only.
+        self.error_reporter = None
+        # Set when the tracker bootstrap could not install binaries. Read by the
+        # health telemetry so a silently-idle agent is distinguishable from a
+        # healthy one that simply has nothing to report.
+        self.tracker_download_failed: bool = False
+        # monotonic timestamp of the last download-failure notify/report.
+        self._last_download_failure_report: float = float("-inf")
 
     @property
     def idle_tracker_blind(self) -> bool:
@@ -627,6 +641,53 @@ class AWManager:
         with self._lifecycle_lock:
             return self._start_locked()
 
+    def _dispatch_download_failure_report(self) -> None:
+        """Throttle-check, then hand the notify/report off to a daemon thread.
+
+        The caller holds _lifecycle_lock, and the notification path shells out
+        (osascript/notify-send) — blocking there would stall `is_managing` and
+        set_capture_suppressed, i.e. the watchdog and sync loop, for seconds on
+        a hung helper. Only the cheap throttle bookkeeping stays under the lock.
+        """
+        now = time.monotonic()
+        if now - self._last_download_failure_report < DOWNLOAD_FAILURE_REPORT_INTERVAL:
+            return
+        self._last_download_failure_report = now
+        threading.Thread(
+            target=self._report_download_failure,
+            name="aw-download-failure-report",
+            daemon=True,
+        ).start()
+
+    def _report_download_failure(self) -> None:
+        """Notify the user and the ops ingest that tracker components could not
+        be installed (so tracking is unavailable). Runs off _lifecycle_lock;
+        throttling is done by _dispatch_download_failure_report."""
+        try:
+            try:
+                from .notifications import send_notification
+            except ImportError:
+                from notifications import send_notification
+            send_notification(
+                "BetterFlow tracking unavailable",
+                "Tracker components could not be installed, so activity is not "
+                "being recorded. Please contact support.",
+            )
+        except Exception:
+            logger.warning("Failed to notify about tracker download failure", exc_info=True)
+        reporter = self.error_reporter
+        if reporter is not None:
+            try:
+                reporter.capture(
+                    "Tracker component download failed — capture unavailable",
+                    level="error",
+                    tags={"component": "aw_manager", "platform": _get_platform_key()},
+                    context={"aw_version": AW_VERSION},
+                    fingerprint="aw_manager:tracker_download_failed",
+                )
+            except Exception:
+                logger.warning("Failed to report tracker download failure", exc_info=True)
+
     def _start_locked(self) -> bool:
         # Every route back to a running tracker funnels through here, so this one
         # guard is enough to keep start()/restart_if_needed()/force_restart() from
@@ -639,15 +700,41 @@ class AWManager:
 
         binaries_dir = self._get_binaries_dir()
 
+        if binaries_dir:
+            # Clear the latch on EVERY route that resolves usable binaries, not
+            # just a fresh download — the frozen-bundle path installs trackers
+            # without downloading, so a device that recovered via an app update
+            # would otherwise keep reporting tracker_download_failed forever and
+            # train the ops ingest to ignore the signal.
+            self.tracker_download_failed = False
+
         # Auto-download if binaries not found
         if not binaries_dir:
             logger.info("Tracker components not found, downloading...")
             install_dir = _get_install_dir()
             if _download_aw_binaries(install_dir):
                 binaries_dir = install_dir
+                self.tracker_download_failed = False
             else:
                 logger.error("Failed to download tracker components")
-                return server_already_running
+                if server_already_running:
+                    # An external server is already capturing on this port, so
+                    # this is NOT a "capturing nothing" situation — only our
+                    # managed watchers are unavailable. Log it; don't latch the
+                    # flag or alarm the user, and keep reporting success.
+                    logger.warning(
+                        "Managed tracker components unavailable, but an external "
+                        "server is running on port %s — attaching to it",
+                        self.aw_port,
+                    )
+                    self._using_external = True
+                    return True
+                # Fail-closed download (bad/absent pinned SHA, missing binaries)
+                # means the agent keeps running while capturing NOTHING. Surface
+                # it instead of leaving a lone log line on the user's machine.
+                self.tracker_download_failed = True
+                self._dispatch_download_failure_report()
+                return False
 
         if server_already_running:
             logger.info(
@@ -888,6 +975,10 @@ class AWManager:
             # sub-second precision is irrelevant for a staleness signal.
             "afk_event_age_seconds": int(afk_age) if afk_age is not None else None,
             "window_event_age_seconds": int(window_age) if window_age is not None else None,
+            # True => the tracker binaries could not be installed (fail-closed
+            # integrity check or a bad archive), so this device is capturing
+            # NOTHING even though the agent looks alive.
+            "tracker_download_failed": self.tracker_download_failed,
         }
 
     def restart_if_needed(self) -> bool:
