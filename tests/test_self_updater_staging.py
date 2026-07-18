@@ -126,10 +126,13 @@ class TestDownloadSizeCap:
     """The download must refuse oversized bodies so a poisoned/misconfigured
     response can't fill the disk (installers are ~60-80 MB; cap is 500 MB)."""
 
-    def _fake_get(self, content_length, chunks):
+    def _fake_get(self, content_length, chunks, final_url="https://github.com/x/ok.bin"):
         from unittest.mock import MagicMock
 
         resp = MagicMock()
+        # The post-redirect URL is re-checked against the host allowlist, so it
+        # has to be a real allowlisted string (a bare MagicMock is not a str).
+        resp.url = final_url
         resp.headers = {"content-length": str(content_length)}
         resp.raise_for_status.return_value = None
         resp.iter_content.return_value = iter(chunks)
@@ -163,6 +166,17 @@ class TestDownloadSizeCap:
         with patch("src.self_updater.requests.get", return_value=ctx):
             su._download_to_file("https://github.com/x/ok.bin", dest)
         assert dest.read_bytes() == b"payload"
+
+    def test_rejects_redirect_off_the_allowlist(self, tmp_path):
+        # requests follows 3xx transparently, so the caller's host gate only
+        # covered the first hop. A redirect landing off-GitHub must abort before
+        # a byte of the body is written.
+        dest = tmp_path / "evil.bin"
+        ctx = self._fake_get(7, [b"payload"], final_url="https://evil.example.com/a.bin")
+        with patch("src.self_updater.requests.get", return_value=ctx):
+            with pytest.raises(ValueError):
+                su._download_to_file("https://github.com/x/ok.bin", dest)
+        assert not dest.exists()
 
 
 class TestArtifactFilename:
