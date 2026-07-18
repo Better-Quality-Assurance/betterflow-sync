@@ -233,6 +233,15 @@ def _download_aw_binaries(install_dir: str) -> bool:
         _MAX_AW_DOWNLOAD_BYTES = 500 * 1024 * 1024
         req = urllib.request.Request(url, headers={"User-Agent": "BetterFlow-Sync"})
         with urllib.request.urlopen(req, timeout=120) as response:
+            # urlopen follows 3xx transparently, so the allowlist check above
+            # only covers the FIRST hop. GitHub legitimately redirects assets to
+            # objects.githubusercontent.com; anywhere else means the download was
+            # steered off-allowlist, so abort before reading/writing the body.
+            final_url = response.geturl()
+            if not is_safe_fetch_url(final_url):
+                raise ValueError(
+                    f"Tracker download redirected to a disallowed host: {final_url}"
+                )
             try:
                 total = int(response.headers.get("Content-Length") or 0)
             except (ValueError, TypeError):
