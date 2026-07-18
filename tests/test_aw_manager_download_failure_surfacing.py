@@ -19,12 +19,14 @@ def _join_report_threads():
             thread.join(timeout=5)
 
 
-def _failing_manager(monkeypatch, *, port_in_use=False):
+def _failing_manager(monkeypatch, *, port_in_use=False, download=None):
     mgr = AWManager(aw_port=5600)
     mgr.error_reporter = Mock()
     monkeypatch.setattr(mgr, "_get_binaries_dir", lambda: None)
     monkeypatch.setattr(mgr, "_port_in_use", lambda: port_in_use)
-    monkeypatch.setattr("src.aw_manager._download_aw_binaries", lambda _dir: False)
+    monkeypatch.setattr(
+        "src.aw_manager._download_aw_binaries", download or (lambda _dir: False)
+    )
     notify = Mock()
     monkeypatch.setattr("src.notifications.send_notification", notify)
     return mgr, notify
@@ -97,3 +99,47 @@ def test_flag_clears_when_binaries_resolve_without_download(monkeypatch, tmp_pat
 
     assert mgr.start() is True
     assert mgr.tracker_download_failed is False
+
+
+def test_download_itself_is_backed_off_across_ticks(monkeypatch):
+    """The ~60s capture-policy tick re-enters _start_locked; without a backoff on
+    the DOWNLOAD (not just its notification) every tick re-pulls a 115-207 MB
+    archive forever."""
+    download = Mock(return_value=False)
+    mgr, _notify = _failing_manager(monkeypatch, download=download)
+
+    for _ in range(5):
+        assert mgr.start() is False
+    _join_report_threads()
+
+    assert download.call_count == 1, "retries inside the backoff window must not refetch"
+
+    # Backoff escalates, so honouring only the initial 5 min is not enough.
+    assert mgr._download_retry_interval > 300
+
+
+def test_backoff_expiry_allows_a_retry(monkeypatch):
+    download = Mock(return_value=False)
+    mgr, _notify = _failing_manager(monkeypatch, download=download)
+
+    mgr.start()
+    mgr._last_download_attempt -= mgr._download_retry_interval + 1
+    mgr.start()
+    _join_report_threads()
+
+    assert download.call_count == 2
+
+
+def test_external_attach_is_flagged_as_unmanaged(monkeypatch):
+    """Attaching to an external server returns True, but nothing here can
+    restart it — the backend needs to see that this device cannot self-heal."""
+    mgr, _notify = _failing_manager(monkeypatch, port_in_use=True)
+    monkeypatch.setattr(mgr, "_get_latest_afk_event_age", lambda: None)
+    monkeypatch.setattr(mgr, "_get_latest_window_event_age", lambda: None)
+
+    assert mgr.start() is True
+    _join_report_threads()
+
+    snapshot = mgr.health_snapshot()
+    assert snapshot["managed_components_unavailable"] is True
+    assert snapshot["tracker_download_failed"] is False

@@ -112,6 +112,12 @@ WINDOW_BLIND_CLEAR_HEALTHY_CYCLES = 3
 # error reports. start() is retried from the health-check tick, so without this
 # a fail-closed download would toast the user every cycle.
 DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
+# Backoff for the DOWNLOAD ITSELF (not just its notification). _start_locked is
+# re-entered from the ~60s capture-policy tick, and every re-entry with no
+# binaries on disk re-fetches a 115-207 MB archive. Without this a device that
+# can never install trackers would pull that archive once a minute forever.
+DOWNLOAD_RETRY_MIN_INTERVAL = 300  # 5 minutes
+DOWNLOAD_RETRY_MAX_INTERVAL = 3600  # 1 hour
 
 
 def _get_platform_key() -> str:
@@ -472,6 +478,15 @@ class AWManager:
         self.tracker_download_failed: bool = False
         # monotonic timestamp of the last download-failure notify/report.
         self._last_download_failure_report: float = float("-inf")
+        # monotonic timestamp of the last tracker-archive download ATTEMPT, plus
+        # the current (exponentially backed off) gap required before retrying.
+        self._last_download_attempt: float = float("-inf")
+        self._download_retry_interval: float = DOWNLOAD_RETRY_MIN_INTERVAL
+        # True while we have no managed watchers of our own (download failed).
+        # Distinct from tracker_download_failed: with an external server on the
+        # port we still capture, but restart_if_needed/force_restart manage
+        # nothing, so the backend should know this device is un-self-healing.
+        self._managed_components_unavailable: bool = False
 
     @property
     def idle_tracker_blind(self) -> bool:
@@ -709,16 +724,39 @@ class AWManager:
             # would otherwise keep reporting tracker_download_failed forever and
             # train the ops ingest to ignore the signal.
             self.tracker_download_failed = False
+            self._managed_components_unavailable = False
 
         # Auto-download if binaries not found
         if not binaries_dir:
+            now = time.monotonic()
+            since_last = now - self._last_download_attempt
+            if since_last < self._download_retry_interval:
+                # Backed off. Report the same outcome the last real attempt did:
+                # an attached external server still captures, nothing else does.
+                logger.debug(
+                    "Skipping tracker download retry (%.0fs since last attempt, "
+                    "backoff %.0fs)",
+                    since_last,
+                    self._download_retry_interval,
+                )
+                self._managed_components_unavailable = True
+                return server_already_running
+            self._last_download_attempt = now
             logger.info("Tracker components not found, downloading...")
             install_dir = _get_install_dir()
             if _download_aw_binaries(install_dir):
                 binaries_dir = install_dir
                 self.tracker_download_failed = False
+                self._managed_components_unavailable = False
+                self._download_retry_interval = DOWNLOAD_RETRY_MIN_INTERVAL
             else:
                 logger.error("Failed to download tracker components")
+                # Escalate 5 min -> 1 h so a permanently-failing device stops
+                # re-pulling a multi-hundred-MB archive on every policy tick.
+                self._download_retry_interval = min(
+                    self._download_retry_interval * 2, DOWNLOAD_RETRY_MAX_INTERVAL
+                )
+                self._managed_components_unavailable = True
                 if server_already_running:
                     # An external server is already capturing on this port, so
                     # this is NOT a "capturing nothing" situation — only our
@@ -952,6 +990,7 @@ class AWManager:
             blind = self._idle_tracker_blind
             window_blind = self._window_tracker_blind
             inproc = self._inproc_afk_active
+            managed_unavailable = self._managed_components_unavailable
 
         window_age = self._get_latest_window_event_age()
         # When the agent owns the AFK stream in-process, the external
@@ -981,6 +1020,10 @@ class AWManager:
             # integrity check or a bad archive), so this device is capturing
             # NOTHING even though the agent looks alive.
             "tracker_download_failed": self.tracker_download_failed,
+            # True => we have no managed watchers of our own. Capture may still
+            # be flowing via an external server on the port, but nothing here can
+            # restart or self-heal it, so an outage will not recover on its own.
+            "managed_components_unavailable": managed_unavailable,
         }
 
     def restart_if_needed(self) -> bool:
