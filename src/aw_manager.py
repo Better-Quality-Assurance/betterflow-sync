@@ -1,5 +1,6 @@
 """Manage bundled tracker processes (ActivityWatch components, white-labeled)."""
 
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,18 @@ RELEASE_ASSETS = {
     "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
     "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
     "linux": f"activitywatch-{AW_VERSION}-linux-x86_64.zip",
+}
+
+# SHA-256 of the vetted RELEASE_ASSETS archives above. GitHub release assets on
+# a pinned tag are mutable by the upstream account, so the version pin alone is
+# not an integrity guarantee — a compromised ActivityWatch account could swap
+# the binaries under the same tag. The download is verified against these
+# hashes before extraction (fail closed on mismatch). MUST be recomputed on
+# every AW_VERSION bump (shasum -a 256 on the freshly-vetted zips).
+RELEASE_SHA256 = {
+    "darwin": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",
+    "windows": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
+    "linux": "8f62b10babf8a8f108cbdf7267c02fbc1ce2a970fa9535f230b3416b803e3360",
 }
 
 # Mapping from original AW names to our branded names (used during download/extract)
@@ -261,7 +274,27 @@ def _download_aw_binaries(install_dir: str) -> bool:
                         )
 
         size_mb = os.path.getsize(tmp_zip) / (1024 * 1024)
-        logger.info(f"Downloaded {size_mb:.1f} MB, extracting binaries...")
+
+        # Integrity check: the tag is pinned but GitHub release assets are
+        # mutable by the upstream account, so verify the archive against the
+        # vetted hash before extracting (and before any chmod/quarantine-strip).
+        expected_sha = RELEASE_SHA256.get(plat)
+        if not expected_sha:
+            logger.error(f"No pinned SHA-256 for platform {plat}; refusing to install trackers")
+            return False
+        hasher = hashlib.sha256()
+        with open(tmp_zip, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        actual_sha = hasher.hexdigest()
+        if actual_sha != expected_sha:
+            logger.error(
+                f"Tracker archive SHA-256 mismatch for {asset}: "
+                f"expected {expected_sha}, got {actual_sha} — refusing to install"
+            )
+            return False
+
+        logger.info(f"Downloaded {size_mb:.1f} MB (SHA-256 verified), extracting binaries...")
 
         ext = ".exe" if plat == "windows" else ""
         # Find full paths to component launchers in the archive.
