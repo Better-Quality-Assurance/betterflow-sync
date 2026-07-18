@@ -263,7 +263,13 @@ class UpdateHandler:
                 if _version_tuple(staged) >= _version_tuple(target_version):
                     return
             except (ValueError, TypeError):
-                pass
+                # Unparseable version: fall through and re-stage, but say so —
+                # otherwise the repeated downloads have no explanation in logs.
+                logger.warning(
+                    "Unparseable staged version %r vs target %r; re-staging",
+                    staged,
+                    target_version,
+                )
 
         now = time.monotonic()
         with self._update_jobs_lock:
