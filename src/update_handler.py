@@ -71,7 +71,14 @@ class UpdateHandler:
             self.coordinator.sync_engine.shutdown()
         except Exception:
             logger.warning("sync_engine.shutdown() during update exit failed", exc_info=True)
-        self.coordinator.stop()
+        # Guarded: coordinator.stop() shuts the scheduler down, and APScheduler
+        # can raise there (racy `if scheduler.running` check). An exception must
+        # not skip the aw_manager.stop() below — that's the tracker-orphaning
+        # regression described next.
+        try:
+            self.coordinator.stop()
+        except Exception:
+            logger.warning("coordinator.stop() during update exit failed", exc_info=True)
         # Terminate the bundled trackers BEFORE the updater's hard os._exit(0).
         # coordinator.stop() only stops the scheduler; without this the
         # self-update relaunch left bf-idle-tracker orphaned, so the new
