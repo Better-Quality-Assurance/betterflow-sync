@@ -97,13 +97,14 @@ class QueuedEvent:
         """Create from database row. Returns None if the row is corrupt."""
         try:
             event_data = json.loads(row[1])
-        except (json.JSONDecodeError, TypeError):
+            created_at = datetime.fromisoformat(row[2])
+        except (json.JSONDecodeError, TypeError, ValueError):
             logger.error(f"[queue] Corrupt event row id={row[0]}, discarding")
             return None
         return cls(
             id=row[0],
             event_data=event_data,
-            created_at=datetime.fromisoformat(row[2]),
+            created_at=created_at,
             retry_count=row[3],
         )
 
