@@ -9,6 +9,8 @@ test is cheap insurance.
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from src.ui.tray import STATE_COLORS, TrayState, _readable_fg_for
@@ -62,7 +64,8 @@ def _tray_with_dead_icon(monkeypatch, died):
     """A TrayIcon whose health probe always fails, wired to record death."""
     from src.ui.tray import TrayIcon
 
-    tray = TrayIcon(on_tray_died=lambda: died.append(True))
+    with patch("src.ui.tray.pystray"):
+        tray = TrayIcon(on_tray_died=lambda: died.append(True))
     monkeypatch.setattr(tray, "_check_tray_health", lambda: False)
     monkeypatch.setattr(tray, "_update_icon", lambda: None)
     return tray
