@@ -56,3 +56,52 @@ class TestReadableFgFor:
         # someone adding a state with an unparseable colour string.
         fg = _readable_fg_for(STATE_COLORS[state])
         assert fg in ("#1a1a1a", "#FFFFFF")
+
+
+def _tray_with_dead_icon(monkeypatch, died):
+    """A TrayIcon whose health probe always fails, wired to record death."""
+    from src.ui.tray import TrayIcon
+
+    tray = TrayIcon(on_tray_died=lambda: died.append(True))
+    monkeypatch.setattr(tray, "_check_tray_health", lambda: False)
+    monkeypatch.setattr(tray, "_update_icon", lambda: None)
+    return tray
+
+
+def test_single_health_failure_does_not_kill_the_agent(monkeypatch):
+    """One failed probe is a transient AppKit hiccup, not a dead status item.
+
+    _on_tray_died shuts the agent down and stops capture for the rest of the
+    day, so it must not fire on a single failure.
+    """
+    died = []
+    tray = _tray_with_dead_icon(monkeypatch, died)
+
+    tray.tick_clock()
+
+    assert died == []
+
+
+def test_consecutive_health_failures_declare_death(monkeypatch):
+    died = []
+    tray = _tray_with_dead_icon(monkeypatch, died)
+
+    for _ in range(tray._TRAY_HEALTH_FAILURES_TO_DIE):
+        tray.tick_clock()
+
+    assert died == [True]
+
+
+def test_recovered_probe_resets_the_failure_streak(monkeypatch):
+    """A healthy tick must clear the streak so isolated blips never accumulate
+    into a shutdown across an entire workday."""
+    died = []
+    tray = _tray_with_dead_icon(monkeypatch, died)
+
+    tray.tick_clock()                                    # fail 1
+    monkeypatch.setattr(tray, "_check_tray_health", lambda: True)
+    tray.tick_clock()                                    # recovered
+    monkeypatch.setattr(tray, "_check_tray_health", lambda: False)
+    tray.tick_clock()                                    # fail 1 again, not 2
+
+    assert died == []
