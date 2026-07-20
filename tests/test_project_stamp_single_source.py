@@ -17,9 +17,12 @@ AfkSource read of `_current_project` (it must stay parameter-fed).
 """
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import src.sync.afk_source as afk_mod
 import src.sync.sync_engine as mod
+from src.config import Config
+from src.sync.sync_engine import SyncEngine
 
 _SOURCE = Path(mod.__file__).read_text()
 _AFK_SOURCE = Path(afk_mod.__file__).read_text()
@@ -49,3 +52,31 @@ def test_afk_source_writes_project_id_once_and_never_reads_current_project():
     # which would re-introduce a second decision source and defeat the dedup.
     assert _AFK_SOURCE.count('["project_id"] = ') == 1
     assert "_current_project" not in _AFK_SOURCE
+
+
+def _engine() -> SyncEngine:
+    return SyncEngine(
+        aw=Mock(),
+        bf=Mock(),
+        queue=Mock(),
+        config=Config(),
+        time_tracker=Mock(),
+    )
+
+
+def test_project_stamp_accepts_integer_project_ids():
+    engine = _engine()
+    engine.set_current_project({"id": "42", "name": "Project"})
+
+    event = engine._stamp_project({"id": "evt"})
+
+    assert event["project_id"] == 42
+
+
+def test_project_stamp_omits_invalid_project_ids():
+    engine = _engine()
+    engine.set_current_project({"id": "4152903c-0894-48ed-ad50-491f97f52a46"})
+
+    event = engine._stamp_project({"id": "evt"})
+
+    assert "project_id" not in event

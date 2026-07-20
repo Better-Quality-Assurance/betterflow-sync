@@ -119,6 +119,80 @@ def test_backfill_only_touches_bucketless_status_spans():
     assert engine.queue.backfill_status_bucket_ids(host) == 0
 
 
+def test_sanitize_project_ids_removes_invalid_queued_values():
+    tmp = Path(tempfile.mkdtemp())
+    queue = OfflineQueue(db_path=tmp / "q.db", max_size=1000)
+    try:
+        queue.enqueue([
+            {
+                "id": "idle_bad_project",
+                "timestamp": _now_iso(),
+                "duration": 60.0,
+                "bucket_id": "bf-status_host",
+                "bucket_type": "idle_time",
+                "project_id": "4152903c-0894-48ed-ad50-491f97f52a46",
+                "data": {"status": "idle"},
+            },
+            {
+                "id": "idle_string_project",
+                "timestamp": _now_iso(),
+                "duration": 60.0,
+                "bucket_id": "bf-status_host",
+                "bucket_type": "idle_time",
+                "project_id": "42",
+                "data": {"status": "idle"},
+            },
+        ])
+
+        assert queue.sanitize_project_ids() == 2
+
+        queued = queue.dequeue(batch_size=10)
+        by_id = {q.event_data["id"]: q.event_data for q in queued}
+        assert "project_id" not in by_id["idle_bad_project"]
+        assert by_id["idle_string_project"]["project_id"] == 42
+    finally:
+        queue.close()
+
+
+def test_startup_sanitizes_invalid_project_id_before_status_span_drain():
+    tmp = Path(tempfile.mkdtemp())
+    queue = OfflineQueue(db_path=tmp / "q.db", max_size=1000)
+    queue.enqueue([
+        {
+            "id": "idle_bad_project",
+            "timestamp": _now_iso(),
+            "duration": 60.0,
+            "bucket_id": "bf-status_host",
+            "bucket_type": "idle_time",
+            "project_id": "not-a-backend-project-id",
+            "data": {"status": "idle"},
+        }
+    ])
+
+    engine = SyncEngine(
+        aw=Mock(),
+        bf=Mock(),
+        queue=queue,
+        config=Config(),
+        time_tracker=Mock(),
+    )
+
+    delivered: list[dict] = []
+
+    def _accept(events):
+        delivered.extend(events)
+        return SyncResult(success=True, events_synced=len(events))
+
+    engine.bf.send_events = Mock(side_effect=_accept)
+    engine._queue_backoff_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    engine._process_queue(SyncStats())
+
+    assert delivered
+    assert "project_id" not in delivered[0]
+    assert engine.queue.size() == 0
+    engine.queue.close()
+
+
 # --- 1b: over-long span is evicted, not left to poison the batch --------------
 
 
