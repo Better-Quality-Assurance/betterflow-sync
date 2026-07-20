@@ -46,7 +46,13 @@ def get_auto_start() -> bool:
             return _get_linux()
         else:
             return False
-    except Exception:
+    except Exception as e:
+        # Its sibling set_auto_start() logs; this one did not. The result drives
+        # both the tray "Launch at Login" checkmark and ensure_synced(), so a
+        # silent failure shows the user "off" while it may be on AND makes
+        # ensure_synced re-bootstrap the LaunchAgent on every startup with no
+        # diagnostic.
+        logger.warning(f"Failed to read auto-start state: {e}")
         return False
 
 
@@ -78,7 +84,14 @@ def _macos_plist_program_args() -> Optional[list[str]]:
     try:
         with open(_plist_path(), "rb") as f:
             data = plistlib.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return None  # No plist installed yet — the normal "not enabled" case.
+    except Exception as e:
+        # A parse/permission error makes _macos_plist_is_current() report "not
+        # current" forever, so ensure_synced() bootout+bootstraps the agent on
+        # every launch and the user sees Launch-at-Login flapping. Distinguish
+        # it from the benign missing-file case above.
+        logger.warning(f"Could not read the LaunchAgent plist: {e}")
         return None
     args = data.get("ProgramArguments")
     return [str(a) for a in args] if isinstance(args, list) else None
