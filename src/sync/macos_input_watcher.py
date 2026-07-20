@@ -27,6 +27,14 @@ _kCGEventRightMouseDown = 3
 _kCGEventOtherMouseDown = 25
 _kCGEventScrollWheel = 22
 _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
+# macOS disables a tap for two reasons, not one. Handling only the timeout case
+# left a tap disabled by user input dead forever: counters frozen at 0 while
+# is_running() still reports True, which reads downstream as "user is idle".
+_kCGEventTapDisabledByUserInput = 0xFFFFFFFF
+_TAP_DISABLED_EVENT_TYPES = (
+    _kCGEventTapDisabledByTimeout,
+    _kCGEventTapDisabledByUserInput,
+)
 
 _EVENT_MASK = (
     (1 << _kCGEventKeyDown)
@@ -269,15 +277,25 @@ class MacOSInputWatcher:
 
     def _event_callback(self, proxy, event_type, event, refcon):
         """CGEventTap callback — increment counters. Never reads key values."""
-        if event_type == _kCGEventTapDisabledByTimeout:
-            # Re-enable the tap if macOS disabled it
+        if event_type in _TAP_DISABLED_EVENT_TYPES:
+            # Re-enable the tap if macOS disabled it. A tap that stays disabled
+            # never increments a counter again, so the agent silently reports
+            # the user idle instead of reporting itself blind — log at warning
+            # so a re-enable that fails is visible in the field.
+            reason = (
+                "timeout"
+                if event_type == _kCGEventTapDisabledByTimeout
+                else "user input"
+            )
             if self._tap_ref is not None:
                 try:
                     from Quartz import CGEventTapEnable
                     CGEventTapEnable(self._tap_ref, True)
-                    logger.debug("Re-enabled CGEventTap after timeout")
+                    logger.warning("Re-enabled CGEventTap after %s disable", reason)
                 except Exception as e:
-                    logger.warning(f"Failed to re-enable CGEventTap: {e}")
+                    logger.warning("Failed to re-enable CGEventTap after %s disable: %s", reason, e)
+            else:
+                logger.warning("CGEventTap disabled by %s but no tap ref to re-enable", reason)
             return event
 
         with self._lock:
