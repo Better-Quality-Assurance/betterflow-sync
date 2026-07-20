@@ -1,6 +1,7 @@
 """ActivityWatch client - reads events from local aw-server."""
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -43,13 +44,43 @@ class AWEvent:
 
     @classmethod
     def from_dict(cls, data: dict) -> "AWEvent":
-        """Create AWEvent from API response."""
-        timestamp = datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
+        """Create AWEvent from API response.
+
+        Raises ValueError on an event the local tracker server sent that we
+        cannot trust. get_events() skips those individually rather than losing
+        the whole bucket fetch, so this may raise freely.
+        """
+        raw_ts = data.get("timestamp")
+        if not isinstance(raw_ts, str):
+            raise ValueError(f"event timestamp is not a string: {raw_ts!r}")
+        try:
+            timestamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise ValueError(f"unparseable event timestamp {raw_ts!r}: {e}") from e
+
+        # A negative or non-numeric duration flows straight into span math and
+        # can produce backwards spans, so reject it here rather than bill it.
+        raw_duration = data.get("duration", 0)
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"non-numeric event duration {raw_duration!r}") from e
+        # NaN/inf slip past a `< 0` check (NaN compares False to everything) and
+        # poison every sum they touch, so reject anything non-finite too.
+        if not math.isfinite(duration):
+            raise ValueError(f"non-finite event duration {raw_duration!r}")
+        if duration < 0:
+            raise ValueError(f"negative event duration {duration!r}")
+
+        event_data = data.get("data", {})
+        if not isinstance(event_data, dict):
+            raise ValueError(f"event data is not a mapping: {type(event_data).__name__}")
+
         return cls(
             id=data.get("id", 0),
             timestamp=timestamp,
-            duration=data.get("duration", 0),
-            data=data.get("data", {}),
+            duration=duration,
+            data=event_data,
         )
 
     @property
@@ -144,6 +175,9 @@ class AWClient:
     # immediately; the later backoff retries ride out a brief server stall.
     _CONNECT_ATTEMPTS = 3
     _CONNECT_BACKOFF = (0.25, 0.5)  # seconds before retry 2 and 3
+
+    # Per-event warnings emitted before falling back to the summary line only.
+    _MALFORMED_LOG_LIMIT = 5
 
     def _request(self, method: str, endpoint: str, timeout: Optional[int] = None, **kwargs) -> dict:
         """Make request to ActivityWatch API.
@@ -291,7 +325,36 @@ class AWClient:
             params["end"] = end.isoformat()
 
         response = self._request("GET", f"buckets/{bucket_id}/events", params=params)
-        return [AWEvent.from_dict(event) for event in response]
+
+        # _request is typed dict but returns whatever the server serialised; a
+        # null/object body would otherwise blow up or silently iterate keys.
+        if not isinstance(response, list):
+            logger.warning(
+                "Bucket %s returned %s, not an event list — treating as empty",
+                bucket_id, type(response).__name__,
+            )
+            return []
+
+        # Per-event, not a comprehension: one malformed event used to raise out
+        # of here and lose the ENTIRE bucket fetch for that cycle. Skipping the
+        # bad event keeps the rest of the user's tracked time.
+        events = []
+        skipped = 0
+        for event in response:
+            try:
+                events.append(AWEvent.from_dict(event))
+            except (ValueError, AttributeError, TypeError) as e:
+                skipped += 1
+                # Bounded: a fully-corrupt bucket is up to `limit` events and
+                # would otherwise flood the log every sync cycle.
+                if skipped <= self._MALFORMED_LOG_LIMIT:
+                    logger.warning("Skipping malformed event from bucket %s: %s", bucket_id, e)
+        if skipped:
+            logger.warning(
+                "Skipped %d malformed event(s) of %d from bucket %s",
+                skipped, len(response), bucket_id,
+            )
+        return events
 
     def get_window_buckets(self) -> list[AWBucket]:
         """Get all window watcher buckets."""
