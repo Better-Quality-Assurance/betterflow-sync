@@ -111,3 +111,22 @@ def test_transition_between_two_healthy_states_preserves_existing_text():
     tray.set_state(TrayState.PAUSED)
 
     assert tray.model.status_text == "Some informational status"
+
+
+def test_status_text_covers_private_hours_and_on_break():
+    """PRIVATE_HOURS and a bare ON_BREAK both fell through to "Starting...",
+    so a user outside their working-hours window saw what looked like a hung
+    app instead of a deliberate not-recording state."""
+    tray = _make_tray()
+
+    def status_for(state):
+        return tray._get_status_text(
+            {"on_break": False, "private_mode": False,
+             "state": state, "break_minutes_left": 0}
+        )
+
+    assert status_for(TrayState.PRIVATE_HOURS) == "Outside working hours"
+    assert status_for(TrayState.ON_BREAK) == "On Break"
+    assert status_for(TrayState.PRIVATE) == "Private Time"
+    # The real starting state must still read as starting.
+    assert status_for(TrayState.STARTING) == "Starting..."

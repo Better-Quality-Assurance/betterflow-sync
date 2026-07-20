@@ -807,6 +807,20 @@ class TrayIcon:
             return "Waiting for login..."
         elif state == TrayState.NEEDS_PERMISSIONS:
             return "Permissions needed"
+        elif state == TrayState.PRIVATE_HOURS:
+            # Without this branch a user outside their enforced working-hours
+            # window read "App status: Starting...", which looks like a hung app
+            # rather than a deliberate not-recording state.
+            return "Outside working hours"
+        elif state == TrayState.ON_BREAK:
+            # Normally covered by the on_break flag above; this catches the state
+            # being set without the model flag, which also fell through to
+            # "Starting...".
+            return "On Break"
+        elif state == TrayState.PRIVATE:
+            # Same gap as ON_BREAK: normally covered by the private_mode flag,
+            # but the state alone must not read as "Starting...".
+            return "Private Time"
         else:
             return "Starting..."
 
