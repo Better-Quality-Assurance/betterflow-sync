@@ -22,7 +22,7 @@ uiautomation>=2.0,<3; sys_platform == "win32"
 # raises ZoneInfoNotFoundError there. WorkingHoursConfig.allows() would catch it and
 # fall back to the MACHINE's local timezone — i.e. evaluate an enforced working-hours
 # window in a timezone the employee themselves controls. Ship the tz database.
-tzdata>=2024.1; sys_platform == "win32"
+tzdata>=2026.3; sys_platform == "win32"
 
 # Linux-only dependencies
 # PyGObject -> AppIndicator tray backend; python-xlib -> XOrg fallback backend;
