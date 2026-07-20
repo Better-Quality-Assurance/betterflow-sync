@@ -74,7 +74,12 @@ class AfkSource:
 
     @property
     def consecutive_clock_failures(self) -> int:
-        return self._consecutive_clock_failures
+        # Mutated in record_sample under the same lock. A lost increment here
+        # keeps the count under the blind-clock threshold, so the engine does
+        # not hold the checkpoint and finalizes an unobserved span as AFK —
+        # real worked time billed as idle. WindowSource locks its equivalent.
+        with self._lock:
+            return self._consecutive_clock_failures
 
     @property
     def bucket_id(self) -> str:
@@ -90,7 +95,11 @@ class AfkSource:
             return True
         try:
             ok = self._idle_clock() is not None
-        except Exception:
+        except Exception as e:
+            # Every other failure path in this class logs. Without this, a
+            # persistently raising idle clock silently reports the platform
+            # incapable, in-process AFK never engages, and nothing says why.
+            logger.debug("AfkSource idle-clock probe failed: %s", e)
             ok = False
         if ok:
             self._available_latched = True
@@ -110,12 +119,15 @@ class AfkSource:
             idle = self._idle_clock()
         except Exception as e:
             logger.debug("AfkSource idle clock failed: %s", e)
-            self._consecutive_clock_failures += 1
+            with self._lock:
+                self._consecutive_clock_failures += 1
             return
         if idle is None:
-            self._consecutive_clock_failures += 1
+            with self._lock:
+                self._consecutive_clock_failures += 1
             return
-        self._consecutive_clock_failures = 0
+        with self._lock:
+            self._consecutive_clock_failures = 0
         last_input_at = self._apply_input_watcher(now - timedelta(seconds=idle))
         # Fold in supplementary activity sources (call, mic, foreground-CPU).
         # Every source receives the same REAL input anchor — the pre-fold

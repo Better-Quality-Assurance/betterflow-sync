@@ -162,7 +162,11 @@ class InputSource:
             return False
         try:
             ok = bool(self._backend.available())
-        except Exception:
+        except Exception as e:
+            # Log it: a permanently failing probe silently disables in-process
+            # input capture and hands it back to the external tracker with no
+            # diagnostic trail.
+            logger.debug("InputSource backend probe failed: %s", e)
             ok = False
         if ok:
             self._available_latched = True
