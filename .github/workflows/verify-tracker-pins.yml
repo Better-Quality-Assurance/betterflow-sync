@@ -1,0 +1,47 @@
+name: Verify Tracker Asset Pins
+
+# The RELEASE_SHA256 pins in src/aw_manager.py are hand-computed literals, and
+# tests/test_aw_manager_asset_integrity.py only cross-checks them against a
+# second copy of the same literals — so a wrong value passes the unit suite and
+# fails closed on the fleet instead (no trackers installed, zero capture).
+# This job is the independent check: it fetches the real upstream archives and
+# asserts their digests equal the pins. It runs nightly so upstream mutating an
+# asset under a pinned tag is caught here rather than on user machines.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/aw_manager.py"
+      - "tests/test_aw_manager_asset_integrity.py"
+      - "scripts/verify_tracker_pins.py"
+      - ".github/workflows/verify-tracker-pins.yml"
+
+# Read-only: this job downloads public upstream release assets and compares
+# hashes. It never writes to the repo or touches releases.
+permissions:
+  contents: read
+
+jobs:
+  verify-pins:
+    runs-on: ubuntu-latest
+    # The per-read socket timeout in the script does not bound total runtime: a
+    # slow-drip upstream can keep three ~100 MB fetches alive for hours on the
+    # default 6h job limit. Cap the whole job instead.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # platformdirs is the only third-party import src/aw_manager.py pulls in at
+      # module level; the verifier needs nothing else from requirements.txt.
+      - name: Install the one import the constants need
+        run: pip install platformdirs
+
+      - name: Fetch upstream archives and compare against the pins
+        run: python scripts/verify_tracker_pins.py

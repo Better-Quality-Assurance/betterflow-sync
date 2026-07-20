@@ -23,6 +23,11 @@ from src.aw_manager import AW_VERSION, RELEASE_ASSETS, RELEASE_SHA256
 # assets) to produce the RELEASE_SHA256 values in src/aw_manager.py. Bumping
 # AW_VERSION without re-vetting and updating BOTH this constant and the hashes
 # is exactly the silent-outage scenario above, so it must break the build.
+#
+# NOTE: this record is a hand-copy of the same literals, so it catches a
+# forgotten bump but CANNOT catch a wrong digest. The independent check is
+# scripts/verify_tracker_pins.py, which downloads the real upstream archives
+# (nightly CI). Do not treat a green run here as proof the pins are correct.
 VETTED_HASHES = {
     "v0.13.2": {
         "darwin": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",

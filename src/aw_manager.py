@@ -59,6 +59,14 @@ RELEASE_ASSETS = {
 # the binaries under the same tag. The download is verified against these
 # hashes before extraction (fail closed on mismatch). MUST be recomputed on
 # every AW_VERSION bump (shasum -a 256 on the freshly-vetted zips).
+#
+# Provenance: computed 2026-07-08 from the upstream v0.13.2 release assets when
+# the pins were introduced. These literals are NOT self-verifying — the unit
+# test only compares them to a second hand-copied record, so a wrong value
+# passes tests and instead fails closed on the fleet (no trackers installed).
+# scripts/verify_tracker_pins.py fetches the real archives and checks the
+# digests; it runs nightly via .github/workflows/verify-tracker-pins.yml and on
+# any change to this file. Run it locally after every AW_VERSION bump.
 RELEASE_SHA256 = {
     "darwin": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",
     "windows": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
