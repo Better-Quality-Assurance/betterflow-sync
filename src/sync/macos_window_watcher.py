@@ -77,6 +77,9 @@ class MacOSWindowWatcher:
         # emit a one-shot log on each transition.
         self._last_accessibility: Optional[bool] = None
         self._last_accessibility_check_ts: float = 0.0
+        # One-shot flag: the AX messaging-timeout symbol is either present for
+        # the whole process lifetime or never, so warn about it only once.
+        self._ax_timeout_warned = False
         # Cache terminal tab title to avoid spawning osascript every poll.
         # _terminal_cache_key is (app_name, ax_title); value is the tab title or None.
         self._terminal_cache_key: Optional[tuple[str, str]] = None
@@ -190,8 +193,19 @@ class MacOSWindowWatcher:
             from ApplicationServices import AXUIElementSetMessagingTimeout
 
             AXUIElementSetMessagingTimeout(app_ref, self._AX_MESSAGING_TIMEOUT_S)
-        except Exception:
-            pass
+        except Exception as e:
+            # This is the guard that stops an unresponsive frontmost app from
+            # blocking the poll thread inside AXUIElementCopyAttributeValue.
+            # When it silently fails to install, a hung app freezes window
+            # tracking with no exception and no log — exactly the silent stall
+            # the fallback is meant to bound. Keep the fallback, log the reason.
+            # Poll loop runs every few seconds; log once, not on every poll.
+            if not self._ax_timeout_warned:
+                self._ax_timeout_warned = True
+                logger.warning(
+                    "AX messaging timeout unavailable (%s) — window polling can "
+                    "stall on an unresponsive app", e,
+                )
         err, focused_window = AXUIElementCopyAttributeValue(
             app_ref, "AXFocusedWindow", None,
         )
