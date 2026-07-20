@@ -556,8 +556,14 @@ class SetupWizard:
             cx,
             344,
             text=(
+                # Do NOT claim on-device title hashing here. There is no
+                # client-side hashing in the agent — titles are sent raw and
+                # handled server-side (see the privacy model in CLAUDE.md).
+                # This screen is the consent boundary on platforms with no OS
+                # permission gate, so it has to describe what actually leaves
+                # the machine.
                 "Your privacy is protected by default:\n"
-                "•  Window titles are hashed on your device\n"
+                "•  Window titles are sent to BetterFlow to categorize your work\n"
                 "•  URLs are reduced to the domain only\n"
                 "•  Excluded apps are never tracked"
             ),

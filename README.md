@@ -9,7 +9,7 @@ BetterFlow reads activity data from your local [ActivityWatch](https://activityw
 ## Features
 
 - **Automatic syncing** - Events sync every 60 seconds (configurable)
-- **Privacy-first** - Window titles are hashed by default, only domains sent for URLs
+- **Privacy-first** - Excluded apps never leave your device, only domains sent for URLs
 - **Offline support** - Events are queued locally when offline and synced when back online
 - **Activity analysis** - Engagement detection distinguishes active work from idle time
 - **Break & private time reminders** - Configurable notifications to take breaks or end private mode
@@ -81,7 +81,10 @@ Right-click the tray icon for options including pause/resume, private time, proj
 
 BetterFlow is designed with privacy in mind:
 
-- **Window titles** are hashed (SHA-256) by default - only a fingerprint is sent, not the actual title
+- **Window titles** are sent to the BetterFlow server, which applies title handling and
+  categorization. The `hash_titles` preference is forwarded to the server and honoured
+  there - the agent does **not** hash titles on your device. If a title must never leave
+  the machine, exclude its app (below); that is the only client-side title control.
 - **URLs** are stripped to domain-only - no full paths or query parameters
 - **Allowlist** for raw titles - IDEs and terminals can show real titles for project tracking
 - **Exclude apps** - Sensitive apps (1Password, etc.) are never tracked
