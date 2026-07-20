@@ -33,7 +33,7 @@ try:
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
-    from .queue import is_event_storable
+    from .queue import is_event_storable, normalized_project_id
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -46,9 +46,13 @@ except ImportError:
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
-    from sync.queue import is_event_storable
+    from sync.queue import is_event_storable, normalized_project_id
 
 logger = logging.getLogger(__name__)
+
+# Sentinel for "no project id has been rejected yet" — distinct from None,
+# which is itself a rejectable value (a project dict with no "id").
+_NO_REJECTED_PROJECT_ID = object()
 
 
 def _is_window_like(bucket_type: str) -> bool:
@@ -229,6 +233,9 @@ class SyncEngine:
         self._private_mode = False
         self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
+        # Last project id normalization rejected, so the drop is logged once per
+        # distinct value instead of once per stamped event (or — worse — never).
+        self._rejected_project_id: object = _NO_REJECTED_PROJECT_ID
         self._session_active = False
         self._config_fetched = False
         self._last_config_fetch_monotonic: float = 0.0
@@ -348,12 +355,20 @@ class SyncEngine:
         # the server accepts them — a lost billing carve-out. Give them the same
         # bf-status_<host> id current spans use, BEFORE the sync loop starts.
         # Idempotent and best-effort: a migration hiccup must never block startup.
-        try:
-            backfill = getattr(self.queue, "backfill_status_bucket_ids", None)
-            if callable(backfill):
-                backfill(self._hostname)
-        except Exception as e:  # pragma: no cover - defensive; never fatal
-            logger.warning("Legacy status-span bucket_id backfill skipped: %s", e)
+        # Each migration is guarded on its own: they are independent, and a
+        # hiccup in one must not silently skip the other (a shared try would
+        # let a backfill error swallow the project_id sanitize, re-exposing the
+        # rejected-span loss this release fixes).
+        for name, args in (
+            ("backfill_status_bucket_ids", (self._hostname,)),
+            ("sanitize_project_ids", ()),
+        ):
+            try:
+                migrate = getattr(self.queue, name, None)
+                if callable(migrate):
+                    migrate(*args)
+            except Exception as e:  # pragma: no cover - defensive; never fatal
+                logger.warning("Queued-event startup migration %s skipped: %s", name, e)
 
         # Dedup: track (bucket_id, event_id) pairs already sent this session.
         # The lookback window re-fetches recent events for duration updates —
@@ -645,13 +660,31 @@ class SyncEngine:
             if ended is not None:
                 stats.calls_detected += 1
 
-    def _current_project_id(self):
+    def _current_project_id(self) -> Optional[int]:
         """The active project's id, or None. The single locked read of
         _current_project that every event-stamping path shares, so the
-        lock+read rule can't drift between call sites."""
+        lock+read rule can't drift between call sites. Normalization is the
+        queue's shared helper, so a live stamp and the queue migration always
+        agree on which ids the backend accepts."""
         with self._state_lock:
             project = self._current_project
-        return project["id"] if project else None
+            if not project:
+                return None
+            raw = project.get("id")
+            pid = normalized_project_id(raw)
+            # Dropping the id silently would untag every event with no trace —
+            # the failure mode is invisible in logs and only shows up as
+            # unprojected rows in the backend. Warn once per distinct value.
+            if pid is None and raw != self._rejected_project_id:
+                self._rejected_project_id = raw
+                logger.warning(
+                    "Active project id %r is not a backend project id; "
+                    "events will be sent untagged",
+                    raw,
+                )
+            elif pid is not None:
+                self._rejected_project_id = _NO_REJECTED_PROJECT_ID
+        return pid
 
     def _stamp_project(self, event: dict) -> dict:
         """Stamp the active project onto a SyncEngine-built event dict (call,
