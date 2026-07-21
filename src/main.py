@@ -146,6 +146,9 @@ class SyncCoordinator:
         # So a failed logs_requested upload surfaces to the ops ingest (it can't
         # surface via the log itself — that's the file we couldn't fetch).
         self.sync_engine.error_reporter = self.error_reporter
+        # Same reason for the tracker bootstrap: a fail-closed component download
+        # means the agent records nothing, which only the ops ingest can catch.
+        self.aw_manager.error_reporter = self.error_reporter
         # Single source of truth for the in-process-AFK flag: the engine publishes
         # its per-cycle decision straight to aw_manager on the path where the
         # decision is made. The 60s _reconcile_inproc_afk_flag below is now only a

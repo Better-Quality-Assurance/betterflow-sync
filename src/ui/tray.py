@@ -435,6 +435,12 @@ def create_icon_image(
 class TrayIcon:
     """System tray icon with status indicator."""
 
+    # Consecutive failed health probes before the tray is declared dead and the
+    # agent shuts down. A dead NSStatusItem stays dead, so requiring two ticks
+    # costs one tick of latency while stopping a transient AppKit error from
+    # ending the user's tracking day.
+    _TRAY_HEALTH_FAILURES_TO_DIE = 2
+
     def __init__(
         self,
         on_login: Optional[Callable[[], None]] = None,
@@ -494,6 +500,15 @@ class TrayIcon:
         self._on_check_update = on_check_update
         self._on_tray_died = on_tray_died
         self._on_show_hours = on_show_hours
+
+        # Consecutive failed tray health probes. Incremented by tick_clock on the
+        # scheduler thread and reset by the icon-creation paths on the main
+        # thread, so every access takes _tray_health_lock: the increment is a
+        # read-modify-write, and a reset landing inside one would let a stale
+        # count carry onto a fresh status item and kill it a tick early. See
+        # _TRAY_HEALTH_FAILURES_TO_DIE for why the counter exists.
+        self._tray_health_lock = threading.Lock()
+        self._tray_health_failures = 0
 
         self.model = TrayModel()
 
@@ -792,6 +807,20 @@ class TrayIcon:
             return "Waiting for login..."
         elif state == TrayState.NEEDS_PERMISSIONS:
             return "Permissions needed"
+        elif state == TrayState.PRIVATE_HOURS:
+            # Without this branch a user outside their enforced working-hours
+            # window read "App status: Starting...", which looks like a hung app
+            # rather than a deliberate not-recording state.
+            return "Outside working hours"
+        elif state == TrayState.ON_BREAK:
+            # Normally covered by the on_break flag above; this catches the state
+            # being set without the model flag, which also fell through to
+            # "Starting...".
+            return "On Break"
+        elif state == TrayState.PRIVATE:
+            # Same gap as ON_BREAK: normally covered by the private_mode flag,
+            # but the state alone must not read as "Starting...".
+            return "Private Time"
         else:
             return "Starting..."
 
@@ -1285,7 +1314,11 @@ class TrayIcon:
                 button = status_item.button()
                 if button is None:
                     return False
-            except Exception:
+            except Exception as e:
+                # A False here shuts the whole agent down via _on_tray_died, so
+                # never swallow the reason — an unexplained mid-day exit with a
+                # bare "Tray icon is dead" line is undiagnosable in the field.
+                logger.warning("Tray health probe failed: %s", e, exc_info=True)
                 return False
 
         return True
@@ -1293,10 +1326,27 @@ class TrayIcon:
     def tick_clock(self) -> None:
         """Called periodically to advance the clock-face icon hands."""
         if not self._check_tray_health():
+            # Require consecutive failures before declaring death: this path
+            # shuts the agent down and stops capture for the rest of the day,
+            # and a single transient AppKit/pyobjc hiccup is not proof the
+            # status item was deallocated. A genuinely dead icon stays dead and
+            # trips on the next tick.
+            with self._tray_health_lock:
+                self._tray_health_failures += 1
+                failures = self._tray_health_failures
+            if failures < self._TRAY_HEALTH_FAILURES_TO_DIE:
+                logger.warning(
+                    "Tray health check failed (%d/%d) — retrying next tick",
+                    failures,
+                    self._TRAY_HEALTH_FAILURES_TO_DIE,
+                )
+                return
             logger.error("Tray icon is dead — triggering shutdown")
             if self._on_tray_died:
                 self._on_tray_died()
             return
+        with self._tray_health_lock:
+            self._tray_health_failures = 0
         self._update_icon()
 
     def _update_icon(self) -> None:
@@ -1484,6 +1534,12 @@ class TrayIcon:
         if self._icon is not None:
             return
 
+        # A fresh icon gets a fresh streak: stop() nulls _icon, so a tick landing
+        # in a stop→start window (logout/re-login) counts a failure that has
+        # nothing to do with the new status item.
+        with self._tray_health_lock:
+            self._tray_health_failures = 0
+
         from datetime import datetime as _dt
         color = STATE_COLORS[self.model.state]
         # Pin the initial render's clock-time to a captured `now` for the
@@ -1519,6 +1575,11 @@ class TrayIcon:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             if self._icon is None:
+                # Fresh icon, fresh streak — same reason as start(): failures
+                # counted against the previous (or not-yet-created) status item
+                # must not carry into the new one and shorten its life.
+                with self._tray_health_lock:
+                    self._tray_health_failures = 0
                 color = STATE_COLORS[self.model.state]
                 self._icon = pystray.Icon(
                     "BetterFlow",

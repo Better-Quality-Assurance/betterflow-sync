@@ -20,6 +20,7 @@ __all__ = [
     "OfflineQueue",
     "QueuedEvent",
     "is_event_storable",
+    "normalized_project_id",
     "MAX_EVENT_DURATION_SECONDS",
 ]
 
@@ -83,6 +84,22 @@ def is_event_storable(ev: object, *, stale_cutoff: datetime) -> bool:
     return True
 
 
+def normalized_project_id(value: object) -> Optional[int]:
+    """Return a backend-safe project id, or None when the payload should omit it.
+
+    Shared with SyncEngine's stamping path so the queue migration and the live
+    stamp can never disagree about which ids the backend will accept.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdecimal():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
 @dataclass
 class QueuedEvent:
     """An event stored in the offline queue."""
@@ -97,13 +114,14 @@ class QueuedEvent:
         """Create from database row. Returns None if the row is corrupt."""
         try:
             event_data = json.loads(row[1])
-        except (json.JSONDecodeError, TypeError):
+            created_at = datetime.fromisoformat(row[2])
+        except (json.JSONDecodeError, TypeError, ValueError):
             logger.error(f"[queue] Corrupt event row id={row[0]}, discarding")
             return None
         return cls(
             id=row[0],
             event_data=event_data,
-            created_at=datetime.fromisoformat(row[2]),
+            created_at=created_at,
             retry_count=row[3],
         )
 
@@ -814,6 +832,50 @@ class OfflineQueue:
             logger.info(
                 "Backfilled bucket_id on %d legacy bucketless status span(s) so "
                 "they deliver instead of being evicted on upgrade",
+                len(updates),
+            )
+        return len(updates)
+
+    def sanitize_project_ids(self) -> int:
+        """Normalize queued ``project_id`` fields to the backend's integer FK.
+
+        Release 1.5.104 stamped the active project onto SyncEngine-built events.
+        If a stale/corrupt project payload put a UUID/string/zero in the queue,
+        the backend could keep rejecting an otherwise valid status span until it
+        exhausted retries and reported ``buckets=bf-status`` real loss. Queued
+        events are account-local and the project id is optional, so the safe
+        migration is: keep positive integer ids, coerce digit strings, and omit
+        anything else before the first queue drain.
+
+        Returns the number of queued rows rewritten.
+        """
+        with self._cursor() as cursor:
+            cursor.execute("SELECT id, event_data FROM queued_events")
+            rows = cursor.fetchall()
+            updates: list[tuple[str, int]] = []
+            for rid, raw in rows:
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(ev, dict) or "project_id" not in ev:
+                    continue
+                normalized = normalized_project_id(ev.get("project_id"))
+                if normalized is None:
+                    ev.pop("project_id", None)
+                else:
+                    ev["project_id"] = normalized
+                updated = json.dumps(ev)
+                if updated != raw:
+                    updates.append((updated, rid))
+            if updates:
+                cursor.executemany(
+                    "UPDATE queued_events SET event_data = ? WHERE id = ?",
+                    updates,
+                )
+        if updates:
+            logger.info(
+                "Sanitized project_id on %d queued event(s) before delivery",
                 len(updates),
             )
         return len(updates)

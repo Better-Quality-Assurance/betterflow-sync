@@ -1,5 +1,8 @@
+import sys
 import threading
+import types
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from src.sync.aw_client import BUCKET_TYPE_INPUT
 from src.sync.input_source import InputSource, _MacOSTapBackend
@@ -222,3 +225,49 @@ def test_macos_watcher_count_only_skips_emitter_flag():
     from src.sync.macos_input_watcher import MacOSInputWatcher
     assert MacOSInputWatcher(aw_client=object(), count_only=True)._count_only is True
     assert MacOSInputWatcher(aw_client=object())._count_only is False
+
+
+def test_macos_watcher_reenables_tap_for_both_disable_reasons():
+    """macOS disables a CGEventTap for timeout OR user input.
+
+    Handling only the timeout constant left a user-input-disabled tap dead for
+    the rest of the session: counters frozen while is_running() stayed True, so
+    the agent reported the user idle instead of reporting itself blind.
+    """
+    from src.sync import macos_input_watcher as miw
+
+    for event_type in (
+        miw._kCGEventTapDisabledByTimeout,
+        miw._kCGEventTapDisabledByUserInput,
+    ):
+        watcher = miw.MacOSInputWatcher(aw_client=object(), count_only=True)
+        watcher._tap_ref = object()
+        enabled = []
+
+        fake_quartz = types.ModuleType("Quartz")
+        fake_quartz.CGEventTapEnable = lambda tap, on: enabled.append((tap, on))
+
+        with patch.dict(sys.modules, {"Quartz": fake_quartz}):
+            returned = watcher._event_callback(None, event_type, "evt", None)
+
+        assert returned == "evt"
+        assert enabled == [(watcher._tap_ref, True)], (
+            f"tap not re-enabled for event_type {event_type:#x}"
+        )
+
+
+def test_macos_watcher_disable_event_does_not_count_as_input():
+    """A tap-disabled notification must not be mistaken for user activity."""
+    from src.sync import macos_input_watcher as miw
+
+    watcher = miw.MacOSInputWatcher(aw_client=object(), count_only=True)
+    watcher._tap_ref = None  # no ref: exercises the warn-only branch
+
+    watcher._event_callback(None, miw._kCGEventTapDisabledByUserInput, "evt", None)
+
+    with watcher._lock:
+        assert (watcher._presses, watcher._clicks, watcher._scrolls) == (0, 0, 0)
+    # Also must not refresh the freshness timestamp: the idle-tracker health
+    # check reads get_last_input_at() to spot a blind watcher, so a disable
+    # notification that looked like input would mask the very outage it signals.
+    assert watcher.get_last_input_at() is None

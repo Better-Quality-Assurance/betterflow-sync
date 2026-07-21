@@ -134,7 +134,7 @@ class KeychainManager:
             return None
         try:
             return StoredCredentials.from_json(data)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
             logger.warning("Invalid credential format in keychain: %s", e)
             return None
 

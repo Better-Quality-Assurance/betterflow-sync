@@ -148,3 +148,31 @@ def test_blind_clock_holds_and_reports():
     assert events == [], "must not finalize-afk over an unobserved window"
     assert eng._afk_inproc_checkpoint == seed_cp, "checkpoint held while blind"
     assert eng.error_reporter.capture.called, "blind clock surfaced to ops"
+
+
+def test_consecutive_clock_failures_survives_concurrent_samplers():
+    """The blind-clock counter must not lose increments under concurrency.
+
+    main.py can replace a wedged _sync_lock with a fresh one, so two _do_sync
+    cycles can overlap. A lost += 1 keeps the count under the blind threshold,
+    so the engine does not hold the checkpoint and finalizes the unobserved
+    span as AFK — real worked time billed as idle.
+    """
+    import threading
+
+    src = AfkSource(600, "host", idle_clock=lambda: None)  # always a failure
+    threads_count, per_thread = 8, 50
+    barrier = threading.Barrier(threads_count)
+
+    def hammer():
+        barrier.wait()
+        for _ in range(per_thread):
+            src.record_sample(T0)
+
+    threads = [threading.Thread(target=hammer) for _ in range(threads_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert src.consecutive_clock_failures == threads_count * per_thread

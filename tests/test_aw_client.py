@@ -310,3 +310,71 @@ class TestAWClient:
                 client.get_info()
 
         assert calls["n"] == AWClient._CONNECT_ATTEMPTS
+
+
+class TestMalformedEventTolerance:
+    """A malformed event from the local tracker server must cost that event,
+    not the whole bucket fetch. Losing the fetch loses the user's tracked time
+    for the cycle."""
+
+    @responses.activate
+    def test_get_events_skips_bad_events_and_keeps_good_ones(self):
+        responses.add(
+            responses.GET,
+            "http://localhost:5600/api/0/buckets/test-bucket/events",
+            json=[
+                {"id": 1, "timestamp": "2026-02-18T10:00:00Z", "duration": 60,
+                 "data": {"app": "Terminal"}},
+                {"id": 2, "duration": 60, "data": {}},                       # no timestamp
+                {"id": 3, "timestamp": "not-a-timestamp", "duration": 60, "data": {}},
+                {"id": 4, "timestamp": "2026-02-18T10:02:00Z", "duration": "abc",
+                 "data": {}},                                                # bad duration
+                {"id": 5, "timestamp": "2026-02-18T10:03:00Z", "duration": -30,
+                 "data": {}},                                                # negative
+                {"id": 6, "timestamp": "2026-02-18T10:04:00Z", "duration": 30,
+                 "data": {"app": "Code"}},
+            ],
+            status=200,
+        )
+
+        events = AWClient().get_events("test-bucket")
+
+        assert [e.id for e in events] == [1, 6], "good events must survive bad neighbours"
+        assert [e.app for e in events] == ["Terminal", "Code"]
+
+    @responses.activate
+    def test_get_events_survives_an_all_malformed_bucket(self):
+        responses.add(
+            responses.GET,
+            "http://localhost:5600/api/0/buckets/test-bucket/events",
+            json=[{"id": 1, "timestamp": None, "duration": 60, "data": {}}],
+            status=200,
+        )
+
+        assert AWClient().get_events("test-bucket") == []
+
+    def test_from_dict_rejects_negative_duration(self):
+        """A negative duration flows into span math and yields backwards spans."""
+        with pytest.raises(ValueError, match="negative event duration"):
+            AWEvent.from_dict(
+                {"id": 1, "timestamp": "2026-02-18T10:00:00Z", "duration": -1, "data": {}}
+            )
+
+    @pytest.mark.parametrize("bad", ["nan", "inf", "-inf", float("nan"), float("inf")])
+    def test_from_dict_rejects_non_finite_duration(self, bad):
+        """NaN compares False to everything, so `< 0` alone lets it through and
+        it poisons every sum it reaches."""
+        with pytest.raises(ValueError, match="non-finite event duration"):
+            AWEvent.from_dict(
+                {"id": 1, "timestamp": "2026-02-18T10:00:00Z", "duration": bad, "data": {}}
+            )
+
+    def test_from_dict_accepts_zero_and_numeric_string_duration(self):
+        zero = AWEvent.from_dict(
+            {"id": 1, "timestamp": "2026-02-18T10:00:00Z", "duration": 0, "data": {}}
+        )
+        assert zero.duration == 0.0
+        coerced = AWEvent.from_dict(
+            {"id": 2, "timestamp": "2026-02-18T10:00:00Z", "duration": "12.5", "data": {}}
+        )
+        assert coerced.duration == 12.5

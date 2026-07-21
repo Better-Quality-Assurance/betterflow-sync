@@ -66,12 +66,19 @@ class UpdateHandler:
         try:
             self.coordinator.flush_idle_event()
         except Exception:
-            pass
+            logger.warning("flush_idle_event() during update exit failed", exc_info=True)
         try:
             self.coordinator.sync_engine.shutdown()
         except Exception:
-            pass
-        self.coordinator.stop()
+            logger.warning("sync_engine.shutdown() during update exit failed", exc_info=True)
+        # Guarded: coordinator.stop() shuts the scheduler down, and APScheduler
+        # can raise there (racy `if scheduler.running` check). An exception must
+        # not skip the aw_manager.stop() below — that's the tracker-orphaning
+        # regression described next.
+        try:
+            self.coordinator.stop()
+        except Exception:
+            logger.warning("coordinator.stop() during update exit failed", exc_info=True)
         # Terminate the bundled trackers BEFORE the updater's hard os._exit(0).
         # coordinator.stop() only stops the scheduler; without this the
         # self-update relaunch left bf-idle-tracker orphaned, so the new
@@ -256,7 +263,13 @@ class UpdateHandler:
                 if _version_tuple(staged) >= _version_tuple(target_version):
                     return
             except (ValueError, TypeError):
-                pass
+                # Unparseable version: fall through and re-stage, but say so —
+                # otherwise the repeated downloads have no explanation in logs.
+                logger.warning(
+                    "Unparseable staged version %r vs target %r; re-staging",
+                    staged,
+                    target_version,
+                )
 
         now = time.monotonic()
         with self._update_jobs_lock:

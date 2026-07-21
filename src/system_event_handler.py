@@ -61,6 +61,14 @@ class SystemEventHandler:
 
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
+            # Branch on a local, not a re-read of the shared field: the sleep and
+            # screen-lock listeners are separate OS notification threads, and a
+            # lock event interleaving here would make the unlocked read below see
+            # a stale value, skip ending Private Time at the sleep boundary, and
+            # silently mark post-wake work private and uncounted — the exact
+            # regression the comment below describes. on_screen_unlock already
+            # captures its counterpart this way.
+            pre_sleep_private = self._pre_sleep_private
             # Keep the EARLIEST sleep start across a sequence of sleep events
             # without an intervening wake (macOS can fire Display Sleep then
             # System Sleep separately; some lid-close → reopen → reclose
@@ -82,7 +90,7 @@ class SystemEventHandler:
         # true enable→sleep span via the normal leave path (private_time event +
         # checkpoint advance); on wake we resume NORMAL tracking, never auto-
         # restoring private.
-        if self._pre_sleep_private:
+        if pre_sleep_private:
             try:
                 self.sync_engine.set_private_mode(False)
             except Exception as e:
