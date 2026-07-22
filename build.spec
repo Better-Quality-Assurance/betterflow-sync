@@ -171,6 +171,11 @@ hiddenimports = [
     "ui.tray",
     "ui.permissions",
     "ui.setup_wizard",
+    # Imported lazily inside BetterFlowApp._show_privacy_notice_if_needed, so
+    # the bundle needs it named here — a missing module there is an ImportError
+    # the unit suite (which imports by path) can never see.
+    "ui.privacy_notice_window",
+    "privacy_notice",
     "aw_manager",
     "autostart",
     "windows_tray",  # Windows 11 tray-icon promotion (best-effort, win-only)

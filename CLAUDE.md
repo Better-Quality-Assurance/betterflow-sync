@@ -141,10 +141,39 @@ weight — a first-run wizard bullet is read once and forgotten. It renders as
 `Device serial: unavailable` when the probe found nothing, never blank and never
 `None`. Keep that row in step with what is actually sent.
 
+- `disclosure_acknowledgement` (`src/privacy_notice.py`) — `{version,
+  acknowledged_at}`, the record that this user was shown the data-collection
+  notice before monitoring continued (Romanian Law 190/2018 art. 5 lit. b).
+  Carries no activity data and no device id: the server binds the record from
+  the authenticated heartbeat and writes `agent_device_id` itself. The key name
+  and shape are the server's contract (`AgentHeartbeatController` →
+  `agent_disclosure_acknowledgements`), so neither end may be renamed alone.
+
 `src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
 of what the heartbeat forwards — a field missing from it never leaves the
 machine. Treat that tuple as the source of truth when auditing egress, and
 update this section whenever it changes.
+
+#### The one-time privacy notice
+
+`src/privacy_notice.py` holds the disclosure text, its version, and the
+acknowledgement record; `src/ui/privacy_notice_window.py` is a rendering shell
+with no copy of its own. It shows once per *text version*, on all three
+platforms, from `BetterFlowApp.run` — deliberately NOT from the first-run
+consent screen, which macOS never executes.
+
+Two rules when editing it:
+
+- **Do not hand-edit a version.** `NOTICE_VERSION` is a SHA-256 of the notice
+  text, so changing a single character re-shows the notice to the whole fleet
+  automatically. That is the feature: a new data category must never reach
+  devices that acknowledged the old text.
+- **The three qualifiers in `REQUIRED_QUALIFIERS` are legal, not editorial** —
+  titles leave the machine *as recorded*, input is *counts only*, and the serial
+  *identifies the machine*. Tests fail if any is removed.
+
+The English notice is a rendering of Regulament Intern art. 64^1 alin. (4)-(5).
+If the two disagree, the Romanian prevails — it is the version employees sign.
 
 ### Configuration Storage
 
