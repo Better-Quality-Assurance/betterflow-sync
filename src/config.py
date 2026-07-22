@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from dataclasses import fields as dc_fields
@@ -1109,6 +1110,57 @@ class Config:
             logger.warning("Failed to persist server config to disk: %s", e)
 
 
+# Agent log files are disclosed to employees as retained for 30 days
+# (Regulament Intern art. 68^1 alin. 8 lit. f). The logs carry app names, the
+# machine hostname, and OS usernames inside stack-trace paths, so this is a
+# privacy CEILING, not a floor: nothing older than the window may remain.
+# Changing this number changes what a signed document promises — tell
+# dpo@betterqa.co. Pinned by tests/test_log_retention.py.
+LOG_RETENTION_DAYS = 30
+
+
+def prune_old_logs(
+    log_dir: "Path", *, now: Optional[float] = None, max_age_days: int = LOG_RETENTION_DAYS
+) -> "list[Path]":
+    """Delete agent log files whose last write predates the retention window.
+
+    Size-based rotation bounds disk use but gives no time guarantee — a quiet
+    machine keeps a rotated file for months. This is the time bound: on every
+    startup, remove any ``betterflow.log`` or ``betterflow.log.N`` whose mtime
+    is older than ``max_age_days``. mtime is the last write, so an active file
+    older than the window has ALL its lines older than the window and is safe to
+    drop; it is recreated fresh by the handler.
+
+    Scoped to our own files by name, so an unrelated ``.log`` in the same
+    directory is never touched. Never raises: retention must not break startup,
+    and one unreadable file must not stop the rest being pruned (a sweep that
+    aborts on the first error silently keeps everything behind it). Returns the
+    files it removed.
+    """
+    from pathlib import Path
+
+    now = time.time() if now is None else now
+    cutoff = now - max_age_days * 86400
+    removed: list[Path] = []
+
+    try:
+        candidates = list(Path(log_dir).glob("betterflow.log*"))
+    except OSError:
+        return removed
+
+    for path in candidates:
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue
+            path.unlink()
+            removed.append(path)
+        except OSError:
+            # Locked, vanished, or permission-denied: skip it, keep sweeping.
+            logger.debug("Log retention could not remove %s", path, exc_info=True)
+
+    return removed
+
+
 def setup_logging(debug: bool = False) -> None:
     """Configure logging.
 
@@ -1116,6 +1168,12 @@ def setup_logging(debug: bool = False) -> None:
     """
     log_dir = Config.get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Enforce the disclosed 30-day retention ceiling before opening the handler.
+    # Done here rather than on a timer so it runs on every launch regardless of
+    # how long the machine was off — the case size-based rotation misses.
+    prune_old_logs(log_dir)
+
     log_file = log_dir / "betterflow.log"
 
     level = logging.DEBUG if debug else logging.INFO
