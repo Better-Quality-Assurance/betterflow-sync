@@ -1,6 +1,6 @@
 # BetterFlow - Build Makefile
 
-.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows build-linux appimage run download-aw clean-aw sign-mac notarize-mac staple-mac dmg _dmg-only pkg _pkg-only ship ship-arm64 ship-x86_64 dev icons
+.PHONY: install install-dev install-mac test lint format clean clean-dist build build-mac build-windows build-linux appimage run download-aw clean-aw sign-mac notarize-mac staple-mac dmg _dmg-only pkg _pkg-only ship ship-arm64 ship-x86_64 dev icons
 
 # Install production dependencies
 install:
@@ -28,6 +28,15 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 
+# Remove ONLY the PyInstaller output paths under dist/. PyInstaller aborts with
+# "the output directory ... is not empty" if a previous partial or failed run
+# left them behind, which is the normal state after any interrupted build.
+# Deliberately scoped: DMGs, PKGs and the arch-renamed .app copies in dist/
+# are left alone, and nothing outside dist/ is touched.
+clean-dist:
+	@rm -rf dist/BetterFlow.app dist/BetterFlow
+	@echo "[clean-dist] removed dist/BetterFlow.app and dist/BetterFlow (if present)"
+
 # Download ActivityWatch binaries for current platform
 download-aw:
 	python scripts/download_aw.py
@@ -40,9 +49,17 @@ clean-aw:
 build: download-aw
 	pyinstaller build.spec --clean
 
-# Build for macOS
-build-mac: download-aw
-	pyinstaller build.spec --clean
+# Build for macOS.
+#
+# Does NOT call `pyinstaller` off PATH: on a post-Rosetta-migration machine that
+# resolves to the stale Intel Homebrew prefix (/usr/local/bin/pyinstaller), which
+# builds a silently x86_64 .app on an arm64 host — indistinguishable from a
+# correct build by filename. scripts/resolve-pyinstaller.sh picks an interpreter
+# whose PyInstaller runs as $(TARGET_ARCH) and fails loudly if there is none.
+# Override with PYINSTALLER_PYTHON=/path/to/venv/bin/python3.
+build-mac: download-aw clean-dist
+	@py=$$(./scripts/resolve-pyinstaller.sh $(TARGET_ARCH)) || exit 1; \
+	"$$py" -m PyInstaller build.spec --clean
 	@$(MAKE) sign-mac
 	@echo "Built: dist/BetterFlow.app"
 

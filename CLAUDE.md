@@ -137,6 +137,27 @@ make dmg
 # 3. Install: drag from DMG to /Applications
 ```
 
+### macOS build environment
+
+`make build-mac` handles the three environment traps that used to fail a first
+build (missing CA bundle, wrong-architecture `pyinstaller` off PATH, stale
+`dist/`). See `docs/SIGNING.md` § "Build environment traps on macOS". Short
+version:
+
+- The tracker download resolves certifi's CA bundle itself — do **not** export
+  `SSL_CERT_FILE` by hand.
+- PyInstaller is resolved by `scripts/resolve-pyinstaller.sh`, which verifies the
+  interpreter's architecture and fails loudly rather than producing a silently
+  x86_64 app. Building from a **git worktree** has no venv, so pass
+  `PYINSTALLER_PYTHON=/path/to/betterflow-sync/venv/bin/python3`.
+- `make clean-dist` (a dependency of `build-mac`) removes only
+  `dist/BetterFlow.app` and `dist/BetterFlow`.
+
+Never capture a build's exit code through a pipeline
+(`( make ... ; echo "EXIT: $?" )` reports success for a failed build — the echo
+succeeded). Write the status to its own file and verify the artifact:
+`lipo -archs dist/BetterFlow.app/Contents/MacOS/BetterFlow`.
+
 ## CI/CD
 
 GitHub Actions workflow (`.github/workflows/build.yml`) builds for macOS and Windows on push to `main`. Tagged releases (`v*`) create draft GitHub releases with ZIP artifacts.
