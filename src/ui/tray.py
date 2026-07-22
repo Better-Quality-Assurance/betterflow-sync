@@ -59,6 +59,15 @@ except ImportError:
         import _build_info  # noqa: F401 — ensure bundle path detection runs first
     from config import PRIVACY_POLICY_URL  # type: ignore[no-redef]
 
+try:
+    from ..clipboard import clipboard_available, copy_to_clipboard
+    from ..hardware_serial import get_hardware_serial
+    from ..notifications import send_notification
+except ImportError:
+    from clipboard import clipboard_available, copy_to_clipboard  # type: ignore[no-redef]
+    from hardware_serial import get_hardware_serial  # type: ignore[no-redef]
+    from notifications import send_notification  # type: ignore[no-redef]
+
 
 def _prevent_termination() -> None:
     """Prevent macOS from silently killing the tray app.
@@ -719,6 +728,7 @@ class TrayIcon:
             Item(f"Queue: {s['queue_size']} events", None, enabled=False),
             Item(f"Last sync: {s['last_sync']}", None, enabled=False),
             Item("─" * 20, None, enabled=False),
+            self._serial_menu_item(),
             Item("Privacy Policy", self._handle_open_privacy),
         ]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
@@ -777,6 +787,51 @@ class TrayIcon:
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
+
+    def _serial_menu_item(self) -> "Item":
+        """The device-serial row: readable value, copyable when we can copy.
+
+        Sits in Diagnostics next to the Privacy Policy link on purpose. The agent
+        reports this serial to the server, so the honest thing is to show the
+        user the exact value we hold about their machine rather than describe it
+        in a first-run wizard they clicked through months ago. Seeing the literal
+        string also makes it self-evident that this identifies the hardware and
+        not them.
+
+        Reads the cached probe from src/hardware_serial.py — the same call site
+        the heartbeat uses, memoised for the life of the process, so rebuilding
+        the menu on every state change costs nothing.
+        """
+        serial = get_hardware_serial()
+
+        if serial is None:
+            # Explicitly "unavailable", never blank and never the repr "None".
+            # A VM, a container or a root-only /sys/class/dmi/id/product_serial
+            # genuinely has no readable serial; that should read as an honest
+            # absence, not as a broken app.
+            return Item("Device serial: unavailable", None, enabled=False)
+
+        label = f"Device serial: {serial}"
+        if not clipboard_available():
+            # No clipboard tool on this box (a bare Linux session with no
+            # wl-copy/xclip/xsel). Render the value as plain info rather than a
+            # button that silently does nothing — the label still carries the
+            # string the user needs to read off.
+            return Item(label, None, enabled=False)
+        return Item(label, self._handle_copy_serial)
+
+    def _handle_copy_serial(self, icon, item) -> None:
+        """Copy the device serial to the clipboard, with a brief confirmation."""
+        serial = get_hardware_serial()
+        if serial is None:
+            return
+        if copy_to_clipboard(serial):
+            send_notification("BetterFlow", f"Device serial {serial} copied.")
+        else:
+            # Don't claim success we didn't get. The value is still on screen.
+            send_notification(
+                "BetterFlow", f"Could not copy. Your device serial is {serial}."
+            )
 
     def _get_status_text(self, s: Optional[dict] = None) -> str:
         """Get short status text for the menu.

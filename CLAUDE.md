@@ -113,6 +113,13 @@ not the person using it:
 - `timezone`, `agent_version`, and the tracker-health telemetry (restart counts,
   event ages, sync staleness).
 
+The serial is shown back to the user in the tray under **Diagnostics > Device
+serial**, next to the Privacy Policy link, and clicking it copies the value.
+Displaying the literal string we hold is the disclosure that actually carries
+weight — a first-run wizard bullet is read once and forgotten. It renders as
+`Device serial: unavailable` when the probe found nothing, never blank and never
+`None`. Keep that row in step with what is actually sent.
+
 `src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
 of what the heartbeat forwards — a field missing from it never leaves the
 machine. Treat that tuple as the source of truth when auditing egress, and
