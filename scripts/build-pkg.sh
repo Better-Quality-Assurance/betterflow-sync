@@ -5,7 +5,10 @@
 # (Miradore -> InstallEnterpriseApplication) can only deploy a signed
 # .pkg. See docs/superpowers/specs/2026-07-22-mdm-pkg-deployment-design.md.
 #
-#   pkgbuild     -> component package (the .app, installed to /Applications)
+#   pkgbuild     -> component package (the .app, installed to /Applications),
+#                   built from a staging root + a component plist that sets
+#                   BundleIsRelocatable=false (see the long note below —
+#                   without it the install silently no-ops)
 #   productbuild -> distribution package (what MDM and Installer.app accept)
 #   productsign  -> signs it with the Developer ID INSTALLER identity
 #
@@ -82,9 +85,60 @@ trap cleanup EXIT
 
 COMPONENT_PKG_NAME="BetterFlow-component.pkg"
 
+# --- Bundle relocation must be OFF -------------------------------------
+#
+# pkgbuild marks every bundle it packages BundleIsRelocatable=true by
+# default. At install time PackageKit then SEARCHES the machine (Spotlight
+# + the receipt database) for any bundle carrying the same identifier
+# (co.betterqa.betterflow) and installs OVER THAT COPY, silently ignoring
+# --install-location. On a Mac with a stray or old BetterFlow.app anywhere
+# — a Downloads copy, a build artifact, an old install — the MDM push
+# reports "Install Succeeded" and /Applications/BetterFlow.app never
+# appears. Observed 2026-07-22: a real install "succeeded" into a
+# dist/BetterFlow.app inside a git worktree.
+#
+# Relocation cannot be turned off on the pkgbuild command line; it is a
+# property of the component, so we have to --analyze into a component
+# plist, flip the flag, and hand that back with --component-plist. That
+# in turn requires --root (a staging tree) rather than --component.
+STAGING="$WORKDIR/root"
+mkdir -p "$STAGING"
+# ditto, not cp: it preserves the code signature's extended attributes.
+ditto "$APP" "$STAGING/$(basename "$APP")"
+
+COMPONENT_PLIST="$WORKDIR/component.plist"
+echo "[build-pkg] pkgbuild --analyze — component property list"
+pkgbuild --analyze --root "$STAGING" "$COMPONENT_PLIST"
+
+python3 - "$COMPONENT_PLIST" <<'PY'
+import plistlib, sys
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    components = plistlib.load(fh)
+if not components:
+    sys.exit("[build-pkg] pkgbuild --analyze produced an empty component list")
+for component in components:
+    component["BundleIsRelocatable"] = False
+with open(path, "wb") as fh:
+    plistlib.dump(components, fh)
+
+# Read it back rather than trusting the write.
+with open(path, "rb") as fh:
+    written = plistlib.load(fh)
+bad = [c for c in written if c.get("BundleIsRelocatable") is not False]
+if bad:
+    sys.exit("[build-pkg] BundleIsRelocatable is still set on: %s" % bad)
+print("[build-pkg] BundleIsRelocatable=false on %d component(s)" % len(written))
+PY
+
+echo "[build-pkg] Component plist:"
+plutil -p "$COMPONENT_PLIST"
+
 echo "[build-pkg] pkgbuild — component package"
 pkgbuild \
-    --component "$APP" \
+    --root "$STAGING" \
+    --component-plist "$COMPONENT_PLIST" \
     --install-location /Applications \
     --identifier "$PKG_IDENTIFIER" \
     --version "$VERSION" \
@@ -108,5 +162,45 @@ productsign --sign "$IDENTITY" "$WORKDIR/BetterFlow-unsigned.pkg" "$OUTPUT_PKG"
 
 echo "[build-pkg] Verifying package signature"
 pkgutil --check-signature "$OUTPUT_PKG"
+
+# Assert against the ARTIFACT, not against the plist we wrote. A relocatable
+# component lists the bundle inside <relocate> in its PackageInfo:
+#     <relocate><bundle id="co.betterqa.betterflow"/></relocate>
+# A non-relocatable one leaves that element empty (<relocate/>). This is the
+# check that would have caught the silent no-op install, so it runs on every
+# build.
+echo "[build-pkg] Verifying the package does not permit bundle relocation"
+EXPANDED="$WORKDIR/expanded"
+pkgutil --expand "$OUTPUT_PKG" "$EXPANDED"
+python3 - "$EXPANDED" <<'PY'
+import pathlib, sys
+import xml.etree.ElementTree as ET
+
+root = pathlib.Path(sys.argv[1])
+package_infos = sorted(root.rglob("PackageInfo"))
+if not package_infos:
+    sys.exit("[build-pkg] FAIL: no PackageInfo found in the expanded package")
+
+offenders = []
+for package_info in package_infos:
+    for relocate in ET.parse(package_info).getroot().iter("relocate"):
+        for bundle in relocate.findall("bundle"):
+            offenders.append("%s: %s" % (package_info.name, bundle.get("id")))
+
+if offenders:
+    sys.stderr.write(
+        "[build-pkg] FAIL: the built package still declares bundles relocatable:\n"
+        + "".join("  %s\n" % o for o in offenders)
+        + "[build-pkg] PackageKit would install over an existing copy of that\n"
+        "[build-pkg] identifier found anywhere on the target Mac and report\n"
+        "[build-pkg] success without ever touching /Applications.\n"
+    )
+    sys.exit(1)
+
+print(
+    "[build-pkg] OK: %d PackageInfo file(s), no bundle marked relocatable"
+    % len(package_infos)
+)
+PY
 
 echo "[build-pkg] Created $OUTPUT_PKG (signed, NOT yet notarized)"
