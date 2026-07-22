@@ -382,6 +382,11 @@ class BetterFlowClient(BaseApiClient):
         "consecutive_sync_failures",
         "idle_while_active_detections",
         "sync_stale_seconds",
+        # Tri-state (True/False/null) — null means "no window events to
+        # judge", which is NOT the same as False ("events but no titles").
+        # Forwarded verbatim; the membership test is `in`, not truthiness,
+        # so a null survives the wire.
+        "window_titles_captured_recently",
         # Stable hardware identifier joining this device to the MDM asset
         # inventory. str | None — see src/hardware_serial.py.
         "hardware_serial",
