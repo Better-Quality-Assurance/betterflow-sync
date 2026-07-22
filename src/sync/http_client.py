@@ -25,9 +25,36 @@ __all__ = [
     "BetterFlowClientError",
     "BetterFlowAuthError",
     "resolve_ca_bundle",
+    "transient_failure_count",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Transient-failure counter ----------------------------------------------
+#
+# Monotonic count of failures classified as transient (network-shaped) by
+# BetterFlowClientError.is_transient — the codebase's SINGLE "network problem vs
+# definitive rejection" decision point. SyncCoordinator._do_sync snapshots this
+# at cycle start so its watchdog can tell "the API was unreachable and the cycle
+# ran long" (a warning) from "the cycle is genuinely hung" (an error) instead of
+# reporting both as "Sync hung" (2026-07-22, device 18: a 150.86s cycle during an
+# hour-long connectivity outage, nothing hung, nothing lost, paged as an ERROR).
+#
+# Deliberately NOT a second classifier — see rules/one-rule-one-implementation.md.
+# Lock-free: one writer in practice (the sync thread), and the only consequence
+# of a lost increment under a rare interpreter-level interleaving is that one
+# watchdog report is labelled a hang instead of an outage.
+_TRANSIENT_FAILURE_COUNT = 0
+
+
+def transient_failure_count() -> int:
+    """Number of transient failures classified since process start (monotonic).
+
+    Only meaningful as a delta between two reads — callers snapshot it and check
+    whether it moved.
+    """
+    return _TRANSIENT_FAILURE_COUNT
 
 
 # ---- TLS CA bundle resolution -----------------------------------------------
@@ -146,8 +173,16 @@ class BetterFlowClientError(Exception):
         ONLY for a definitive client rejection (a non-retryable 4xx), so "no code"
         means transient. NOTE: this is a rejection classifier, not a raw HTTP
         status — do not set status_code on a retryable 4xx or it becomes
-        definitive and its events burn retries during e.g. a rate-limit window."""
-        return self.status_code is None or self.status_code >= 500
+        definitive and its events burn retries during e.g. a rate-limit window.
+
+        Side effect: a transient verdict bumps the module counter read by
+        SyncCoordinator's watchdog (see _TRANSIENT_FAILURE_COUNT). It lives here,
+        and nowhere else, so there is exactly one transient/definitive rule."""
+        global _TRANSIENT_FAILURE_COUNT
+        transient = self.status_code is None or self.status_code >= 500
+        if transient:
+            _TRANSIENT_FAILURE_COUNT += 1
+        return transient
 
 
 class BetterFlowAuthError(BetterFlowClientError):
