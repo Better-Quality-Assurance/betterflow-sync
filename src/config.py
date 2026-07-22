@@ -855,6 +855,7 @@ class Config:
         Server returns:
             privacy.hash_window_titles -> local hash_titles
             privacy.title_allowlist -> local title_allowlist
+            privacy.exclude_apps -> EXTENDS local exclude_apps (union, never replace)
             privacy.track_browser_domains -> local domain_only_urls (inverted)
             sync.sync_interval_seconds -> local interval_seconds
             sync.batch_size -> local batch_size
@@ -880,6 +881,33 @@ class Config:
                 self.privacy.domain_only_urls = self._to_bool(privacy["track_browser_domains"])
             if "collect_full_urls" in privacy:
                 self.privacy.collect_full_urls = self._to_bool(privacy["collect_full_urls"])
+            if "exclude_apps" in privacy:
+                # ADDITIVE ONLY — union with what this build ships, never a
+                # replacement. The Regulament Intern states the excluded-app list
+                # is not limitative and may be extended; this is the mechanism.
+                # Making it a replacement would let one server row REMOVE
+                # 1Password/Keychain from the list, i.e. turn a signed privacy
+                # guarantee off remotely with no release and nobody informed —
+                # exactly the failure mode the deferral gate above exists for.
+                # Union can only ever send LESS data, so the worst a bad payload
+                # can do is stop tracking an app, which is visible and harmless.
+                extra = privacy["exclude_apps"]
+                if isinstance(extra, list):
+                    added = [
+                        a.strip() for a in extra
+                        if isinstance(a, str) and a.strip()
+                        and a.strip() not in self.privacy.exclude_apps
+                    ]
+                    if added:
+                        self.privacy.exclude_apps = self.privacy.exclude_apps + added
+                        logger.info(
+                            "Server config: extended exclude_apps with %s", added
+                        )
+                else:
+                    logger.warning(
+                        "Invalid privacy.exclude_apps from server (expected a "
+                        "list, got %s) — ignoring", type(extra).__name__
+                    )
 
         if "collection" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             collection = server_config["collection"]

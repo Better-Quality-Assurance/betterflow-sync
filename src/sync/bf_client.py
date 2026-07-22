@@ -5,20 +5,22 @@ import json
 import logging
 import platform
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import urlparse
 
 import requests
 
 try:
     from .. import __version__
-    from ..config import DEFAULT_API_URL, get_machine_uuid
+    from ..config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
     from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from .privacy_filter import partition_excluded
     from .retry import RetryConfig
 except ImportError:
     from src import __version__
-    from config import DEFAULT_API_URL, get_machine_uuid
+    from config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
     from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from sync.privacy_filter import partition_excluded
     from sync.retry import RetryConfig
 
 __all__ = [
@@ -120,6 +122,7 @@ class BetterFlowClient(BaseApiClient):
         compress: bool = True,
         timeout: int = 30,
         retry_config: Optional[RetryConfig] = None,
+        excluded_apps_provider: Optional[Callable[[], Iterable[str]]] = None,
     ):
         """Initialize BetterFlow client.
 
@@ -131,6 +134,12 @@ class BetterFlowClient(BaseApiClient):
             compress: Use gzip compression for event batches
             timeout: Request timeout in seconds
             retry_config: Configuration for retry with exponential backoff
+            excluded_apps_provider: Callable returning the CURRENT excluded-app
+                list, consulted on every send so a live config edit takes effect
+                immediately (a snapshotted list would keep egressing an app the
+                user just excluded). When omitted, the shipped defaults apply:
+                an unwired client still honours the baseline guarantee rather
+                than failing open.
         """
         super().__init__(
             api_url=api_url,
@@ -141,6 +150,27 @@ class BetterFlowClient(BaseApiClient):
             timeout=timeout,
             retry_config=retry_config,
         )
+        self._excluded_apps_provider = excluded_apps_provider
+
+    def _excluded_apps(self) -> Iterable[str]:
+        """Current excluded-app list. Fails CLOSED: if the provider is missing
+        or raises, fall back to the shipped defaults instead of transmitting
+        everything."""
+        provider = self._excluded_apps_provider
+        if provider is None:
+            return PrivacySettings().exclude_apps
+        try:
+            apps = provider()
+        except Exception:
+            logger.warning(
+                "excluded-apps provider failed — falling back to the shipped "
+                "exclusion defaults for this send",
+                exc_info=True,
+            )
+            return PrivacySettings().exclude_apps
+        if apps is None:
+            return PrivacySettings().exclude_apps
+        return apps
 
     # =========================================================================
     # Authentication
@@ -264,6 +294,35 @@ class BetterFlowClient(BaseApiClient):
         if not events:
             return SyncResult(success=True, events_synced=0)
 
+        # THE PRIVACY EGRESS CHOKEPOINT. This is the one function that puts
+        # events on the wire, so it is the one place the excluded-app guarantee
+        # can be enforced for EVERY producer — external AW buckets, the
+        # in-process window/input sources, status spans, the call detector, the
+        # offline-queue drain, and whatever is added next. Enforcing it in the
+        # producers instead is how the in-process sources shipped able to
+        # egress 1Password titles. Do not move this below the request.
+        events, dropped = partition_excluded(events, self._excluded_apps())
+        dropped_ids = [e.get("id") for e in dropped if e.get("id") is not None]
+        if dropped:
+            # Never log the titles/URLs of an excluded app — the app names are
+            # the most that may be recorded, and only locally.
+            logger.info(
+                "Privacy filter: dropped %d event(s) for excluded app(s) %s "
+                "before egress",
+                len(dropped),
+                ", ".join(sorted({a for a in (
+                    e.get("data", {}).get("app") for e in dropped
+                ) if a})),
+            )
+        if not events:
+            # Nothing left to transmit. Report SUCCESS with the dropped ids
+            # reported as accepted: exclusion is a permanent local decision, so
+            # callers must retire these events (drop the queue row, advance the
+            # checkpoint) rather than retry them forever.
+            return SyncResult(
+                success=True, events_synced=0, accepted_ids=dropped_ids
+            )
+
         try:
             # Idempotency key prevents duplicate processing when the same batch
             # is re-sent — either the retry loop after the connection drops once
@@ -341,7 +400,14 @@ class BetterFlowClient(BaseApiClient):
                 success=delivered,
                 events_synced=events_synced,
                 events_queued=queued,
-                accepted_ids=accepted_ids,
+                # Privacy-dropped ids ride along ONLY when the server gave a
+                # per-event verdict. Callers use accepted_ids to decide what not
+                # to re-queue, and a dropped event must never be re-queued; when
+                # there is no verdict (accepted_ids empty) the caller holds the
+                # whole batch and the next attempt re-drops them harmlessly.
+                accepted_ids=(
+                    list(accepted_ids) + dropped_ids if accepted_ids else accepted_ids
+                ),
             )
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login

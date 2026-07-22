@@ -84,7 +84,15 @@ categorization signal). The settings in `Config.privacy`:
   (default False, opt-in, sensitive).
 - `exclude_apps` (default: 1Password, Keychain, System Settings, ...) -
   **enforced client-side** — these apps' events never leave the device. This is
-  the real "never send this app's titles" control.
+  the real "never send this app's titles" control. Enforced at the **egress
+  chokepoint**, `BetterFlowClient.send_events` (via `src/sync/privacy_filter.py`),
+  because that is the one function that puts events on the wire. Do NOT re-add
+  the check to individual producers and do NOT add a new send path that bypasses
+  `send_events`: enforcing per-producer is exactly how the in-process window and
+  input sources shipped able to egress 1Password titles.
+  `Config.update_from_server` may only **extend** this list (union with the
+  shipped defaults), and only once `DEFER_UNAPPLIED_SERVER_SETTINGS` is lifted —
+  a server row can never un-exclude an app.
 - `title_allowlist` - apps allowed to send raw titles even when `hash_titles` is
   set (forwarded to the server alongside `hash_titles`).
 
