@@ -2,8 +2,8 @@
 
 A single 401/403 (backend deploy, momentary token-lookup blip) used to log the
 user out immediately and stop tracking → dashboard showed "idle". Now:
-- SyncCoordinator._handle_auth_error tolerates failures below a threshold and
-  only logs out after N consecutive ones; a fresh login resets the streak.
+- SyncCoordinator._handle_auth_error tolerates failures below a count+time
+  threshold; a fresh login resets the streak.
 - LoginManager.try_auto_login retries auth failures with backoff before wiping
   stored credentials.
 """
@@ -46,10 +46,19 @@ class TestHandleAuthErrorTolerance:
         assert coord.logged_in is True
         coord._on_auth_error.assert_not_called()
 
-    def test_threshold_logs_out_and_triggers_relogin(self):
+    def test_threshold_inside_grace_window_keeps_session(self):
         coord = _make_coordinator()
         for _ in range(coord._AUTH_FAILURE_LOGOUT_THRESHOLD):
             coord._handle_auth_error(BetterFlowAuthError("401"), source="sync")
+        assert coord.logged_in is True
+        coord._on_auth_error.assert_not_called()
+
+    def test_sustained_threshold_logs_out_and_triggers_relogin(self):
+        coord = _make_coordinator()
+        coord._first_auth_failure_monotonic = 0.0
+        with patch("src.main.time.monotonic", return_value=coord._AUTH_FAILURE_LOGOUT_MIN_SECONDS + 1):
+            for _ in range(coord._AUTH_FAILURE_LOGOUT_THRESHOLD):
+                coord._handle_auth_error(BetterFlowAuthError("401"), source="sync")
         assert coord.logged_in is False
         coord._on_auth_error.assert_called_once()
 
@@ -60,6 +69,7 @@ class TestHandleAuthErrorTolerance:
         coord._handle_auth_error(BetterFlowAuthError("401"), source="sync")
         coord.logged_in = True  # setter resets the auth streak
         assert coord._consecutive_auth_failures == 0
+        assert coord._first_auth_failure_monotonic is None
         # Two more failures must still be tolerated (streak restarted).
         coord._handle_auth_error(BetterFlowAuthError("401"), source="sync")
         coord._handle_auth_error(BetterFlowAuthError("401"), source="sync")

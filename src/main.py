@@ -190,10 +190,13 @@ class SyncCoordinator:
         # transient — a backend deploy, a momentary token-lookup blip — so
         # logging out on the first one needlessly stops tracking and leaves the
         # user "idle" until they re-login. Only treat the session as lost after
-        # this many CONSECUTIVE failures; any successful sync resets the streak.
+        # enough consecutive failures over a sustained time window; any
+        # successful sync resets both.
         # Mutated only inside _do_sync's call chain (sync thread), no extra lock.
         self._consecutive_auth_failures = 0
         self._AUTH_FAILURE_LOGOUT_THRESHOLD = 3
+        self._first_auth_failure_monotonic: Optional[float] = None
+        self._AUTH_FAILURE_LOGOUT_MIN_SECONDS = 15 * 60
 
         # Consecutive cycles where the LOCAL ActivityWatch server is unreachable.
         # is_running() already resets+retries the HTTP session internally, so a
@@ -324,6 +327,7 @@ class SyncCoordinator:
         # transient 401 doesn't immediately re-cross the logout threshold.
         if value:
             self._consecutive_auth_failures = 0
+            self._first_auth_failure_monotonic = None
 
     @property
     def paused_by_network(self) -> bool:
@@ -1486,6 +1490,7 @@ class SyncCoordinator:
                 # A successful authenticated round-trip means the token is fine,
                 # so any earlier 401/403 was transient — clear the auth streak.
                 self._consecutive_auth_failures = 0
+                self._first_auth_failure_monotonic = None
                 # Partial success: some buckets may fail but data still syncs
                 if stats.errors:
                     for err in stats.errors:
@@ -1652,28 +1657,38 @@ class SyncCoordinator:
 
         Logging out on the FIRST auth error is what froze users at "idle" after
         a backend deploy or a momentary token blip: one 401 → wipe session →
-        tracking stops. We instead require several CONSECUTIVE failures before
-        treating the session as lost. Until the threshold, we keep the session
-        and keep tracking/queuing — the next sync retries, and a success resets
-        the streak (see _do_sync). Only a sustained failure (genuine
-        revoke/logout) crosses the threshold and prompts re-login.
+        tracking stops. We instead require several consecutive failures over a
+        sustained time window before treating the session as lost. Until then,
+        we keep the session and keep tracking/queuing — the next sync retries,
+        and a success resets the streak (see _do_sync). Only a sustained failure
+        (genuine revoke/logout) crosses the threshold and prompts re-login.
         """
+        now = time.monotonic()
         self._consecutive_auth_failures += 1
-        if self._consecutive_auth_failures < self._AUTH_FAILURE_LOGOUT_THRESHOLD:
+        if self._first_auth_failure_monotonic is None:
+            self._first_auth_failure_monotonic = now
+        auth_failure_age = now - self._first_auth_failure_monotonic
+        if (
+            self._consecutive_auth_failures < self._AUTH_FAILURE_LOGOUT_THRESHOLD
+            or auth_failure_age < self._AUTH_FAILURE_LOGOUT_MIN_SECONDS
+        ):
             logger.warning(
-                "Auth error during %s (%d/%d consecutive): %s — tolerating as "
-                "likely transient; keeping session, will retry",
+                "Auth error during %s (%d/%d consecutive, %.0fs/%.0fs): %s — "
+                "tolerating as likely transient; keeping session, will retry",
                 source,
                 self._consecutive_auth_failures,
                 self._AUTH_FAILURE_LOGOUT_THRESHOLD,
+                auth_failure_age,
+                self._AUTH_FAILURE_LOGOUT_MIN_SECONDS,
                 e,
             )
             return
 
         logger.warning(
-            "Auth error during %s — %d consecutive failures, session lost: %s",
+            "Auth error during %s — %d consecutive failures over %.0fs, session lost: %s",
             source,
             self._consecutive_auth_failures,
+            auth_failure_age,
             e,
         )
         self.logged_in = False
