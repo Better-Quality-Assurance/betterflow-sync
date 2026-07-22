@@ -1782,6 +1782,10 @@ class BetterFlowApp:
         self.bf = BetterFlowClient(
             api_url=self.config.api_url,
             compress=self.config.sync.compress,
+            # Read LIVE (a lambda, not a snapshot): the exclusion list can change
+            # under us via a config reload, and an app the user just excluded
+            # must stop egressing on the very next send.
+            excluded_apps_provider=lambda: self.config.privacy.exclude_apps,
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
