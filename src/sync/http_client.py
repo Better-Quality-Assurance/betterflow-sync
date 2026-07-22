@@ -33,13 +33,18 @@ logger = logging.getLogger(__name__)
 
 # ---- Transient-failure counter ----------------------------------------------
 #
-# Monotonic count of failures classified as transient (network-shaped) by
-# BetterFlowClientError.is_transient — the codebase's SINGLE "network problem vs
-# definitive rejection" decision point. SyncCoordinator._do_sync snapshots this
-# at cycle start so its watchdog can tell "the API was unreachable and the cycle
-# ran long" (a warning) from "the cycle is genuinely hung" (an error) instead of
-# reporting both as "Sync hung" (2026-07-22, device 18: a 150.86s cycle during an
+# Monotonic count of BetterFlowClientErrors that its is_transient rule — the
+# codebase's SINGLE "network problem vs definitive rejection" decision point —
+# classified as transient. SyncCoordinator._do_sync snapshots this at cycle start
+# so its watchdog can tell "the API was unreachable and the cycle ran long" (a
+# warning) from "the cycle is genuinely hung" (an error) instead of reporting
+# both as "Sync hung" (2026-07-22, device 18: a 150.86s cycle during an
 # hour-long connectivity outage, nothing hung, nothing lost, paged as an ERROR).
+#
+# Incremented once per failure OBJECT, in __init__ — never in the is_transient
+# getter, which stays a pure query. A read-counting metric inflates the moment
+# anyone logs or re-reads the property, and inflation is the fail-open direction:
+# it makes a real hang report as an outage warning.
 #
 # Deliberately NOT a second classifier — see rules/one-rule-one-implementation.md.
 # Lock-free: one writer in practice (the sync thread), and the only consequence
@@ -164,6 +169,18 @@ class BetterFlowClientError(Exception):
     def __init__(self, message: str = "", status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+        # Count the FAILURE, not the classification READ. Incrementing inside the
+        # is_transient getter would make the metric a function of how many times
+        # the property is consulted — one debug log or a second caller and it
+        # inflates, which is the fail-open direction: an inflated count makes the
+        # watchdog report a genuine hang as an outage warning. Counting here is
+        # once per failure object, and every construction site in this module is
+        # a `raise` representing a real failure (checked 2026-07-22). The
+        # transient/definitive RULE still lives in exactly one place — the pure
+        # query below.
+        if self.is_transient:
+            global _TRANSIENT_FAILURE_COUNT
+            _TRANSIENT_FAILURE_COUNT += 1
 
     @property
     def is_transient(self) -> bool:
@@ -175,14 +192,10 @@ class BetterFlowClientError(Exception):
         status — do not set status_code on a retryable 4xx or it becomes
         definitive and its events burn retries during e.g. a rate-limit window.
 
-        Side effect: a transient verdict bumps the module counter read by
-        SyncCoordinator's watchdog (see _TRANSIENT_FAILURE_COUNT). It lives here,
-        and nowhere else, so there is exactly one transient/definitive rule."""
-        global _TRANSIENT_FAILURE_COUNT
-        transient = self.status_code is None or self.status_code >= 500
-        if transient:
-            _TRANSIENT_FAILURE_COUNT += 1
-        return transient
+        Pure query — free to read as often as you like. This is the codebase's
+        ONLY transient/definitive rule; __init__ consults it to maintain the
+        counter SyncCoordinator's watchdog reads (_TRANSIENT_FAILURE_COUNT)."""
+        return self.status_code is None or self.status_code >= 500
 
 
 class BetterFlowAuthError(BetterFlowClientError):

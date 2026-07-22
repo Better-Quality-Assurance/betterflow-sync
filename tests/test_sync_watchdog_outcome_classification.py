@@ -203,6 +203,31 @@ class TestWatchdogGenuineHang(_CoordinatorHarness):
 class TestTransientFailureCounter:
     """Case 3 — the counter moves on a transient failure and not on a 4xx."""
 
+    def test_counter_counts_failures_not_property_reads(self):
+        """The count must be a function of how many transient failures OCCURRED,
+        not how many times ``is_transient`` was READ.
+
+        Counting inside the property getter inflates the moment anyone logs
+        ``e.is_transient``, asserts on it in a test, or reads it twice in one
+        path — and inflation is the fail-open direction here: it makes a real
+        hang report as an outage warning, which is precisely the signal this
+        feature exists to get right. So the increment belongs at construction and
+        ``is_transient`` stays a pure query.
+        """
+        error = BetterFlowClientError("Cannot connect to BetterFlow API")
+        before = transient_failure_count()
+
+        assert error.is_transient is True
+        assert error.is_transient is True
+        assert error.is_transient is True
+
+        assert transient_failure_count() == before
+
+    def test_one_failure_object_counts_exactly_once(self):
+        before = transient_failure_count()
+        BetterFlowClientError("Cannot connect to BetterFlow API")
+        assert transient_failure_count() == before + 1
+
     def test_counter_increments_on_transient_failure(self):
         before = transient_failure_count()
         result = _unreachable_client().send_events(_one_event())
