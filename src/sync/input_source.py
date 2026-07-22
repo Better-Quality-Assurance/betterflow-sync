@@ -5,9 +5,9 @@ blocked (Windows UIPI / AV) and produces ZERO input events for hours.
 
 Mirrors ``WindowSource`` / ``AfkSource``: thread-safe state under a lock, a
 sticky ``available()`` latch, a single-source-of-truth ``bucket_id``, and a
-drain-and-build reconstructor (``drain_input_event``). Ships dormant
-(``SyncSettings.in_process_input`` defaults False) — opt-in per the AFK/window
-convergence playbook.
+drain-and-build reconstructor (``drain_input_event``). Enabled by default on
+Windows, where the external tracker is known to report zero input on affected
+devices; macOS stays opt-in under its Input Monitoring grant.
 
 Counting backend: unlike WindowSource (which polls a frontmost probe each
 cycle), input COUNTS must be captured continuously — a keystroke between two

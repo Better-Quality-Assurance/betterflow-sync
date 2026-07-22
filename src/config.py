@@ -328,10 +328,12 @@ class SyncSettings:
     # / macOS CGEventTap) instead of relying on the external aw-watcher-input
     # tracker. Same convergence move as in_process_window, for machines where
     # aw-watcher-input's low-level hook is blocked (UIPI / AV) and reports ZERO
-    # keystrokes/clicks for hours (Fraud Risk 75). Default OFF — ships
-    # dormant/opt-in; when on AND an in-process backend is usable, the external
-    # input bucket is skipped so the two sources never double-count.
-    in_process_input: bool = False
+    # keystrokes/clicks for hours (Fraud Risk 75). Windows defaults ON because
+    # the external tracker is the known-bad path there; macOS stays opt-in under
+    # its Input Monitoring grant. A server config value can still explicitly
+    # switch it either way, and when on AND an in-process backend is usable, the
+    # external input bucket is skipped so the two sources never double-count.
+    in_process_input: bool = field(default_factory=lambda: sys.platform == "win32")
 
 
 @dataclass

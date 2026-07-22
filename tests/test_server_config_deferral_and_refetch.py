@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from src.config import Config
+import src.config as config_module
 from src.sync.queue import OfflineQueue
 from src.sync.sync_engine import SyncEngine
 
@@ -93,7 +94,7 @@ def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
 
 
 def test_in_process_input_server_flag_round_trip():
-    # Un-deferred but still strictly server-driven and string-safe.
+    # Un-deferred, string-safe, and still remotely kill-switchable.
     cfg = Config()
     assert cfg.sync.in_process_input is False, "ships dormant"
 
@@ -105,6 +106,17 @@ def test_in_process_input_server_flag_round_trip():
 
     cfg.update_from_server({"sync": {"in_process_input": False}})
     assert cfg.sync.in_process_input is False, "server can also switch it back off"
+
+
+def test_in_process_input_defaults_on_for_windows(monkeypatch):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+
+    cfg = Config()
+
+    assert cfg.sync.in_process_input is True
+
+    cfg.update_from_server({"sync": {"in_process_input": False}})
+    assert cfg.sync.in_process_input is False, "server kill-switch must still win"
 
 
 def test_working_hours_and_sync_tuning_still_apply():

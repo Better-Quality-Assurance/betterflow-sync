@@ -2913,6 +2913,7 @@ class BetterFlowApp:
         """Handle server config update — apply AFK timeout, then the working-hours
         capture policy the server just told us about."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
+        self._sync_window_sample_job()
 
         # The schedule is already on disk by now: update_from_server() ends with
         # self.save(), which is what lets the NEXT cold start know the window
@@ -2924,6 +2925,35 @@ class BetterFlowApp:
         # The schedule may have just changed or first resolved — re-align the
         # one-shot boundary trigger to the new next edge.
         self.coordinator.arm_capture_boundary()
+
+    def _sync_window_sample_job(self) -> None:
+        """Keep the fast in-process window sampler aligned with live config.
+
+        The scheduler is created before the first server config fetch. If
+        in_process_window is enabled later, relying on the initial add_job branch
+        leaves Windows with only one coarse sample per sync cycle until restart.
+        """
+        if not getattr(self, "coordinator", None):
+            return
+        scheduler = self.coordinator.scheduler
+        if not scheduler.running:
+            return
+        if self.config.sync.in_process_window:
+            scheduler.add_job(
+                self.coordinator._sample_window,
+                trigger=IntervalTrigger(
+                    seconds=self.coordinator.WINDOW_SAMPLE_INTERVAL_SECONDS
+                ),
+                id="window_sample_job",
+                replace_existing=True,
+            )
+        else:
+            try:
+                job = scheduler.get_job("window_sample_job")
+                if job is not None:
+                    scheduler.remove_job("window_sample_job")
+            except Exception as e:
+                logger.debug("window sample job sync failed: %s", e)
 
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""
