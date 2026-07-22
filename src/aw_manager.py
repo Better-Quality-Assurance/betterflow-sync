@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -116,6 +116,20 @@ WINDOW_BLIND_RETRY_INTERVAL = 1800  # 30 minutes
 # CONSECUTIVE healthy health-checks (~30s each) before trusting recovery and
 # unlatching, so a flapping source stays backed off instead of churning per flap.
 WINDOW_BLIND_CLEAR_HEALTHY_CYCLES = 3
+# Window-title capture telemetry (see
+# docs/superpowers/specs/2026-07-22-window-title-capture-telemetry-design.md).
+# "Did ANY window event in the last 15 minutes carry a non-empty title?" — a
+# platform-independent symptom check for the fault whose cause differs per OS
+# (macOS Accessibility not granted / Windows bf-window-tracker blind / Linux X11
+# watcher dead). A boolean, deliberately not a ratio: some apps legitimately
+# report an empty title (screensaver, login window, app mid-launch), so any
+# ratio threshold needs per-platform tuning and then drifts silently. On a
+# working machine the answer is yes within one tick; on a broken one it is no,
+# forever. This is VISIBILITY ONLY and must never influence tracked/billed time.
+WINDOW_TITLE_CAPTURE_LOOKBACK = 900  # 15 minutes
+# Cap the fetch: one poll every couple of seconds for 15 min is well under this,
+# and we only need to know whether ANY title arrived.
+WINDOW_TITLE_EVENT_LIMIT = 500
 # Min gap between "tracker components could not be installed" notifications /
 # error reports. start() is retried from the health-check tick, so without this
 # a fail-closed download would toast the user every cycle.
@@ -1011,6 +1025,9 @@ class AWManager:
         # tracker is still running but irrelevant). The restart count + blind flag
         # are already 0/False on this path (the restart loop is suppressed).
         afk_age = None if inproc else self._get_latest_afk_event_age()
+        # Same rule as the ages above: tracker-server I/O, no shared mutable
+        # state, so it stays OUTSIDE the lifecycle lock.
+        titles_recent = self._window_titles_captured_recently()
         return {
             # idle-tracker-only — window-tracker restarts are excluded so this
             # figure isn't inflated by an unrelated flapping window watcher.
@@ -1027,6 +1044,15 @@ class AWManager:
             # sub-second precision is irrelevant for a staleness signal.
             "afk_event_age_seconds": int(afk_age) if afk_age is not None else None,
             "window_event_age_seconds": int(window_age) if window_age is not None else None,
+            # True  => at least one window event in the last 15 min had a
+            #          non-empty title.
+            # False => window events exist but every title is empty (macOS
+            #          Accessibility missing / Windows tracker blind / Linux
+            #          watcher dead). This is the finding.
+            # None  => no window events in the period, or the probe couldn't run.
+            #          NEVER collapse None into False — "not tracking" is a
+            #          different fault, already covered by the age field above.
+            "window_titles_captured_recently": titles_recent,
             # True => the tracker binaries could not be installed (fail-closed
             # integrity check or a bad archive), so this device is capturing
             # NOTHING even though the agent looks alive.
@@ -1463,6 +1489,80 @@ class AWManager:
     def _get_latest_window_event_age(self) -> Optional[float]:
         """Return seconds since the most recent window event, or None on error."""
         return self._get_latest_event_age("aw-watcher-window")
+
+    def _window_bucket_id(self) -> str:
+        """The host's window bucket id (both the bundled bf-window-tracker and
+        the in-process macOS watcher register under this id)."""
+        return f"aw-watcher-window_{platform.node()}"
+
+    def _get_recent_window_events(self, lookback_seconds: float) -> Optional[list]:
+        """Window events whose range overlaps the last ``lookback_seconds``.
+
+        Returns None on any fetch/parse failure — an unreachable tracker server
+        must never be reported as "titles are broken" (that's a different fault,
+        already covered by ``window_event_age_seconds``).
+        """
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(seconds=lookback_seconds)
+        try:
+            url = (
+                f"http://localhost:{self.aw_port}/api/0/buckets/"
+                f"{urllib.parse.quote(self._window_bucket_id(), safe='')}/events"
+                f"?limit={WINDOW_TITLE_EVENT_LIMIT}"
+                f"&start={urllib.parse.quote(start.isoformat(), safe='')}"
+                f"&end={urllib.parse.quote(now.isoformat(), safe='')}"
+            )
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                events = json.loads(resp.read())
+            return events if isinstance(events, list) else None
+        except Exception as e:
+            logger.debug("_get_recent_window_events failed: %s", e)
+            return None
+
+    def _window_titles_captured_recently(self) -> Optional[bool]:
+        """Whether ANY window event in the last 15 minutes carried a title.
+
+        True  => titles are arriving (platform- and cause-independent).
+        False => window events exist but every title is empty. THIS is the
+                 finding: macOS Accessibility missing, Windows tracker blind,
+                 Linux watcher dead — one symptom, three causes, no per-platform
+                 detector needed.
+        None  => no window events in the period (or the probe could not run).
+                 Kept DISTINCT from False on purpose: "not tracking" is a
+                 different fault from "tracking without titles", and
+                 ``window_event_age_seconds`` already covers the former.
+        """
+        events = self._get_recent_window_events(WINDOW_TITLE_CAPTURE_LOOKBACK)
+        if not events:
+            return None
+
+        cutoff = time.time() - WINDOW_TITLE_CAPTURE_LOOKBACK
+        saw_event_in_window = False
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            # The server should have honoured start/end, but don't rely on it:
+            # an older AW build that ignores the params would otherwise let a
+            # title captured yesterday claim capture is healthy today.
+            try:
+                ts = datetime.fromisoformat(
+                    str(event["timestamp"]).replace("Z", "+00:00")
+                )
+                event_end = ts.timestamp() + (event.get("duration") or 0)
+            except Exception:
+                continue
+            if event_end < cutoff:
+                continue
+            saw_event_in_window = True
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            title = data.get("title")
+            if isinstance(title, str) and title.strip():
+                return True
+
+        return False if saw_event_in_window else None
 
     def _component_running_seconds(self, name: str) -> Optional[float]:
         """Seconds since we last (re)started ``name``, or None if we never did."""
