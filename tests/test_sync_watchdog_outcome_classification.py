@@ -31,7 +31,11 @@ from src.config import Config
 from src.main import SyncCoordinator
 from src.reminders import ReminderManager
 from src.sync.bf_client import BetterFlowClient
-from src.sync.http_client import BetterFlowClientError, transient_failure_count
+from src.sync.http_client import (
+    BetterFlowAuthError,
+    BetterFlowClientError,
+    transient_failure_count,
+)
 from src.sync.sync_engine import SyncEngine
 
 # Shrunk deadline so the watchdog fires inside a test, not in 150s. The
@@ -199,6 +203,36 @@ class TestWatchdogGenuineHang(_CoordinatorHarness):
         assert self.bf.reset_session.called
         assert self.aw.reset_session.called
 
+    def test_zombie_cycles_failures_do_not_downgrade_this_cycle(self):
+        """A failure raised by an ABANDONED cycle must not classify this one.
+
+        _acquire_sync_slot deliberately abandons a cycle that has held the lock
+        past _SYNC_WEDGE_CEILING and re-arms a fresh lock, and documents that the
+        stuck thread cannot be killed. So two _do_sync bodies can be live at once:
+        the zombie cycle A keeps making requests while cycle B runs. A single
+        process-wide counter has no cycle identity, so A's late transient failure
+        would classify B as "the API was unreachable" — masking a genuine wedge
+        with a warning, on the strength of a failure that was not B's.
+
+        Attribution is per-thread: A's work runs on A's thread, B's on B's.
+        """
+
+        def zombie_failure():
+            # Another thread — as the abandoned cycle's zombie would be —
+            # experiences a transient failure while THIS cycle is running.
+            other = threading.Thread(
+                target=lambda: BetterFlowClientError("Cannot connect to BetterFlow API")
+            )
+            other.start()
+            other.join()
+
+        self._run_overrunning_cycle(before_overrun=zombie_failure)
+
+        hung = self.recorder.by_fingerprint("sync-watchdog-timeout")
+        assert len(hung) == 1, self.recorder.captures
+        assert hung[0]["level"] == "error"
+        assert self.recorder.by_fingerprint("sync-watchdog-timeout-offline") == []
+
 
 class TestTransientFailureCounter:
     """Case 3 — the counter moves on a transient failure and not on a 4xx."""
@@ -233,6 +267,31 @@ class TestTransientFailureCounter:
         result = _unreachable_client().send_events(_one_event())
         assert result.transient is True
         assert transient_failure_count() == before + 1
+
+    def test_auth_failure_does_not_move_the_counter(self):
+        """A 401/403 is a definitive rejection — the fix is re-authentication, not
+        waiting for a network to come back. Counting it would report an expired
+        token as "the API was unreachable", hiding the actionable condition.
+
+        Both live call sites construct BetterFlowAuthError with no status_code,
+        so is_transient is True and only the COUNTER excludes it.
+        """
+        before = transient_failure_count()
+        BetterFlowAuthError("Invalid or expired API token")
+        assert transient_failure_count() == before
+
+    def test_auth_error_is_still_transient_for_the_queue(self):
+        """The counter and is_transient deliberately DISAGREE on auth errors, and
+        this pins the half that must not move.
+
+        is_transient is load-bearing for offline-queue durability: a transient
+        failure HOLDS events without burning a retry. Flipping auth errors to
+        definitive would burn retries and, past the threshold, drop real queued
+        activity — the 2026-06-30 data-loss class (up to ~18h of spans). The
+        watchdog's classification must never buy accuracy with that.
+        """
+        assert BetterFlowAuthError("Invalid or expired API token").is_transient is True
+        assert BetterFlowAuthError("Device not authorized").is_transient is True
 
     def test_counter_does_not_move_on_definitive_4xx(self):
         before = transient_failure_count()

@@ -29,7 +29,7 @@ try:
     from .display_info import start_display_tracker
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from .sync.http_client import BetterFlowAuthError, transient_failure_count
+    from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -54,7 +54,7 @@ except ImportError:
     from display_info import start_display_tracker
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from sync.http_client import BetterFlowAuthError, transient_failure_count
+    from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -1361,9 +1361,16 @@ class SyncCoordinator:
         # not hung, and reporting it as an ERROR "Sync hung" paged humans and drew
         # the autofix drafter onto a non-problem (2026-07-22, device 18: 150.86s,
         # no log gap, all three events delivered next cycle). The counter is
-        # incremented by BetterFlowClientError.is_transient — the one place the
-        # codebase classifies network-vs-definitive failures.
-        transient_at_cycle_start = transient_failure_count()
+        # maintained by BetterFlowClientError, off is_transient — the one place
+        # the codebase classifies network-vs-definitive failures.
+        #
+        # THIS THREAD's counter, captured as an object. The watchdog runs on a
+        # Timer thread, so it must not re-read the counter itself (it would get
+        # the Timer's own, always zero). Per-thread also means a cycle abandoned
+        # by _acquire_sync_slot keeps incrementing its OWN counter, so its late
+        # failures can't misclassify the cycle that replaced it.
+        cycle_transients = transient_failure_counter()
+        transient_at_cycle_start = cycle_transients.value
 
         def _watchdog():
             if watchdog_cancelled.is_set():
@@ -1372,7 +1379,7 @@ class SyncCoordinator:
             # downgrades it. A genuine wedge that coincides with one flaky request
             # is downgraded at the deadline — acceptable, because
             # _SYNC_WEDGE_CEILING (420s) still pages it as an error.
-            transient_this_cycle = transient_failure_count() - transient_at_cycle_start
+            transient_this_cycle = cycle_transients.value - transient_at_cycle_start
             if transient_this_cycle > 0:
                 logger.warning(
                     "_do_sync watchdog: sync exceeded %ss with %d transient API "
