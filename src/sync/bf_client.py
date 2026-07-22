@@ -367,6 +367,26 @@ class BetterFlowClient(BaseApiClient):
     # Lightweight retry for heartbeat (N14): 1 retry, 5s timeout
     _HEARTBEAT_RETRY = RetryConfig(max_retries=1, base_delay=1.0, max_delay=5.0)
 
+    # Health/metadata keys forwarded from the caller's dict onto the heartbeat
+    # body. Anything not listed here is dropped at this boundary — a field can be
+    # collected, logged and unit-tested end to end and still never reach the
+    # server because its name is missing from this tuple. Membership is tested
+    # with ``in``, never truthiness: ``hardware_serial: None`` is a meaningful
+    # report ("this device has no readable serial"), not an absent value.
+    HEARTBEAT_HEALTH_KEYS = (
+        "idle_tracker_stale_restarts",
+        "idle_tracker_blind",
+        "inproc_afk",
+        "afk_event_age_seconds",
+        "window_event_age_seconds",
+        "consecutive_sync_failures",
+        "idle_while_active_detections",
+        "sync_stale_seconds",
+        # Stable hardware identifier joining this device to the MDM asset
+        # inventory. str | None — see src/hardware_serial.py.
+        "hardware_serial",
+    )
+
     def heartbeat(
         self,
         agent_version: str = AGENT_VERSION,
@@ -389,16 +409,7 @@ class BetterFlowClient(BaseApiClient):
             "timezone": self._detect_timezone(),
         }
         if health is not None:
-            for key in (
-                "idle_tracker_stale_restarts",
-                "idle_tracker_blind",
-                "inproc_afk",
-                "afk_event_age_seconds",
-                "window_event_age_seconds",
-                "consecutive_sync_failures",
-                "idle_while_active_detections",
-                "sync_stale_seconds",
-            ):
+            for key in self.HEARTBEAT_HEALTH_KEYS:
                 if key in health:
                     data[key] = health[key]
 

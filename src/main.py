@@ -27,6 +27,7 @@ try:
     from . import error_reporter
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
+    from .hardware_serial import get_hardware_serial
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
@@ -52,6 +53,7 @@ except ImportError:
     import error_reporter
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
+    from hardware_serial import get_hardware_serial
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
@@ -1648,6 +1650,12 @@ class SyncCoordinator:
         telemetry: dict = {
             "consecutive_sync_failures": self._consecutive_sync_failures,
             "idle_while_active_detections": blind_window,
+            # Hardware serial: the join key between this fleet and the MDM asset
+            # inventory. Probed once per process and cached (including a failed
+            # probe), so this is a memo read, not a per-heartbeat syscall. Always
+            # sent, even as None — "no readable serial" is the answer for a VM or
+            # a locked-down box, and the server must be able to see it.
+            "hardware_serial": get_hardware_serial(),
         }
         # Seconds since the last successful sync round-trip. Lets the server flag
         # "alive but sync stale" (heartbeat fresh, uploads frozen) directly rather
@@ -2361,6 +2369,13 @@ class BetterFlowApp:
         # bootloader or Rosetta 2 translation can reset it to SIG_DFL.
         if hasattr(signal, "SIGPIPE"):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+        # Warm the hardware-serial memo here rather than letting the first
+        # heartbeat pay for it. On Windows the probe shells out to PowerShell,
+        # which would otherwise land on the sync thread and could push a
+        # heartbeat past its 5s budget. Probed once for the life of the process,
+        # failures included; never raises.
+        get_hardware_serial()
 
         # Apply an update staged in a previous session before anything else —
         # a fast local replace + relaunch into the new version. No-op if nothing
