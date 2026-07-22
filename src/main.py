@@ -1667,18 +1667,21 @@ class SyncCoordinator:
             # a locked-down box, and the server must be able to see it.
             "hardware_serial": get_hardware_serial(),
         }
-        # The privacy-notice acknowledgement: the Law 190/2018 evidence that this
-        # user was informed before monitoring. Re-sent on EVERY heartbeat rather
-        # than once — the server-side reader ships separately and later, so a
-        # send-once design would lose every acknowledgement made before that
-        # deploy. Idempotent upsert; omitted entirely until one exists. Wrapped
-        # because a corrupt record must cost the notice, never the heartbeat.
+        # The disclosure acknowledgement: the Law 190/2018 evidence that this
+        # user was informed before monitoring. The key name is the server's
+        # (AgentHeartbeatController reads `disclosure_acknowledgement`), not a
+        # local convention — renaming it here alone silently un-wires the
+        # record. Re-sent on EVERY heartbeat rather than once, because the
+        # server-side reader ships separately and later and a send-once design
+        # would lose every acknowledgement made before that deploy. Idempotent
+        # upsert; omitted entirely until one exists. Wrapped because a corrupt
+        # record must cost the notice, never the heartbeat.
         try:
             ack = acknowledgement_telemetry(self.config)
             if ack is not None:
-                telemetry["privacy_notice_ack"] = ack
+                telemetry["disclosure_acknowledgement"] = ack
         except Exception as e:  # noqa: BLE001
-            logger.debug("privacy-notice telemetry unavailable: %s", e)
+            logger.debug("disclosure-acknowledgement telemetry unavailable: %s", e)
         # Seconds since the last successful sync round-trip. Lets the server flag
         # "alive but sync stale" (heartbeat fresh, uploads frozen) directly rather
         # than inferring it from upload gaps. Omitted until the first good sync.

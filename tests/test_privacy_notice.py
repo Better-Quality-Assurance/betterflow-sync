@@ -183,7 +183,16 @@ def test_no_telemetry_before_an_acknowledgement(config):
     assert pn.acknowledgement_telemetry(config) is None
 
 
-def test_telemetry_carries_version_time_and_device(config):
+def test_telemetry_is_exactly_the_server_contract(config):
+    """{version, acknowledged_at} — the shape AgentHeartbeatController reads.
+
+    Asserted as EQUALITY, not as "contains", so an extra field is a failure
+    rather than a passing test and some bytes nobody reads. Note the device id
+    is set on the config and still absent from the payload: the server binds the
+    record to a device from the authenticated heartbeat and writes
+    agent_device_id itself, so a second client-asserted copy could only agree
+    (noise) or disagree (an expensive question on an evidence record).
+    """
     config.device_id = "sync:abc-123"
     when = _fixed_now(-120)
     pn.record_acknowledgement(config, now=when)
@@ -192,7 +201,6 @@ def test_telemetry_carries_version_time_and_device(config):
     assert payload == {
         "version": pn.NOTICE_VERSION,
         "acknowledged_at": when.astimezone(timezone.utc).isoformat(),
-        "device_id": "sync:abc-123",
     }
 
 

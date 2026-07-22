@@ -141,10 +141,13 @@ weight — a first-run wizard bullet is read once and forgotten. It renders as
 `Device serial: unavailable` when the probe found nothing, never blank and never
 `None`. Keep that row in step with what is actually sent.
 
-- `privacy_notice_ack` (`src/privacy_notice.py`) — `{version, acknowledged_at,
-  device_id}`, the record that this user was shown the data-collection notice
-  before monitoring continued (Romanian Law 190/2018 art. 5 lit. b). Carries no
-  activity data.
+- `disclosure_acknowledgement` (`src/privacy_notice.py`) — `{version,
+  acknowledged_at}`, the record that this user was shown the data-collection
+  notice before monitoring continued (Romanian Law 190/2018 art. 5 lit. b).
+  Carries no activity data and no device id: the server binds the record from
+  the authenticated heartbeat and writes `agent_device_id` itself. The key name
+  and shape are the server's contract (`AgentHeartbeatController` →
+  `agent_disclosure_acknowledgements`), so neither end may be renamed alone.
 
 `src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
 of what the heartbeat forwards — a field missing from it never leaves the

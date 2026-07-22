@@ -39,18 +39,14 @@ def _last_body():
 
 def _sample_ack():
     when = datetime.now(timezone.utc) - timedelta(minutes=5)
-    return {
-        "version": pn.NOTICE_VERSION,
-        "acknowledged_at": when.isoformat(),
-        "device_id": "sync:abc-123",
-    }
+    return {"version": pn.NOTICE_VERSION, "acknowledged_at": when.isoformat()}
 
 
 # ── The wire boundary ───────────────────────────────────────────────────
 
 def test_the_key_is_whitelisted_for_the_heartbeat():
     """Membership, not truthiness. Absence here is a silent drop, not an error."""
-    assert "privacy_notice_ack" in BetterFlowClient.HEARTBEAT_HEALTH_KEYS
+    assert "disclosure_acknowledgement" in BetterFlowClient.HEARTBEAT_HEALTH_KEYS
 
 
 @responses.activate
@@ -64,14 +60,14 @@ def test_the_acknowledgement_reaches_the_request_body():
     ack = _sample_ack()
     client = _make_client()
     try:
-        client.heartbeat(health={"privacy_notice_ack": ack})
+        client.heartbeat(health={"disclosure_acknowledgement": ack})
     finally:
         client.close()
 
     body = _last_body()
-    assert body["privacy_notice_ack"] == ack
-    assert body["privacy_notice_ack"]["version"] == pn.NOTICE_VERSION
-    assert body["privacy_notice_ack"]["acknowledged_at"]
+    assert body["disclosure_acknowledgement"] == ack
+    assert body["disclosure_acknowledgement"]["version"] == pn.NOTICE_VERSION
+    assert body["disclosure_acknowledgement"]["acknowledged_at"]
 
 
 @responses.activate
@@ -90,11 +86,11 @@ def test_a_falsy_payload_is_still_forwarded():
     )
     client = _make_client()
     try:
-        client.heartbeat(health={"privacy_notice_ack": {}})
+        client.heartbeat(health={"disclosure_acknowledgement": {}})
     finally:
         client.close()
 
-    assert "privacy_notice_ack" in _last_body()
+    assert "disclosure_acknowledgement" in _last_body()
 
 
 @responses.activate
@@ -111,7 +107,7 @@ def test_a_device_that_never_acknowledged_sends_no_key():
     finally:
         client.close()
 
-    assert "privacy_notice_ack" not in _last_body()
+    assert "disclosure_acknowledgement" not in _last_body()
 
 
 # ── The callsite guard ──────────────────────────────────────────────────
@@ -143,14 +139,14 @@ def test_the_heartbeat_assembler_includes_the_acknowledgement(tmp_path):
     )
 
     telemetry = _telemetry_from_real_app(config)
-    assert "privacy_notice_ack" in telemetry
-    assert telemetry["privacy_notice_ack"]["version"] == pn.NOTICE_VERSION
-    assert telemetry["privacy_notice_ack"]["device_id"] == "sync:abc-123"
+    assert "disclosure_acknowledgement" in telemetry
+    assert telemetry["disclosure_acknowledgement"]["version"] == pn.NOTICE_VERSION
+    assert set(telemetry["disclosure_acknowledgement"]) == {"version", "acknowledged_at"}
 
 
 def test_the_assembler_omits_it_before_any_acknowledgement():
     telemetry = _telemetry_from_real_app(Config())
-    assert "privacy_notice_ack" not in telemetry
+    assert "disclosure_acknowledgement" not in telemetry
 
 
 def test_the_assembler_delegates_instead_of_rebuilding_the_payload():
@@ -180,4 +176,4 @@ def test_reporting_never_raises_into_the_heartbeat(monkeypatch):
     )
     telemetry = _telemetry_from_real_app(Config())
     assert isinstance(telemetry, dict)
-    assert "privacy_notice_ack" not in telemetry
+    assert "disclosure_acknowledgement" not in telemetry

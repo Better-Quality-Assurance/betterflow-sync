@@ -36,6 +36,44 @@ Authoritative source: Regulament Intern art. 64^1 alin. (4) and (5), in
 Romanian. The agent UI is English, so the notice is English — but if the two
 ever disagree, **the Romanian wins**; it is the version employees sign. That is
 stated inside the notice itself rather than only in this docstring.
+
+Why the version is computed here and NOT taken from the server
+--------------------------------------------------------------
+
+The heartbeat response carries ``disclosure.version`` — the version the server
+considers in force — and ``disclosure.acknowledged``. This module deliberately
+does not consume either, and that is a decision rather than an omission.
+
+The two ends mean different things by "version". Here it means *the words that
+were displayed*; server-side it means *the policy in force*. Those coincide only
+by luck, because *the server does not deliver the text* — the notice ships
+inside the agent build. So:
+
+- Recording the server's version against a click would produce a record saying
+  the user read text identified by a version the server chose, while they
+  actually read whatever their installed build contained. On a fleet spanning
+  several agent versions, every device reports the same label for different
+  words, and the record stops being falsifiable — which is the exact property
+  that makes it evidence.
+- Re-showing on ``server.version != acknowledged`` would, with today's
+  contract, re-display the SAME words the user already dismissed, because
+  nothing new arrived. It would also not terminate: the agent acknowledges with
+  its text hash, the server compares that against its in-force version, sees a
+  mismatch, and asks again forever.
+
+So the two schemes are not interchangeable. The client hash is tamper-evident
+(copy cannot move without the version moving) and is the only value that
+describes what was on screen. The server's version is centrally controllable,
+which is genuinely valuable — legal should be able to invalidate every prior
+acknowledgement without waiting for an agent release.
+
+Getting both needs a contract change, not an agent change. Either the server
+delivers the notice TEXT (and the agent hashes what it actually rendered — the
+version stays derived, central control is real), or the acknowledgement carries
+BOTH values (``version`` = what was displayed, ``policy_version`` = what the
+server asked for) so the server can close its own loop. Until one of those
+exists, adopting ``disclosure.version`` would trade a property we have for one
+we would not actually get.
 """
 
 import hashlib
@@ -200,15 +238,25 @@ def record_acknowledgement(config, *, now: Optional[datetime] = None) -> None:
 def acknowledgement_telemetry(config) -> Optional[dict]:
     """The heartbeat payload for a recorded acknowledgement, or ``None``.
 
+    Shape is the SERVER's contract, not ours: ``AgentHeartbeatController`` reads
+    ``disclosure_acknowledgement`` as ``{version, acknowledged_at}`` and stores
+    it in ``agent_disclosure_acknowledgements``. Adding a field here does not
+    extend the record, it just sends bytes nothing reads.
+
+    No ``device_id``, deliberately. The server already knows which device is
+    calling — the heartbeat is authenticated by a per-device token and the
+    server writes ``agent_device_id`` itself. A second copy travelling in the
+    body could only ever agree (noise) or disagree (a bug someone then has to
+    adjudicate), and on an evidence record "the two device ids disagree" is a
+    genuinely expensive question. The authenticated context is the stronger
+    binding anyway: a body field is asserted by the client, the token is proven.
+
     Reported on EVERY heartbeat for as long as an acknowledgement exists, not
     once. There is deliberately no delivery state machine here: the server-side
     reader ships separately and later, so a send-once design would silently lose
     every acknowledgement made before that deploy — the exact
     write-with-no-reader failure in one-rule-one-implementation.md, inverted.
-    An idempotent ~80-byte upsert on a 2.5-minute cadence is the cheaper trade.
-
-    ``device_id`` rides along so the record is self-describing; the user is
-    identified by the per-device token the heartbeat is authenticated with.
+    An idempotent ~60-byte upsert on a 2.5-minute cadence is the cheaper trade.
     """
     version = getattr(config, "privacy_notice_ack_version", None)
     acknowledged_at = getattr(config, "privacy_notice_ack_at", None)
@@ -216,8 +264,4 @@ def acknowledgement_telemetry(config) -> Optional[dict]:
     # delivery, and reporting it would let a half-written record read as proof.
     if version is None or acknowledged_at is None:
         return None
-    payload = {"version": version, "acknowledged_at": acknowledged_at}
-    device_id = getattr(config, "device_id", None)
-    if device_id:
-        payload["device_id"] = device_id
-    return payload
+    return {"version": version, "acknowledged_at": acknowledged_at}
