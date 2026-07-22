@@ -92,6 +92,32 @@ The OS keychain holds the auth token (never on disk / in config). If raw titles
 must never leave the device, that requires client-side hashing/redaction, which
 is **not implemented** — track it as a feature, not an assumed guarantee.
 
+#### Device identifiers sent on the heartbeat
+
+Alongside activity data the agent reports identifiers describing the *machine*,
+not the person using it:
+
+- `device_id` — a `sync:<uuid>` generated on this device at first run.
+- `hardware_serial` (`src/hardware_serial.py`) — the machine's hardware serial:
+  `IOPlatformSerialNumber` on macOS, `Win32_BIOS.SerialNumber` on Windows,
+  `/sys/class/dmi/id/product_serial` on Linux. Read once at startup and cached;
+  no permission is requested or required, and an unreadable serial is reported
+  as `null` rather than retried. **Why it is collected:** the MDM asset
+  inventory keys company laptops by serial while the agent keyed itself by a
+  random UUID, so the two systems could not be joined and "is this machine
+  managed?" could only be guessed at by matching people's names. **Scope:**
+  asset correlation only. It identifies hardware, never an individual, it does
+  not affect tracked or billed time, and it must not reach a client-facing
+  surface. A VM, a container or a locked-down Linux box legitimately reports
+  `null`.
+- `timezone`, `agent_version`, and the tracker-health telemetry (restart counts,
+  event ages, sync staleness).
+
+`src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
+of what the heartbeat forwards — a field missing from it never leaves the
+machine. Treat that tuple as the source of truth when auditing egress, and
+update this section whenever it changes.
+
 ### Configuration Storage
 
 - **Config**: `~/Library/Application Support/BetterFlow/config.json` (macOS) or `%APPDATA%\BetterQA\BetterFlow\config.json` (Windows)

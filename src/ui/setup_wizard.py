@@ -565,7 +565,12 @@ class SetupWizard:
                 "Your privacy is protected by default:\n"
                 "•  Window titles are sent to BetterFlow to categorize your work\n"
                 "•  URLs are reduced to the domain only\n"
-                "•  Excluded apps are never tracked"
+                "•  Excluded apps are never tracked\n"
+                # A hardware serial is a durable device identifier, so it is
+                # named here rather than left to the privacy policy PDF. It
+                # describes the machine, not the person.
+                "•  This computer's serial number identifies the hardware,\n"
+                "    so IT can match it to the company asset list"
             ),
             font=FONT_SMALL,
             fill="#9a87c4",
@@ -710,6 +715,10 @@ class SetupWizard:
             "Counts of keys / clicks / scrolls",
             "Active app name & window title",
             "Idle vs. active state",
+            # macOS users never see the Windows/Linux consent screen — this gate
+            # is their equivalent boundary, so any new identifier leaving the
+            # device has to be named here too or it goes undisclosed.
+            "This computer's hardware serial",
         ]
         dont_items = [
             "The keys you press or text you type",
