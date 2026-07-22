@@ -2984,8 +2984,6 @@ class BetterFlowApp:
         if key == "sync_interval":
             self.config.sync.interval_seconds = value
             self.coordinator.reschedule(value)
-        elif key == "hash_titles":
-            self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
             self.config.privacy.domain_only_urls = value
         elif key == "auto_categorize":

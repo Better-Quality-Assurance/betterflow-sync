@@ -176,61 +176,13 @@ def get_machine_uuid() -> str:
 class PrivacySettings:
     """Privacy configuration."""
 
-    hash_titles: bool = False  # Send actual window titles for categorization
-    title_allowlist: list[str] = field(
-        default_factory=lambda: [
-            # IDEs and code editors
-            "Visual Studio Code",
-            "Code",
-            "Cursor",
-            "PyCharm",
-            "IntelliJ IDEA",
-            "WebStorm",
-            "PhpStorm",
-            "GoLand",
-            "CLion",
-            "Rider",
-            "RubyMine",
-            "DataGrip",
-            "RustRover",
-            "Fleet",
-            "Android Studio",
-            "Xcode",
-            "Visual Studio",
-            "Sublime Text",
-            "Nova",
-            "BBEdit",
-            "Zed",
-            "Vim",
-            "Neovim",
-            "nvim",
-            "Eclipse",
-            # Terminals
-            "Terminal",
-            "iTerm2",
-            "iTerm",
-            "Windows Terminal",
-            "PowerShell",
-            "Command Prompt",
-            "Warp",
-            "Alacritty",
-            "Kitty",
-            "WezTerm",
-            "Hyper",
-            # API and database tools
-            "Postman",
-            "Insomnia",
-            "DBeaver",
-            "TablePlus",
-            "pgAdmin",
-            "MongoDB Compass",
-            "Redis Insight",
-            # Design tools
-            "Figma",
-            "Sketch",
-            "Adobe XD",
-        ]
-    )
+    # `hash_titles` / `title_allowlist` were REMOVED (2026-07-23). They were declared
+    # here and populated from the server, but no capture or transform code in src/ ever
+    # read them — the agent has never hashed a window title. Keeping a dead field named
+    # "hash_titles" misrepresented how titles are handled, in a settings surface offered
+    # to employees. Title handling is a SERVER-side control (AgentDevice::
+    # shouldStoreRawTitle in internal-tool2, driven by the device row); the agent sends
+    # titles raw and has no say. Do not re-add these without a real client-side consumer.
     domain_only_urls: bool = True  # Strip URLs to domain only
     collect_full_urls: bool = False  # Collect full URLs (sensitive, opt-in)
     collect_page_category: bool = True  # Include coarse page category classification
@@ -466,19 +418,23 @@ def _normalize_hhmm(value) -> str:
 
 
 # Fixing the /config envelope unwrap (bf_client.get_config) means server settings reach
-# the agent for the FIRST TIME EVER — none of them have ever applied. Two of those move
-# real-world behaviour and have nothing to do with working-hours enforcement, so they
-# must land as their own deliberate change rather than as a side effect of a privacy fix:
+# the agent for the FIRST TIME EVER — none of them have ever applied. One of those moves
+# real-world behaviour and has nothing to do with working-hours enforcement, so it must
+# land as its own deliberate change rather than as a side effect of a privacy fix:
 #
 #   tracking.afk_timeout_minutes  — 37 of 44 prod devices are set to 20 while every agent
 #                                   has run the client default of 10. Applying it lengthens
 #                                   the idle grace, i.e. it CHANGES BILLED HOURS.
-#   privacy.hash_window_titles    — 41 of 44 are set to ON. Applying it turns window titles
-#                                   into hashes, so admins lose readable titles.
 #
-# Both are what the DB has always said and what someone intended; they have simply never
-# taken effect. Each needs its own release, with the affected people told first. Flip this
-# to False (one setting at a time) to roll them out.
+# That is what the DB has always said and what someone intended; it has simply never
+# taken effect. It needs its own release, with the affected people told first. Flip this
+# to False to roll it out.
+#
+# An earlier revision of this comment also listed privacy.hash_window_titles here and
+# claimed that applying it would "turn window titles into hashes". That was never true:
+# no client-side title hashing has ever existed in src/, so the setting was inert whether
+# deferred or not. Its local mirror was removed 2026-07-23 — see PrivacySettings and the
+# ignore note in update_from_server.
 #
 # Because the /config envelope fix makes server config reach agents for the FIRST time
 # ever (the whole fleet has run on local defaults), this gate now covers EVERY block that
@@ -853,8 +809,6 @@ class Config:
         """Update local config from server response.
 
         Server returns:
-            privacy.hash_window_titles -> local hash_titles
-            privacy.title_allowlist -> local title_allowlist
             privacy.exclude_apps -> EXTENDS local exclude_apps (union, never replace)
             privacy.track_browser_domains -> local domain_only_urls (inverted)
             sync.sync_interval_seconds -> local interval_seconds
@@ -872,10 +826,14 @@ class Config:
         # are the intended live behaviours.)
         if "privacy" in server_config and not DEFER_UNAPPLIED_SERVER_SETTINGS:
             privacy = server_config["privacy"]
-            if "hash_window_titles" in privacy:
-                self.privacy.hash_titles = self._to_bool(privacy["hash_window_titles"])
-            if "title_allowlist" in privacy:
-                self.privacy.title_allowlist = privacy["title_allowlist"]
+            # DELIBERATELY IGNORED: privacy.hash_window_titles and
+            # privacy.title_allowlist. The server still sends both (they are real
+            # columns on the agent_devices row and AgentConfigController emits
+            # them), but the agent has no client-side title hashing and never had
+            # any — the values were stored in Config and read by nothing. They are
+            # dropped here rather than mirrored, so that no future reader mistakes
+            # a populated field for an enforced control. Title handling is enforced
+            # SERVER-side (AgentDevice::shouldStoreRawTitle). Do not "restore" these.
             if "track_browser_domains" in privacy:
                 # Server tracks domains = we extract domain only
                 self.privacy.domain_only_urls = self._to_bool(privacy["track_browser_domains"])

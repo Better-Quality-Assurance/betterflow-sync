@@ -76,9 +76,6 @@ hash titles before egress — there is no client-side title hashing today, and
 implementing it would disable server-side categorization (titles are the
 categorization signal). The settings in `Config.privacy`:
 
-- `hash_titles` (default: **False**) - a per-device preference *forwarded to the
-  server*, NOT a client-side transform. The agent never hashes; the server
-  honours this flag. (Despite the name, raw titles still leave the device.)
 - `domain_only_urls` (default: True) - **enforced client-side** — URLs are
   reduced to their domain before egress. Full URLs require `collect_full_urls`
   (default False, opt-in, sensitive).
@@ -93,8 +90,24 @@ categorization signal). The settings in `Config.privacy`:
   `Config.update_from_server` may only **extend** this list (union with the
   shipped defaults), and only once `DEFER_UNAPPLIED_SERVER_SETTINGS` is lifted —
   a server row can never un-exclude an app.
-- `title_allowlist` - apps allowed to send raw titles even when `hash_titles` is
-  set (forwarded to the server alongside `hash_titles`).
+
+**`hash_titles` and `title_allowlist` no longer exist here (removed 2026-07-23).**
+They were declared on `PrivacySettings`, persisted to `config.json`, populated
+from `/config` and carried in the tray model — and read by nothing. No capture or
+transform path ever consumed them, so the agent's behaviour was identical with
+them on or off. A field named `hash_titles` in a settings surface offered to
+employees, next to controls that *are* enforced, misrepresents how their data is
+handled; since we deliberately keep sending titles raw (they are the server's
+categorisation signal), removal was the fix rather than implementation.
+
+The agent never sent either value to the server — there is no outbound payload or
+PATCH carrying them — so their removal changed nothing server-side. The server
+still emits `privacy.hash_window_titles` / `privacy.title_allowlist` on `/config`;
+`Config.update_from_server` drops both on purpose, with a comment saying why.
+**Title handling is a server-side control** (`AgentDevice::shouldStoreRawTitle` in
+internal-tool2, driven by the `agent_devices` row); the agent has no say in it and
+must not appear to. `tests/test_hash_titles_control_removed.py` fails if either
+symbol returns as live code in `src/`.
 
 The OS keychain holds the auth token (never on disk / in config). If raw titles
 must never leave the device, that requires client-side hashing/redaction, which
