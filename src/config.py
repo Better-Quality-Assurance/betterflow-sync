@@ -649,6 +649,15 @@ class Config:
     call_detection: CallDetectionSettings = field(default_factory=CallDetectionSettings)
     foreground_activity: ForegroundActivitySettings = field(default_factory=ForegroundActivitySettings)
     setup_complete: bool = False
+    # Record of the one-time privacy notice (src/privacy_notice.py). The version
+    # is a hash of the notice text, so a device holding an OLDER version is
+    # re-shown the notice — that comparison is the whole point, and it is why
+    # this stores the version rather than a bare `privacy_notice_seen: bool`.
+    # Purely local + reported on the heartbeat; the server never writes it back
+    # (update_from_server touches neither field), so a config push cannot forge
+    # an acknowledgement.
+    privacy_notice_ack_version: Optional[str] = None
+    privacy_notice_ack_at: Optional[str] = None  # UTC ISO 8601
     auto_start: bool = False
     check_updates: bool = True
     auto_install_updates: bool = True

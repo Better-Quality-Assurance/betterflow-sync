@@ -456,6 +456,12 @@ class BetterFlowClient(BaseApiClient):
         # Stable hardware identifier joining this device to the MDM asset
         # inventory. str | None — see src/hardware_serial.py.
         "hardware_serial",
+        # Record that this device was shown, and the user acknowledged, the
+        # current data-collection notice: {version, acknowledged_at, device_id}.
+        # The Law 190/2018 art. 5 lit. b evidence of prior information; the user
+        # is bound by the per-device token this heartbeat authenticates with.
+        # See src/privacy_notice.py.
+        "privacy_notice_ack",
     )
 
     def heartbeat(
