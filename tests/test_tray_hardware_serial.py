@@ -6,16 +6,29 @@ device identifier, so showing the user the exact value we hold is a stronger
 honesty signal than a wizard bullet they clicked past months ago. It also makes
 the collection self-evidently about the machine rather than about them.
 
-These drive the real ``_create_menu()`` and read the labels it produced — the
-label string is never mocked, or the test would only prove that a format string
-formats.
+**These must run headless.** pystray binds its display backend at import time,
+so on a CI Linux runner ``src.ui.tray.pystray`` is ``None`` and ``TrayIcon()``
+raises — the repo already works around this in ``test_tray_state_transitions``
+and ``test_tray_icon`` by patching ``src.ui.tray.pystray``. A test that skips or
+errors in the only environment that gates merges is not a guard, so nothing here
+needs a live backend:
+
+- the label/copyable rule is asserted on ``serial_menu_row()``, which is pure;
+- the callsite guard renders the REAL ``_create_menu()`` with ``Item`` swapped
+  for a recorder, so dropping the row from the production menu fails a test.
+
+The second half is what keeps the first honest: without it ``serial_menu_row``
+could be perfect and unreferenced (test-fixture-discipline.md, Phantom 3).
 """
+
+import inspect
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src import hardware_serial as hw
 from src.ui import tray as tray_mod
-from src.ui.tray import TrayIcon
+from src.ui.tray import TrayIcon, serial_menu_row
 
 
 @pytest.fixture(autouse=True)
@@ -25,44 +38,54 @@ def _clear_serial_cache():
     hw.reset_cache_for_tests()
 
 
-def _menu_labels(icon) -> list[str]:
-    """Flatten every label in the menu, submenus included."""
-    labels: list[str] = []
+class _RecordedItem:
+    """Stand-in for pystray.MenuItem that records what production asked for.
 
-    def walk(menu):
-        for item in menu.items:
-            labels.append(str(item.text))
-            submenu = getattr(item, "submenu", None)
-            if submenu is not None:
-                walk(submenu)
+    Mirrors the bits of the real MenuItem the menu code and these tests touch:
+    ``text``, ``enabled``, and calling the item to fire its action.
+    """
 
-    walk(icon._create_menu())
-    return labels
+    instances: list = []
 
+    def __init__(self, text, action=None, enabled=True, **kwargs):
+        self.text = text
+        self.action = action
+        self.enabled = enabled
+        _RecordedItem.instances.append(self)
 
-def _serial_items(icon):
-    """Every menu item whose label mentions the device serial."""
-    found = []
-
-    def walk(menu):
-        for item in menu.items:
-            if "Device serial" in str(item.text):
-                found.append(item)
-            submenu = getattr(item, "submenu", None)
-            if submenu is not None:
-                walk(submenu)
-
-    walk(icon._create_menu())
-    return found
+    def __call__(self, icon=None):
+        if self.action is not None:
+            self.action(icon, self)
 
 
-def test_menu_shows_the_real_serial(monkeypatch):
+def _render_real_menu(icon) -> list:
+    """Drive the production _create_menu() and return every item it built."""
+    _RecordedItem.instances = []
+    with patch.object(tray_mod, "Item", _RecordedItem), \
+            patch.object(tray_mod, "pystray", MagicMock()):
+        icon._create_menu()
+    return list(_RecordedItem.instances)
+
+
+def _make_tray() -> TrayIcon:
+    """Construct a TrayIcon without a display backend (repo-standard pattern)."""
+    with patch.object(tray_mod, "pystray", MagicMock()):
+        return TrayIcon()
+
+
+def _serial_items(icon) -> list:
+    return [i for i in _render_real_menu(icon) if "Device serial" in str(i.text)]
+
+
+# ── The rule: serial_menu_row() ─────────────────────────────────────────
+
+def test_row_shows_the_real_serial(monkeypatch):
     monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
-    labels = _menu_labels(TrayIcon())
-    assert "Device serial: C02Z60U3LVCJ" in labels
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
+    assert serial_menu_row() == ("Device serial: C02Z60U3LVCJ", True)
 
 
-def test_menu_says_unavailable_when_there_is_no_serial(monkeypatch):
+def test_row_says_unavailable_when_there_is_no_serial(monkeypatch):
     """A VM or a locked-down Linux box must read as "not readable", not broken.
 
     Specifically NOT blank, not an empty tail after the colon, and never the
@@ -70,20 +93,31 @@ def test_menu_says_unavailable_when_there_is_no_serial(monkeypatch):
     absence.
     """
     monkeypatch.setattr(hw, "_probe_serial", lambda: None)
-    labels = _menu_labels(TrayIcon())
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
 
-    assert "Device serial: unavailable" in labels
-    assert "Device serial: None" not in labels
-    assert "Device serial: " not in labels
+    label, copyable = serial_menu_row()
+    assert label == "Device serial: unavailable"
+    assert label != "Device serial: None"
+    assert label != "Device serial: "
+    # Nothing to copy, so no affordance — clicking would copy the word
+    # "unavailable" and look like it had worked.
+    assert copyable is False
 
 
-def test_serial_item_is_rendered_once(monkeypatch):
-    """One rule, one implementation — no second call site for the UI."""
+def test_row_is_not_copyable_without_a_clipboard(monkeypatch):
+    """No clipboard tool on this box => an info row, not a dead button.
+
+    The label still carries the value to read off.
+    """
     monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
-    assert len(_serial_items(TrayIcon())) == 1
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: False)
+
+    label, copyable = serial_menu_row()
+    assert "C02Z60U3LVCJ" in label
+    assert copyable is False
 
 
-def test_menu_does_not_reprobe_per_render(monkeypatch):
+def test_row_does_not_reprobe(monkeypatch):
     """The menu rebuilds on every state change; the probe must not follow it."""
     calls = []
 
@@ -92,49 +126,83 @@ def test_menu_does_not_reprobe_per_render(monkeypatch):
         return "C02Z60U3LVCJ"
 
     monkeypatch.setattr(hw, "_probe_serial", probe)
-    icon = TrayIcon()
-    _menu_labels(icon)
-    _menu_labels(icon)
-    _menu_labels(icon)
+    serial_menu_row()
+    serial_menu_row()
+    serial_menu_row()
     assert len(calls) == 1
 
 
-def test_serial_item_copies_when_a_clipboard_exists(monkeypatch):
-    """Clicking hands the REAL serial to the clipboard writer."""
+# ── The callsite guard: the production menu really uses it ──────────────
+
+def test_production_menu_renders_the_serial_row(monkeypatch):
+    """Fails if the row is dropped from _create_menu, not only if the rule breaks."""
     monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
     monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
+
+    (item,) = _serial_items(_make_tray())
+    assert str(item.text) == "Device serial: C02Z60U3LVCJ"
+    assert item.enabled, "a copyable serial should not render greyed out"
+
+
+def test_production_menu_renders_unavailable(monkeypatch):
+    monkeypatch.setattr(hw, "_probe_serial", lambda: None)
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
+
+    (item,) = _serial_items(_make_tray())
+    assert str(item.text) == "Device serial: unavailable"
+    assert not item.enabled
+
+
+def test_production_menu_label_agrees_with_the_row_builder(monkeypatch):
+    """The rendered label matches serial_menu_row()'s output."""
+    monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
+
+    (item,) = _serial_items(_make_tray())
+    assert str(item.text) == serial_menu_row()[0]
+
+
+def test_serial_item_delegates_instead_of_re_deriving_the_label():
+    """Callsite guard — the menu must not grow its own copy of the rule.
+
+    Comparing outputs cannot catch this: a parallel builder that happens to emit
+    the same string passes every behavioural assertion above (verified — a
+    hand-rolled f-string lookalike kept all 11 of them green). Only reading the
+    consumer's source sees it, which is the pattern
+    one-rule-one-implementation.md prescribes. The failure this prevents is the
+    two copies drifting later, when only one of them gets a fix.
+    """
+    source = inspect.getsource(TrayIcon._serial_menu_item)
+    # Assert on code, not prose — the docstring is free to discuss the probe.
+    doc = TrayIcon._serial_menu_item.__doc__
+    if doc:
+        source = source.replace(doc, "")
+
+    assert "serial_menu_row()" in source, "the menu stopped calling the shared builder"
+    assert "Device serial" not in source, "label text re-derived at the callsite"
+    assert "get_hardware_serial" not in source, "probe read a second time at the callsite"
+
+
+def test_clicking_the_row_copies_the_real_serial(monkeypatch):
+    monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
+    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
+    monkeypatch.setattr(tray_mod, "send_notification", lambda *a, **k: None)
     copied = []
     monkeypatch.setattr(
         tray_mod, "copy_to_clipboard", lambda text: (copied.append(text), True)[1]
     )
 
-    (item,) = _serial_items(TrayIcon())
-    assert item.enabled, "a copyable serial should not render greyed out"
-
-    item(None)  # pystray invokes the item with the icon; it forwards to the action
+    (item,) = _serial_items(_make_tray())
+    item(None)
     assert copied == ["C02Z60U3LVCJ"]
 
 
-def test_serial_item_is_inert_without_a_clipboard(monkeypatch):
-    """No clipboard tool on this box => an info row, not a dead button.
-
-    Offering a Copy affordance that silently does nothing is worse than not
-    offering one; the label still carries the value to read off.
-    """
+def test_uncopyable_row_has_no_action(monkeypatch):
     monkeypatch.setattr(hw, "_probe_serial", lambda: "C02Z60U3LVCJ")
     monkeypatch.setattr(tray_mod, "clipboard_available", lambda: False)
 
-    (item,) = _serial_items(TrayIcon())
-    assert not item.enabled
-    assert "C02Z60U3LVCJ" in str(item.text)
-
-
-def test_unavailable_serial_is_never_copyable(monkeypatch):
-    """Nothing to copy, so no affordance — clicking would copy the word "unavailable"."""
-    monkeypatch.setattr(hw, "_probe_serial", lambda: None)
-    monkeypatch.setattr(tray_mod, "clipboard_available", lambda: True)
-
-    (item,) = _serial_items(TrayIcon())
+    (item,) = _serial_items(_make_tray())
+    assert item.action is None
     assert not item.enabled
 
 

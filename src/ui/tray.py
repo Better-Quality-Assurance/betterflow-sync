@@ -237,6 +237,41 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def serial_menu_row() -> tuple:
+    """Build the (label, copyable) pair for the tray's device-serial row.
+
+    Pure: no pystray, no TrayIcon, no display backend. That is deliberate —
+    pystray's backend binds at import time and fails on a headless CI runner,
+    which leaves ``pystray = None`` (see the import guard above) and makes
+    ``TrayIcon()`` unconstructable there. A row-building rule that could only be
+    exercised through a live TrayIcon would therefore be untestable in the one
+    environment that gates merges, and per test-fixture-discipline.md a guard
+    that skips where it matters is not a guard.
+
+    ``TrayIcon._serial_menu_item`` is the only consumer and does nothing except
+    turn this pair into a MenuItem, so the production menu and the test assert
+    on the same string.
+
+    Returns:
+        (label, copyable). ``copyable`` is True only when there is a serial to
+        copy AND a clipboard tool exists to copy it with.
+    """
+    serial = get_hardware_serial()
+
+    if serial is None:
+        # Explicitly "unavailable", never blank and never the repr "None". A VM,
+        # a container or a root-only /sys/class/dmi/id/product_serial genuinely
+        # has no readable serial; that must read as an honest absence rather
+        # than as a broken app.
+        return ("Device serial: unavailable", False)
+
+    # No clipboard tool on this box (a bare Linux session with no
+    # wl-copy/xclip/xsel) => not copyable. A menu row that looks clickable and
+    # silently does nothing is worse than an inert one, and the label still
+    # carries the string the user needs to read off.
+    return (f"Device serial: {serial}", clipboard_available())
+
+
 class TrayState(Enum):
     """Tray icon states."""
 
@@ -798,25 +833,17 @@ class TrayIcon:
         string also makes it self-evident that this identifies the hardware and
         not them.
 
-        Reads the cached probe from src/hardware_serial.py — the same call site
-        the heartbeat uses, memoised for the life of the process, so rebuilding
-        the menu on every state change costs nothing.
+        The label/copyable decision lives in the module-level serial_menu_row()
+        so it can be asserted without a live pystray backend; this method only
+        wraps that pair in a MenuItem. Do not re-derive the label here — a
+        second copy is how the test and the menu drift apart.
+
+        serial_menu_row() reads the cached probe from src/hardware_serial.py,
+        the same call site the heartbeat uses, memoised for the life of the
+        process, so rebuilding the menu on every state change costs nothing.
         """
-        serial = get_hardware_serial()
-
-        if serial is None:
-            # Explicitly "unavailable", never blank and never the repr "None".
-            # A VM, a container or a root-only /sys/class/dmi/id/product_serial
-            # genuinely has no readable serial; that should read as an honest
-            # absence, not as a broken app.
-            return Item("Device serial: unavailable", None, enabled=False)
-
-        label = f"Device serial: {serial}"
-        if not clipboard_available():
-            # No clipboard tool on this box (a bare Linux session with no
-            # wl-copy/xclip/xsel). Render the value as plain info rather than a
-            # button that silently does nothing — the label still carries the
-            # string the user needs to read off.
+        label, copyable = serial_menu_row()
+        if not copyable:
             return Item(label, None, enabled=False)
         return Item(label, self._handle_copy_serial)
 
