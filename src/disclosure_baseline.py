@@ -466,6 +466,14 @@ UNWATCHED_CONFIG_FIELDS: dict[str, str] = {
     ),
     "engagement": "Thresholds for scoring activity already collected.",
     "fraud_detection": "Thresholds for scoring activity already collected.",
+    "privacy_notice_ack_version": (
+        "Records WHICH disclosure version this user acknowledged. Compliance "
+        "record that the notice was shown, not a collection setting — it "
+        "changes nothing about what the agent gathers."
+    ),
+    "privacy_notice_ack_at": (
+        "When the acknowledgement happened. Compliance state, not collection."
+    ),
     "setup_complete": "First-run wizard state.",
     "auto_start": "Launch at login.",
     "check_updates": "Updater behaviour.",
@@ -499,6 +507,10 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     "sync_stale_seconds",
     "window_titles_captured_recently",
     "hardware_serial",
+    # The disclosure acknowledgement record (version + timestamp). It
+    # forwards proof the notice was shown; it is compliance evidence, not
+    # a new fact gathered about the machine or the person.
+    "disclosure_acknowledgement",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so
