@@ -28,7 +28,13 @@ def _drive(*, press_button: bool = False, close_window: bool = False):
 
     def _mainloop():
         if press_button:
-            tk_mock.Button.call_args.kwargs["command"]()
+            # The ack control is a tk.Label with a "<Button-1>" binding, not a
+            # tk.Button (Aqua ignores a Button's bg — see the window module).
+            # Drive the REAL bound callback, so this exercises the same click
+            # path a user takes rather than a stand-in.
+            binds = tk_mock.Label.return_value.bind.call_args_list
+            click = next(c for c in binds if c.args[0] == "<Button-1>")
+            click.args[1](None)  # the callback takes an event; a dummy is fine
         if close_window:
             root.protocol.call_args.args[1]()
 

@@ -56,6 +56,7 @@ CARD_COLOR = "#1a1028"
 TEXT_COLOR = "#f4f0ff"
 TEXT_MUTED = "#b8a8d6"
 PRIMARY_COLOR = "#7D69B8"
+PRIMARY_HOVER = "#8f7ccb"  # lighter purple on hover
 BTN_TEXT = "#ffffff"
 
 
@@ -134,21 +135,27 @@ def show_privacy_notice(_root_factory=tk.Tk) -> bool:
     # copied, and someone should be able to paste this to their own records.
     body.config(state=tk.DISABLED)
 
-    tk.Button(
+    # A tk.Button uses the native macOS Aqua style, which IGNORES `bg` — the
+    # purple is silently dropped, leaving white text on the default light button
+    # face (unreadable, caught on a real Mac 2026-07-23). A tk.Label honours
+    # `bg` on every platform, so we render the button as a clickable label and
+    # bind the click ourselves. `hand2` cursor + a hover tint make it read as a
+    # button rather than a caption.
+    ack_button = tk.Label(
         root,
         text=ACK_BUTTON_TEXT,
-        command=_on_acknowledge,
         font=(FONT_FAMILY, 13, "bold"),
         bg=PRIMARY_COLOR,
         fg=BTN_TEXT,
-        activebackground=PRIMARY_COLOR,
-        activeforeground=BTN_TEXT,
-        relief=tk.FLAT,
-        highlightthickness=0,
-        borderwidth=0,
         padx=28,
         pady=10,
-    ).pack(pady=(20, 28))
+        cursor="hand2",
+    )
+    ack_button.pack(pady=(20, 28))
+    ack_button.bind("<Button-1>", lambda _event: _on_acknowledge())
+    ack_button.bind("<Return>", lambda _event: _on_acknowledge())
+    ack_button.bind("<Enter>", lambda _e: ack_button.configure(bg=PRIMARY_HOVER))
+    ack_button.bind("<Leave>", lambda _e: ack_button.configure(bg=PRIMARY_COLOR))
 
     _bring_to_front(root)
     root.mainloop()
