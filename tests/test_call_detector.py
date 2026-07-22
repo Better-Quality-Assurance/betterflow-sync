@@ -766,9 +766,19 @@ class TestCaptureBoundariesCloseSessions:
 
 class TestStaleOngoingSnapshotsNeverReplay:
     def test_process_queue_drops_ongoing_call_rows(self):
+        from inspect import signature
+
+        from src.sync.queue import OfflineQueue, is_event_storable
+
         harness = TestCallPersistsAcrossSyncCycles()
         engine = harness._build_engine()
-        t0 = datetime(2026, 7, 15, 17, 0, 0, tzinfo=timezone.utc)
+        # RELATIVE anchor, deliberately. _process_queue() evicts anything past
+        # the server's retention window BEFORE batching, so an absolute date
+        # here is a time bomb: it silently ages out of the window and the
+        # 'completed' event is evicted instead of sent, failing this test on a
+        # commit that never changed (it detonated on 2026-07-22, exactly 7d
+        # after the 2026-07-15 literal it used to pin).
+        t0 = datetime.now(timezone.utc) - timedelta(days=1)
         stale_snapshot = {
             "id": "call_Zoom_1784000000",
             "timestamp": t0.isoformat(),
@@ -785,6 +795,23 @@ class TestStaleOngoingSnapshotsNeverReplay:
             "bucket_type": "call",
             "data": {"app": "Zoom", "call_type": "native", "status": "completed"},
         }
+        # Pin the geometry this test depends on: BOTH events must be inside the
+        # retention window, or evict_unstorable() drops them and the assertions
+        # below pass/fail for reasons that have nothing to do with replay.
+        # Read the window from production's own default so it tracks any change.
+        retention_days = (
+            signature(OfflineQueue.evict_unstorable)
+            .parameters["stale_after_days"]
+            .default
+        )
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        for ev in (stale_snapshot, final_event):
+            assert is_event_storable(ev, stale_cutoff=stale_cutoff), (
+                "test fixture aged out of the queue's retention window "
+                f"({retention_days}d) — anchor the timestamp relative to now, "
+                "never to an absolute date"
+            )
+
         engine.queue.enqueue([stale_snapshot, final_event])
 
         from src.sync.sync_engine import SyncStats
