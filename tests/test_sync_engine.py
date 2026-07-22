@@ -296,10 +296,20 @@ class TestSyncEngine:
         assert transformed[0]["duration"] == 120.0
         self.time_tracker.add_active_time.assert_called_once()
 
-    def test_within_working_hours_gate(self):
+    def test_within_working_hours_gate(self, monkeypatch):
         """1.5.43: B2E/Trainee working-hours enforcement. When enforced, events
         outside [work_start, work_end] or on non-working days are rejected; when
-        unenforced (B2B/others), everything passes."""
+        unenforced (B2B/others), everything passes.
+
+        Evaluation is machine-local (config._localize), so pin this device to UTC to
+        match the UTC instants below — the conftest default is Bucharest. The
+        schedule's own ``timezone`` no longer drives evaluation (only drift
+        detection), so this asserts the gate's before/inside/after/non-working-day
+        logic in a single zone, which is the point of the test."""
+        import src.config as config_module
+
+        monkeypatch.setattr(config_module, "detect_machine_timezone", lambda: "UTC")
+
         wh = self.engine.config.working_hours
         wh.known = True  # the server has told us the schedule
         wh.enforced = True

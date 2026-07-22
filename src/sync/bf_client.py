@@ -12,11 +12,13 @@ import requests
 
 try:
     from .. import __version__
+    from .. import config as config_mod
     from ..config import DEFAULT_API_URL, get_machine_uuid
     from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from .retry import RetryConfig
 except ImportError:
     from src import __version__
+    import config as config_mod
     from config import DEFAULT_API_URL, get_machine_uuid
     from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
     from sync.retry import RetryConfig
@@ -398,6 +400,7 @@ class BetterFlowClient(BaseApiClient):
                 "consecutive_sync_failures",
                 "idle_while_active_detections",
                 "sync_stale_seconds",
+                "schedule_timezone_mismatch",
             ):
                 if key in health:
                     data[key] = health[key]
@@ -410,29 +413,15 @@ class BetterFlowClient(BaseApiClient):
 
     @staticmethod
     def _detect_timezone() -> str:
-        """Detect local IANA timezone name, falling back to UTC offset."""
-        import os
-        from datetime import datetime, timezone as tz
+        """Detect local IANA timezone name, falling back to UTC offset.
 
-        # macOS/Linux: read /etc/localtime symlink
-        try:
-            link = os.readlink("/etc/localtime")
-            # e.g., /var/db/timezone/zoneinfo/Europe/Bucharest
-            if "zoneinfo/" in link:
-                return link.split("zoneinfo/")[1]
-        except (OSError, IndexError):
-            pass
-
-        # Windows: use tzlocal if available
-        try:
-            from tzlocal import get_localzone
-            return str(get_localzone())
-        except ImportError:
-            pass
-
-        # Fallback: UTC offset like "+03:00"
-        offset = datetime.now(tz.utc).astimezone().strftime("%z")  # "+0300"
-        return f"{offset[:3]}:{offset[3:]}"  # "+03:00"
+        Delegates to config.detect_machine_timezone so the heartbeat report and
+        working-hours evaluation share ONE detector and can never disagree about
+        which zone this device is in. Called via the module reference (not a
+        by-name import) so a single monkeypatch of config.detect_machine_timezone is
+        authoritative for both this report and window evaluation.
+        """
+        return config_mod.detect_machine_timezone()
 
     def get_status(self) -> dict:
         """Get sync status (non-critical, short timeout)."""

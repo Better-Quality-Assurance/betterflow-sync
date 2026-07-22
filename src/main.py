@@ -1609,6 +1609,17 @@ class SyncCoordinator:
         last_ok = self._last_successful_sync
         if last_ok is not None:
             telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
+        # Surface a working-hours anchor that has drifted from this device's real
+        # timezone: allows() self-heals by evaluating in machine-local time, but the
+        # fleet still needs to see (and re-anchor) the stale schedule. Included only
+        # when there IS drift, so the backend reads absence as "aligned". Best-effort
+        # — never let a tz lookup block the heartbeat.
+        try:
+            drift = self.config.working_hours.timezone_mismatch()
+            if drift:
+                telemetry["schedule_timezone_mismatch"] = drift
+        except Exception as e:  # noqa: BLE001
+            logger.debug("timezone_mismatch check failed: %s", e)
         try:
             telemetry.update(self.aw_manager.health_snapshot())
         except Exception as e:  # noqa: BLE001

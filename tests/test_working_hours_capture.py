@@ -207,3 +207,119 @@ class TestOvernightWindow:
     )
     def test_wraps_past_midnight(self, when, allowed):
         assert self._night_shift().allows(when) is allowed
+
+
+def _machine_tz(monkeypatch, name):
+    """Pin what the device reports as its own timezone, overriding the conftest
+    Bucharest default. One setattr suffices: both _localize and
+    bf_client._detect_timezone reach the detector through the config module."""
+    import src.config as config_module
+
+    monkeypatch.setattr(config_module, "detect_machine_timezone", lambda: name)
+
+
+class TestTimezoneHarmonization:
+    """The device's own timezone is authoritative for evaluation; a schedule whose
+    server anchor has drifted from it self-heals, and the drift is reported.
+
+    Origin: 2026-07-22 — a device reporting America/Los_Angeles while the schedule
+    was authored for a Europe-based user recorded nothing all day, because the window
+    was judged in the stale LA anchor. Correcting the machine's clock must fix it
+    immediately, without waiting for an admin to re-anchor server-side."""
+
+    def _la_anchored(self):
+        wh = WorkingHoursConfig(
+            enforced=True, work_start="07:30", work_end="22:00",
+            working_days=[1, 2, 3, 4, 5], timezone="America/Los_Angeles", known=True,
+        )
+        return wh
+
+    def test_drifted_anchor_self_heals_to_machine_local(self, monkeypatch):
+        """Anchor says LA, machine is really Bucharest. Wed 10:00 Bucharest is a work
+        moment and MUST be allowed — pre-fix it was evaluated in LA (00:00 there) and
+        rejected, zeroing the day."""
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        wh = self._la_anchored()
+        wed_10_bucharest = datetime(2026, 7, 22, 7, 0, tzinfo=timezone.utc)  # 10:00 EEST
+        assert wh.allows(wed_10_bucharest) is True
+
+    def test_drifted_anchor_still_closes_the_evening_in_machine_local(self, monkeypatch):
+        """Late-evening Bucharest is outside the window even though the LA anchor
+        would still call it midday — machine-local is what protects the evening."""
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        wh = self._la_anchored()
+        wed_2330_bucharest = datetime(2026, 7, 22, 20, 30, tzinfo=timezone.utc)  # 23:30 EEST
+        assert wh.allows(wed_2330_bucharest) is False
+
+    def test_timezone_mismatch_reports_drifted_anchor(self, monkeypatch):
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        assert self._la_anchored().timezone_mismatch() == "America/Los_Angeles"
+
+    def test_timezone_mismatch_none_when_offsets_agree(self, monkeypatch):
+        """Aligned anchor, and same-offset aliases, are NOT drift: comparison is by
+        live UTC offset, not zone name."""
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        aligned = WorkingHoursConfig(
+            enforced=True, work_start="07:30", work_end="22:00",
+            working_days=[1, 2, 3, 4, 5], timezone="Europe/Bucharest", known=True,
+        )
+        assert aligned.timezone_mismatch() is None
+
+        _machine_tz(monkeypatch, "Etc/UTC")
+        utc_alias = WorkingHoursConfig(
+            enforced=True, work_start="07:30", work_end="22:00",
+            working_days=[1, 2, 3, 4, 5], timezone="UTC", known=True,
+        )
+        assert utc_alias.timezone_mismatch() is None
+
+    def test_timezone_mismatch_none_when_no_anchor_or_not_enforced(self, monkeypatch):
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        no_anchor = WorkingHoursConfig(
+            enforced=True, work_start="07:30", work_end="22:00",
+            working_days=[1, 2, 3, 4, 5], timezone="", known=True,
+        )
+        assert no_anchor.timezone_mismatch() is None
+        assert WorkingHoursConfig(enforced=False, known=True).timezone_mismatch() is None
+        assert WorkingHoursConfig().timezone_mismatch() is None  # unknown
+
+    def test_window_close_after_uses_machine_local_not_anchor(self, monkeypatch):
+        """window_close_after must clamp to the machine-local 22:00, so a span that
+        began in-window closes at the employee's real evening, not LA's."""
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        wh = self._la_anchored()
+        start = datetime(2026, 7, 22, 15, 0, tzinfo=timezone.utc)  # 18:00 Bucharest
+        close = wh.window_close_after(start)
+        # 22:00 Bucharest (EEST, UTC+3) == 19:00 UTC
+        assert close == datetime(2026, 7, 22, 19, 0, tzinfo=timezone.utc)
+
+    def test_next_boundary_after_uses_machine_local(self, monkeypatch):
+        """The next flip is the machine-local window edge. From 06:00 Bucharest the
+        next boundary is 07:30 Bucharest (04:30 UTC), regardless of the LA anchor."""
+        _machine_tz(monkeypatch, "Europe/Bucharest")
+        wh = self._la_anchored()
+        when = datetime(2026, 7, 22, 3, 0, tzinfo=timezone.utc)  # 06:00 Bucharest
+        boundary = wh.next_boundary_after(when)
+        assert boundary == datetime(2026, 7, 22, 4, 30, tzinfo=timezone.utc)
+
+    def test_detection_is_cache_served_not_per_call(self, monkeypatch):
+        """_localize calls detect per event (upload gate) and up to thousands of
+        times per next_boundary_after walk; detection must be cache-served within a
+        time bucket, not an os.readlink/tzlocal lookup each time. Guards against
+        reverting to the uncached hot-path storm both reviewers flagged."""
+        import src.config as config_module
+
+        calls = {"n": 0}
+
+        def counting():
+            calls["n"] += 1
+            return "Europe/Bucharest"
+
+        monkeypatch.setattr(
+            config_module, "_detect_machine_timezone_uncached", counting
+        )
+        config_module._detect_machine_timezone_bucketed.cache_clear()
+        bucket = 424242  # one fixed monotonic bucket
+        for _ in range(200):
+            config_module._detect_machine_timezone_bucketed(bucket)
+        assert calls["n"] == 1
+        config_module._detect_machine_timezone_bucketed.cache_clear()
