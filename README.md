@@ -81,12 +81,12 @@ Right-click the tray icon for options including pause/resume, private time, proj
 
 BetterFlow is designed with privacy in mind:
 
-- **Window titles** are sent to the BetterFlow server, which applies title handling and
-  categorization. The `hash_titles` preference is forwarded to the server and honoured
-  there - the agent does **not** hash titles on your device. If a title must never leave
-  the machine, exclude its app (below); that is the only client-side title control.
+- **Window titles** are sent to the BetterFlow server **raw**. The agent does **not**
+  hash, redact or transform them on your device, and it has no setting that does -
+  title handling is applied server-side, on the server's own configuration. If a title
+  must never leave the machine, exclude its app (below); that is the **only**
+  client-side title control.
 - **URLs** are stripped to domain-only - no full paths or query parameters
-- **Allowlist** for raw titles - IDEs and terminals can show real titles for project tracking
 - **Exclude apps** - Sensitive apps (1Password, etc.) are never tracked
 - **No keylogging** - We never capture what you type
 - **No screenshots** - We never capture your screen

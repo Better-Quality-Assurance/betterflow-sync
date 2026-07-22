@@ -158,7 +158,6 @@ class TrayModel:
 
         # Preferences
         self.sync_interval: int = 30
-        self.hash_titles: bool = False
         self.domain_only_urls: bool = False
         self.debug_mode: bool = False
         self.auto_start: bool = False
@@ -603,7 +602,6 @@ class TrayIcon:
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
                 "sync_interval": self.model.sync_interval,
-                "hash_titles": self.model.hash_titles,
                 "domain_only_urls": self.model.domain_only_urls,
                 "debug_mode": self.model.debug_mode,
                 "auto_start": self.model.auto_start,
@@ -1211,7 +1209,6 @@ class TrayIcon:
         dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
         with self.model.lock:
             self.model.sync_interval = config.sync.interval_seconds
-            self.model.hash_titles = config.privacy.hash_titles
             self.model.domain_only_urls = config.privacy.domain_only_urls
             self.model.auto_categorize = config.privacy.auto_categorize
             self.model.track_display_info = config.privacy.track_display_info
