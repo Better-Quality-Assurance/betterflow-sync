@@ -25,9 +25,74 @@ __all__ = [
     "BetterFlowClientError",
     "BetterFlowAuthError",
     "resolve_ca_bundle",
+    "transient_failure_count",
+    "transient_failure_counter",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# ---- Transient-failure counter ----------------------------------------------
+#
+# Monotonic count of network-shaped failures, i.e. those the is_transient rule —
+# the codebase's SINGLE "network problem vs definitive rejection" decision point —
+# classified as transient. SyncCoordinator._do_sync snapshots it at cycle start
+# so its watchdog can tell "the API was unreachable and the cycle ran long" (a
+# warning) from "the cycle is genuinely hung" (an error) instead of reporting
+# both as "Sync hung" (2026-07-22, device 18: a 150.86s cycle during an
+# hour-long connectivity outage, nothing hung, nothing lost, paged as an ERROR).
+#
+# Incremented once per failure OBJECT, in __init__ — never in the is_transient
+# getter, which stays a pure query. A read-counting metric inflates the moment
+# anyone logs or re-reads the property, and inflation is the fail-open direction:
+# it makes a real hang report as an outage warning.
+#
+# PER-THREAD, not process-wide. _acquire_sync_slot abandons a cycle that has held
+# the sync lock past _SYNC_WEDGE_CEILING and re-arms a fresh lock — and documents
+# that the stuck thread cannot be killed. So two _do_sync bodies can be live at
+# once, and a single global would let the zombie cycle's late failures classify
+# the healthy cycle's watchdog ("offline" over a genuine wedge). Each cycle's
+# work runs on its own thread, so attribution by thread is attribution by cycle.
+# The watchdog fires on a Timer thread, so _do_sync captures its thread's counter
+# OBJECT and the closure reads that — never transient_failure_count(), which
+# would answer for the Timer thread. Same reason a background HTTP failure (update
+# checker, error-report daemon) no longer classifies a sync cycle.
+#
+# Deliberately NOT a second classifier — see rules/one-rule-one-implementation.md.
+# Lock-free by construction: a thread's counter is written only by that thread.
+_thread_state = threading.local()
+
+
+class _TransientFailureCounter:
+    """One thread's transient-failure tally. Mutable so a watchdog closure can
+    hold the object and observe increments made after it was captured."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
+def transient_failure_counter() -> _TransientFailureCounter:
+    """The CALLING THREAD's transient-failure counter, created on first use.
+
+    Capture this object (not its value) when the reader runs on another thread —
+    SyncCoordinator's watchdog Timer does exactly that.
+    """
+    counter = getattr(_thread_state, "counter", None)
+    if counter is None:
+        counter = _TransientFailureCounter()
+        _thread_state.counter = counter
+    return counter
+
+
+def transient_failure_count() -> int:
+    """The calling thread's transient-failure count (monotonic within a thread).
+
+    Only meaningful as a delta between two reads ON THE SAME THREAD — callers
+    snapshot it and check whether it moved.
+    """
+    return transient_failure_counter().value
 
 
 # ---- TLS CA bundle resolution -----------------------------------------------
@@ -134,9 +199,37 @@ class BetterFlowClientError(Exception):
     server outage against an event's drop threshold (2026-06-30 data loss).
     """
 
+    #: Whether an instance of this class counts toward the watchdog's
+    #: network-shaped failure tally. False for auth errors — see __init__.
+    _COUNTS_AS_NETWORK_FAILURE = True
+
     def __init__(self, message: str = "", status_code: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+        # Count the FAILURE, not the classification READ. Incrementing inside the
+        # is_transient getter would make the metric a function of how many times
+        # the property is consulted — one debug log or a second caller and it
+        # inflates, which is the fail-open direction: an inflated count makes the
+        # watchdog report a genuine hang as an outage warning. Counting once per
+        # failure object is safe because every construction site in this module
+        # raises immediately (test code does build these speculatively as mock
+        # side-effects, which only shifts a per-thread tally the tests read as a
+        # delta). The transient/definitive RULE still lives in exactly one place:
+        # the pure query below.
+        #
+        # The counter and is_transient DELIBERATELY DISAGREE on auth errors, and
+        # that asymmetry is not an oversight. A 401/403 is definitive for the
+        # WATCHDOG's question ("was the network down?" — no, the token expired;
+        # reporting "API unreachable" would hide the actionable condition), but it
+        # must stay transient for the QUEUE's question ("burn a retry?" — no).
+        # is_transient is load-bearing for offline-queue durability: transient
+        # failures HOLD events without counting toward the drop threshold, so
+        # flipping auth errors to definitive would burn retries and, past the
+        # threshold, drop real activity — the 2026-06-30 data-loss class. The
+        # watchdog's accuracy is not worth billing data, so the exclusion lives
+        # here, in the counter, and never in the classifier.
+        if self._COUNTS_AS_NETWORK_FAILURE and self.is_transient:
+            transient_failure_counter().value += 1
 
     @property
     def is_transient(self) -> bool:
@@ -146,14 +239,26 @@ class BetterFlowClientError(Exception):
         ONLY for a definitive client rejection (a non-retryable 4xx), so "no code"
         means transient. NOTE: this is a rejection classifier, not a raw HTTP
         status — do not set status_code on a retryable 4xx or it becomes
-        definitive and its events burn retries during e.g. a rate-limit window."""
+        definitive and its events burn retries during e.g. a rate-limit window.
+
+        Pure query — free to read as often as you like. This is the codebase's
+        ONLY transient/definitive rule; __init__ consults it to maintain the
+        counter SyncCoordinator's watchdog reads (_TRANSIENT_FAILURE_COUNT)."""
         return self.status_code is None or self.status_code >= 500
 
 
 class BetterFlowAuthError(BetterFlowClientError):
-    """Authentication error."""
+    """Authentication error (401/403).
 
-    pass
+    Excluded from the watchdog's network-failure tally: an expired token or an
+    unauthorized device is a definitive rejection whose fix is re-authentication,
+    not waiting out a network. ``is_transient`` stays True — the offline queue
+    depends on it to hold events without burning retries — so only the COUNTER
+    disagrees. See BetterFlowClientError.__init__ for why that asymmetry is
+    deliberate.
+    """
+
+    _COUNTS_AS_NETWORK_FAILURE = False
 
 
 class _TransientError(Exception):

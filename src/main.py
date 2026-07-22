@@ -29,7 +29,7 @@ try:
     from .display_info import start_display_tracker
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from .sync.http_client import BetterFlowAuthError
+    from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -54,7 +54,7 @@ except ImportError:
     from display_info import start_display_tracker
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from sync.http_client import BetterFlowAuthError
+    from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -1355,17 +1355,63 @@ class SyncCoordinator:
         # for cases where the sleep notification was missed.
         watchdog_cancelled = threading.Event()
 
+        # Snapshot the transient-failure counter so the watchdog can tell WHY the
+        # cycle ran long. An unreachable API makes a healthy cycle overrun (the
+        # retry chain plus the send budget legitimately eat ~150s) — that is slow,
+        # not hung, and reporting it as an ERROR "Sync hung" paged humans and drew
+        # the autofix drafter onto a non-problem (2026-07-22, device 18: 150.86s,
+        # no log gap, all three events delivered next cycle). The counter is
+        # maintained by BetterFlowClientError, off is_transient — the one place
+        # the codebase classifies network-vs-definitive failures.
+        #
+        # THIS THREAD's counter, captured as an object. The watchdog runs on a
+        # Timer thread, so it must not re-read the counter itself (it would get
+        # the Timer's own, always zero). Per-thread also means a cycle abandoned
+        # by _acquire_sync_slot keeps incrementing its OWN counter, so its late
+        # failures can't misclassify the cycle that replaced it.
+        cycle_transients = transient_failure_counter()
+        transient_at_cycle_start = cycle_transients.value
+
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
-            logger.error("_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE)
-            if self.error_reporter is not None:
-                self.error_reporter.capture(
-                    f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
-                    level="error",
-                    tags={"component": "sync-watchdog"},
-                    fingerprint="sync-watchdog-timeout",
+            # Deliberately permissive: ANY transient failure during the cycle
+            # downgrades it. A genuine wedge that coincides with one flaky request
+            # is downgraded at the deadline — acceptable, because
+            # _SYNC_WEDGE_CEILING (420s) still pages it as an error.
+            transient_this_cycle = cycle_transients.value - transient_at_cycle_start
+            if transient_this_cycle > 0:
+                logger.warning(
+                    "_do_sync watchdog: sync exceeded %ss with %d transient API "
+                    "failure(s) — API unreachable, resetting sessions",
+                    self._DO_SYNC_DEADLINE,
+                    transient_this_cycle,
                 )
+                if self.error_reporter is not None:
+                    self.error_reporter.capture(
+                        f"Sync slow — exceeded {self._DO_SYNC_DEADLINE}s while the "
+                        "BetterFlow API was unreachable "
+                        f"({transient_this_cycle} transient "
+                        f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
+                        level="warning",
+                        tags={"component": "sync-watchdog"},
+                        fingerprint="sync-watchdog-timeout-offline",
+                    )
+            else:
+                logger.error(
+                    "_do_sync watchdog: sync exceeded %ss — resetting sessions",
+                    self._DO_SYNC_DEADLINE,
+                )
+                if self.error_reporter is not None:
+                    self.error_reporter.capture(
+                        f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
+                        level="error",
+                        tags={"component": "sync-watchdog"},
+                        fingerprint="sync-watchdog-timeout",
+                    )
+            # Unchanged by design: both resets run in BOTH branches. Discarding
+            # pooled connections after a network outage is the correct recovery,
+            # and the stale-socket backstop was the watchdog's original purpose.
             try:
                 self.bf.reset_session()
                 self.aw.reset_session()
