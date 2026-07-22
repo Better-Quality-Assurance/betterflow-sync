@@ -107,6 +107,38 @@ def test_definitive_rejection_still_drops_to_avoid_head_of_line_block():
     )
 
 
+def test_live_delivery_clears_queue_backoff_so_backlog_drains():
+    """A previous transient queue failure must not keep production stale after
+    the events route has already accepted fresh live activity.
+
+    Pre-fix: _process_queue returned early because _queue_backoff_until was still
+    in the future, so queued events could sit locally for up to the 10-minute
+    max backoff even though /events/batch was healthy again.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    engine = _engine(tmp)
+    engine.queue.enqueue(_events(2))
+    engine._queue_consecutive_failures = 4
+    engine._queue_backoff_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    engine.bf.send_events = Mock(
+        side_effect=[
+            SyncResult(success=True, events_synced=1),
+            SyncResult(success=True, events_synced=2),
+        ]
+    )
+
+    stats = SyncStats()
+    engine._send_events(_events(1), stats)
+
+    assert engine._queue_consecutive_failures == 0
+    assert engine._queue_backoff_until <= datetime.now(timezone.utc)
+
+    engine._process_queue(stats)
+
+    assert engine.bf.send_events.call_count == 2
+    assert engine.queue.size() == 0
+
+
 def _unstorable_events(n: int) -> list[dict]:
     """n events the server would reject anyway: bucketless (nowhere to route)."""
     now = datetime.now(timezone.utc).isoformat()

@@ -326,11 +326,10 @@ class SyncEngine:
         # enabled by config, and an in-process counting backend is usable
         # (Windows ctypes hooks / macOS CGEventTap; off on Linux), the agent
         # uploads its own input-count stream and the external aw-watcher-input
-        # bucket is skipped so the two never double-count. Ships dormant
-        # (in_process_input defaults False). Counts accrue continuously on the
-        # backend listener thread; the sync thread only DRAINS them into an event
-        # each cycle. Checkpoint committed only after a confirmed send, mirroring
-        # AFK/window. Mutated only on the sync thread.
+        # bucket is skipped so the two never double-count. Counts accrue
+        # continuously on the backend listener thread; the sync thread only
+        # DRAINS them into an event each cycle. Checkpoint committed only after a
+        # confirmed send, mirroring AFK/window. Mutated only on the sync thread.
         self.input_source = None
         self._input_inproc_checkpoint: Optional[datetime] = None
 
@@ -3301,6 +3300,7 @@ class SyncEngine:
                 result = self.bf.send_events(batch)
                 if result.success:
                     stats.events_sent += result.events_synced
+                    self._clear_queue_backoff("live batch accepted")
                 else:
                     if result.accepted_ids:
                         # True partial success: re-queue only the events the
@@ -3308,6 +3308,7 @@ class SyncEngine:
                         accepted_set = set(result.accepted_ids)
                         failed = [e for e in batch if e.get("id") not in accepted_set]
                         stats.events_sent += len(batch) - len(failed)
+                        self._clear_queue_backoff("live batch partially accepted")
                         if failed:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
@@ -3485,7 +3486,7 @@ class SyncEngine:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
                     processed += len(events)
-                    self._queue_consecutive_failures = 0
+                    self._clear_queue_backoff("queue batch accepted")
                 elif result.accepted_ids and not result.transient:
                     # A per-event verdict and a transient (no-verdict) failure are
                     # mutually exclusive in send_events today. The `and not
@@ -3509,7 +3510,7 @@ class SyncEngine:
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
                         stats.events_sent += len(succeeded_ids)
-                        self._queue_consecutive_failures = 0
+                        self._clear_queue_backoff("queue batch partially accepted")
                     if failed_ids:
                         self.queue.increment_retry(failed_ids)
                     processed += len(succeeded_ids)
@@ -3585,6 +3586,22 @@ class SyncEngine:
         delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
         self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
         logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
+
+    def _clear_queue_backoff(self, reason: str) -> None:
+        """Clear stale queue backoff after confirmed events-route delivery.
+
+        Queue backoff is correct while the events route is failing, but a later
+        successful live upload proves the route is accepting writes again. Keep
+        draining immediately instead of leaving older queued events parked until
+        a previous 60s-600s backoff expires.
+        """
+        if (
+            self._queue_consecutive_failures > 0
+            or self._queue_backoff_until > datetime.now(timezone.utc)
+        ):
+            logger.info("Queue backoff cleared: %s", reason)
+        self._queue_consecutive_failures = 0
+        self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
 
     def send_heartbeat_if_due(self, stats: "SyncStats") -> Optional["BetterFlowAuthError"]:
         """Public entry point: send heartbeat iff the sync stats marked it due.
