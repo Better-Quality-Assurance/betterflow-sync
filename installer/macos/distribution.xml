@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  productbuild distribution definition for the BetterFlow MDM installer.
+
+  The at-sign placeholders below are substituted by scripts/build-pkg.sh;
+  this file is a template and is NOT a valid distribution on its own.
+  Three are substituted: the package identifier (co.betterqa.betterflow),
+  the version read from src/__init__.py, and the filename of the pkgbuild
+  component package.
+
+  customize="never" + a hidden choice means the installer has no
+  component-selection screen: MDM (Miradore -> InstallEnterpriseApplication)
+  installs it unattended, and a human double-clicking it gets a
+  straight-through install.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>BetterFlow</title>
+    <organization>co.betterqa</organization>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="10.15"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="@IDENTIFIER@"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="@IDENTIFIER@" visible="false">
+        <pkg-ref id="@IDENTIFIER@"/>
+    </choice>
+    <pkg-ref id="@IDENTIFIER@" version="@VERSION@" onConclusion="none">@COMPONENT_PKG@</pkg-ref>
+</installer-gui-script>

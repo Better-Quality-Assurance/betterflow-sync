@@ -22,6 +22,7 @@ pytest tests/test_sync_engine.py::TestSyncEngine::test_pause_resume -v
 make build            # Build for current platform (requires pyinstaller)
 make build-mac        # Build macOS .app bundle
 make dmg              # Build macOS DMG installer (requires create-dmg)
+make pkg              # Build signed+notarized macOS .pkg for MDM (see docs/SIGNING.md)
 
 # Linux build (run on Linux; needs gobject-introspection + libnotify-bin)
 make build-linux      # Build dist/BetterFlow/ one-dir bundle
