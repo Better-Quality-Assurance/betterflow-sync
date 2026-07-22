@@ -102,6 +102,69 @@ gh release create v1.5.X \
     --notes-from-tag
 ```
 
+## MDM installer package (`make pkg`)
+
+macOS MDM (Miradore → `InstallEnterpriseApplication`) cannot deploy a DMG; it
+needs a **signed `.pkg`**. `make pkg` builds one from the same
+`dist/BetterFlow.app` the DMG uses:
+
+```bash
+make pkg                      # host arch
+TARGET_ARCH=x86_64 make pkg   # explicit arch
+```
+
+It runs `pkgbuild` → `productbuild` → `productsign`, then submits the pkg for
+its **own** notarization pass and staples it. Notarizing the `.app` does not
+cover the package containing it, so this is a separate submission from the one
+`make ship` does for the DMG.
+
+If `dist/BetterFlow.app` is already built and signed, `make _pkg-only` produces
+the signed (not yet notarized) pkg on its own.
+
+Signing needs a **`Developer ID Installer`** certificate — a *different*
+certificate type from the `Developer ID Application` one used above. Having one
+does not give you the other, and creating it is an Apple Developer account-holder
+task. Confirm it is present with:
+
+```bash
+security find-identity -v | grep "Developer ID Installer"
+```
+
+Note `security find-identity -p codesigning` does **not** list installer
+certificates; the default (all-policy) query does.
+
+### Bundle relocation must stay off
+
+`pkgbuild` marks bundles **relocatable by default**. A relocatable package does
+not install to `--install-location`: at install time PackageKit searches the
+machine for any bundle carrying the same identifier (`co.betterqa.betterflow`)
+and installs over **that** copy instead — then reports success. On a Mac holding
+a stray copy (an old install, a Downloads copy, a build artifact) the MDM push
+silently no-ops and `/Applications/BetterFlow.app` never appears.
+
+This was observed for real on 2026-07-22: the installer showed *Install
+Succeeded*, `pkgutil --pkg-info co.betterqa.betterflow` recorded 892 files at
+`location: Applications`, `/Applications/BetterFlow.app` did not exist, and
+`/var/log/install.log` showed the payload landing in a `dist/BetterFlow.app`
+inside a git worktree. It is the macOS twin of the Windows "running from
+Downloads" incident that v1.5.91 added a guard for.
+
+`scripts/build-pkg.sh` therefore builds via `pkgbuild --analyze` → set
+`BundleIsRelocatable=false` → `pkgbuild --root … --component-plist …`, and then
+asserts on the built artifact that no `PackageInfo` lists a bundle inside
+`<relocate>`. To check any pkg by hand:
+
+```bash
+pkgutil --expand BetterFlow-macOS-arm64.pkg /tmp/x
+grep -A2 '<relocate' /tmp/x/*/PackageInfo   # want an empty <relocate/>
+```
+
+The DMG stays the download for anyone outside MDM, including the unmanaged
+devices. **MDM bootstraps the install once; the in-app updater stays the owner of
+which version is running** — see
+`docs/superpowers/specs/2026-07-22-mdm-pkg-deployment-design.md` §2. `make pkg`
+is deliberately not wired into `make ship` or the CI release workflow.
+
 ## CI signing (GitHub Actions)
 
 `make ship` signs + notarizes on a developer Mac. CI (`.github/workflows/build.yml`)
