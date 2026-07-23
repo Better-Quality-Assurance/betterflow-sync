@@ -896,14 +896,46 @@ class Config:
         if env_api_url:
             data["api_url"] = env_api_url.rstrip("/")
 
-        aw_data = data.pop("aw", {})
-        sync_data = data.pop("sync", {})
-        privacy_data = data.pop("privacy", {})
-        reminders_data = data.pop("reminders", {})
-        engagement_data = data.pop("engagement", {})
-        fraud_detection_data = data.pop("fraud_detection", {})
-        call_detection_data = data.pop("call_detection", {})
-        foreground_activity_data = data.pop("foreground_activity", {})
+        def _block(key: str) -> dict:
+            """Pop a nested settings block as a defensive COPY.
+
+            Two traps, closed for every block rather than the one that happened
+            to need it:
+
+            (a) `data = dict(data)` above is a TOP-LEVEL copy only, so popping a
+            key out of a nested block reaches through and mutates the CALLER's
+            dict — which the drops below (foreground_activity.enabled,
+            sync.in_process_input) do exactly.
+
+            (b) A hand-edited or corrupt block that is not a mapping (null, a
+            list, a string) used to reach `_safe()` as a non-mapping and raise.
+            `_from_dict` runs inside load()'s `except`, so ONE bad block silently
+            discarded the WHOLE config — api_url, working_hours, engagement, the
+            lot — and fell back to full defaults. Anything that is not a mapping
+            now degrades to {}, i.e. that block's defaults, and leaves the rest
+            of the file intact.
+            """
+            value = data.pop(key, None)
+            if isinstance(value, dict):
+                return dict(value)
+            if value is not None:
+                # Log it: degrading to defaults silently is how a partially
+                # reverted config looks identical to a healthy one.
+                logger.warning(
+                    "Config block %r is %s, not an object — using that block's "
+                    "defaults and keeping the rest of the file",
+                    key, type(value).__name__,
+                )
+            return {}
+
+        aw_data = _block("aw")
+        sync_data = _block("sync")
+        privacy_data = _block("privacy")
+        reminders_data = _block("reminders")
+        engagement_data = _block("engagement")
+        fraud_detection_data = _block("fraud_detection")
+        call_detection_data = _block("call_detection")
+        foreground_activity_data = _block("foreground_activity")
         # working_hours was missing from this list until 2026-07-14, so it fell
         # through to the **data splat below and was rebuilt as a plain dict. A
         # dict has no attributes: update_from_server's `self.working_hours.
@@ -912,7 +944,7 @@ class Config:
         # "enforced", False)` read False. Net effect: on EVERY device that had
         # ever written a config.json, working-hours enforcement was silently and
         # permanently off, and restricted users were recorded around the clock.
-        working_hours_data = data.pop("working_hours", {})
+        working_hours_data = _block("working_hours")
         # Ignore any persisted foreground_activity.enabled — it's server-driven
         # and default-OFF. A device that ran a default-ON beta build already has
         # enabled=true on disk; honouring it would override the safe default on
@@ -924,6 +956,22 @@ class Config:
             logger.info(
                 "Ignoring persisted foreground_activity.enabled=true on load; it "
                 "is server-driven and default-OFF (server re-enables per-session)"
+            )
+        # Same trap, opposite direction: in_process_input is PLATFORM-defaulted
+        # (True on Windows, where there is no external input tracker at all) and
+        # server-overridable. update_from_server ends with save(), so every agent
+        # that ever fetched config has "in_process_input": false on disk from the
+        # builds where it shipped dormant fleet-wide — and honouring that would
+        # pin the Windows default OFF on upgrade, leaving exactly the devices
+        # this exists for reporting zero keystrokes forever. Only a FRESH install
+        # would have gotten the fix. Drop it so the platform default wins on
+        # load; the server still switches it either way per session.
+        persisted_inproc_input = sync_data.pop("in_process_input", None)
+        if persisted_inproc_input is not None:
+            logger.info(
+                "Ignoring persisted sync.in_process_input=%s on load; it is "
+                "platform-defaulted and server-driven",
+                persisted_inproc_input,
             )
         data.pop("screenshots", None)
 
@@ -972,6 +1020,12 @@ class Config:
         # devices that never saved it. Drop it so the code default always wins on
         # load and only the server can switch it on.
         data.get("foreground_activity", {}).pop("enabled", None)
+        # Never persist sync.in_process_input either — same reason, and this is
+        # the write side of the _from_dict drop above. It is platform-defaulted
+        # (Windows True: no external input tracker ships there) and server-
+        # overridable, so a value on disk can only ever outrank both and pin a
+        # Windows device at zero keystrokes across an upgrade.
+        data.get("sync", {}).pop("in_process_input", None)
         tmp_file = config_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:

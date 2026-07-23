@@ -3142,8 +3142,11 @@ class SyncEngine:
 
         Note: unlike the window source, the input backend has no per-sample
         "blind" fallback — a period with no keystrokes is a legitimate gap, not a
-        blind probe. If the backend fails to install at all, ``available()`` never
-        latches on and this returns False, so the external tracker keeps its job.
+        blind probe. If the backend fails to install at all, ``available()``
+        reports False and this returns False, so the external tracker keeps its
+        job — and since ``available()`` caches nothing, a backend that dies
+        AFTER a good start flips this back to False on the very next cycle
+        rather than going on suppressing the external bucket.
         """
         return self._should_use_inproc_input()
 

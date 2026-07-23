@@ -94,9 +94,15 @@ def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
 
 
 def test_in_process_input_server_flag_round_trip():
-    # Un-deferred, string-safe, and still remotely kill-switchable.
+    # Un-deferred, string-safe, and still remotely kill-switchable. Deliberately
+    # platform-INDEPENDENT: the default is the subject of the two tests around
+    # this one, so this case starts from a known-off flag instead of patching
+    # the real sys.platform process-wide. (It also used to read the RUNNER's
+    # platform, which passes on the ubuntu PR job and fails on the
+    # windows-latest leg of the release-tag matrix — a red release build days
+    # after a green PR.)
     cfg = Config()
-    assert cfg.sync.in_process_input is False, "ships dormant"
+    cfg.sync.in_process_input = False
 
     cfg.update_from_server({"sync": {"in_process_input": "false"}})
     assert cfg.sync.in_process_input is False, 'STRING "false" must not enable'
@@ -117,6 +123,18 @@ def test_in_process_input_defaults_on_for_windows(monkeypatch):
 
     cfg.update_from_server({"sync": {"in_process_input": False}})
     assert cfg.sync.in_process_input is False, "server kill-switch must still win"
+
+
+def test_in_process_input_ships_dormant_off_windows(monkeypatch):
+    """The other half of the platform default, and the half that has to stay
+    OFF. Making the round-trip test above platform-independent removed the only
+    assertion that macOS/Linux ship dormant — and on those platforms "enabled"
+    means installing a CGEventTap under the user's Input Monitoring grant, so
+    it must be opt-in (server) and never a default. Pinned to a patched
+    platform, not the CI runner's, so it holds on every leg of the matrix."""
+    for plat in ("darwin", "linux"):
+        monkeypatch.setattr(config_module.sys, "platform", plat)
+        assert Config().sync.in_process_input is False, f"{plat} must ship dormant"
 
 
 def test_working_hours_and_sync_tuning_still_apply():
@@ -259,3 +277,84 @@ def test_sync_gates_config_fetch_on_config_refetch_due():
     with _patch.object(engine, "_config_refetch_due", return_value=True):
         engine.sync()
         assert bf.get_config.called, "due → sync() must re-fetch (proves the gate is wired)"
+
+
+# -- the persisted-config override that would have made the rollout a no-op ---
+#
+# Origin 2026-07-23: flipping in_process_input's default ON for Windows fixes
+# nothing on a device that already has a config.json — update_from_server() ends
+# with self.save(), so every Windows agent in the fleet has written
+# "in_process_input": false to disk, and _from_dict rebuilds SyncSettings from
+# that. The new default only ever reaches FRESH installs. Same trap, same file,
+# as foreground_activity.enabled (see save()/_from_dict).
+
+
+def test_persisted_in_process_input_does_not_override_platform_default(monkeypatch):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+
+    # What every upgraded Windows device has on disk, written by <=1.5.116.
+    cfg = Config._from_dict({"sync": {"in_process_input": False, "batch_size": 250}})
+
+    assert cfg.sync.in_process_input is True, (
+        "a stale persisted false must not pin the Windows default off on upgrade"
+    )
+    assert cfg.sync.batch_size == 250, "unrelated persisted sync tuning still loads"
+
+    # The server keeps both directions: it can still switch it off per device.
+    cfg.update_from_server({"sync": {"in_process_input": False}})
+    assert cfg.sync.in_process_input is False
+
+
+def test_in_process_input_is_never_persisted(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+    monkeypatch.setattr(Config, "get_config_file",
+                        classmethod(lambda cls: tmp_path / "config.json"))
+
+    cfg = Config()
+    cfg.update_from_server({"sync": {"in_process_input": True}})  # ends in save()
+
+    import json
+    written = json.loads((tmp_path / "config.json").read_text())
+
+    assert "in_process_input" not in written.get("sync", {}), (
+        "the flag is platform-defaulted and server-driven; persisting it lets a "
+        "stale disk value outrank both"
+    )
+    assert "batch_size" in written.get("sync", {}), "sibling sync settings still persist"
+
+
+# -- _from_dict must not damage the caller's dict, or lose the file to one bad
+#    block. Both traps applied to every nested block, not just the one that
+#    happened to need a fix.
+
+
+def test_from_dict_does_not_mutate_the_callers_nested_blocks():
+    """`data = dict(data)` is a TOP-LEVEL copy, so popping a key out of a nested
+    block reached through to the caller's dict — which the in_process_input and
+    foreground_activity.enabled drops both do."""
+    original = {
+        "sync": {"in_process_input": False, "batch_size": 250},
+        "foreground_activity": {"enabled": True, "max_credit_minutes": 90},
+    }
+    snapshot = {k: dict(v) for k, v in original.items()}
+
+    Config._from_dict(original)
+
+    assert original == snapshot, "_from_dict must leave the caller's dict intact"
+
+
+def test_one_corrupt_block_does_not_discard_the_whole_config():
+    """_from_dict runs inside load()'s except, so a block that is not a mapping
+    used to raise and take the ENTIRE config with it — api_url, working_hours,
+    engagement — silently falling back to defaults."""
+    for bad in (None, [], "nonsense", 42):
+        cfg = Config._from_dict({
+            "api_url": "https://app.betterflow.eu/api/agent",
+            "sync": bad,
+            "working_hours": {"enforced": True, "work_start": "07:30"},
+        })
+        assert cfg.api_url == "https://app.betterflow.eu/api/agent", (
+            f"a {type(bad).__name__} sync block must not cost us the rest of the file"
+        )
+        assert cfg.working_hours.work_start == "07:30", "sibling blocks survive"
+        assert cfg.sync.batch_size == Config().sync.batch_size, "bad block -> defaults"
