@@ -1,6 +1,6 @@
 # BetterFlow - Build Makefile
 
-.PHONY: install install-dev install-mac test lint format clean build build-mac build-windows build-linux appimage run download-aw clean-aw sign-mac notarize-mac staple-mac dmg _dmg-only ship ship-arm64 ship-x86_64 dev icons
+.PHONY: install install-dev install-mac test lint format clean clean-dist build build-mac build-windows build-linux appimage run download-aw clean-aw sign-mac notarize-mac staple-mac dmg _dmg-only pkg _pkg-only ship ship-arm64 ship-x86_64 dev icons
 
 # Install production dependencies
 install:
@@ -28,6 +28,15 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 
+# Remove ONLY the PyInstaller output paths under dist/. PyInstaller aborts with
+# "the output directory ... is not empty" if a previous partial or failed run
+# left them behind, which is the normal state after any interrupted build.
+# Deliberately scoped: DMGs, PKGs and the arch-renamed .app copies in dist/
+# are left alone, and nothing outside dist/ is touched.
+clean-dist:
+	@rm -rf dist/BetterFlow.app dist/BetterFlow
+	@echo "[clean-dist] removed dist/BetterFlow.app and dist/BetterFlow (if present)"
+
 # Download ActivityWatch binaries for current platform
 download-aw:
 	python scripts/download_aw.py
@@ -40,9 +49,17 @@ clean-aw:
 build: download-aw
 	pyinstaller build.spec --clean
 
-# Build for macOS
-build-mac: download-aw
-	pyinstaller build.spec --clean
+# Build for macOS.
+#
+# Does NOT call `pyinstaller` off PATH: on a post-Rosetta-migration machine that
+# resolves to the stale Intel Homebrew prefix (/usr/local/bin/pyinstaller), which
+# builds a silently x86_64 .app on an arm64 host — indistinguishable from a
+# correct build by filename. scripts/resolve-pyinstaller.sh picks an interpreter
+# whose PyInstaller runs as $(TARGET_ARCH) and fails loudly if there is none.
+# Override with PYINSTALLER_PYTHON=/path/to/venv/bin/python3.
+build-mac: download-aw clean-dist
+	@py=$$(./scripts/resolve-pyinstaller.sh $(TARGET_ARCH)) || exit 1; \
+	"$$py" -m PyInstaller build.spec --clean
 	@$(MAKE) sign-mac
 	@echo "Built: dist/BetterFlow.app"
 
@@ -140,6 +157,35 @@ ws = Cocoa.NSWorkspace.sharedWorkspace(); \
 img = Cocoa.NSImage.alloc().initWithContentsOfFile_(os.path.abspath('resources/icon.png')); \
 ws.setIcon_forFile_options_(img, os.path.abspath('$$dmg_path'), 0); \
 print('Custom icon set on', '$$dmg_path')"
+
+# Create an arch-suffixed, signed, notarized and stapled macOS installer
+# package. The DMG stays the download for humans and for the unmanaged
+# devices; the pkg exists solely because macOS MDM (Miradore ->
+# InstallEnterpriseApplication) can only deploy a signed .pkg.
+# See docs/superpowers/specs/2026-07-22-mdm-pkg-deployment-design.md.
+#
+# MDM bootstraps the install ONCE on a new machine; the in-app updater
+# stays the owner of "which version is running". Do not wire this into
+# the release pipeline without deciding that question first — two
+# updaters fighting over one install is a known churn failure mode.
+#
+# The pkg needs its OWN notarization pass: notarizing the .app does not
+# cover the package that contains it.
+pkg: build-mac
+	@$(MAKE) _pkg-only
+	NOTARIZE_DMG=dist/BetterFlow-macOS-$(TARGET_ARCH).pkg $(MAKE) notarize-mac
+	STAPLE_DMG=dist/BetterFlow-macOS-$(TARGET_ARCH).pkg STAPLE_APP= $(MAKE) staple-mac
+	@echo "[pkg] Created dist/BetterFlow-macOS-$(TARGET_ARCH).pkg"
+
+# Internal: wrap whatever is currently in dist/BetterFlow.app as a signed
+# dist/BetterFlow-macOS-$(TARGET_ARCH).pkg. No notarization — the `pkg`
+# target adds that. Identity is hardcoded in scripts/build-pkg.sh:
+# "Developer ID Installer: Better Quality Assurance SRL (87NVC57J44)",
+# a different certificate type from the Application identity sign-mac.sh
+# uses. The script refuses to run if the cert is missing.
+_pkg-only:
+	TARGET_ARCH=$(TARGET_ARCH) ./scripts/build-pkg.sh \
+		dist/BetterFlow.app dist/BetterFlow-macOS-$(TARGET_ARCH).pkg
 
 # Development server (auto-reload)
 dev:

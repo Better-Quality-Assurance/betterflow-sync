@@ -41,13 +41,16 @@ def test_privacy_egress_settings_do_not_apply_on_upgrade():
     cfg = Config()
     before_full_urls = cfg.privacy.collect_full_urls
     before_domain_only = cfg.privacy.domain_only_urls
-    before_allowlist = list(cfg.privacy.title_allowlist)
 
     cfg.update_from_server({
         "privacy": {
             "collect_full_urls": True,       # would egress FULL urls
             "track_browser_domains": False,  # would flip domain_only_urls off
-            "title_allowlist": ["SomeAppNotInDefaults"],
+            # hash_window_titles / title_allowlist are no longer asserted here:
+            # the agent stopped mirroring them entirely on 2026-07-23 (they had
+            # no client-side consumer), so "deferred" is not the property that
+            # holds any more — "ignored, gate or no gate" is. That is pinned in
+            # tests/test_hash_titles_control_removed.py.
         },
         "collection": {"track_browser_urls": True, "collect_page_category": True},
     })
@@ -56,7 +59,6 @@ def test_privacy_egress_settings_do_not_apply_on_upgrade():
         "server collect_full_urls must be deferred, not applied silently on upgrade"
     )
     assert cfg.privacy.domain_only_urls == before_domain_only
-    assert cfg.privacy.title_allowlist == before_allowlist, "title_allowlist deferred too"
 
 
 def test_capture_and_billing_blocks_do_not_apply_on_upgrade():

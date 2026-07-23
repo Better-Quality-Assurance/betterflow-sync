@@ -3,10 +3,12 @@
 import os
 import platform
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -83,14 +85,70 @@ def resolve_binary_path(output_dir: str, name: str, plat: str) -> str | None:
     return None
 
 
+def build_ssl_context() -> ssl.SSLContext:
+    """Build a TLS context with a CA bundle that actually exists.
+
+    Several Pythons on macOS (notably the python.org framework builds) ship
+    with `openssl_cafile` pointing at an `etc/openssl/cert.pem` that was never
+    installed, so *every* HTTPS request fails with
+    CERTIFICATE_VERIFY_FAILED / "unable to get local issuer certificate".
+    The error names TLS and says nothing about the missing bundle, which is
+    why this used to be worked around by exporting SSL_CERT_FILE by hand.
+
+    Resolution order:
+      1. SSL_CERT_FILE / REQUESTS_CA_BUNDLE, if the caller set one that exists.
+      2. certifi's bundle, if certifi is importable.
+      3. The interpreter's own default (may or may not work).
+    """
+    for env_var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        path = os.environ.get(env_var)
+        if path and os.path.isfile(path):
+            print(f"  TLS: using {env_var}={path}")
+            return ssl.create_default_context(cafile=path)
+
+    try:
+        import certifi
+
+        cafile = certifi.where()
+        if os.path.isfile(cafile):
+            print(f"  TLS: using certifi bundle {cafile}")
+            return ssl.create_default_context(cafile=cafile)
+        print(f"  TLS: certifi reported a missing bundle at {cafile}")
+    except ImportError:
+        print("  TLS: certifi not installed, falling back to system defaults")
+
+    return ssl.create_default_context()
+
+
 def download_release(plat: str) -> str:
     """Download release zip to a temp file. Returns path to zip."""
     asset = RELEASE_ASSETS[plat]
     url = f"{RELEASE_BASE}/{asset}"
     print(f"Downloading {url} ...")
 
+    context = build_ssl_context()
     tmp = tempfile.mktemp(suffix=".zip")
-    urllib.request.urlretrieve(url, tmp)
+    try:
+        with urllib.request.urlopen(url, context=context) as response, open(
+            tmp, "wb"
+        ) as out:
+            shutil.copyfileobj(response, out)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            print()
+            print("ERROR: TLS certificate verification failed.")
+            print(f"  interpreter: {sys.executable}")
+            print(f"  default CA file: {ssl.get_default_verify_paths().openssl_cafile}")
+            print()
+            print("  This is a missing CA bundle on this machine, not a network or")
+            print("  GitHub problem. Fix it with ONE of:")
+            print(f"    {sys.executable} -m pip install --upgrade certifi")
+            print("    /Applications/Python 3.x/Install Certificates.command")
+            print("    SSL_CERT_FILE=/path/to/cacert.pem make download-aw")
+            print()
+            print(f"  Underlying error: {exc.reason}")
+            sys.exit(1)
+        raise
 
     size_mb = os.path.getsize(tmp) / (1024 * 1024)
     print(f"Downloaded {size_mb:.1f} MB")

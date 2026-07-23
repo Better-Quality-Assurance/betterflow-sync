@@ -59,6 +59,15 @@ except ImportError:
         import _build_info  # noqa: F401 — ensure bundle path detection runs first
     from config import PRIVACY_POLICY_URL  # type: ignore[no-redef]
 
+try:
+    from ..clipboard import clipboard_available, copy_to_clipboard
+    from ..hardware_serial import get_hardware_serial
+    from ..notifications import send_notification
+except ImportError:
+    from clipboard import clipboard_available, copy_to_clipboard  # type: ignore[no-redef]
+    from hardware_serial import get_hardware_serial  # type: ignore[no-redef]
+    from notifications import send_notification  # type: ignore[no-redef]
+
 
 def _prevent_termination() -> None:
     """Prevent macOS from silently killing the tray app.
@@ -149,7 +158,6 @@ class TrayModel:
 
         # Preferences
         self.sync_interval: int = 30
-        self.hash_titles: bool = False
         self.domain_only_urls: bool = False
         self.debug_mode: bool = False
         self.auto_start: bool = False
@@ -226,6 +234,41 @@ except Exception:
             Item = None
 
 logger = logging.getLogger(__name__)
+
+
+def serial_menu_row() -> tuple:
+    """Build the (label, copyable) pair for the tray's device-serial row.
+
+    Pure: no pystray, no TrayIcon, no display backend. That is deliberate —
+    pystray's backend binds at import time and fails on a headless CI runner,
+    which leaves ``pystray = None`` (see the import guard above) and makes
+    ``TrayIcon()`` unconstructable there. A row-building rule that could only be
+    exercised through a live TrayIcon would therefore be untestable in the one
+    environment that gates merges, and per test-fixture-discipline.md a guard
+    that skips where it matters is not a guard.
+
+    ``TrayIcon._serial_menu_item`` is the only consumer and does nothing except
+    turn this pair into a MenuItem, so the production menu and the test assert
+    on the same string.
+
+    Returns:
+        (label, copyable). ``copyable`` is True only when there is a serial to
+        copy AND a clipboard tool exists to copy it with.
+    """
+    serial = get_hardware_serial()
+
+    if serial is None:
+        # Explicitly "unavailable", never blank and never the repr "None". A VM,
+        # a container or a root-only /sys/class/dmi/id/product_serial genuinely
+        # has no readable serial; that must read as an honest absence rather
+        # than as a broken app.
+        return ("Device serial: unavailable", False)
+
+    # No clipboard tool on this box (a bare Linux session with no
+    # wl-copy/xclip/xsel) => not copyable. A menu row that looks clickable and
+    # silently does nothing is worse than an inert one, and the label still
+    # carries the string the user needs to read off.
+    return (f"Device serial: {serial}", clipboard_available())
 
 
 class TrayState(Enum):
@@ -559,7 +602,6 @@ class TrayIcon:
                 "on_break": self.model.on_break,
                 "break_minutes_left": self.model.break_minutes_left,
                 "sync_interval": self.model.sync_interval,
-                "hash_titles": self.model.hash_titles,
                 "domain_only_urls": self.model.domain_only_urls,
                 "debug_mode": self.model.debug_mode,
                 "auto_start": self.model.auto_start,
@@ -719,6 +761,7 @@ class TrayIcon:
             Item(f"Queue: {s['queue_size']} events", None, enabled=False),
             Item(f"Last sync: {s['last_sync']}", None, enabled=False),
             Item("─" * 20, None, enabled=False),
+            self._serial_menu_item(),
             Item("Privacy Policy", self._handle_open_privacy),
         ]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
@@ -777,6 +820,43 @@ class TrayIcon:
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
+
+    def _serial_menu_item(self) -> "Item":
+        """The device-serial row: readable value, copyable when we can copy.
+
+        Sits in Diagnostics next to the Privacy Policy link on purpose. The agent
+        reports this serial to the server, so the honest thing is to show the
+        user the exact value we hold about their machine rather than describe it
+        in a first-run wizard they clicked through months ago. Seeing the literal
+        string also makes it self-evident that this identifies the hardware and
+        not them.
+
+        The label/copyable decision lives in the module-level serial_menu_row()
+        so it can be asserted without a live pystray backend; this method only
+        wraps that pair in a MenuItem. Do not re-derive the label here — a
+        second copy is how the test and the menu drift apart.
+
+        serial_menu_row() reads the cached probe from src/hardware_serial.py,
+        the same call site the heartbeat uses, memoised for the life of the
+        process, so rebuilding the menu on every state change costs nothing.
+        """
+        label, copyable = serial_menu_row()
+        if not copyable:
+            return Item(label, None, enabled=False)
+        return Item(label, self._handle_copy_serial)
+
+    def _handle_copy_serial(self, icon, item) -> None:
+        """Copy the device serial to the clipboard, with a brief confirmation."""
+        serial = get_hardware_serial()
+        if serial is None:
+            return
+        if copy_to_clipboard(serial):
+            send_notification("BetterFlow", f"Device serial {serial} copied.")
+        else:
+            # Don't claim success we didn't get. The value is still on screen.
+            send_notification(
+                "BetterFlow", f"Could not copy. Your device serial is {serial}."
+            )
 
     def _get_status_text(self, s: Optional[dict] = None) -> str:
         """Get short status text for the menu.
@@ -1129,7 +1209,6 @@ class TrayIcon:
         dashboard_url = f"{parsed.scheme}://{parsed.netloc}/agent/my"
         with self.model.lock:
             self.model.sync_interval = config.sync.interval_seconds
-            self.model.hash_titles = config.privacy.hash_titles
             self.model.domain_only_urls = config.privacy.domain_only_urls
             self.model.auto_categorize = config.privacy.auto_categorize
             self.model.track_display_info = config.privacy.track_display_info

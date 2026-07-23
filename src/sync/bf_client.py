@@ -5,7 +5,7 @@ import json
 import logging
 import platform
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -13,14 +13,16 @@ import requests
 try:
     from .. import __version__
     from .. import config as config_mod
-    from ..config import DEFAULT_API_URL, get_machine_uuid
+    from ..config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
     from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from .privacy_filter import partition_excluded
     from .retry import RetryConfig
 except ImportError:
     from src import __version__
     import config as config_mod
-    from config import DEFAULT_API_URL, get_machine_uuid
+    from config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
     from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from sync.privacy_filter import partition_excluded
     from sync.retry import RetryConfig
 
 __all__ = [
@@ -122,6 +124,7 @@ class BetterFlowClient(BaseApiClient):
         compress: bool = True,
         timeout: int = 30,
         retry_config: Optional[RetryConfig] = None,
+        excluded_apps_provider: Optional[Callable[[], Iterable[str]]] = None,
     ):
         """Initialize BetterFlow client.
 
@@ -133,6 +136,12 @@ class BetterFlowClient(BaseApiClient):
             compress: Use gzip compression for event batches
             timeout: Request timeout in seconds
             retry_config: Configuration for retry with exponential backoff
+            excluded_apps_provider: Callable returning the CURRENT excluded-app
+                list, consulted on every send so a live config edit takes effect
+                immediately (a snapshotted list would keep egressing an app the
+                user just excluded). When omitted, the shipped defaults apply:
+                an unwired client still honours the baseline guarantee rather
+                than failing open.
         """
         super().__init__(
             api_url=api_url,
@@ -143,6 +152,27 @@ class BetterFlowClient(BaseApiClient):
             timeout=timeout,
             retry_config=retry_config,
         )
+        self._excluded_apps_provider = excluded_apps_provider
+
+    def _excluded_apps(self) -> Iterable[str]:
+        """Current excluded-app list. Fails CLOSED: if the provider is missing
+        or raises, fall back to the shipped defaults instead of transmitting
+        everything."""
+        provider = self._excluded_apps_provider
+        if provider is None:
+            return PrivacySettings().exclude_apps
+        try:
+            apps = provider()
+        except Exception:
+            logger.warning(
+                "excluded-apps provider failed — falling back to the shipped "
+                "exclusion defaults for this send",
+                exc_info=True,
+            )
+            return PrivacySettings().exclude_apps
+        if apps is None:
+            return PrivacySettings().exclude_apps
+        return apps
 
     # =========================================================================
     # Authentication
@@ -266,6 +296,35 @@ class BetterFlowClient(BaseApiClient):
         if not events:
             return SyncResult(success=True, events_synced=0)
 
+        # THE PRIVACY EGRESS CHOKEPOINT. This is the one function that puts
+        # events on the wire, so it is the one place the excluded-app guarantee
+        # can be enforced for EVERY producer — external AW buckets, the
+        # in-process window/input sources, status spans, the call detector, the
+        # offline-queue drain, and whatever is added next. Enforcing it in the
+        # producers instead is how the in-process sources shipped able to
+        # egress 1Password titles. Do not move this below the request.
+        events, dropped = partition_excluded(events, self._excluded_apps())
+        dropped_ids = [e.get("id") for e in dropped if e.get("id") is not None]
+        if dropped:
+            # Never log the titles/URLs of an excluded app — the app names are
+            # the most that may be recorded, and only locally.
+            logger.info(
+                "Privacy filter: dropped %d event(s) for excluded app(s) %s "
+                "before egress",
+                len(dropped),
+                ", ".join(sorted({a for a in (
+                    e.get("data", {}).get("app") for e in dropped
+                ) if a})),
+            )
+        if not events:
+            # Nothing left to transmit. Report SUCCESS with the dropped ids
+            # reported as accepted: exclusion is a permanent local decision, so
+            # callers must retire these events (drop the queue row, advance the
+            # checkpoint) rather than retry them forever.
+            return SyncResult(
+                success=True, events_synced=0, accepted_ids=dropped_ids
+            )
+
         try:
             # Idempotency key prevents duplicate processing when the same batch
             # is re-sent — either the retry loop after the connection drops once
@@ -343,7 +402,14 @@ class BetterFlowClient(BaseApiClient):
                 success=delivered,
                 events_synced=events_synced,
                 events_queued=queued,
-                accepted_ids=accepted_ids,
+                # Privacy-dropped ids ride along ONLY when the server gave a
+                # per-event verdict. Callers use accepted_ids to decide what not
+                # to re-queue, and a dropped event must never be re-queued; when
+                # there is no verdict (accepted_ids empty) the caller holds the
+                # whole batch and the next attempt re-drops them harmlessly.
+                accepted_ids=(
+                    list(accepted_ids) + dropped_ids if accepted_ids else accepted_ids
+                ),
             )
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login
@@ -369,6 +435,49 @@ class BetterFlowClient(BaseApiClient):
     # Lightweight retry for heartbeat (N14): 1 retry, 5s timeout
     _HEARTBEAT_RETRY = RetryConfig(max_retries=1, base_delay=1.0, max_delay=5.0)
 
+    # Health/metadata keys forwarded from the caller's dict onto the heartbeat
+    # body. Anything not listed here is dropped at this boundary — a field can be
+    # collected, logged and unit-tested end to end and still never reach the
+    # server because its name is missing from this tuple. Membership is tested
+    # with ``in``, never truthiness: ``hardware_serial: None`` is a meaningful
+    # report ("this device has no readable serial"), not an absent value.
+    HEARTBEAT_HEALTH_KEYS = (
+        "idle_tracker_stale_restarts",
+        "idle_tracker_blind",
+        "inproc_afk",
+        "afk_event_age_seconds",
+        "window_event_age_seconds",
+        "consecutive_sync_failures",
+        "idle_while_active_detections",
+        "sync_stale_seconds",
+        # The device's live timezone disagrees with the one its working-hours
+        # schedule is anchored to. Carried here because a drifted anchor is
+        # otherwise a SILENT failure — it zeroes a whole day ("Outside working
+        # hours", 0h 0m) with nothing to explain it. Re-added during the merge
+        # that turned this list into the enforced gate: it was added to the old
+        # inline loop on this branch, and taking the refactor verbatim would
+        # have dropped it without a compile error or a failing test.
+        "schedule_timezone_mismatch",
+        # Tri-state (True/False/null) — null means "no window events to
+        # judge", which is NOT the same as False ("events but no titles").
+        # Forwarded verbatim; the membership test is `in`, not truthiness,
+        # so a null survives the wire.
+        "window_titles_captured_recently",
+        # Stable hardware identifier joining this device to the MDM asset
+        # inventory. str | None — see src/hardware_serial.py.
+        "hardware_serial",
+        # Record that this device was shown, and the user acknowledged, the
+        # current data-collection notice: {version, acknowledged_at}. The Law
+        # 190/2018 art. 5 lit. b evidence of prior information. The key name and
+        # payload shape are the SERVER's contract — AgentHeartbeatController
+        # reads `disclosure_acknowledgement` and stores it in
+        # agent_disclosure_acknowledgements; do not rename either end alone.
+        # The device is identified by the authenticated heartbeat context, so
+        # the payload deliberately carries no device id. See
+        # src/privacy_notice.py.
+        "disclosure_acknowledgement",
+    )
+
     def heartbeat(
         self,
         agent_version: str = AGENT_VERSION,
@@ -391,17 +500,7 @@ class BetterFlowClient(BaseApiClient):
             "timezone": self._detect_timezone(),
         }
         if health is not None:
-            for key in (
-                "idle_tracker_stale_restarts",
-                "idle_tracker_blind",
-                "inproc_afk",
-                "afk_event_age_seconds",
-                "window_event_age_seconds",
-                "consecutive_sync_failures",
-                "idle_while_active_detections",
-                "sync_stale_seconds",
-                "schedule_timezone_mismatch",
-            ):
+            for key in self.HEARTBEAT_HEALTH_KEYS:
                 if key in health:
                     data[key] = health[key]
 

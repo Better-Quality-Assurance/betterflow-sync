@@ -79,6 +79,93 @@ file .venv-arm64/bin/python3    # should say "arm64"
 file .venv-x86_64/bin/python3   # should say "x86_64"
 ```
 
+## Build environment traps on macOS (read this before your first build)
+
+Three environment problems used to make a first build from a clean checkout or a
+worktree fail three times in a row, each error masking the next. All three are
+now handled by the build itself; this section records what they were, so an
+unfamiliar error message is recognisable.
+
+### 1. TLS: `CERTIFICATE_VERIFY_FAILED` from `make download-aw`
+
+Some macOS Pythons (notably the python.org framework builds under
+`/usr/local/bin`) point `openssl_cafile` at an `etc/openssl/cert.pem` that was
+never installed, so *every* HTTPS request fails with "unable to get local issuer
+certificate". The error names TLS and says nothing about the missing bundle.
+
+`scripts/download_aw.py` now resolves a usable CA bundle itself, in order:
+`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` if the caller set one that exists, then
+certifi's bundle, then the interpreter default. It prints which one it used. If
+verification still fails it exits 1 with a message naming the real cause and the
+three ways to fix it — no more exporting `SSL_CERT_FILE` by hand.
+
+### 2. Toolchain: `pyinstaller` off PATH can be the wrong architecture
+
+On a machine that has been through a Rosetta migration, `which pyinstaller` can
+resolve to `/usr/local/bin/pyinstaller` — the **Intel** Homebrew prefix. That
+either dies with a "bad interpreter" error or builds a silently **x86_64** .app
+on an arm64 host. A wrong-arch bundle shipped to an Apple Silicon fleet runs
+under Rosetta and nothing in the artifact name says so.
+
+`make build-mac` therefore never calls `pyinstaller` off PATH. It calls
+`scripts/resolve-pyinstaller.sh`, which picks the first interpreter that both
+imports PyInstaller **and** reports the wanted architecture, announcing every
+candidate it rejects and why:
+
+```
+$ ./scripts/resolve-pyinstaller.sh
+[resolve-pyinstaller] using /path/venv/bin/python3 (PyInstaller 6.19.0, arm64)
+/path/venv/bin/python3
+```
+
+Search order: `$PYINSTALLER_PYTHON`, `$VIRTUAL_ENV`, `.venv-<arch>`, `venv`,
+`.venv`, then `python3` from PATH. If nothing matches it exits 1 and prints the
+full rejection list plus the venv-creation command — it never falls back to
+"whatever builds".
+
+Two consequences worth knowing:
+
+- **Worktrees have no venv.** `git worktree` checkouts do not contain
+  `.venv-arm64/` or `venv/`, so the resolver falls through to PATH `python3` and
+  the build usually fails on a mismatched wheel (e.g. an x86_64-only `psutil`).
+  Point it at the primary checkout's venv:
+  `PYINSTALLER_PYTHON=/path/to/betterflow-sync/venv/bin/python3 make build-mac`.
+- **The name is `venv/`, not `.venv/`.** Both may exist on an older machine and
+  only one has PyInstaller. The resolver checks, so you do not have to.
+
+### 3. Stale `dist/` blocks PyInstaller
+
+PyInstaller refuses to write into a non-empty output directory:
+
+```
+ERROR: The output directory ".../dist/BetterFlow.app" is not empty.
+```
+
+which is the normal state after any interrupted build. `make build-mac` now
+depends on `clean-dist`, which removes exactly `dist/BetterFlow.app` and
+`dist/BetterFlow` — DMGs, PKGs and the arch-renamed `.app` copies in `dist/` are
+left alone, and nothing outside `dist/` is touched.
+
+### 4. Do not capture a build's exit code through a pipeline
+
+```bash
+# WRONG — reports 0 for a failed build, because `echo` succeeded
+( make build-mac > build.log 2>&1 ; echo "EXIT: $?" >> build.log )
+
+# RIGHT — status goes to its own file, read separately
+make build-mac > /tmp/build.log 2>&1; echo "MAKE_EXIT=$?" > /tmp/build.status
+```
+
+Then verify the **artifact**, not the command:
+
+```bash
+lipo -archs dist/BetterFlow.app/Contents/MacOS/BetterFlow   # expect: arm64
+codesign -dv --verbose=4 dist/BetterFlow.app 2>&1 | grep TeamIdentifier
+spctl -a -vv -t install dist/BetterFlow-macOS-*.pkg         # if packaging
+```
+
+A fresh timestamp and the right arch are facts. A green command is a claim.
+
 ## Releasing
 
 Once setup is done, the release pipeline is:
@@ -101,6 +188,69 @@ gh release create v1.5.X \
     dist/BetterFlow-macOS-x86_64.dmg \
     --notes-from-tag
 ```
+
+## MDM installer package (`make pkg`)
+
+macOS MDM (Miradore → `InstallEnterpriseApplication`) cannot deploy a DMG; it
+needs a **signed `.pkg`**. `make pkg` builds one from the same
+`dist/BetterFlow.app` the DMG uses:
+
+```bash
+make pkg                      # host arch
+TARGET_ARCH=x86_64 make pkg   # explicit arch
+```
+
+It runs `pkgbuild` → `productbuild` → `productsign`, then submits the pkg for
+its **own** notarization pass and staples it. Notarizing the `.app` does not
+cover the package containing it, so this is a separate submission from the one
+`make ship` does for the DMG.
+
+If `dist/BetterFlow.app` is already built and signed, `make _pkg-only` produces
+the signed (not yet notarized) pkg on its own.
+
+Signing needs a **`Developer ID Installer`** certificate — a *different*
+certificate type from the `Developer ID Application` one used above. Having one
+does not give you the other, and creating it is an Apple Developer account-holder
+task. Confirm it is present with:
+
+```bash
+security find-identity -v | grep "Developer ID Installer"
+```
+
+Note `security find-identity -p codesigning` does **not** list installer
+certificates; the default (all-policy) query does.
+
+### Bundle relocation must stay off
+
+`pkgbuild` marks bundles **relocatable by default**. A relocatable package does
+not install to `--install-location`: at install time PackageKit searches the
+machine for any bundle carrying the same identifier (`co.betterqa.betterflow`)
+and installs over **that** copy instead — then reports success. On a Mac holding
+a stray copy (an old install, a Downloads copy, a build artifact) the MDM push
+silently no-ops and `/Applications/BetterFlow.app` never appears.
+
+This was observed for real on 2026-07-22: the installer showed *Install
+Succeeded*, `pkgutil --pkg-info co.betterqa.betterflow` recorded 892 files at
+`location: Applications`, `/Applications/BetterFlow.app` did not exist, and
+`/var/log/install.log` showed the payload landing in a `dist/BetterFlow.app`
+inside a git worktree. It is the macOS twin of the Windows "running from
+Downloads" incident that v1.5.91 added a guard for.
+
+`scripts/build-pkg.sh` therefore builds via `pkgbuild --analyze` → set
+`BundleIsRelocatable=false` → `pkgbuild --root … --component-plist …`, and then
+asserts on the built artifact that no `PackageInfo` lists a bundle inside
+`<relocate>`. To check any pkg by hand:
+
+```bash
+pkgutil --expand BetterFlow-macOS-arm64.pkg /tmp/x
+grep -A2 '<relocate' /tmp/x/*/PackageInfo   # want an empty <relocate/>
+```
+
+The DMG stays the download for anyone outside MDM, including the unmanaged
+devices. **MDM bootstraps the install once; the in-app updater stays the owner of
+which version is running** — see
+`docs/superpowers/specs/2026-07-22-mdm-pkg-deployment-design.md` §2. `make pkg`
+is deliberately not wired into `make ship` or the CI release workflow.
 
 ## CI signing (GitHub Actions)
 

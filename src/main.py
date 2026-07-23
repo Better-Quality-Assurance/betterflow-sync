@@ -27,9 +27,15 @@ try:
     from . import error_reporter
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
+    from .hardware_serial import get_hardware_serial
+    from .privacy_notice import (
+        acknowledgement_telemetry,
+        needs_acknowledgement,
+        record_acknowledgement,
+    )
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from .sync.http_client import BetterFlowAuthError
+    from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -52,9 +58,15 @@ except ImportError:
     import error_reporter
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
+    from hardware_serial import get_hardware_serial
+    from privacy_notice import (
+        acknowledgement_telemetry,
+        needs_acknowledgement,
+        record_acknowledgement,
+    )
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from sync.http_client import BetterFlowAuthError
+    from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -1359,17 +1371,63 @@ class SyncCoordinator:
         # for cases where the sleep notification was missed.
         watchdog_cancelled = threading.Event()
 
+        # Snapshot the transient-failure counter so the watchdog can tell WHY the
+        # cycle ran long. An unreachable API makes a healthy cycle overrun (the
+        # retry chain plus the send budget legitimately eat ~150s) — that is slow,
+        # not hung, and reporting it as an ERROR "Sync hung" paged humans and drew
+        # the autofix drafter onto a non-problem (2026-07-22, device 18: 150.86s,
+        # no log gap, all three events delivered next cycle). The counter is
+        # maintained by BetterFlowClientError, off is_transient — the one place
+        # the codebase classifies network-vs-definitive failures.
+        #
+        # THIS THREAD's counter, captured as an object. The watchdog runs on a
+        # Timer thread, so it must not re-read the counter itself (it would get
+        # the Timer's own, always zero). Per-thread also means a cycle abandoned
+        # by _acquire_sync_slot keeps incrementing its OWN counter, so its late
+        # failures can't misclassify the cycle that replaced it.
+        cycle_transients = transient_failure_counter()
+        transient_at_cycle_start = cycle_transients.value
+
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
-            logger.error("_do_sync watchdog: sync exceeded %ds — resetting sessions", self._DO_SYNC_DEADLINE)
-            if self.error_reporter is not None:
-                self.error_reporter.capture(
-                    f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
-                    level="error",
-                    tags={"component": "sync-watchdog"},
-                    fingerprint="sync-watchdog-timeout",
+            # Deliberately permissive: ANY transient failure during the cycle
+            # downgrades it. A genuine wedge that coincides with one flaky request
+            # is downgraded at the deadline — acceptable, because
+            # _SYNC_WEDGE_CEILING (420s) still pages it as an error.
+            transient_this_cycle = cycle_transients.value - transient_at_cycle_start
+            if transient_this_cycle > 0:
+                logger.warning(
+                    "_do_sync watchdog: sync exceeded %ss with %d transient API "
+                    "failure(s) — API unreachable, resetting sessions",
+                    self._DO_SYNC_DEADLINE,
+                    transient_this_cycle,
                 )
+                if self.error_reporter is not None:
+                    self.error_reporter.capture(
+                        f"Sync slow — exceeded {self._DO_SYNC_DEADLINE}s while the "
+                        "BetterFlow API was unreachable "
+                        f"({transient_this_cycle} transient "
+                        f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
+                        level="warning",
+                        tags={"component": "sync-watchdog"},
+                        fingerprint="sync-watchdog-timeout-offline",
+                    )
+            else:
+                logger.error(
+                    "_do_sync watchdog: sync exceeded %ss — resetting sessions",
+                    self._DO_SYNC_DEADLINE,
+                )
+                if self.error_reporter is not None:
+                    self.error_reporter.capture(
+                        f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
+                        level="error",
+                        tags={"component": "sync-watchdog"},
+                        fingerprint="sync-watchdog-timeout",
+                    )
+            # Unchanged by design: both resets run in BOTH branches. Discarding
+            # pooled connections after a network outage is the correct recovery,
+            # and the stale-socket backstop was the watchdog's original purpose.
             try:
                 self.bf.reset_session()
                 self.aw.reset_session()
@@ -1607,7 +1665,28 @@ class SyncCoordinator:
         telemetry: dict = {
             "consecutive_sync_failures": self._consecutive_sync_failures,
             "idle_while_active_detections": blind_window,
+            # Hardware serial: the join key between this fleet and the MDM asset
+            # inventory. Probed once per process and cached (including a failed
+            # probe), so this is a memo read, not a per-heartbeat syscall. Always
+            # sent, even as None — "no readable serial" is the answer for a VM or
+            # a locked-down box, and the server must be able to see it.
+            "hardware_serial": get_hardware_serial(),
         }
+        # The disclosure acknowledgement: the Law 190/2018 evidence that this
+        # user was informed before monitoring. The key name is the server's
+        # (AgentHeartbeatController reads `disclosure_acknowledgement`), not a
+        # local convention — renaming it here alone silently un-wires the
+        # record. Re-sent on EVERY heartbeat rather than once, because the
+        # server-side reader ships separately and later and a send-once design
+        # would lose every acknowledgement made before that deploy. Idempotent
+        # upsert; omitted entirely until one exists. Wrapped because a corrupt
+        # record must cost the notice, never the heartbeat.
+        try:
+            ack = acknowledgement_telemetry(self.config)
+            if ack is not None:
+                telemetry["disclosure_acknowledgement"] = ack
+        except Exception as e:  # noqa: BLE001
+            logger.debug("disclosure-acknowledgement telemetry unavailable: %s", e)
         # Seconds since the last successful sync round-trip. Lets the server flag
         # "alive but sync stale" (heartbeat fresh, uploads frozen) directly rather
         # than inferring it from upload gaps. Omitted until the first good sync.
@@ -1754,6 +1833,10 @@ class BetterFlowApp:
         self.bf = BetterFlowClient(
             api_url=self.config.api_url,
             compress=self.config.sync.compress,
+            # Read LIVE (a lambda, not a snapshot): the exclusion list can change
+            # under us via a config reload, and an app the user just excluded
+            # must stop egressing on the very next send.
+            excluded_apps_provider=lambda: self.config.privacy.exclude_apps,
         )
         self.queue = OfflineQueue()
         self.keychain = KeychainManager()
@@ -2342,6 +2425,13 @@ class BetterFlowApp:
         if hasattr(signal, "SIGPIPE"):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
+        # Warm the hardware-serial memo here rather than letting the first
+        # heartbeat pay for it. On Windows the probe shells out to PowerShell,
+        # which would otherwise land on the sync thread and could push a
+        # heartbeat past its 5s budget. Probed once for the life of the process,
+        # failures included; never raises.
+        get_hardware_serial()
+
         # Apply an update staged in a previous session before anything else —
         # a fast local replace + relaunch into the new version. No-op if nothing
         # newer is staged. Relaunches (os._exit) on success.
@@ -2444,11 +2534,53 @@ class BetterFlowApp:
         # startup — the worker retries until the entry appears.
         self._promote_windows_tray_async()
 
+        # One-time data-collection notice for the INSTALLED BASE.
+        #
+        # Placement is the requirement, not a detail. It sits here because:
+        #  - startup has already begun on its own thread, so tracking, syncing
+        #    and billing run normally while the window is open — the notice
+        #    never gates work;
+        #  - this is the last point the main thread is still ours, and Tk is not
+        #    safe off the main thread on macOS (same sequencing as the first-run
+        #    wizard and the Input Monitoring gate);
+        #  - it is unconditional, so it reaches macOS, which never runs the
+        #    Windows/Linux consent screen and would otherwise stay undisclosed.
+        self._show_privacy_notice_if_needed()
+
         logger.info("BetterFlow tray starting")
         try:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _show_privacy_notice_if_needed(self) -> None:
+        """Show the one-time data-collection notice, once, and record it.
+
+        The whole method is best-effort. A machine with no display, a Tk that
+        will not initialise, a read-only config dir — each of those costs the
+        notice and nothing else. Unrecorded means "retry next launch", which is
+        also what a user who closes the window without pressing the button gets:
+        an acknowledgement has to mean somebody dismissed the text deliberately,
+        or it is not evidence of anything.
+
+        The decision and the record both live in ``privacy_notice`` so the
+        version comparison exists exactly once.
+        """
+        try:
+            if not needs_acknowledgement(self.config):
+                return
+            try:
+                from .ui.privacy_notice_window import show_privacy_notice
+            except ImportError:
+                from ui.privacy_notice_window import show_privacy_notice  # type: ignore[no-redef]
+
+            logger.info("Showing the one-time privacy notice")
+            if show_privacy_notice():
+                record_acknowledgement(self.config)
+            else:
+                logger.info("Privacy notice dismissed without acknowledgement")
+        except Exception as e:  # noqa: BLE001 — a notice is never worth a crash
+            logger.warning("Privacy notice could not be shown: %s", e, exc_info=True)
 
     def _promote_windows_tray_async(self) -> None:
         """Best-effort: promote our Windows 11 tray icon onto the taskbar.
@@ -2975,8 +3107,6 @@ class BetterFlowApp:
         if key == "sync_interval":
             self.config.sync.interval_seconds = value
             self.coordinator.reschedule(value)
-        elif key == "hash_titles":
-            self.config.privacy.hash_titles = value
         elif key == "domain_only_urls":
             self.config.privacy.domain_only_urls = value
         elif key == "auto_categorize":

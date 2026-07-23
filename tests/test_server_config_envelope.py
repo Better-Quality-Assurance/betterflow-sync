@@ -114,12 +114,18 @@ class TestTheWireResponseActuallyConfiguresTheAgent:
 
 
 class TestDeferredSettingsDoNotRideAlong:
-    """The envelope fix makes EVERY server setting apply for the first time ever. Two of
-    them change the real world and have nothing to do with working hours, so they are
-    gated behind DEFER_UNAPPLIED_SERVER_SETTINGS until each is rolled out on purpose:
+    """The envelope fix makes EVERY server setting apply for the first time ever. One of
+    them changes the real world and has nothing to do with working hours, so it is gated
+    behind DEFER_UNAPPLIED_SERVER_SETTINGS until it is rolled out on purpose:
 
       afk_timeout_minutes  37/44 prod devices say 20, agents have run 10 -> moves HOURS
-      hash_window_titles   41/44 say ON -> window titles become hashes, admins lose them
+
+    hash_window_titles used to be listed here as the second one, on the belief that
+    applying it would make the agent hash titles. It never would have: no client-side
+    hashing exists. Its local mirror was removed 2026-07-23 and the payload key is now
+    ignored outright — pinned in tests/test_hash_titles_control_removed.py, which is
+    where that behaviour is asserted. It is still sent in the payload below, because
+    the server still sends it and receiving it must stay harmless.
 
     The privacy release must change exactly one thing: we stop recording out of hours.
     """
@@ -127,7 +133,7 @@ class TestDeferredSettingsDoNotRideAlong:
     def _applied(self):
         client = BetterFlowClient(api_url="https://example.test/api/agent")
         config = Config()
-        before = (config.aw.afk_timeout_minutes, config.privacy.hash_titles)
+        before = (config.aw.afk_timeout_minutes,)
         payload = dict(WIRE_RESPONSE["data"])
         payload["privacy"] = {"hash_window_titles": True, "track_browser_domains": True}
         with patch.object(BetterFlowClient, "_request",
@@ -147,11 +153,15 @@ class TestDeferredSettingsDoNotRideAlong:
             "AFK timeout moved: this silently changes billed hours on 37 devices"
         )
 
-    def test_window_titles_do_not_start_hashing(self):
-        config, before = self._applied()
-        assert config.privacy.hash_titles == before[1], (
-            "hash_window_titles applied: admins would silently lose readable titles"
-        )
+    def test_a_hash_window_titles_payload_is_harmless(self):
+        """The server still puts hash_window_titles on the wire. Receiving it must
+        not resurrect a local field, and must not disturb the rest of the update."""
+        config, _ = self._applied()
+        assert not hasattr(config.privacy, "hash_titles")
+        assert not hasattr(config.privacy, "title_allowlist")
+        # The same payload's schedule still landed, i.e. the ignored key did not
+        # abort the update — this test would otherwise pass on a total no-op.
+        assert config.working_hours.work_start == "07:30"
 
 
 class TestSyncEngineFetchPath:
