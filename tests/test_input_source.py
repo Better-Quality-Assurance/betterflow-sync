@@ -760,3 +760,42 @@ def test_a_live_sensor_still_reports_available(monkeypatch):
     be._thread = _LiveThread()
 
     assert be.available() is True
+
+
+def test_discard_also_drops_what_the_backend_is_still_holding():
+    """discard_counts() must reach the backend's own buffer, not just ours.
+
+    The macOS backend wraps a MacOSInputWatcher that counts into ITS counters;
+    a poll folds them onto the source once a second. Clearing only the source
+    leaves up to a poll interval of Private Time input in the watcher — and if
+    the poll thread has died, start()'s leftover-drain resurrects a whole
+    window's counts on the next 60s converge. Windows increments the source
+    directly and holds nothing, which is why this is expressed against the
+    backend protocol rather than a platform.
+    """
+    src = _src(backend=None)
+    backend = _MacOSTapBackend(src)
+    backend._watcher = _StubWatcher(presses=250, clicks=9, scrolls=3)
+    src._backend = backend
+
+    src._on_press(500)  # already folded onto the source by an earlier poll
+
+    dropped = src.discard_counts()
+
+    assert dropped == (500, 0, 0), "reports what the SOURCE was holding"
+    assert src.counts == (0, 0, 0)
+    assert backend._drain_watcher_counts() == (0, 0, 0), (
+        "the watcher's own buffer must be emptied too, or the next poll folds "
+        "private-window input onto a post-resume span"
+    )
+
+
+def test_discard_is_safe_on_a_backend_with_nothing_buffered():
+    """Negative control: a backend with no pending buffer (Windows, and every
+    test fake) must not be required to implement the hook."""
+    b = _FakeBackend()
+    src = _src(b)
+    src._on_press(4)
+
+    assert src.discard_counts() == (4, 0, 0)
+    assert src.counts == (0, 0, 0)

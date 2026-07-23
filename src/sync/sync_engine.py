@@ -3986,6 +3986,36 @@ class SyncEngine:
         if self._window_inproc_checkpoint is not None:
             self._window_inproc_checkpoint = now
 
+        # And the in-process INPUT stream. Two steps, both required: advancing
+        # the checkpoint alone would leave the counters holding every keystroke
+        # typed inside the window, and the next drain bills them against the
+        # first span after it. Private Time records nothing — that is the
+        # contract, not a tuning choice — so the counts are DISCARDED rather
+        # than re-attributed. discard_counts() ignores available() on purpose:
+        # the source is normally already stopped by the time we get here (the
+        # capture policy stops the watchers first), and a drain-based clear
+        # would no-op and strand them until counting resumed.
+        if self._input_inproc_checkpoint is not None:
+            self._input_inproc_checkpoint = now
+        if self.input_source is not None:
+            try:
+                dropped = self.input_source.discard_counts()
+                if any(dropped):
+                    # WHETHER a discard happened, never HOW MUCH. Every reason
+                    # that reaches this method names a window this machine
+                    # contractually does not record — private time, a pause,
+                    # outside working hours — and betterflow.log is uploaded to
+                    # the server on admin request (_upload_requested_logs). An
+                    # exact keystroke/click/scroll volume in that tail is a
+                    # low-resolution recording of the window we just refused to
+                    # record. The reason alone is what a reader needs to debug
+                    # the mechanism.
+                    logger.info(
+                        "Discarded buffered in-process input counts on %s", reason
+                    )
+            except Exception as e:
+                logger.warning("Discarding in-process input counts failed: %s", e)
+
         bucket_ids: set[str] = set()
 
         def _collect(fetcher) -> None:

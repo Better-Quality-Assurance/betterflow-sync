@@ -146,6 +146,52 @@ class InputSource:
         except Exception as e:
             logger.debug("InputSource backend stop failed: %s", e)
 
+    def _take_counts(self) -> tuple[int, int, int]:
+        """Atomically snapshot AND zero the counters, returning the triple.
+
+        The ONE implementation of snapshot-and-reset, so the drain path and the
+        discard path can never diverge over which counters they clear (a fourth
+        counter added to one and not the other would leak into the next span)."""
+        with self._lock:
+            counts = (self._presses, self._clicks, self._scrolls)
+            self._presses = 0
+            self._clicks = 0
+            self._scrolls = 0
+        return counts
+
+    def discard_counts(self) -> tuple[int, int, int]:
+        """Throw away everything counted so far, returning what was dropped.
+
+        For a window that must never be recorded at all — Private Time, a manual
+        pause, a working-hours close. Unlike drain_input_event this emits no
+        event and does NOT depend on available(): the counters have to be
+        cleared even when the backend has already stopped, or the keystrokes
+        stall and land on the next span the moment counting resumes.
+
+        Also asks the backend to drop anything IT is still holding. The macOS
+        backend counts into the wrapped MacOSInputWatcher and folds those onto
+        the source once a second, so clearing only our counters leaves up to a
+        poll interval of private-window input behind — and if the poll thread
+        has died, start()'s leftover-drain resurrects the whole window on the
+        next 60s converge. Optional protocol (getattr, not a required method):
+        Windows increments the source directly and holds nothing, and neither do
+        the test fakes, so nothing should be forced to stub it.
+
+        Returns the dropped triple so the caller can tell an empty discard from
+        a real one (and tests can assert on it). It is NOT for logging: every
+        window that discards is one this machine contractually does not record,
+        and the log tail is uploadable, so the volume must not be written there —
+        see _advance_checkpoints_to_now. The triple is what the SOURCE held; the
+        backend's own buffer is dropped without a separate count, since it has no
+        distinct meaning to a caller."""
+        discard_pending = getattr(self._backend, "discard_pending", None)
+        if discard_pending is not None:
+            try:
+                discard_pending()
+            except Exception as e:
+                logger.warning("Backend discard_pending failed: %s", e)
+        return self._take_counts()
+
     @property
     def bucket_id(self) -> str:
         """The synthetic input bucket id this source uploads under. Single
@@ -222,14 +268,9 @@ class InputSource:
             return None
         if range_end <= range_start:
             return None
-        with self._lock:
-            presses = self._presses
-            clicks = self._clicks
-            scrolls = self._scrolls
-            # Reset now that we've snapshotted — the next range accrues fresh.
-            self._presses = 0
-            self._clicks = 0
-            self._scrolls = 0
+        # Snapshot-and-reset in one step — the next range accrues fresh. Shared
+        # with discard_counts() so both paths clear exactly the same state.
+        presses, clicks, scrolls = self._take_counts()
         if presses == 0 and clicks == 0 and scrolls == 0:
             return None
         return self._event(range_start, range_end, presses, clicks, scrolls)
@@ -579,6 +620,17 @@ class _MacOSTapBackend:
         self._watcher = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Serialises a whole "read the watcher AND fold it onto the source" step
+        # against discard_pending(). Without it the two locks (the watcher's and
+        # the source's) leave a gap: the poll thread can have already read the
+        # counters and not yet folded them when a Private Time / pause discard
+        # runs, so discard_pending() zeroes an already-empty watcher,
+        # _take_counts() zeroes an empty source, and the in-flight counts land on
+        # the source AFTER the discard — billed to the first span after the
+        # window, which is the bug discard_counts() exists to stop. Lock order is
+        # always _drain_lock -> watcher lock -> source lock; nothing acquires
+        # them the other way round.
+        self._drain_lock = threading.Lock()
         # Mirrors _WindowsHookBackend: the tap install is what fails here (a
         # denied/stale Input Monitoring grant), and "does Quartz import" cannot
         # see that. Without this a refused tap probes available() -> True and
@@ -710,14 +762,33 @@ class _MacOSTapBackend:
         """Fold whatever the watcher has counted since the last poll onto the
         source. One implementation, so every path that abandons a watcher
         preserves its counts the same way instead of dropping them — the tap
-        keeps counting even once nothing is polling it."""
-        presses, clicks, scrolls = self._drain_watcher_counts()
-        if presses > 0:
-            self._source._on_press(presses)
-        if clicks > 0:
-            self._source._on_click(clicks)
-        if scrolls > 0:
-            self._source._on_scroll(scrolls)
+        keeps counting even once nothing is polling it.
+
+        Read-and-fold is ONE step under _drain_lock: a concurrent
+        discard_pending() must see either all of it or none of it, never the
+        half where the counts have left the watcher and not yet reached the
+        source."""
+        with self._drain_lock:
+            presses, clicks, scrolls = self._drain_watcher_counts()
+            if presses > 0:
+                self._source._on_press(presses)
+            if clicks > 0:
+                self._source._on_click(clicks)
+            if scrolls > 0:
+                self._source._on_scroll(scrolls)
+
+    def discard_pending(self) -> None:
+        """Drop whatever the wrapped watcher has counted but not yet handed over.
+
+        The tap keeps counting even when nothing is polling it, so a window that
+        must never be recorded (Private Time, a pause) has to be cleared HERE as
+        well as on the source — see InputSource.discard_counts. Reuses the
+        drain, discarding its result, so there is exactly one implementation of
+        "read and zero the watcher". Takes _drain_lock so an in-flight poll
+        cannot fold counts onto the source in the gap between this and the
+        source's own reset — see _drain_to_source."""
+        with self._drain_lock:
+            self._drain_watcher_counts()
 
     def _drain_watcher_counts(self) -> tuple[int, int, int]:
         """Atomically read AND zero the watcher's counters under its lock, so
