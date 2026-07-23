@@ -22,6 +22,7 @@ child exits: that needs a real menu bar and is the human-QA smoke in the PR.
 """
 
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -155,3 +156,40 @@ def test_child_argv_unfrozen_reruns_the_module_from_repo_root():
     # cwd must be the repo root (parent of src/) so `-m src.main` imports resolve.
     assert cwd == str(Path(m.__file__).resolve().parents[1])
     assert (Path(cwd) / "src" / "main.py").exists()
+
+
+# ── the force-exit must actually exit, even when cleanup deadlocks ───────
+
+def test_on_tray_died_force_exits_even_when_shutdown_deadlocks(monkeypatch):
+    """The tray-died force-exit must not depend on cleanup returning.
+
+    _on_tray_died runs on an APScheduler worker thread (tick_clock -> _tick_60s),
+    and _shutdown() stops that SAME scheduler with wait=True — a self-join that
+    deadlocks and never reaches os._exit(), leaving exactly the ghost process
+    this guard exists to prevent (reproduced 2026-07-23: both the notice child
+    and the parent left alive, scheduler error-storming). An armed backstop must
+    call os._exit even if _shutdown never comes back.
+    """
+    stub = MagicMock()
+    hang = threading.Event()
+    stub._shutdown = MagicMock(side_effect=lambda: hang.wait(2.0))
+    codes = []
+    exited = threading.Event()
+
+    def fake_exit(code):
+        codes.append(code)
+        hang.set()  # let the hung _shutdown unwind so the worker thread ends
+        exited.set()
+
+    monkeypatch.setattr(m.os, "_exit", fake_exit)
+    # Short backstop so the test is fast; raising=False keeps the pre-fix RED
+    # clean (the constant does not exist until the fix adds it).
+    monkeypatch.setattr(m, "_TRAY_DIED_HARD_EXIT_SECONDS", 0.05, raising=False)
+
+    worker = threading.Thread(
+        target=m.BetterFlowApp._on_tray_died, args=(stub,), daemon=True
+    )
+    worker.start()
+
+    assert exited.wait(1.0), "force-exit never fired while _shutdown was hung"
+    assert 1 in codes

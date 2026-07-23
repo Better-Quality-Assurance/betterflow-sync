@@ -3203,17 +3203,26 @@ class BetterFlowApp:
         never return from the dead Cocoa event loop.
         """
         logger.critical("Tray icon died — force-exiting to prevent ghost process")
-        # Block so the report leaves the machine before os._exit kills the
-        # daemon sender thread.
-        self.error_reporter.capture(
-            "Tray icon died — agent force-exiting (ghost process)",
-            level="fatal",
-            tags={"component": "tray"},
-            fingerprint="tray-died",
-            block=True,
-        )
-        self._shutdown()
-        os._exit(1)
+        # Arm an unconditional hard exit FIRST. This handler runs on an
+        # APScheduler worker thread, and _shutdown() below stops that same
+        # scheduler with wait=True — a self-join that deadlocks and never
+        # reaches os._exit(), wedging the very ghost process this guard exists to
+        # kill (reproduced 2026-07-23). The backstop guarantees the exit even if
+        # the capture or the shutdown never returns.
+        _arm_hard_exit(_TRAY_DIED_HARD_EXIT_SECONDS)
+        try:
+            # Block so the report leaves the machine before os._exit kills the
+            # daemon sender thread.
+            self.error_reporter.capture(
+                "Tray icon died — agent force-exiting (ghost process)",
+                level="fatal",
+                tags={"component": "tray"},
+                fingerprint="tray-died",
+                block=True,
+            )
+            self._shutdown()
+        finally:
+            os._exit(1)
 
     # -- Failure reporting ------------------------------------------------
 
@@ -3385,6 +3394,30 @@ class SingleInstanceLock:
 
 
 _instance_lock = SingleInstanceLock()
+
+
+# Seconds a dying agent allows for graceful cleanup before forcing the process
+# down unconditionally. _on_tray_died runs on an APScheduler worker thread and
+# its _shutdown() stops that SAME scheduler (wait=True) — a self-join that
+# deadlocks and never reaches os._exit(), wedging the very ghost process the
+# guard exists to kill (reproduced 2026-07-23). The backstop below makes the
+# exit unconditional even when cleanup hangs.
+_TRAY_DIED_HARD_EXIT_SECONDS = 10.0
+
+
+def _arm_hard_exit(timeout: float) -> None:
+    """Guarantee the process exits ``timeout`` seconds from now, no matter what
+    the caller does next.
+
+    os._exit works from any thread, so a daemon timer cannot be blocked by a
+    hung error-report send or a deadlocked _shutdown running on another thread.
+    """
+
+    def _hard_exit() -> None:
+        time.sleep(timeout)
+        os._exit(1)
+
+    threading.Thread(target=_hard_exit, name="tray-died-hard-exit", daemon=True).start()
 
 
 # Exit codes for the isolated ``--privacy-notice`` child process. The parent
