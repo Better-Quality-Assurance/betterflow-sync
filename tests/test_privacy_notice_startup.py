@@ -31,23 +31,39 @@ def _stub_app(config):
 
 
 def _run_notice(config, *, shows=True, raises=None):
-    """Call the production method with the window replaced."""
-    window = MagicMock(return_value=shows)
+    """Call the production method with the CHILD PROCESS replaced.
+
+    The notice now renders in a separate process (spawned via
+    ``subprocess.run``) so Tk never touches the agent's own NSApplication. We
+    drive the real production method against a stubbed ``subprocess.run`` whose
+    return code encodes the child's acknowledge/dismiss decision:
+    ``shows=True`` -> exit 0 (acknowledged), ``shows=False`` -> exit 2
+    (dismissed). ``raises`` simulates the spawn itself failing.
+
+    Returns the ``subprocess.run`` mock so callers can assert whether — and with
+    what argv — the child was launched.
+    """
+    returncode = 0 if shows else 2
+    run = MagicMock(return_value=MagicMock(returncode=returncode))
     if raises is not None:
-        window.side_effect = raises
-    with patch(
-        "src.ui.privacy_notice_window.show_privacy_notice", window
-    ):
+        run.side_effect = raises
+    with patch("src.main.subprocess.run", run):
         BetterFlowApp._show_privacy_notice_if_needed(_stub_app(config))
-    return window
+    return run
 
 
 # ── Shown once, then stopped ────────────────────────────────────────────
 
 def test_a_device_that_never_acknowledged_sees_it():
     config = Config()
-    window = _run_notice(config)
-    window.assert_called_once()
+    run = _run_notice(config)
+    run.assert_called_once()
+    # It must launch the isolated child, not render Tk inline.
+    argv = run.call_args.args[0]
+    assert "--privacy-notice" in argv, (
+        "the notice was not spawned in a separate process — Tk would run in the "
+        "agent's own NSApplication and reintroduce the ghost-process crash (#158)"
+    )
     assert pn.needs_acknowledgement(config) is False, "the acknowledgement was not recorded"
 
 
@@ -148,8 +164,29 @@ def test_the_handler_delegates_to_the_shared_policy():
         source = source.replace(doc, "")
     assert "needs_acknowledgement(" in source
     assert "record_acknowledgement(" in source
-    assert "show_privacy_notice(" in source
     assert "NOTICE_VERSION" not in source, "version comparison re-rolled at the callsite"
     assert "privacy_notice_ack_version" not in source, (
         "the handler reads the config field directly instead of asking the policy"
+    )
+
+
+def test_the_handler_spawns_a_child_and_never_runs_tk_inline():
+    """The whole point of the fix: Tk must NOT run in the agent's process.
+
+    If ``show_privacy_notice`` is imported/called inside the handler, Tk's
+    mainloop runs in the process that then calls ``tray.run_blocking()`` — the
+    exact sequence that killed the tray on macOS (#158). The handler must spawn
+    a subprocess instead.
+    """
+    source = inspect.getsource(BetterFlowApp._show_privacy_notice_if_needed)
+    # Drop the def line — the method's own name contains "show_privacy_notice".
+    body = "\n".join(source.splitlines()[1:])
+    assert "subprocess.run(" in body, "the notice is no longer spawned out of process"
+    assert "_privacy_notice_child_argv(" in body
+    assert "import show_privacy_notice" not in body, (
+        "the window's Tk renderer is imported into the agent process again"
+    )
+    assert "show_privacy_notice()" not in body, (
+        "Tk is being rendered inline in the agent process again — this is the "
+        "regression the child-process split exists to prevent"
     )

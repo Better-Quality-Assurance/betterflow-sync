@@ -2530,29 +2530,47 @@ class BetterFlowApp:
     def _show_privacy_notice_if_needed(self) -> None:
         """Show the one-time data-collection notice, once, and record it.
 
-        The whole method is best-effort. A machine with no display, a Tk that
-        will not initialise, a read-only config dir — each of those costs the
-        notice and nothing else. Unrecorded means "retry next launch", which is
-        also what a user who closes the window without pressing the button gets:
-        an acknowledgement has to mean somebody dismissed the text deliberately,
-        or it is not evidence of anything.
+        The notice is rendered in a SEPARATE child process, not inline. Tk and
+        pystray both contend for macOS's single shared ``NSApplication``; once
+        Tk's ``mainloop()`` had created and torn down its ``NSApp`` on the main
+        thread, the ``NSStatusItem`` pystray created immediately afterwards went
+        unstable and the agent force-exited (the "ghost process" crash, #158).
+        Handing the notice to a throwaway process leaves this process a pristine
+        ``NSApplication`` for ``tray.run_blocking()``.
+
+        Behaviour is otherwise unchanged. The whole method is best-effort: a
+        machine with no display, a Tk that will not initialise, a read-only
+        config dir — each costs the notice and nothing else. Only exit code 0
+        (the user pressed the button) records an acknowledgement; a dismissal or
+        a render failure leaves it unrecorded, which re-shows next launch, so an
+        acknowledgement always means somebody dismissed the text deliberately.
 
         The decision and the record both live in ``privacy_notice`` so the
-        version comparison exists exactly once.
+        version comparison exists exactly once, and the persisted-flag write
+        stays on the parent, exactly where the inline path had it.
         """
         try:
             if not needs_acknowledgement(self.config):
                 return
-            try:
-                from .ui.privacy_notice_window import show_privacy_notice
-            except ImportError:
-                from ui.privacy_notice_window import show_privacy_notice  # type: ignore[no-redef]
 
-            logger.info("Showing the one-time privacy notice")
-            if show_privacy_notice():
+            argv, cwd = _privacy_notice_child_argv()
+            logger.info("Showing the one-time privacy notice in a child process")
+            # Blocks until the user responds — identical to the old inline
+            # mainloop, and background startup is already running on its own
+            # thread, so tracking/syncing/billing are unaffected. No timeout:
+            # the window is modal and must wait for a person to read it.
+            result = subprocess.run(argv, cwd=cwd)  # noqa: S603
+
+            if result.returncode == PRIVACY_NOTICE_ACKNOWLEDGED:
                 record_acknowledgement(self.config)
-            else:
+            elif result.returncode == PRIVACY_NOTICE_DISMISSED:
                 logger.info("Privacy notice dismissed without acknowledgement")
+            else:
+                logger.warning(
+                    "Privacy notice child exited with %s — not recorded, "
+                    "will retry next launch",
+                    result.returncode,
+                )
         except Exception as e:  # noqa: BLE001 — a notice is never worth a crash
             logger.warning("Privacy notice could not be shown: %s", e, exc_info=True)
 
@@ -3185,17 +3203,29 @@ class BetterFlowApp:
         never return from the dead Cocoa event loop.
         """
         logger.critical("Tray icon died — force-exiting to prevent ghost process")
-        # Block so the report leaves the machine before os._exit kills the
-        # daemon sender thread.
-        self.error_reporter.capture(
-            "Tray icon died — agent force-exiting (ghost process)",
-            level="fatal",
-            tags={"component": "tray"},
-            fingerprint="tray-died",
-            block=True,
-        )
-        self._shutdown()
-        os._exit(1)
+        # Arm an unconditional hard exit FIRST. This handler runs on an
+        # APScheduler worker thread, and _shutdown() below stops that same
+        # scheduler with wait=True — a self-join that deadlocks and never
+        # reaches os._exit(), wedging the very ghost process this guard exists to
+        # kill (reproduced 2026-07-23). The backstop guarantees the exit even if
+        # the capture or the shutdown never returns.
+        _arm_hard_exit(_TRAY_DIED_HARD_EXIT_SECONDS)
+        try:
+            # Block so the report leaves the machine before os._exit kills the
+            # daemon sender thread.
+            self.error_reporter.capture(
+                "Tray icon died — agent force-exiting (ghost process)",
+                level="fatal",
+                tags={"component": "tray"},
+                fingerprint="tray-died",
+                block=True,
+            )
+            # drain=False: we ARE the scheduler worker thread, so draining it
+            # self-joins and hangs. Undrained, _shutdown returns and the finally
+            # below fires promptly; the backstop above only covers a hung report.
+            self._shutdown(drain=False)
+        finally:
+            os._exit(1)
 
     # -- Failure reporting ------------------------------------------------
 
@@ -3237,8 +3267,16 @@ class BetterFlowApp:
 
     # -- Lifecycle --------------------------------------------------------
 
-    def _shutdown(self) -> None:
-        """Shutdown the application. Safe to call multiple times."""
+    def _shutdown(self, drain: bool = True) -> None:
+        """Shutdown the application. Safe to call multiple times.
+
+        ``drain`` controls whether we wait for the scheduler's in-flight jobs to
+        finish (``coordinator.stop(wait=drain)``). It MUST be False when called
+        from the scheduler's own worker thread — as ``_on_tray_died`` is —
+        because ``scheduler.shutdown(wait=True)`` there self-joins the pool and
+        hangs, wedging the process (reproduced 2026-07-23). Normal shutdown keeps
+        draining so an in-flight sync completes before the queue closes.
+        """
         with self._shutdown_lock:
             if self._shutdown_done:
                 return
@@ -3251,9 +3289,11 @@ class BetterFlowApp:
         # Flush idle event before stopping (otherwise idle period is lost)
         self.coordinator.flush_idle_event()
         clear_notifications()
-        # wait=True so an in-flight scheduled sync completes BEFORE we close the
-        # offline queue below — otherwise it dies on a closed SQLite handle.
-        self.coordinator.stop(wait=True)
+        # Draining (wait=True) lets an in-flight scheduled sync complete BEFORE
+        # we close the offline queue below — otherwise it dies on a closed SQLite
+        # handle. But from the scheduler's OWN worker thread (_on_tray_died) a
+        # drain self-joins the pool and hangs, so that caller passes drain=False.
+        self.coordinator.stop(wait=drain)
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()
@@ -3369,8 +3409,98 @@ class SingleInstanceLock:
 _instance_lock = SingleInstanceLock()
 
 
+# Seconds a dying agent allows for graceful cleanup before forcing the process
+# down unconditionally. _on_tray_died runs on an APScheduler worker thread and
+# its _shutdown() stops that SAME scheduler (wait=True) — a self-join that
+# deadlocks and never reaches os._exit(), wedging the very ghost process the
+# guard exists to kill (reproduced 2026-07-23). The backstop below makes the
+# exit unconditional even when cleanup hangs.
+_TRAY_DIED_HARD_EXIT_SECONDS = 10.0
+
+
+def _arm_hard_exit(timeout: float) -> None:
+    """Guarantee the process exits ``timeout`` seconds from now, no matter what
+    the caller does next.
+
+    os._exit works from any thread, so a daemon timer cannot be blocked by a
+    hung error-report send or a deadlocked _shutdown running on another thread.
+    """
+
+    def _hard_exit() -> None:
+        time.sleep(timeout)
+        os._exit(1)
+
+    threading.Thread(target=_hard_exit, name="tray-died-hard-exit", daemon=True).start()
+
+
+# Exit codes for the isolated ``--privacy-notice`` child process. The parent
+# maps these back to the acknowledge/dismiss decision; ONLY an acknowledgement
+# (0) is recorded, so both a deliberate dismissal (2) and a render failure (3)
+# leave the record unwritten and re-show the notice next launch — the same
+# best-effort, retry-next-launch semantics the inline path had.
+PRIVACY_NOTICE_ACKNOWLEDGED = 0
+PRIVACY_NOTICE_DISMISSED = 2
+PRIVACY_NOTICE_RENDER_ERROR = 3
+
+
+def _privacy_notice_child_argv() -> "tuple[list[str], Optional[str]]":
+    """Command (and cwd) that re-launches THIS app in ``--privacy-notice`` mode.
+
+    Must work both frozen and unfrozen. Frozen: ``sys.executable`` IS the app
+    binary, so run it directly with the flag — a direct exec passes argv
+    reliably, unlike the macOS ``open`` that ``_relaunch`` uses, which routes
+    through Apple Events and would silently drop ``--privacy-notice``. Unfrozen
+    dev: re-run the module exactly as the Makefile does (``python -m src.main``)
+    from the repo root so the package-relative imports resolve; a bare
+    ``python <path>/main.py`` would break them.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--privacy-notice"], None
+    repo_root = str(Path(__file__).resolve().parents[1])
+    return [sys.executable, "-m", "src.main", "--privacy-notice"], repo_root
+
+
+def _run_privacy_notice_child() -> int:
+    """Render the one-time privacy notice in THIS (isolated) process, then exit.
+
+    Spawned by the running agent as a SEPARATE process (see
+    ``BetterFlowApp._show_privacy_notice_if_needed``) so Tk creates and tears
+    down its ``NSApplication`` in a throwaway process, leaving the parent a
+    pristine ``NSApplication`` for pystray's status item. Running Tk's
+    ``mainloop()`` in the same process that then calls ``tray.run_blocking()``
+    destabilised the macOS ``NSStatusItem`` — its ``button()`` went nil, the
+    tray-health probe failed two consecutive ticks and the agent force-exited
+    with ``os._exit(1)`` (the "ghost process" crash introduced by #158).
+
+    Deliberately minimal: it does NOT take the single-instance lock (the parent
+    already holds it) and does NOT touch config. The PARENT records the
+    acknowledgement from this process's exit code, so the persisted-flag write
+    stays on exactly the one code path it lived on before.
+    """
+    try:
+        try:
+            from .ui.privacy_notice_window import show_privacy_notice
+        except ImportError:
+            from ui.privacy_notice_window import show_privacy_notice  # type: ignore[no-redef]
+        acknowledged = show_privacy_notice()
+    except Exception:
+        logger.warning("Privacy notice child failed to render", exc_info=True)
+        return PRIVACY_NOTICE_RENDER_ERROR
+    return (
+        PRIVACY_NOTICE_ACKNOWLEDGED if acknowledged else PRIVACY_NOTICE_DISMISSED
+    )
+
+
 def main() -> None:
     """Main entry point."""
+    # Isolated child process that renders ONLY the one-time privacy notice and
+    # exits. Handled BEFORE the single-instance lock (the parent agent already
+    # holds it, so contending would just print "already running" and never show
+    # the notice) and BEFORE any app construction — this process must stay a
+    # throwaway Tk host so the parent keeps a pristine NSApplication.
+    if "--privacy-notice" in sys.argv[1:]:
+        sys.exit(_run_privacy_notice_child())
+
     if not _instance_lock.acquire():
         print("BetterFlow is already running.")
         sys.exit(0)
