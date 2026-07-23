@@ -3220,7 +3220,10 @@ class BetterFlowApp:
                 fingerprint="tray-died",
                 block=True,
             )
-            self._shutdown()
+            # drain=False: we ARE the scheduler worker thread, so draining it
+            # self-joins and hangs. Undrained, _shutdown returns and the finally
+            # below fires promptly; the backstop above only covers a hung report.
+            self._shutdown(drain=False)
         finally:
             os._exit(1)
 
@@ -3264,8 +3267,16 @@ class BetterFlowApp:
 
     # -- Lifecycle --------------------------------------------------------
 
-    def _shutdown(self) -> None:
-        """Shutdown the application. Safe to call multiple times."""
+    def _shutdown(self, drain: bool = True) -> None:
+        """Shutdown the application. Safe to call multiple times.
+
+        ``drain`` controls whether we wait for the scheduler's in-flight jobs to
+        finish (``coordinator.stop(wait=drain)``). It MUST be False when called
+        from the scheduler's own worker thread — as ``_on_tray_died`` is —
+        because ``scheduler.shutdown(wait=True)`` there self-joins the pool and
+        hangs, wedging the process (reproduced 2026-07-23). Normal shutdown keeps
+        draining so an in-flight sync completes before the queue closes.
+        """
         with self._shutdown_lock:
             if self._shutdown_done:
                 return
@@ -3278,9 +3289,11 @@ class BetterFlowApp:
         # Flush idle event before stopping (otherwise idle period is lost)
         self.coordinator.flush_idle_event()
         clear_notifications()
-        # wait=True so an in-flight scheduled sync completes BEFORE we close the
-        # offline queue below — otherwise it dies on a closed SQLite handle.
-        self.coordinator.stop(wait=True)
+        # Draining (wait=True) lets an in-flight scheduled sync complete BEFORE
+        # we close the offline queue below — otherwise it dies on a closed SQLite
+        # handle. But from the scheduler's OWN worker thread (_on_tray_died) a
+        # drain self-joins the pool and hangs, so that caller passes drain=False.
+        self.coordinator.stop(wait=drain)
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()

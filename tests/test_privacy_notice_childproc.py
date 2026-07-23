@@ -158,38 +158,45 @@ def test_child_argv_unfrozen_reruns_the_module_from_repo_root():
     assert (Path(cwd) / "src" / "main.py").exists()
 
 
-# ── the force-exit must actually exit, even when cleanup deadlocks ───────
+# ── the force-exit: armed backstop + drain-free shutdown (no self-join) ──
 
-def test_on_tray_died_force_exits_even_when_shutdown_deadlocks(monkeypatch):
-    """The tray-died force-exit must not depend on cleanup returning.
+def test_arm_hard_exit_fires_os_exit_after_its_timeout(monkeypatch):
+    """_arm_hard_exit guarantees the process exits on its own daemon timer even
+    if the caller's cleanup never returns (a hung report send).
 
-    _on_tray_died runs on an APScheduler worker thread (tick_clock -> _tick_60s),
-    and _shutdown() stops that SAME scheduler with wait=True — a self-join that
-    deadlocks and never reaches os._exit(), leaving exactly the ghost process
-    this guard exists to prevent (reproduced 2026-07-23: both the notice child
-    and the parent left alive, scheduler error-storming). An armed backstop must
-    call os._exit even if _shutdown never comes back.
+    os._exit is mocked and the test waits for the single fire, so the daemon
+    calls the mock — never the real os._exit — and has finished before the test
+    returns. A real os._exit escaping here would tear down the whole pytest run
+    (which is exactly the leaked-thread trap this rewrite avoids).
+    """
+    codes = []
+    fired = threading.Event()
+    monkeypatch.setattr(m.os, "_exit", lambda code: (codes.append(code), fired.set()))
+
+    m._arm_hard_exit(0.02)
+
+    assert fired.wait(1.0), "backstop never fired"
+    assert codes == [1]
+
+
+def test_on_tray_died_arms_backstop_shuts_down_undrained_and_exits(monkeypatch):
+    """_on_tray_died must (1) arm the hard-exit backstop BEFORE any blocking
+    cleanup, (2) shut down with drain=False, and (3) reach os._exit(1) in the
+    finally.
+
+    drain=False is load-bearing: _on_tray_died runs ON the scheduler worker
+    thread, so draining that same scheduler (wait=True) self-joins and hangs —
+    os._exit unreached, cleanup half-done (reproduced on a real Mac 2026-07-23).
+    _arm_hard_exit is mocked, so the test spawns no real self-destruct thread.
     """
     stub = MagicMock()
-    hang = threading.Event()
-    stub._shutdown = MagicMock(side_effect=lambda: hang.wait(2.0))
+    armed = []
     codes = []
-    exited = threading.Event()
+    monkeypatch.setattr(m, "_arm_hard_exit", lambda timeout: armed.append(timeout))
+    monkeypatch.setattr(m.os, "_exit", lambda code: codes.append(code))
 
-    def fake_exit(code):
-        codes.append(code)
-        hang.set()  # let the hung _shutdown unwind so the worker thread ends
-        exited.set()
+    m.BetterFlowApp._on_tray_died(stub)
 
-    monkeypatch.setattr(m.os, "_exit", fake_exit)
-    # Short backstop so the test is fast; raising=False keeps the pre-fix RED
-    # clean (the constant does not exist until the fix adds it).
-    monkeypatch.setattr(m, "_TRAY_DIED_HARD_EXIT_SECONDS", 0.05, raising=False)
-
-    worker = threading.Thread(
-        target=m.BetterFlowApp._on_tray_died, args=(stub,), daemon=True
-    )
-    worker.start()
-
-    assert exited.wait(1.0), "force-exit never fired while _shutdown was hung"
-    assert 1 in codes
+    assert armed == [m._TRAY_DIED_HARD_EXIT_SECONDS], "backstop not armed before cleanup"
+    stub._shutdown.assert_called_once_with(drain=False)
+    assert codes == [1], "os._exit(1) must fire via the finally"
