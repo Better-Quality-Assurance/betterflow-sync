@@ -1805,6 +1805,15 @@ class BetterFlowApp:
 
     def __init__(self):
         """Initialize the application."""
+        # Logging FIRST, at the default level, because Config.load() itself
+        # logs: it reports every persisted setting it deliberately drops
+        # (foreground_activity.enabled, sync.in_process_input) and every
+        # migration it applies. Loading before any handler existed sent all of
+        # that to nowhere — the comments in config.py promise a trail for
+        # exactly the "my setting silently changed after an update" question,
+        # and there was none. setup_logging is documented safe to call twice;
+        # the second call re-runs it at the user's real debug level.
+        setup_logging()
         self.config = Config.load()
         setup_logging(self.config.debug_mode)
 

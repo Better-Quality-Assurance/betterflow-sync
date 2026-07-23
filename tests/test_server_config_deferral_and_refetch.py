@@ -360,3 +360,84 @@ def test_one_corrupt_block_does_not_discard_the_whole_config():
         )
         assert cfg.working_hours.work_start == "07:30", "sibling blocks survive"
         assert cfg.sync.batch_size == Config().sync.batch_size, "bad block -> defaults"
+
+
+def test_load_time_drops_are_actually_logged(tmp_path, monkeypatch, caplog):
+    """The drop-on-load messages must reach a handler.
+
+    Config.load() used to run BEFORE setup_logging(), so every line it emitted
+    — including "I am ignoring the setting you have on disk" — went nowhere.
+    The comments in config.py promise a trail for exactly the "my setting
+    changed after an update" question; without a handler there was none. This
+    pins the messages themselves, so the ordering fix in main.py cannot be
+    undone without a red test.
+    """
+    import json
+    import logging
+
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "sync": {"in_process_input": False},
+        "foreground_activity": {"enabled": True},
+    }))
+    monkeypatch.setattr(Config, "get_config_file", classmethod(lambda cls: cfg_file))
+
+    with caplog.at_level(logging.INFO, logger="src.config"):
+        cfg = Config.load()
+
+    assert cfg.sync.in_process_input is True, "the drop happened"
+    text = caplog.text
+    assert "in_process_input" in text, (
+        "a dropped persisted setting must say so where someone can read it"
+    )
+    assert "foreground_activity.enabled" in text
+
+
+def test_logging_is_configured_before_config_is_loaded():
+    """Callsite guard for the test above.
+
+    The message test uses caplog, which attaches its OWN handler — so it passes
+    whatever order main.py does things in, and on its own it is a phantom. The
+    behaviour that actually matters is the ordering in BetterFlowApp.__init__,
+    and only reading the source can pin it: importing main here would build a
+    tray.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+    tree = ast.parse(src)
+
+    init = next(
+        node
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "BetterFlowApp"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+    first_setup = first_load = None
+    for node in ast.walk(init):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "setup_logging":
+            if first_setup is None or node.lineno < first_setup:
+                first_setup = node.lineno
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "load"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "Config"
+        ):
+            if first_load is None or node.lineno < first_load:
+                first_load = node.lineno
+
+    assert first_setup is not None, "probe found no setup_logging call at all"
+    assert first_load is not None, "probe found no Config.load call at all"
+    assert first_setup < first_load, (
+        f"setup_logging (line {first_setup}) must run BEFORE Config.load "
+        f"(line {first_load}) — load() logs the settings it drops, and with no "
+        f"handler attached yet those lines are discarded"
+    )
