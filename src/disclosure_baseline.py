@@ -110,6 +110,28 @@ _UNSET = object()
 
 
 @dataclass(frozen=True)
+class PlatformDefault:
+    """A declared default that legitimately differs by platform.
+
+    Kept explicit rather than pinning one platform's value and letting the
+    guard fire everywhere else. A declaration that is wrong on two runners out
+    of three teaches people to edit the baseline until it goes green, which is
+    precisely how a guard stops guarding — and both values here are still
+    pinned exactly, so nothing is loosened. The guard checks BOTH of them on
+    every runner (see `_effective` in tests/test_disclosure_baseline.py); it
+    deliberately does not resolve against whichever platform happens to be
+    running the tests, or the half that is not the CI runner's would be
+    declared and never verified.
+    """
+
+    win32: Any
+    other: Any
+
+    def __repr__(self) -> str:  # what a failing guard prints to a human
+        return f"{self.win32!r} on Windows, {self.other!r} elsewhere"
+
+
+@dataclass(frozen=True)
 class Declared:
     """One field of one watched settings group, as declared to employees."""
 
@@ -275,14 +297,30 @@ BASELINE: dict[str, dict[str, Declared]] = {
         ),
         "in_process_input": Declared(
             DISCLOSED,
-            value=False,
+            value=PlatformDefault(win32=True, other=False),
             server=(LIVE,),
             why=(
                 "Counts keystrokes, clicks and scrolls using OS-level input "
                 "hooks in this process. It records counts, never characters, "
                 "but employees are told about keyboard and mouse ACTIVITY "
                 "measurement and this is the mechanism. Remotely switchable "
-                "with no deferral gate."
+                "with no deferral gate.\n\n"
+                "DEFAULT-ON FOR WINDOWS since 1.5.117, and that IS a change "
+                "in what is collected there: Windows bundles no input tracker "
+                "at all (BF_WATCHERS is window + idle only) and the in-process "
+                "hook shipped dormant, so until now a Windows device collected "
+                "NO input data whatsoever. Every Windows day therefore reported "
+                "zero keystrokes and was scored as fraud (Sachi 23 days, "
+                "Claudia 26, Fraud Risk 95) — the collection gap was itself "
+                "harming the employees it spared. macOS and Linux are unchanged "
+                "and stay opt-in; macOS already counts via its own Input "
+                "Monitoring watcher.\n\n"
+                "The disclosed CATEGORY is unchanged — keyboard and mouse "
+                "activity, counts only, never characters — so this is a change "
+                "of mechanism and reach, not of kind. The Regulament article "
+                "still needs to be checked against it: per this file's own "
+                "instruction, update the baseline first, then amend the "
+                "article, in that order."
             ),
         ),
         "in_process_afk": Declared(

@@ -26,7 +26,9 @@ from __future__ import annotations
 import ast
 import dataclasses
 import inspect
+import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -45,6 +47,7 @@ from src.disclosure_baseline import (
     REGULAMENT_TITLE,
     UNWATCHED_CONFIG_FIELDS,
     WATCHED_GROUPS,
+    PlatformDefault,
     is_pinned,
 )
 
@@ -268,6 +271,29 @@ def test_no_unclassified_setting(group: str):
 # ---------------------------------------------------------------------------
 
 
+def _effective(group: str, name: str, platform: str | None = None):
+    """What this build actually ships for one setting.
+
+    With `platform` set, the group's defaults are rebuilt as they would be
+    computed ON that platform. A platform-conditional default must be checked
+    in BOTH directions on EVERY runner: the routine CI gate is a single
+    ubuntu job (the 4-platform matrix runs only on release tags), so resolving
+    against the runner alone would leave the Windows half of a PlatformDefault
+    declared but never verified — a guard nobody watches fail. Rebuilding is
+    also fail-closed: a default that stopped depending on the platform makes
+    the two cases identical and one of them fails loudly.
+
+    Both branches measure the SAME object — a fully constructed `Config` — so
+    the platform path cannot quietly become a weaker measurement than the
+    unpinned one (a group class built on its own would stop seeing anything
+    that adjusts a group's defaults after Config is constructed).
+    """
+    if platform is None:
+        return getattr(getattr(Config(), group), name)
+    with patch.object(sys, "platform", platform):
+        return getattr(getattr(Config(), group), name)
+
+
 @pytest.mark.parametrize(
     ("group", "name"),
     [
@@ -279,23 +305,65 @@ def test_no_unclassified_setting(group: str):
 )
 def test_declared_values_still_hold(group: str, name: str):
     declared = BASELINE[group][name]
-    effective = getattr(getattr(Config(), group), name)
 
-    assert _normalise(effective) == _normalise(declared.value), _fail(
-        f"COLLECTION SETTING CHANGED: {group}.{name}",
-        (
-            f"    declared to employees : {declared.value!r}\n"
-            f"    shipping in this build: {effective!r}\n\n"
-            f"  What this setting governs:\n"
-            f"    {declared.why}\n\n"
-        ),
-        (
-            "    * If the new value is intended, update BASELINE and get the\n"
-            "      Regulament article amended to match, in that order.\n"
-            "    * If it is not intended, this guard just caught a silent\n"
-            "      change to what BetterQA collects from its employees.\n"
-        ),
-    )
+    # A default may legitimately differ by platform (sync.in_process_input is
+    # ON for Windows, which ships no input tracker at all, and opt-in
+    # elsewhere). Both halves stay pinned exactly and both are compared here,
+    # whatever platform this is running on.
+    # `other` means every non-Windows platform, so it is checked on both of
+    # the ones this agent ships to. Resolving it on linux alone would let a
+    # default that grew a `darwin` special case stay green while the macOS
+    # half of the fleet silently started collecting something else.
+    if isinstance(declared.value, PlatformDefault):
+        # This mapping is the one place that knows which platforms a
+        # PlatformDefault splits into, and it lives in a different file from
+        # the class. A half added there and not listed here would be declared
+        # and never verified — the exact failure this guard exists to stop —
+        # so pin the shape rather than silently ignoring the new field.
+        assert {f.name for f in dataclasses.fields(PlatformDefault)} == {
+            "win32",
+            "other",
+        }, (
+            "PlatformDefault grew a new half; add it to the cases below or it "
+            "is declared to employees and never checked against the build"
+        )
+        cases = [
+            ("win32", declared.value.win32),
+            ("darwin", declared.value.other),
+            ("linux", declared.value.other),
+        ]
+    else:
+        # A scalar declaration claims something stronger than "the value is X":
+        # it claims the value does not depend on the platform. Measuring only
+        # the runner leaves that half unchecked — a field that quietly grows a
+        # `sys.platform == "win32"` default stays green forever on the single
+        # ubuntu job that gates routine merges, and Windows devices start
+        # collecting something nobody declared. So check the runner (which also
+        # catches a default keyed off something other than sys.platform) AND
+        # each platform this agent ships to.
+        cases = [(None, declared.value)] + [
+            (plat, declared.value) for plat in ("win32", "darwin", "linux")
+        ]
+
+    for platform, expected in cases:
+        effective = _effective(group, name, platform)
+        where = f" (as computed on {platform})" if platform else ""
+
+        assert _normalise(effective) == _normalise(expected), _fail(
+            f"COLLECTION SETTING CHANGED: {group}.{name}{where}",
+            (
+                f"    declared to employees : {declared.value!r}\n"
+                f"    shipping in this build: {effective!r}\n\n"
+                f"  What this setting governs:\n"
+                f"    {declared.why}\n\n"
+            ),
+            (
+                "    * If the new value is intended, update BASELINE and get the\n"
+                "      Regulament article amended to match, in that order.\n"
+                "    * If it is not intended, this guard just caught a silent\n"
+                "      change to what BetterQA collects from its employees.\n"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

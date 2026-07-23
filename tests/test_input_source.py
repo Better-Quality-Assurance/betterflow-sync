@@ -513,7 +513,13 @@ def test_macos_backend_recovers_when_the_grant_is_restored(monkeypatch):
 
     monkeypatch.setattr(be, "_build_watcher", lambda: _Watcher(True))
     assert be.start() is True
-    assert be.available() is True, "a restored grant must clear the verdict"
+    # available() probes `import Quartz`, which only resolves on a Mac — without
+    # this the assertion below is a macOS-only truth and goes red on the ubuntu
+    # and windows-latest legs of the matrix. Same shape as the platform leak
+    # already fixed in the config round-trip test: a test that reads the
+    # RUNNER's environment instead of pinning the condition it is testing.
+    with patch.dict(sys.modules, {"Quartz": types.ModuleType("Quartz")}):
+        assert be.available() is True, "a restored grant must clear the verdict"
     be.stop()
 
 
