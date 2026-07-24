@@ -57,3 +57,11 @@ def test_unknown_keys_are_still_rejected():
     # not turn it into a passthrough.
     data = _sent_payload({"window_title": "Bank of America — Accounts"})
     assert "window_title" not in data
+
+
+def test_window_tracker_blind_reaches_the_server():
+    # Third field of the same shape. idle_tracker_blind was forwarded and its
+    # window counterpart was not, so the backend could see a blind idle tracker
+    # but never a blind window tracker.
+    data = _sent_payload({"window_tracker_blind": True})
+    assert data.get("window_tracker_blind") is True

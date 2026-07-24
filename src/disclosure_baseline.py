@@ -530,6 +530,11 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # field and update the notice text, not to drop it and go back to blind.
     "tracker_download_failed",
     "managed_components_unavailable",
+    # The window watcher has stayed blind across repeated restarts. Exactly the
+    # same category as idle_tracker_blind, which this list already carries: a
+    # fact about whether a watcher on this machine is working, never about what
+    # the person did.
+    "window_tracker_blind",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so

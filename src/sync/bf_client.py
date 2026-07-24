@@ -480,6 +480,13 @@ class BetterFlowClient(BaseApiClient):
         # wire and can CLEAR a degraded episode rather than latching it.
         "tracker_download_failed",
         "managed_components_unavailable",
+        # Third field of the same shape, found while fixing the two above: the
+        # window watcher has stayed blind across repeated restarts (the macOS
+        # Accessibility counterpart of idle_tracker_blind, which IS forwarded).
+        # Computed into health_snapshot() and dropped here, so the backend could
+        # see a blind idle tracker but never a blind window tracker. Same
+        # category as its sibling — the agent reporting on its own watchers.
+        "window_tracker_blind",
     )
 
     def heartbeat(
