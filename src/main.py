@@ -215,6 +215,12 @@ class SyncCoordinator:
         # than on one transient blip. Mutated only inside _do_sync (sync thread).
         self._aw_unreachable_streak = 0
         self._AW_UNREACHABLE_ERROR_THRESHOLD = 2
+        # monotonic timestamp of the FIRST unreachable observation in the
+        # current outage, or None when ActivityWatch last answered. Time-based
+        # because the consecutive-tick counter it replaces was reset by any
+        # suppressed tick and so never reached its threshold in the field.
+        self._aw_unreachable_since: Optional[float] = None
+        self._AW_UNREACHABLE_ESCALATE_SECONDS = 180.0
 
         # Consecutive cycles where AW answered is_running() (/info) but the bucket
         # fetch (/buckets/) failed — a half-hung bf-data-service the is_running()
@@ -1147,6 +1153,64 @@ class SyncCoordinator:
         if self._tick_failure_counts.pop(label, None):
             self._tick_failure_reported.discard(label)
 
+    def _note_aw_unreachable(self, now: Optional[float] = None) -> bool:
+        """Record an unreachable observation. True once the grace period is up.
+
+        Time-based, not a consecutive-tick counter. The counter it replaces was
+        reset by ANY tick where capture happened to be suppressed — a break,
+        private time, an out-of-hours minute — so on a real device it rarely got
+        past 1 and the escalation below was effectively dead code. Measured over
+        the 47 agent logs from 2026-07-22/23: reached 1 nine times, reached 2
+        never, across four hours of a completely dead ActivityWatch.
+        """
+        now = time.monotonic() if now is None else now
+        if self._aw_unreachable_since is None:
+            self._aw_unreachable_since = now
+        self._aw_unreachable_streak += 1
+        elapsed = now - self._aw_unreachable_since
+        if elapsed >= self._AW_UNREACHABLE_ESCALATE_SECONDS:
+            return True
+        logger.info(
+            "ActivityWatch unreachable for %.0fs (escalating at %.0fs)",
+            elapsed, self._AW_UNREACHABLE_ESCALATE_SECONDS,
+        )
+        return False
+
+    def _note_aw_capture_suppressed(self) -> None:
+        """Capture is deliberately off. Leave the unreachable clock untouched."""
+
+    def _note_aw_reachable(self) -> None:
+        """ActivityWatch answered. This is the ONLY thing that counts as recovery."""
+        self._aw_unreachable_since = None
+        self._aw_unreachable_streak = 0
+
+    def _escalate_aw_unreachable(self, now: Optional[float] = None) -> None:
+        """Rebuild the tracker stack and surface the fault.
+
+        The rebuild is NOT gated on aw_manager.is_managing. That property is
+        `bool(self._processes)`, which is false exactly when every component
+        failed to start — the case where a rebuild is the only thing that can
+        help, and the one case the old gate skipped. Fabian's device never
+        started a single component, so it stayed empty and force_restart was
+        unreachable for the entire outage.
+        """
+        now = time.monotonic() if now is None else now
+        since = self._aw_unreachable_since or now
+        logger.warning(
+            "ActivityWatch unreachable for %.0fs — rebuilding the tracker stack",
+            now - since,
+        )
+        try:
+            # force_restart also reclaims a hung-but-listening server (port held,
+            # HTTP dead); a plain stop()+start() only cycles the watchers and
+            # leaves the dead server in place.
+            self.aw_manager.force_restart(reason="server unreachable")
+        except Exception:
+            # A rebuild that fails must not swallow the escalation below — that
+            # would hide the very fault it was trying to report.
+            logger.warning("force_restart failed during escalation", exc_info=True)
+        self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+
     def _handle_aw_bucket_failure(self) -> None:
         """AW answers is_running() (/info) but the bucket fetch (/buckets/) keeps
         failing — a half-hung bf-data-service. is_running() can't see this, so the
@@ -1497,35 +1561,22 @@ class SyncCoordinator:
                 datetime.now(timezone.utc)
             )
 
-            if not capture_suppressed and not self.aw.is_running():
+            if capture_suppressed:
+                # Deliberately down. Hold the unreachable clock where it is
+                # rather than clearing it: suppression is not evidence that
+                # ActivityWatch recovered, and clearing here is what made the
+                # escalation unreachable in practice (see _note_aw_unreachable).
+                self._note_aw_capture_suppressed()
+            elif not self.aw.is_running():
                 # is_running() already reset+retried the HTTP session, so this
-                # is a real stall, not a stale-socket blip. Debounce before
-                # escalating: one missed cycle stays silent (it usually
-                # self-heals next cycle); only after consecutive failures do we
-                # force-restart and surface an Error.
-                self._aw_unreachable_streak += 1
-                if self._aw_unreachable_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
-                    if self.aw_manager.is_managing:
-                        logger.warning(
-                            "ActivityWatch unreachable for %d cycles — forcing tracker+server restart",
-                            self._aw_unreachable_streak,
-                        )
-                        # force_restart also reclaims a hung-but-listening server
-                        # (port held, HTTP dead); a plain stop()+start() only
-                        # cycles the watchers and leaves the dead server in place.
-                        self.aw_manager.force_restart(reason="server unreachable")
-                    self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
-                else:
-                    logger.info(
-                        "ActivityWatch unreachable (%d/%d) — retrying next cycle before escalating",
-                        self._aw_unreachable_streak, self._AW_UNREACHABLE_ERROR_THRESHOLD,
-                    )
+                # is a real stall, not a stale-socket blip. Grace period before
+                # escalating: a single missed cycle usually self-heals.
+                if self._note_aw_unreachable():
+                    self._escalate_aw_unreachable()
                 return
-
-            # Reachable (or deliberately down) — clear the streak. A suppressed
-            # night must not leave a stale streak that escalates the moment the
-            # window reopens.
-            self._aw_unreachable_streak = 0
+            else:
+                # AW actually answered — the only thing that counts as recovery.
+                self._note_aw_reachable()
 
             stats = self.sync_engine.sync()
 
