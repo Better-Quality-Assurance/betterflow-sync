@@ -213,20 +213,28 @@ class SystemEventHandler:
         except ImportError:
             from ui.tray import TrayState
 
+        # A network outage suspends UPLOAD, never capture.
+        #
+        # This used to call sync_engine.pause(), which means "this window must
+        # never be recorded" and enforces that by advancing every checkpoint
+        # past it. The work was therefore deleted rather than queued: the events
+        # were never fetched, so the offline queue never saw them, which is why
+        # outages that lost real time still reported "0 queued". Measured on one
+        # machine in one week: 38 network-offline windows, 9 of them longer than
+        # the 2-minute lookback that accidentally rescued the rest.
         if is_online:
             logger.info("Network back online - triggering sync to flush queue")
-            if self.coordinator.paused_by_network:
-                with self._pause_state_lock:
-                    user_paused = self._user_paused
-                if not user_paused and not self.coordinator.is_on_break:
-                    self.sync_engine.resume()
-                self.coordinator.paused_by_network = False
+            # Resume unconditionally, NOT under `if paused_by_network`: that flag
+            # is cleared by other paths that can run mid-outage (on_system_sleep,
+            # and a manual pause via _set_user_paused), so gating on it leaves
+            # _upload_suspended latched on for the rest of the process with
+            # nothing left to clear it. resume_upload is idempotent — it only
+            # logs on a real transition.
+            self.sync_engine.resume_upload("network online")
+            self.coordinator.paused_by_network = False
             self.coordinator.trigger_sync("network_sync")
         else:
-            logger.info("Network offline - pausing sync")
-            with self._pause_state_lock:
-                already_paused = self._user_paused
-            if not already_paused:
-                self.sync_engine.pause()
+            logger.info("Network offline - suspending upload (capture continues)")
+            self.sync_engine.suspend_upload("network offline")
             self.coordinator.paused_by_network = True
             self.tray.set_state(TrayState.QUEUED, "Offline")

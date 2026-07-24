@@ -230,6 +230,10 @@ class SyncEngine:
         self._display_tracker = display_tracker
         self._browser_tracker = browser_tracker
         self._paused = False
+        # "cannot upload right now", NOT "must not record". Distinct from
+        # _paused on purpose: _paused discards the window, this one keeps it.
+        # See suspend_upload().
+        self._upload_suspended = False
         self._private_mode = False
         self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
@@ -498,6 +502,59 @@ class SyncEngine:
         # advance to pause-START doesn't cover it). See Lucian, 2026-06-22.
         if was_paused:
             self._advance_checkpoints_to_now("resume")
+
+    def suspend_upload(self, reason: str) -> None:
+        """Record that uploads can't land right now. NOT the same as pause().
+
+        This is deliberately an observable marker, NOT an egress gate: it is
+        written here and read only by is_upload_suspended (tray/diagnostics).
+        Upload is already gated by `bf.is_reachable()` at every send site, with
+        the offline queue as the durability layer, so the network outage stops
+        the sends on its own — this flag adds nothing to that and must not
+        become a second gate. If it ever gates a send, an outage the OS network
+        monitor never reports as recovered (see
+        BetterFlowApp._set_sync_failure_state: Wi-Fi "connected" with no route
+        is exactly that case) latches it True for the rest of the process and
+        the device stops uploading with a healthy network.
+
+        pause() means "this window must never be recorded" — private time, a
+        manual break, a working-hours close — and it enforces that by advancing
+        every checkpoint past the window so the events can never be fetched.
+
+        A network outage is the opposite: the work happened, it is billable, we
+        simply cannot upload it yet. Routing it through pause() deleted it. The
+        offline queue never saw those events because they were never fetched —
+        which is why "0 queued" was reported all the way through outages that
+        lost real time. Reproduced against this engine: 8 min offline lost 6 min,
+        20 min lost 18, 95 min lost 93 (duration minus the 2-minute lookback),
+        with send_events never called once.
+
+        Livia Cimpeanu described it on 2026-06-16, five weeks before it was
+        found in the code: "I was tracked before my break. It isn't anymore."
+        """
+        with self._state_lock:
+            already = self._upload_suspended
+            self._upload_suspended = True
+        if not already:
+            logger.info("Upload suspended (%s) — still capturing and queueing", reason)
+
+    def resume_upload(self, reason: str) -> None:
+        """Clear the marker. Deliberately does NOT touch checkpoints.
+
+        That is the whole point: nothing is skipped on the way back, so the
+        next normal "since checkpoint" fetch picks up everything recorded
+        during the outage and the queue drains on the usual sync path.
+        """
+        with self._state_lock:
+            was = self._upload_suspended
+            self._upload_suspended = False
+        if was:
+            logger.info("Upload resumed (%s) — draining the queue", reason)
+
+    @property
+    def is_upload_suspended(self) -> bool:
+        with self._state_lock:
+            return self._upload_suspended
 
     @property
     def is_paused(self) -> bool:
