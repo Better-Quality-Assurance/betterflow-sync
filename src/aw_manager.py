@@ -861,12 +861,23 @@ class AWManager:
 
         binaries_dir = self._get_binaries_dir()
 
-        if binaries_dir:
+        if binaries_dir and not (self._exec_failed_components - self._disabled_components):
             # Clear the latch on EVERY route that resolves usable binaries, not
             # just a fresh download — the frozen-bundle path installs trackers
             # without downloading, so a device that recovered via an app update
             # would otherwise keep reporting tracker_download_failed forever and
             # train the ops ingest to ignore the signal.
+            #
+            # But NOT while a component is still known-unrunnable. "binaries_dir
+            # resolved" proves they DOWNLOADED; it has never proved they EXECUTE,
+            # and tracker_download_failed now also means "cannot execute" (see the
+            # EBADARCH/ENOEXEC handler in _start_component). Clearing here on an
+            # exec-broken device — before the watcher loop below re-latches it, or
+            # when BF_SERVER/_wait_for_server bails first and the loop never runs —
+            # reports the device healthy while it captures nothing. The successful
+            # _start_component below is the only proof of execution and clears the
+            # flags itself under this exact same guard; that is where the clear
+            # belongs. _lifecycle_lock (RLock) is held by our caller.
             self.tracker_download_failed = False
             self._managed_components_unavailable = False
 
