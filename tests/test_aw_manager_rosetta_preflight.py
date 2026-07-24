@@ -96,7 +96,13 @@ def test_start_refuses_and_reports_instead_of_spawning():
     # The consumer. Detecting it internally proves nothing if the start path
     # still spawns 21 times and the backend still sees a healthy device.
     mgr = _mgr()
+    # The notification is patched out too: `src.aw_manager.subprocess` IS the
+    # shared stdlib module, so patching Popen on it also intercepts the
+    # notifier's own spawn (notify-send on Linux). Without this the assertion
+    # below reads that as "a tracker was started" — green on macOS, red on the
+    # Linux CI runner.
     with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch("src.aw_manager.subprocess.Popen") as popen:
         started = mgr._start_locked()
 
