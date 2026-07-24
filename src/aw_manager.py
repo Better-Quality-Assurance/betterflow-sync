@@ -530,6 +530,11 @@ class AWManager:
         # port we still capture, but restart_if_needed/force_restart manage
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
+        # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
+        # not probed yet. Rosetta cannot appear or vanish without a reboot, so
+        # this is probed once rather than on every 60s start attempt.
+        self._rosetta_missing_cached: Optional[bool] = None
+        self._rosetta_notified: bool = False
         # Components whose binary is on disk but cannot EXECUTE (EBADARCH /
         # ENOEXEC). Keeps the capture-dead latch honest when only SOME binaries
         # are unrunnable: a sibling that starts fine must not unlatch on behalf
@@ -760,12 +765,96 @@ class AWManager:
         except Exception:
             logger.warning("Failed to notify about tracker download failure", exc_info=True)
 
+    def _rosetta_missing(self) -> bool:
+        """True only when this Mac is Apple Silicon AND cannot run x86_64.
+
+        RELEASE_ASSETS is x86_64 on every platform because upstream
+        ActivityWatch publishes nothing else for macOS: v0.13.2 has only
+        `activitywatch-v0.13.2-macos-x86_64.zip`, and an arm64 asset first
+        appears in the v0.14.0b* betas. So on Apple Silicon these binaries need
+        Rosetta 2, and without it every start raises
+
+            [Errno 86] Bad CPU type in executable
+
+        forever, at 60-second intervals, while the agent reports itself healthy.
+        Laszlo Fabian Raul's device did exactly that for two days, recording
+        zero seconds on 2026-07-22 and 07-23.
+
+        The probe runs a known-good system binary under the x86_64 personality.
+        It is the same thing the failing spawn does, minus the tracker, so a
+        false negative here would also have been a real spawn failure. Cached:
+        Rosetta cannot appear or vanish without a reboot, and this is on the
+        60-second start path.
+        """
+        if self._rosetta_missing_cached is not None:
+            return self._rosetta_missing_cached
+
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            self._rosetta_missing_cached = False
+            return False
+
+        try:
+            result = subprocess.run(
+                ["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            missing = result.returncode != 0
+        except Exception as e:
+            # Probe itself failed. Do NOT claim Rosetta is missing on a broken
+            # probe — that would refuse to start trackers on a machine that is
+            # fine. Fail towards attempting the start; the EBADARCH handler in
+            # _start_component still catches the real thing.
+            logger.warning("Rosetta probe failed, assuming available: %s", e)
+            missing = False
+
+        self._rosetta_missing_cached = missing
+        if missing:
+            logger.error(
+                "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
+                "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
+                "until it is installed: run `softwareupdate --install-rosetta` "
+                "(needs an admin password, so the agent cannot do it for you)."
+            )
+        return missing
+
+    def _notify_rosetta_required_once(self) -> None:
+        """Tell the user once per process. The tray state is set by the caller's
+        health reporting; this is the actionable instruction, and repeating it
+        every 60s would train them to dismiss it."""
+        if self._rosetta_notified:
+            return
+        self._rosetta_notified = True
+        try:
+            try:
+                from .notifications import send_notification
+            except ImportError:
+                from notifications import send_notification
+            send_notification(
+                "BetterFlow can't track on this Mac",
+                "Rosetta 2 is required. Open Terminal and run: "
+                "softwareupdate --install-rosetta",
+            )
+        except Exception:
+            logger.debug("Rosetta notification failed", exc_info=True)
+
     def _start_locked(self) -> bool:
         # Every route back to a running tracker funnels through here, so this one
         # guard is enough to keep start()/restart_if_needed()/force_restart() from
         # resurrecting capture while it is suppressed.
         if self._capture_suppressed:
             logger.debug("Tracker start refused: capture is suppressed")
+            return False
+
+        # Apple Silicon without Rosetta 2 can never run these binaries. Checked
+        # BEFORE spawning rather than after 21 identical EBADARCH failures, and
+        # reported rather than retried, because no amount of retrying installs
+        # Rosetta. See _rosetta_missing().
+        if self._rosetta_missing():
+            self.tracker_download_failed = True
+            self._managed_components_unavailable = True
+            self._notify_rosetta_required_once()
             return False
 
         server_already_running = self._port_in_use()
