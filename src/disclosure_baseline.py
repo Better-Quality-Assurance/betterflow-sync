@@ -511,6 +511,25 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # forwards proof the notice was shown; it is compliance evidence, not
     # a new fact gathered about the machine or the person.
     "disclosure_acknowledgement",
+    # Two booleans about the AGENT'S OWN health, not about the person: whether
+    # the tracker binaries failed to install, and whether this process has any
+    # managed watchers of its own. Neither describes what the employee did —
+    # they describe whether this machine is capable of recording anything at
+    # all. They join the operational-health keys this allowlist already carries
+    # (restart counts, blind flags, event ages, sync staleness) — no NOTICE
+    # bullet names any of those individually; the notice's technical-details
+    # bullet covers only the agent version and the time zone. So this adds no
+    # new CATEGORY, but do not read it as "the notice already lists it": it
+    # does not. Both flags were already computed and simply filtered out before
+    # egress, which is why a device that recorded zero for two consecutive days
+    # still reported itself healthy.
+    #
+    # Adding a field that reports LESS capture, and cannot distinguish one
+    # person's activity from another's, does not widen what is collected about
+    # anyone. If that reading is ever contested, the safe answer is to keep the
+    # field and update the notice text, not to drop it and go back to blind.
+    "tracker_download_failed",
+    "managed_components_unavailable",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so

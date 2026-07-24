@@ -466,6 +466,20 @@ class BetterFlowClient(BaseApiClient):
         # the payload deliberately carries no device id. See
         # src/privacy_notice.py.
         "disclosure_acknowledgement",
+        # The two "this device records NOTHING" flags. aw_manager computes both
+        # (see its health payload) precisely to catch a device that heartbeats,
+        # authenticates and looks healthy while capturing zero — and they were
+        # absent from this tuple, so they never left the machine and the backend
+        # could not grade the device degraded. Laszlo Fabian Raul's device 50 sat
+        # in exactly that state for two full days on 1.5.116: bf-data-service
+        # could not start at all ([Errno 86] Bad CPU type), both work days
+        # recorded 0 seconds, and tracking_degraded stayed 0 the whole time.
+        #
+        # Forwarded as tri-state, like window_titles_captured_recently above: the
+        # membership test below is `in`, not truthiness, so a False survives the
+        # wire and can CLEAR a degraded episode rather than latching it.
+        "tracker_download_failed",
+        "managed_components_unavailable",
     )
 
     def heartbeat(
