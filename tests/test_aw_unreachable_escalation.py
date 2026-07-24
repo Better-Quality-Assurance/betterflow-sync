@@ -126,3 +126,30 @@ def test_a_failing_rebuild_still_surfaces_the_error(coord):
     coord._escalate_aw_unreachable(now=clock())
 
     coord.tray.set_state.assert_called_once()
+
+
+def test_bucket_fetch_escalation_rebuilds_without_the_is_managing_gate(coord):
+    # Sibling of _escalate_aw_unreachable: AW answers /info but 503s on
+    # /buckets/, i.e. a half-hung bf-data-service. Same gate, same reason for
+    # removing it — bool(_processes) is false precisely when nothing started.
+    coord.aw_manager.is_managing = False
+    coord._aw_buckets_failed_streak = 0
+    coord.error_reporter = None
+
+    for _ in range(coord._AW_UNREACHABLE_ERROR_THRESHOLD):
+        coord._handle_aw_bucket_failure()
+
+    coord.aw_manager.force_restart.assert_called_once()
+    coord.tray.set_state.assert_called_once()
+
+
+def test_bucket_fetch_escalation_survives_a_failing_rebuild(coord):
+    coord.aw_manager.is_managing = False
+    coord._aw_buckets_failed_streak = 0
+    coord.error_reporter = None
+    coord.aw_manager.force_restart.side_effect = RuntimeError("cannot rebuild")
+
+    for _ in range(coord._AW_UNREACHABLE_ERROR_THRESHOLD):
+        coord._handle_aw_bucket_failure()
+
+    coord.tray.set_state.assert_called_once()

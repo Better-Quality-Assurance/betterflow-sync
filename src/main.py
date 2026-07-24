@@ -1221,13 +1221,22 @@ class SyncCoordinator:
         133 failures, ~75 min of tracking lost."""
         self._aw_buckets_failed_streak += 1
         if self._aw_buckets_failed_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
-            if self.aw_manager.is_managing:
-                logger.warning(
-                    "ActivityWatch responding but bucket fetch failing for %d "
-                    "cycles — forcing tracker+server restart (hung bf-data-service)",
-                    self._aw_buckets_failed_streak,
-                )
+            logger.warning(
+                "ActivityWatch responding but bucket fetch failing for %d "
+                "cycles — forcing tracker+server restart (hung bf-data-service)",
+                self._aw_buckets_failed_streak,
+            )
+            # Not gated on is_managing, for the same reason as
+            # _escalate_aw_unreachable: that property is bool(_processes), so it
+            # is false exactly when every component failed to start — the case
+            # where a rebuild is the only thing that can help. force_restart
+            # rebuilds the whole stack, including a server this process does not
+            # own but which is holding the port dead.
+            try:
                 self.aw_manager.force_restart(reason="bucket fetch failing (server hung)")
+            except Exception:
+                # A failing rebuild must not swallow the tray escalation below.
+                logger.warning("force_restart failed on bucket-fetch escalation", exc_info=True)
             self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
         else:
             logger.info(
