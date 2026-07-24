@@ -55,6 +55,12 @@ logger = logging.getLogger(__name__)
 _NO_REJECTED_PROJECT_ID = object()
 
 
+#: Reasons that mark the START of an excluded window. Only these flush the
+#: pre-window tail before advancing checkpoints — on the LEAVE side `now` is the
+#: end of the window, so flushing there would upload the span being excluded.
+_FLUSH_TAIL_ON_ENTER = frozenset({"pause", "private_time"})
+
+
 def _is_window_like(bucket_type: str) -> bool:
     """Window/web buckets whose events carry per-event activity + time tracking.
 
@@ -4040,11 +4046,14 @@ class SyncEngine:
             self._window_inproc_checkpoint = now
 
         bucket_ids: set[str] = set()
+        buckets: list = []
 
         def _collect(fetcher) -> None:
             try:
                 for bucket in fetcher():
-                    bucket_ids.add(bucket.id)
+                    if bucket.id not in bucket_ids:
+                        bucket_ids.add(bucket.id)
+                        buckets.append(bucket)
             except (AWClientError, TypeError, AttributeError) as e:
                 logger.debug(f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}")
 
@@ -4056,12 +4065,86 @@ class SyncEngine:
         if not bucket_ids:
             return
 
+        # On the way IN, rescue the tail of real work first.
+        #
+        # This method's own contract is that "the enter call only drops
+        # pre-window buffered events" — but those events are not part of the
+        # window being excluded. They are seconds the person actually worked in
+        # the up-to-60s since the last fetch, immediately before they locked the
+        # screen, started a break or turned on Private Time. Losing them was
+        # never the intent of any of those three features; it was collateral,
+        # and it happened on every single one, fleet-wide.
+        #
+        # ENTER only. On the way out `now` is the END of the window, so flushing
+        # there would upload the very span the caller is excluding — that is the
+        # Private Time contract, not a tuning choice.
+        if reason in _FLUSH_TAIL_ON_ENTER:
+            self._flush_pre_window_tail(buckets, now, reason)
+
         for bucket_id in bucket_ids:
             self.queue.set_checkpoint(bucket_id, now)
 
         logger.info(
             f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
         )
+
+    def _flush_pre_window_tail(self, buckets: list, boundary: datetime, reason: str) -> None:
+        """Queue whatever AW recorded between each bucket's checkpoint and
+        ``boundary``, so the checkpoint advance that follows discards only the
+        window itself.
+
+        Deliberately mirrors _reconcile_backlog, which does the same
+        fetch-transform-enqueue and is the proven path: the backend upserts by
+        AW event id so re-enqueuing is deduped, window events go through the
+        counted-time cache so an already-counted event is a no-op, and
+        non-window events pass skip_time_tracking so the daily total is never
+        touched twice. A fresh, empty _SyncCycleContext is used for the same
+        reason it is there — deterministic, never inherits a prior cycle.
+
+        Bounded and local: the range is normally the ~60s since the last sync,
+        ActivityWatch is on localhost and the queue is SQLite, so this adds no
+        backend network to a path that runs on the tray thread. Never raises —
+        every failure degrades to exactly the old behaviour, never worse.
+        """
+        cycle = _SyncCycleContext()
+        enqueued = 0
+        for bucket in buckets:
+            try:
+                checkpoint = self.queue.get_checkpoint(bucket.id)
+                if checkpoint is None or checkpoint >= boundary:
+                    continue
+                events = self.aw.get_events(
+                    bucket.id,
+                    start=checkpoint,
+                    end=boundary,
+                    limit=self._BACKLOG_FETCH_LIMIT,
+                )
+                if not events:
+                    continue
+                events.sort(key=lambda e: e.timestamp)  # AW is newest-first
+                batch: list[dict] = []
+                for event in events:
+                    if _is_window_like(bucket.type):
+                        batch.extend(
+                            self._transform_window_event_with_timeout(
+                                event, bucket.id, bucket.type, cycle
+                            )
+                        )
+                    else:
+                        transformed = self._transform_event(
+                            event, bucket.id, bucket.type,
+                            skip_time_tracking=True, cycle=cycle,
+                        )
+                        if transformed:
+                            batch.append(transformed)
+                if batch:
+                    enqueued += self.queue.enqueue(batch)
+            except Exception as e:
+                logger.debug("pre-%s tail flush failed for %s: %s", reason, bucket.id, e)
+        if enqueued:
+            logger.info(
+                "Queued %d event(s) captured before %s took effect", enqueued, reason
+            )
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active work time for today.
