@@ -544,10 +544,21 @@ class SyncEngine:
         That is the whole point: nothing is skipped on the way back, so the
         next normal "since checkpoint" fetch picks up everything recorded
         during the outage and the queue drains on the usual sync path.
+
+        It DOES drop the session flag, though. pause() used to do that on the
+        way into an outage (end_session + _session_active = False), so the
+        first cycle back always re-established the session. Nothing heartbeats
+        during an outage, so the server's 30-min cleanup marks the session
+        'crashed' — and without this the agent would never call
+        sessions/start again and tracking would not resume on return. Only the
+        local flag is cleared: end_session is pointless mid-outage and the next
+        cycle's start_session is the same call the pre-outage path made.
         """
         with self._state_lock:
             was = self._upload_suspended
             self._upload_suspended = False
+            if was:
+                self._session_active = False
         if was:
             logger.info("Upload resumed (%s) — draining the queue", reason)
 
@@ -3980,6 +3991,7 @@ class SyncEngine:
         with self._state_lock:
             paused = self._paused
             session_active = self._session_active
+            upload_suspended = self._upload_suspended
         aw_running = self.aw.is_running()
         bf_reachable = self.bf.is_reachable() if not paused else False
         queue_size = self.queue.size()
@@ -3987,6 +3999,10 @@ class SyncEngine:
 
         return {
             "paused": paused,
+            # The one reader of the suspend marker: without it the flag is a
+            # write nothing consumes, and "offline but still capturing" is
+            # indistinguishable from "paused" in diagnostics.
+            "upload_suspended": upload_suspended,
             "session_active": session_active,
             "aw_running": aw_running,
             "bf_reachable": bf_reachable,
