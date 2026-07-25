@@ -14,6 +14,7 @@ directly and never through `_do_sync`, so this branch had zero coverage.
 """
 
 import threading
+import time
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import src.main as main_mod
@@ -80,7 +81,12 @@ def test_a_dead_tracker_during_an_outage_is_rebuilt():
     # branch returned before any of this, so the rebuild never fired.
     c = _coord()
     c.aw.is_running.return_value = False
-    c._aw_unreachable_since = 0.001  # already well past the 180s grace window
+    # Already unreachable for longer than the 180s grace. Derived from the real
+    # monotonic clock, NOT a small constant: _note_aw_unreachable compares against
+    # time.monotonic(), so a literal 0.001 only looks "200s ago" on a machine with
+    # high uptime. On a fresh CI runner monotonic() is ~95s, making elapsed < 180
+    # and the escalation silently not fire (this test was green locally, red on CI).
+    c._aw_unreachable_since = time.monotonic() - 200.0
 
     _drive_do_sync(c)
 
@@ -100,7 +106,7 @@ def test_monitor_returns_true_and_notes_recovery_when_aw_answers():
 def test_monitor_skips_sync_and_escalates_a_real_outage():
     c = _coord()
     c.aw.is_running.return_value = False
-    c._aw_unreachable_since = 0.001
+    c._aw_unreachable_since = time.monotonic() - 200.0  # past the 180s grace (clock-derived)
 
     assert c._monitor_capture_health() is False
     c.aw_manager.force_restart.assert_called_once()
