@@ -92,6 +92,41 @@ def _get_app_bundle_path() -> Optional[Path]:
     return None
 
 
+def app_bundle_replaceable() -> bool:
+    """True if the current user can replace the running app in place.
+
+    The self-update applies by renaming the bundle within its parent
+    (``BetterFlow.app`` -> ``BetterFlow.old.app``) then moving the new one in. A
+    bundle installed by the MDM ``.pkg`` lands in ``/Applications`` owned by
+    **root**, so a user-context updater gets ``[Errno 13] Permission denied`` on
+    that rename — every 30-min cycle, silently, forever (Tudor/Fabian, 2026-07).
+    The updater cannot fix that itself; the caller must fail loud (tell the user
+    to reinstall / route updates via MDM) rather than loop on a doomed attempt.
+
+    macOS only: the root-owned ``.pkg`` case is macOS-specific, and the Windows /
+    Linux paths differ (exe-dir swap / AppImage replace), so this returns True
+    there. Returns True when the layout is unknown (dev/source run) so it never
+    blocks a normal install; a genuine permission failure is still caught in the
+    apply path.
+    """
+    if sys.platform != "darwin":
+        return True
+    app_path = _get_app_bundle_path()
+    if app_path is None:
+        return True
+    try:
+        bundle_uid = app_path.stat().st_uid
+    except OSError:
+        return True
+    my_uid = os.getuid()
+    if my_uid == 0:
+        return True
+    # Ownership is the reliable signal: a bundle we don't own can't be renamed by
+    # us (the observed EPERM). /Applications is group-writable for admins, so an
+    # os.access() on the parent would miss the root-owned case.
+    return bundle_uid == my_uid
+
+
 # Set once per process so the "install properly" nag isn't repeated on every
 # stage / staged-apply attempt within a single run.
 _downloads_warning_sent = False
