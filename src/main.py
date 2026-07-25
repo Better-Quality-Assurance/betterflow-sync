@@ -1425,6 +1425,80 @@ class SyncCoordinator:
             return TrayState.PAUSED, "Idle"
         return TrayState.SYNCING, None
 
+    def _monitor_capture_health(self) -> bool:
+        """Self-heal the local tracker stack and escalate a real AW outage.
+
+        Local-only: it restarts/rebuilds trackers and updates the reachability
+        clock, but never uploads. That is exactly why it is factored out of the
+        inline sync path and shared with the paused_by_network branch: capture
+        continues during a network outage, but that branch used to ``return``
+        before any of this ran, so a tracker that died (or never started)
+        mid-outage was never restarted until the network came back.
+
+        Returns True if the caller should proceed to ``sync_engine.sync()``,
+        False if it should skip the upload this cycle (AW unreachable, escalated).
+        """
+        if self.aw_manager.is_managing:
+            self.aw_manager.restart_if_needed()
+            # Escalate a non-converging restart loop: repeated forced restarts
+            # mean the restart isn't fixing it (orphan tracker / missing Input
+            # Monitoring permission). Capture so it surfaces instead of looping
+            # silently; error_reporter dedup throttles.
+            try:
+                restarts = self.aw_manager.stale_restart_count()
+                if (
+                    restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
+                    and not self._restart_loop_escalated
+                    and self.error_reporter is not None
+                ):
+                    self.error_reporter.capture(
+                        f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
+                        level="warning",
+                        tags={"component": "idle-tracker"},
+                        context={"stale_restarts": restarts},
+                        fingerprint="idle-tracker-restart-loop",
+                    )
+                    # Once per session — the restart count is monotonic, so
+                    # without this latch the capture would re-fire every cycle
+                    # (only the reporter's dedup window kept it from flooding).
+                    self._restart_loop_escalated = True
+            except Exception:
+                # WARNING, not debug: if the reporter itself is broken (bad DSN,
+                # etc.) the escalation we built to surface this loop must not fail
+                # silently every cycle.
+                logger.warning("restart-loop escalation check failed", exc_info=True)
+
+        # Outside working hours the trackers are stopped ON PURPOSE, so
+        # aw.is_running() is False and escalating it would (a) flip the tray to
+        # "ActivityWatch not responding" every night and (b) rebuild a stack that
+        # is meant to be down. Hold the unreachable clock instead. The online
+        # caller still falls through to sync() on this path — that is where the
+        # offline queue drains, the heartbeat is sent, AND fetch_server_config()
+        # retries (a device whose first config fetch failed has known=False, so
+        # capture is suppressed, so the tracker is down; only reaching sync()
+        # re-fetches it). The offline caller returns regardless.
+        capture_suppressed = not self.config.working_hours.allows(
+            datetime.now(timezone.utc)
+        )
+
+        if capture_suppressed:
+            # Deliberately down. Hold the unreachable clock where it is rather
+            # than clearing it: suppression is not evidence that ActivityWatch
+            # recovered, and clearing here is what made the escalation unreachable
+            # in practice (see _note_aw_unreachable).
+            self._note_aw_capture_suppressed()
+        elif not self.aw.is_running():
+            # is_running() already reset+retried the HTTP session, so this is a
+            # real stall, not a stale-socket blip. Grace period before escalating:
+            # a single missed cycle usually self-heals.
+            if self._note_aw_unreachable():
+                self._escalate_aw_unreachable()
+            return False
+        else:
+            # AW actually answered — the only thing that counts as recovery.
+            self._note_aw_reachable()
+        return True
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         my_lock = self._acquire_sync_slot()
@@ -1523,69 +1597,24 @@ class SyncCoordinator:
             if self.paused_by_network:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
                 self.tray.update_stats(queue_size=self.queue.size())
+                # A network outage suspends UPLOAD, not capture: suspend_upload()
+                # keeps the trackers recording and queueing locally, often for
+                # hours. So the capture stack must still be health-checked and
+                # self-healed here — every restart/rebuild path lives below this
+                # gate and used to be skipped for the ENTIRE outage, so a tracker
+                # that crashed (or never started) recorded nothing until the
+                # network returned: the exact blind capture this release exists
+                # to prevent. Only the upload sync is skipped (it cannot land
+                # while offline); _monitor_capture_health is local-only, and its
+                # sync-gate return is intentionally ignored on this path.
+                self._monitor_capture_health()
                 return
 
-            if self.aw_manager.is_managing:
-                self.aw_manager.restart_if_needed()
-                # Escalate a non-converging restart loop: repeated forced
-                # restarts mean the restart isn't fixing it (orphan tracker /
-                # missing Input Monitoring permission). Capture so it surfaces
-                # instead of looping silently; error_reporter dedup throttles.
-                try:
-                    restarts = self.aw_manager.stale_restart_count()
-                    if (
-                        restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
-                        and not self._restart_loop_escalated
-                        and self.error_reporter is not None
-                    ):
-                        self.error_reporter.capture(
-                            f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
-                            level="warning",
-                            tags={"component": "idle-tracker"},
-                            context={"stale_restarts": restarts},
-                            fingerprint="idle-tracker-restart-loop",
-                        )
-                        # Once per session — the restart count is monotonic, so
-                        # without this latch the capture would re-fire every cycle
-                        # (only the reporter's dedup window kept it from flooding).
-                        self._restart_loop_escalated = True
-                except Exception:
-                    # WARNING, not debug: if the reporter itself is broken (bad
-                    # DSN, etc.) the escalation we built to surface this loop must
-                    # not fail silently every cycle.
-                    logger.warning("restart-loop escalation check failed", exc_info=True)
-
-            # Outside working hours the trackers are stopped ON PURPOSE, so
-            # aw.is_running() is False and the branch below would (a) escalate a
-            # deliberate silence to "ActivityWatch not responding" in the tray every
-            # single night, and (b) `return` before sync_engine.sync() — which is
-            # where the offline queue gets drained, the heartbeat is sent, AND
-            # fetch_server_config() retries. That last one is a trap: a device whose
-            # first config fetch failed has known=False, so capture is suppressed, so
-            # the tracker is down, so sync() is never reached, so the config is never
-            # re-fetched — suppressed forever, zero tracking, until someone restarts
-            # the app AND the network happens to be up. Fall through instead: sync()
-            # has its own suppressed path that skips the AW reads.
-            capture_suppressed = not self.config.working_hours.allows(
-                datetime.now(timezone.utc)
-            )
-
-            if capture_suppressed:
-                # Deliberately down. Hold the unreachable clock where it is
-                # rather than clearing it: suppression is not evidence that
-                # ActivityWatch recovered, and clearing here is what made the
-                # escalation unreachable in practice (see _note_aw_unreachable).
-                self._note_aw_capture_suppressed()
-            elif not self.aw.is_running():
-                # is_running() already reset+retried the HTTP session, so this
-                # is a real stall, not a stale-socket blip. Grace period before
-                # escalating: a single missed cycle usually self-heals.
-                if self._note_aw_unreachable():
-                    self._escalate_aw_unreachable()
+            # Health-check + self-heal the local tracker stack. Returns False when
+            # the caller should skip the upload sync this cycle (AW unreachable and
+            # escalated); True to proceed.
+            if not self._monitor_capture_health():
                 return
-            else:
-                # AW actually answered — the only thing that counts as recovery.
-                self._note_aw_reachable()
 
             stats = self.sync_engine.sync()
 
