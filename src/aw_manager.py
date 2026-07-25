@@ -1,5 +1,6 @@
 """Manage bundled tracker processes (ActivityWatch components, white-labeled)."""
 
+import errno
 import hashlib
 import json
 import logging
@@ -134,6 +135,26 @@ WINDOW_TITLE_EVENT_LIMIT = 500
 # error reports. start() is retried from the health-check tick, so without this
 # a fail-closed download would toast the user every cycle.
 DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
+# (ops summary, ops fingerprint, user toast) per cause of "this device captures
+# NOTHING". Keyed rather than branched so a new cause is a table row. Both are
+# the same outage to the person using the machine, so both must reach them —
+# a device whose binaries cannot execute recorded zero seconds for two days
+# while only a log line said so.
+CAPTURE_UNAVAILABLE_REPORTS = {
+    "download": (
+        "Tracker component download failed — capture unavailable",
+        "aw_manager:tracker_download_failed",
+        "Tracker components could not be installed, so activity is not "
+        "being recorded. Please contact support.",
+    ),
+    "exec": (
+        "Tracker components cannot execute — capture unavailable",
+        "aw_manager:tracker_binary_cannot_execute",
+        "Tracker components are installed but cannot run on this computer, so "
+        "activity is not being recorded. On Apple Silicon Macs this usually "
+        "means Rosetta 2 is not installed. Please contact support.",
+    ),
+}
 # Backoff for the DOWNLOAD ITSELF (not just its notification). _start_locked is
 # re-entered from the ~60s capture-policy tick, and every re-entry with no
 # binaries on disk re-fetches a 115-207 MB archive. Without this a device that
@@ -509,6 +530,16 @@ class AWManager:
         # port we still capture, but restart_if_needed/force_restart manage
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
+        # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
+        # not probed yet. Rosetta cannot appear or vanish without a reboot, so
+        # this is probed once rather than on every 60s start attempt.
+        self._rosetta_missing_cached: Optional[bool] = None
+        self._rosetta_notified: bool = False
+        # Components whose binary is on disk but cannot EXECUTE (EBADARCH /
+        # ENOEXEC). Keeps the capture-dead latch honest when only SOME binaries
+        # are unrunnable: a sibling that starts fine must not unlatch on behalf
+        # of a component that is permanently blind. Guarded by _lifecycle_lock.
+        self._exec_failed_components: set[str] = set()
 
     @property
     def idle_tracker_blind(self) -> bool:
@@ -674,8 +705,12 @@ class AWManager:
         with self._lifecycle_lock:
             return self._start_locked()
 
-    def _dispatch_download_failure_report(self) -> None:
+    def _dispatch_download_failure_report(self, reason: str = "download") -> None:
         """Throttle-check, then hand the notify/report off to a daemon thread.
+
+        ``reason`` keys CAPTURE_UNAVAILABLE_REPORTS: the archive never arrived
+        ("download"), or it arrived and cannot execute ("exec"). Both share the
+        throttle — they are the same outage and never happen together.
 
         The caller holds _lifecycle_lock, and the notification path shells out
         (osascript/notify-send) — blocking there would stall `is_managing` and
@@ -688,13 +723,14 @@ class AWManager:
         self._last_download_failure_report = now
         threading.Thread(
             target=self._report_download_failure,
+            args=(reason,),
             name="aw-download-failure-report",
             daemon=True,
         ).start()
 
-    def _report_download_failure(self) -> None:
-        """Notify the user and the ops ingest that tracker components could not
-        be installed (so tracking is unavailable). Runs off _lifecycle_lock;
+    def _report_download_failure(self, reason: str = "download") -> None:
+        """Notify the user and the ops ingest that tracker components are not
+        usable (so tracking is unavailable). Runs off _lifecycle_lock;
         throttling is done by _dispatch_download_failure_report.
 
         Ops ingest FIRST, user toast last: this failure happens during startup,
@@ -702,15 +738,18 @@ class AWManager:
         in main.py to deadlock when driven off the main thread before the Cocoa
         run loop is up. If it hangs, the ops signal must already be away.
         """
+        summary, fingerprint, toast = CAPTURE_UNAVAILABLE_REPORTS.get(
+            reason, CAPTURE_UNAVAILABLE_REPORTS["download"]
+        )
         reporter = self.error_reporter
         if reporter is not None:
             try:
                 reporter.capture(
-                    "Tracker component download failed — capture unavailable",
+                    summary,
                     level="error",
                     tags={"component": "aw_manager", "platform": _get_platform_key()},
                     context={"aw_version": AW_VERSION},
-                    fingerprint="aw_manager:tracker_download_failed",
+                    fingerprint=fingerprint,
                 )
             except Exception:
                 logger.warning("Failed to report tracker download failure", exc_info=True)
@@ -721,11 +760,84 @@ class AWManager:
                 from notifications import send_notification
             send_notification(
                 "BetterFlow tracking unavailable",
-                "Tracker components could not be installed, so activity is not "
-                "being recorded. Please contact support.",
+                toast,
             )
         except Exception:
             logger.warning("Failed to notify about tracker download failure", exc_info=True)
+
+    def _rosetta_missing(self) -> bool:
+        """True only when this Mac is Apple Silicon AND cannot run x86_64.
+
+        RELEASE_ASSETS is x86_64 on every platform because upstream
+        ActivityWatch publishes nothing else for macOS: v0.13.2 has only
+        `activitywatch-v0.13.2-macos-x86_64.zip`, and an arm64 asset first
+        appears in the v0.14.0b* betas. So on Apple Silicon these binaries need
+        Rosetta 2, and without it every start raises
+
+            [Errno 86] Bad CPU type in executable
+
+        forever, at 60-second intervals, while the agent reports itself healthy.
+        Laszlo Fabian Raul's device did exactly that for two days, recording
+        zero seconds on 2026-07-22 and 07-23.
+
+        The probe runs a known-good system binary under the x86_64 personality.
+        It is the same thing the failing spawn does, minus the tracker, so a
+        false negative here would also have been a real spawn failure. Cached:
+        Rosetta cannot appear or vanish without a reboot, and this is on the
+        60-second start path.
+        """
+        if self._rosetta_missing_cached is not None:
+            return self._rosetta_missing_cached
+
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            self._rosetta_missing_cached = False
+            return False
+
+        try:
+            result = subprocess.run(
+                ["/usr/bin/arch", "-x86_64", "/usr/bin/true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            missing = result.returncode != 0
+        except Exception as e:
+            # Probe itself failed. Do NOT claim Rosetta is missing on a broken
+            # probe — that would refuse to start trackers on a machine that is
+            # fine. Fail towards attempting the start; the EBADARCH handler in
+            # _start_component still catches the real thing.
+            logger.warning("Rosetta probe failed, assuming available: %s", e)
+            missing = False
+
+        self._rosetta_missing_cached = missing
+        if missing:
+            logger.error(
+                "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
+                "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
+                "until it is installed: run `softwareupdate --install-rosetta` "
+                "(needs an admin password, so the agent cannot do it for you)."
+            )
+        return missing
+
+    def _notify_rosetta_required_once(self) -> None:
+        """Tell the user once per process. The tray state is set by the caller's
+        health reporting; this is the actionable instruction, and repeating it
+        every 60s would train them to dismiss it."""
+        if self._rosetta_notified:
+            return
+        self._rosetta_notified = True
+        try:
+            try:
+                from .notifications import send_notification
+            except ImportError:
+                from notifications import send_notification
+            send_notification(
+                "BetterFlow can't track on this Mac",
+                "Rosetta 2 is required. Open Terminal and run: "
+                "softwareupdate --install-rosetta",
+            )
+        except Exception:
+            logger.debug("Rosetta notification failed", exc_info=True)
 
     def _start_locked(self) -> bool:
         # Every route back to a running tracker funnels through here, so this one
@@ -735,16 +847,37 @@ class AWManager:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
 
+        # Apple Silicon without Rosetta 2 can never run these binaries. Checked
+        # BEFORE spawning rather than after 21 identical EBADARCH failures, and
+        # reported rather than retried, because no amount of retrying installs
+        # Rosetta. See _rosetta_missing().
+        if self._rosetta_missing():
+            self.tracker_download_failed = True
+            self._managed_components_unavailable = True
+            self._notify_rosetta_required_once()
+            return False
+
         server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
 
-        if binaries_dir:
+        if binaries_dir and not (self._exec_failed_components - self._disabled_components):
             # Clear the latch on EVERY route that resolves usable binaries, not
             # just a fresh download — the frozen-bundle path installs trackers
             # without downloading, so a device that recovered via an app update
             # would otherwise keep reporting tracker_download_failed forever and
             # train the ops ingest to ignore the signal.
+            #
+            # But NOT while a component is still known-unrunnable. "binaries_dir
+            # resolved" proves they DOWNLOADED; it has never proved they EXECUTE,
+            # and tracker_download_failed now also means "cannot execute" (see the
+            # EBADARCH/ENOEXEC handler in _start_component). Clearing here on an
+            # exec-broken device — before the watcher loop below re-latches it, or
+            # when BF_SERVER/_wait_for_server bails first and the loop never runs —
+            # reports the device healthy while it captures nothing. The successful
+            # _start_component below is the only proof of execution and clears the
+            # flags itself under this exact same guard; that is where the clear
+            # belongs. _lifecycle_lock (RLock) is held by our caller.
             self.tracker_download_failed = False
             self._managed_components_unavailable = False
 
@@ -1385,8 +1518,80 @@ class AWManager:
             proc = subprocess.Popen(args, **kwargs)
             self._processes[name] = proc
             self._component_started_at[name] = time.monotonic()
+            # A component that actually launched proves this device's binaries
+            # both exist AND execute, so unlatch here as well. The clear in
+            # _start_locked is not enough now that the latch can be set from a
+            # start attempt: the watchdog restarts components directly, so a
+            # device that recovers (Rosetta 2 installed, say) would otherwise
+            # keep reporting "capturing NOTHING" forever and train the ops
+            # ingest to ignore the signal — see the same argument at the
+            # _start_locked clear.
+            with self._lifecycle_lock:
+                self._exec_failed_components.discard(name)
+                # Unlatch only once NOTHING is still unrunnable. A single
+                # corrupt/foreign-arch binary leaves that one component blind
+                # forever, and clearing on a sibling's success would report the
+                # device healthy again — the exact false-healthy this branch
+                # exists to end. Disabled components are never started, so they
+                # must not hold the latch either.
+                if not (self._exec_failed_components - self._disabled_components):
+                    self.tracker_download_failed = False
+                    self._managed_components_unavailable = False
             logger.info(f"Started {name} (PID {proc.pid})")
             return True
+
+        except OSError as e:
+            # A binary that cannot EXECUTE is as unusable as one that never
+            # arrived, and unlike a transient failure it will never fix itself:
+            # retrying every 60s forever just produces a silent, permanently
+            # blind agent. macOS trackers are x86_64-only (upstream v0.13.2
+            # publishes no arm64 asset; arm64 first appears in the v0.14.0b*
+            # betas), so on Apple Silicon they require Rosetta 2. Without it
+            # every start raises EBADARCH.
+            #
+            # Fabian's device, 2026-07-23: this exact error 21 times, and both
+            # 07-22 and 07-23 recorded zero seconds while the heartbeat reported
+            # a healthy device, because neither health flag covered "downloaded
+            # fine, cannot run".
+            #
+            # Reusing tracker_download_failed rather than adding a third flag:
+            # it already means "this device has no usable trackers" to every
+            # consumer, and a new egress field would need its own disclosure
+            # review for no gain. The name is narrower than the meaning; the
+            # comment on the attribute says so.
+            permanent = e.errno in (getattr(errno, "EBADARCH", 86), errno.ENOEXEC)
+            logger.error(
+                "Failed to start %s: %s%s", name, e,
+                " — binary cannot execute on this CPU; on Apple Silicon this "
+                "usually means Rosetta 2 is not installed. Not retryable."
+                if permanent else "",
+            )
+            if permanent:
+                with self._lifecycle_lock:
+                    self._exec_failed_components.add(name)
+                    self._managed_components_unavailable = True
+                    if self._using_external and self._port_in_use():
+                        # Same carve-out the download-failure path makes: a
+                        # server we attached to (never one we started — that
+                        # leaves _using_external False) is still capturing on
+                        # this port, so only OUR watchers are unusable. Latching
+                        # the capture-dead flag or toasting here would report a
+                        # blackout on a device that is recording fine.
+                        logger.warning(
+                            "Managed tracker components cannot execute, but an "
+                            "external server is running on port %s — attaching "
+                            "to it",
+                            self.aw_port,
+                        )
+                    else:
+                        self.tracker_download_failed = True
+                        # Same outage as a failed download — zero capture — so
+                        # it takes the same route out: ops ingest plus a user
+                        # toast, throttled to hourly. The heartbeat flag alone
+                        # is log-only from the machine owner's point of view,
+                        # and only they can install Rosetta 2.
+                        self._dispatch_download_failure_report("exec")
+            return False
 
         except Exception as e:
             logger.error(f"Failed to start {name}: {e}")

@@ -55,6 +55,12 @@ logger = logging.getLogger(__name__)
 _NO_REJECTED_PROJECT_ID = object()
 
 
+#: Reasons that mark the START of an excluded window. Only these flush the
+#: pre-window tail before advancing checkpoints — on the LEAVE side `now` is the
+#: end of the window, so flushing there would upload the span being excluded.
+_FLUSH_TAIL_ON_ENTER = frozenset({"pause", "private_time"})
+
+
 def _is_window_like(bucket_type: str) -> bool:
     """Window/web buckets whose events carry per-event activity + time tracking.
 
@@ -230,6 +236,10 @@ class SyncEngine:
         self._display_tracker = display_tracker
         self._browser_tracker = browser_tracker
         self._paused = False
+        # "cannot upload right now", NOT "must not record". Distinct from
+        # _paused on purpose: _paused discards the window, this one keeps it.
+        # See suspend_upload().
+        self._upload_suspended = False
         self._private_mode = False
         self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
@@ -498,6 +508,70 @@ class SyncEngine:
         # advance to pause-START doesn't cover it). See Lucian, 2026-06-22.
         if was_paused:
             self._advance_checkpoints_to_now("resume")
+
+    def suspend_upload(self, reason: str) -> None:
+        """Record that uploads can't land right now. NOT the same as pause().
+
+        This is deliberately an observable marker, NOT an egress gate: it is
+        written here and read only by is_upload_suspended (tray/diagnostics).
+        Upload is already gated by `bf.is_reachable()` at every send site, with
+        the offline queue as the durability layer, so the network outage stops
+        the sends on its own — this flag adds nothing to that and must not
+        become a second gate. If it ever gates a send, an outage the OS network
+        monitor never reports as recovered (see
+        BetterFlowApp._set_sync_failure_state: Wi-Fi "connected" with no route
+        is exactly that case) latches it True for the rest of the process and
+        the device stops uploading with a healthy network.
+
+        pause() means "this window must never be recorded" — private time, a
+        manual break, a working-hours close — and it enforces that by advancing
+        every checkpoint past the window so the events can never be fetched.
+
+        A network outage is the opposite: the work happened, it is billable, we
+        simply cannot upload it yet. Routing it through pause() deleted it. The
+        offline queue never saw those events because they were never fetched —
+        which is why "0 queued" was reported all the way through outages that
+        lost real time. Reproduced against this engine: 8 min offline lost 6 min,
+        20 min lost 18, 95 min lost 93 (duration minus the 2-minute lookback),
+        with send_events never called once.
+
+        Livia Cimpeanu described it on 2026-06-16, five weeks before it was
+        found in the code: "I was tracked before my break. It isn't anymore."
+        """
+        with self._state_lock:
+            already = self._upload_suspended
+            self._upload_suspended = True
+        if not already:
+            logger.info("Upload suspended (%s) — still capturing and queueing", reason)
+
+    def resume_upload(self, reason: str) -> None:
+        """Clear the marker. Deliberately does NOT touch checkpoints.
+
+        That is the whole point: nothing is skipped on the way back, so the
+        next normal "since checkpoint" fetch picks up everything recorded
+        during the outage and the queue drains on the usual sync path.
+
+        It DOES drop the session flag, though. pause() used to do that on the
+        way into an outage (end_session + _session_active = False), so the
+        first cycle back always re-established the session. Nothing heartbeats
+        during an outage, so the server's 30-min cleanup marks the session
+        'crashed' — and without this the agent would never call
+        sessions/start again and tracking would not resume on return. Only the
+        local flag is cleared: end_session is pointless mid-outage and the next
+        cycle's start_session is the same call the pre-outage path made.
+        """
+        with self._state_lock:
+            was = self._upload_suspended
+            self._upload_suspended = False
+            if was:
+                self._session_active = False
+        if was:
+            logger.info("Upload resumed (%s) — draining the queue", reason)
+
+    @property
+    def is_upload_suspended(self) -> bool:
+        with self._state_lock:
+            return self._upload_suspended
 
     @property
     def is_paused(self) -> bool:
@@ -3923,6 +3997,7 @@ class SyncEngine:
         with self._state_lock:
             paused = self._paused
             session_active = self._session_active
+            upload_suspended = self._upload_suspended
         aw_running = self.aw.is_running()
         bf_reachable = self.bf.is_reachable() if not paused else False
         queue_size = self.queue.size()
@@ -3930,6 +4005,10 @@ class SyncEngine:
 
         return {
             "paused": paused,
+            # The one reader of the suspend marker: without it the flag is a
+            # write nothing consumes, and "offline but still capturing" is
+            # indistinguishable from "paused" in diagnostics.
+            "upload_suspended": upload_suspended,
             "session_active": session_active,
             "aw_running": aw_running,
             "bf_reachable": bf_reachable,
@@ -3967,11 +4046,14 @@ class SyncEngine:
             self._window_inproc_checkpoint = now
 
         bucket_ids: set[str] = set()
+        buckets: list = []
 
         def _collect(fetcher) -> None:
             try:
                 for bucket in fetcher():
-                    bucket_ids.add(bucket.id)
+                    if bucket.id not in bucket_ids:
+                        bucket_ids.add(bucket.id)
+                        buckets.append(bucket)
             except (AWClientError, TypeError, AttributeError) as e:
                 logger.debug(f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}")
 
@@ -3983,12 +4065,86 @@ class SyncEngine:
         if not bucket_ids:
             return
 
+        # On the way IN, rescue the tail of real work first.
+        #
+        # This method's own contract is that "the enter call only drops
+        # pre-window buffered events" — but those events are not part of the
+        # window being excluded. They are seconds the person actually worked in
+        # the up-to-60s since the last fetch, immediately before they locked the
+        # screen, started a break or turned on Private Time. Losing them was
+        # never the intent of any of those three features; it was collateral,
+        # and it happened on every single one, fleet-wide.
+        #
+        # ENTER only. On the way out `now` is the END of the window, so flushing
+        # there would upload the very span the caller is excluding — that is the
+        # Private Time contract, not a tuning choice.
+        if reason in _FLUSH_TAIL_ON_ENTER:
+            self._flush_pre_window_tail(buckets, now, reason)
+
         for bucket_id in bucket_ids:
             self.queue.set_checkpoint(bucket_id, now)
 
         logger.info(
             f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
         )
+
+    def _flush_pre_window_tail(self, buckets: list, boundary: datetime, reason: str) -> None:
+        """Queue whatever AW recorded between each bucket's checkpoint and
+        ``boundary``, so the checkpoint advance that follows discards only the
+        window itself.
+
+        Deliberately mirrors _reconcile_backlog, which does the same
+        fetch-transform-enqueue and is the proven path: the backend upserts by
+        AW event id so re-enqueuing is deduped, window events go through the
+        counted-time cache so an already-counted event is a no-op, and
+        non-window events pass skip_time_tracking so the daily total is never
+        touched twice. A fresh, empty _SyncCycleContext is used for the same
+        reason it is there — deterministic, never inherits a prior cycle.
+
+        Bounded and local: the range is normally the ~60s since the last sync,
+        ActivityWatch is on localhost and the queue is SQLite, so this adds no
+        backend network to a path that runs on the tray thread. Never raises —
+        every failure degrades to exactly the old behaviour, never worse.
+        """
+        cycle = _SyncCycleContext()
+        enqueued = 0
+        for bucket in buckets:
+            try:
+                checkpoint = self.queue.get_checkpoint(bucket.id)
+                if checkpoint is None or checkpoint >= boundary:
+                    continue
+                events = self.aw.get_events(
+                    bucket.id,
+                    start=checkpoint,
+                    end=boundary,
+                    limit=self._BACKLOG_FETCH_LIMIT,
+                )
+                if not events:
+                    continue
+                events.sort(key=lambda e: e.timestamp)  # AW is newest-first
+                batch: list[dict] = []
+                for event in events:
+                    if _is_window_like(bucket.type):
+                        batch.extend(
+                            self._transform_window_event_with_timeout(
+                                event, bucket.id, bucket.type, cycle
+                            )
+                        )
+                    else:
+                        transformed = self._transform_event(
+                            event, bucket.id, bucket.type,
+                            skip_time_tracking=True, cycle=cycle,
+                        )
+                        if transformed:
+                            batch.append(transformed)
+                if batch:
+                    enqueued += self.queue.enqueue(batch)
+            except Exception as e:
+                logger.debug("pre-%s tail flush failed for %s: %s", reason, bucket.id, e)
+        if enqueued:
+            logger.info(
+                "Queued %d event(s) captured before %s took effect", enqueued, reason
+            )
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active work time for today.
