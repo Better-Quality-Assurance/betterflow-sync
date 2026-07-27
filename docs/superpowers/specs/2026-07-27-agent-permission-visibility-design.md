@@ -88,8 +88,20 @@ contaminates the self-reported population. Three reason codes:
   nowhere to put it. Requires the one migration in M1: a nullable boolean column,
   persistence in the heartbeat, and an entry in `hasHealthTelemetry()`.
 - `input_counters_dead` — fully derived from `agent_activity_aggregates`: rows
-  exist with real `active_seconds`, and `SUM(keystrokes_count + clicks_count) = 0`
-  across two consecutive days.
+  exist for the day, `SUM(active_seconds) >= 4h`, and
+  `SUM(keystrokes_count + clicks_count + scrolls_count) = 0`.
+
+**Why all three counters, and why same-day.** Scrolls are the discriminator. A
+quiet user still scrolls constantly — a healthy device logged 58,631 scrolls in
+Chrome in one day. The two broken devices report zero keystrokes, zero clicks
+**and** zero scrolls across every app, including hours in Excel and Slack. That
+is not a person working quietly; it is a tracker that is not reporting, and one
+day of it is already conclusive. Requiring a second consecutive day would add no
+confidence and delay the alert by a day. Including scrolls makes the predicate
+strictly harder to satisfy than keystrokes+clicks alone, which is the safe
+direction: a device with scrolls but no keystrokes is a different, partial
+failure and must NOT be flagged under this reason. The 4h active floor exists so
+a machine left awake and idle cannot trip it.
 
 **Fail-closed rules, non-negotiable in review.** Never-reported devices are
 excluded by an explicit predicate, never by relying on `DEFAULT false` —
@@ -138,8 +150,24 @@ between an alert someone can act on and one they have to investigate.
   (`src/sync/sync_engine.py:3772-3783`, VERIFIED). A second mechanism for the two
   1.5.95 machines duplicates a working lever. Confirm those two builds carry that
   handler before relying on it for them.
-- **No admin UI work in M1.** The chosen model is push, not pull. UI columns
-  remain a real gap (see Open questions) but are not on this path.
+- **No admin UI work in M1.** The chosen model is push, not pull — and the pull
+  surface already exists and is better than what would be built: the
+  `betterflow_agent_devices` MCP tool is tri-state aware (`tracking_degraded_known`,
+  the true/false/null split on title capture) and filterable by
+  `title_capture="broken"`, neither of which the admin screen does.
+
+  This makes one thing mandatory rather than optional: **the Slack line must be
+  self-sufficient.** It names the person, the device, the platform and the exact
+  remedial action, because there is deliberately nowhere to click through to. An
+  alert that says "device 24 is degraded" fails this bar; "Claudia Malau
+  (Windows, device 24): input tracker reporting nothing — 8h active today with
+  zero keystrokes, clicks and scrolls. Reinstall the agent or check AV blocking
+  bf-idle-tracker" meets it.
+
+  Accepted risk: this reasoning holds while the people acting on alerts can reach
+  the MCP. If someone needs to self-serve without it, the UI becomes real work —
+  but nothing in M1 blocks adding it later, and the derived reasons would feed it
+  unchanged.
 
 ## Testing
 
@@ -150,7 +178,11 @@ change. The valuable cases are the adversarial ones, not the happy path:
 - A device with no aggregate rows at all is **not** flagged as
   `input_counters_dead` (guards the `fail-closed.md` Rule 4 shape: a read that
   returned nothing is not proof there is nothing).
-- A device with one zero-input day is **not** flagged; two consecutive are.
+- A device with **zero keystrokes and zero clicks but non-zero scrolls** is
+  **not** flagged. This is the adversarial case — it is the arrangement the
+  author would not naturally pick, and it separates a partial failure from a dead
+  tracker.
+- A device under the 4h active floor is **not** flagged, however quiet.
 - A soft-deleted or non-active device is never flagged.
 
 Plus a **contract test** that every reason code the server can emit has a
