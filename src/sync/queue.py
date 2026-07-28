@@ -189,11 +189,34 @@ class OfflineQueue:
         return self._local.connection
 
     @contextmanager
-    def _cursor(self) -> Iterator[sqlite3.Cursor]:
-        """Context manager for database cursor."""
+    def _cursor(self, *, immediate: bool = False) -> Iterator[sqlite3.Cursor]:
+        """Context manager for database cursor.
+
+        ``immediate=True`` opens the transaction with ``BEGIN IMMEDIATE`` BEFORE
+        the first statement runs. Required for every read-then-write sequence
+        that claims atomicity, because pysqlite's implicit transaction does not
+        begin until the first DML statement — so a ``SELECT`` that CHOOSES the
+        rows a later ``INSERT``/``DELETE`` acts on runs in autocommit, outside
+        the transaction, and is not protected by it.
+
+        Connections are per-thread here, so two threads reach the same file with
+        two connections and can both read the same rows before either writes.
+        That is reachable in production, not theoretical:
+        ``main._acquire_sync_slot`` abandons a wedged cycle after 420s and starts
+        a fresh ``_do_sync`` while the zombie thread is still inside
+        ``_process_queue``.
+
+        This does not add a new way to fail. Every caller that needs it already
+        had to take the same write lock for its ``INSERT``; ``BEGIN IMMEDIATE``
+        only takes it earlier, so the contention window shrinks rather than
+        grows. A conflicting writer blocks for the connection's busy timeout
+        exactly as it did before.
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            if immediate:
+                cursor.execute("BEGIN IMMEDIATE")
             yield cursor
             conn.commit()
         except Exception:
@@ -365,8 +388,13 @@ class OfflineQueue:
             logger.warning(f"Batch larger than max_size, truncated to {len(events)} events")
 
         now = datetime.now(timezone.utc).isoformat()
-        with self._cursor() as cursor:
-            # Atomic: check size + evict + insert in a single transaction
+        with self._cursor(immediate=True) as cursor:
+            # Atomic: check size + evict + insert in a single transaction.
+            # immediate=True is what makes that claim TRUE — the COUNT decides
+            # how many rows to evict, so it has to be inside the transaction the
+            # eviction runs in. Without it two concurrent enqueues both read the
+            # same count, both decide there is room, and the queue overshoots
+            # max_size.
             cursor.execute("SELECT COUNT(*) FROM queued_events")
             current_size = cursor.fetchone()[0]
             if current_size + len(events) > self.max_size:
@@ -580,13 +608,21 @@ class OfflineQueue:
         out for queryability), created_at, retry_count, an optional last_error,
         and a dropped_at stamp — nothing is silently lost.
 
-        The INSERT and the matching DELETE run inside the SAME ``_cursor()``
-        transaction (committed atomically on exit), so a crash can never both
-        drop the events from the queue AND fail to record the dead letter. The
-        DELETE targets the exact ids that were moved (not the ``>= max_retries``
-        predicate) so a concurrent writer that pushes another event over the
-        ceiling between the SELECT and the DELETE can't have it deleted without
-        first being dead-lettered.
+        The selecting SELECT, the INSERT and the matching DELETE all run inside
+        the SAME ``BEGIN IMMEDIATE`` ``_cursor()`` transaction (committed
+        atomically on exit), so a crash can never both drop the events from the
+        queue AND fail to record the dead letter. The DELETE targets the exact
+        ids that were moved (not the ``>= max_retries`` predicate) so a
+        concurrent writer that pushes another event over the ceiling between the
+        SELECT and the DELETE can't have it deleted without first being
+        dead-lettered.
+
+        ``immediate=True`` is load-bearing for the same reason as in
+        ``requeue_storable_dead_letter``: pysqlite opens the implicit
+        transaction at the first DML, so the SELECT that CHOOSES the rows used
+        to run in autocommit. Two threads then both selected the same event and
+        wrote TWO dead-letter rows for it — and the replay resurrects both, so
+        the same billable span is delivered twice.
 
         Args:
             max_retries: Maximum retry attempts
@@ -605,7 +641,7 @@ class OfflineQueue:
             Number of events moved out of the queue
         """
         now = (now or datetime.now(timezone.utc)).isoformat()
-        with self._cursor() as cursor:
+        with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 """
                 SELECT id, event_data, created_at, retry_count
@@ -715,7 +751,11 @@ class OfflineQueue:
             "unstorable_count": 0,
         }
 
-        with self._cursor() as cursor:
+        # immediate=True: same shape as remove_failed — the SELECT chooses which
+        # rows get MOVED, so it belongs inside the write transaction. Two
+        # concurrent evictions would otherwise both select the same event and
+        # write it to dead_letter twice.
+        with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 "SELECT id, event_data, created_at, retry_count FROM queued_events"
             )
@@ -969,11 +1009,17 @@ class OfflineQueue:
           server-side condition time to clear before the retry.
         - **Bounded** — at most ``limit`` rows per call (oldest dead-letter
           first), so a large table can't flood one cycle.
-        - **MOVE, not copy** — each resurrected row is INSERTed into
-          ``queued_events`` and DELETEd from ``dead_letter_events`` in ONE
-          transaction, so a row can never be resurrected twice (no double-send),
-          and a crash can't both drop it from the dead-letter table and fail to
-          re-enqueue it.
+        - **MOVE, not copy** — the candidate SELECT, the ``queued_events``
+          INSERT and the ``dead_letter_events`` DELETE all run inside ONE
+          ``BEGIN IMMEDIATE`` transaction, so a row can never be resurrected
+          twice (no double-send), and a crash can't both drop it from the
+          dead-letter table and fail to re-enqueue it. The SELECT has to be
+          inside it: pysqlite's implicit transaction does not open until the
+          first DML, so a plain ``_cursor()`` left the row-choosing read in
+          autocommit and two threads could both select the same ids and both
+          INSERT a copy. Reachable via ``main._acquire_sync_slot``, which
+          abandons a wedged cycle after 420s and starts a fresh ``_do_sync``
+          while the zombie is still inside ``_process_queue``.
         - **Fresh retry budget** — the row re-enters with ``retry_count`` reset
           to 0 (the default), so it isn't instantly re-dropped at the ceiling.
         - **Self-limiting churn** — a genuinely-poison row that keeps getting
@@ -995,7 +1041,9 @@ class OfflineQueue:
         cooldown_cutoff = (now - timedelta(seconds=min_dead_age_seconds)).isoformat()
         requeued_at = now.isoformat()
 
-        with self._cursor() as cursor:
+        # immediate=True: the SELECT below CHOOSES the rows the INSERT/DELETE act
+        # on, so it must be inside the write transaction, not ahead of it.
+        with self._cursor(immediate=True) as cursor:
             # Only rows that have sat past the cooldown are candidates. The
             # lexical comparison on ISO-8601 strings is chronological (every
             # dropped_at is a tz-aware UTC isoformat), matching set_checkpoint_forward.
