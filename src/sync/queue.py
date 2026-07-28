@@ -946,13 +946,18 @@ class OfflineQueue:
         brief bad-deploy window) sat in ``dead_letter_events`` forever. This is
         the bounded, conservative replay path.
 
-        A row is eligible only if it is storable NOW, by the SAME classification
-        ``evict_unstorable`` and ``_batch_has_storable_activity`` use: it has a
-        ``bucket_id`` to route to AND a ``timestamp`` still within the server's
-        retention window (``stale_after_days``). Rows with no bucket, an
-        unparseable payload, or a timestamp that has since aged past retention are
-        genuinely unstorable and are LEFT in the dead-letter table — never
-        resurrected into a batch the server would only reject again.
+        A row is eligible only if it is storable NOW by the shared
+        ``is_event_storable`` — the SAME function (not "the same rule") that
+        ``evict_unstorable``, ``failed_event_summary`` and
+        ``_batch_has_storable_activity`` call, so the replay can never resurrect
+        something eviction would immediately remove again. That requires a
+        ``bucket_id`` to route to, a ``timestamp`` still within the server's
+        retention window (``stale_after_days``), AND a ``duration`` inside the
+        server's accepted 0..``MAX_EVENT_DURATION_SECONDS`` bounds. Rows with no
+        bucket, an unparseable payload, an over-long duration, or a timestamp
+        that has since aged past retention are genuinely unstorable and are LEFT
+        in the dead-letter table — never resurrected into a batch the server
+        would only reject again.
 
         Conservative by construction:
         - **Cooldown** — a row is skipped until it has sat in the dead-letter
@@ -1011,18 +1016,25 @@ class OfflineQueue:
             new_rows: list[tuple] = []
             for row in rows:
                 dead_id, raw = row[0], row[1]
-                bucket_id = None
-                ts = None
                 try:
                     ev = json.loads(raw)
-                    if isinstance(ev, dict):
-                        bucket_id = ev.get("bucket_id")
-                        ts = ev.get("timestamp")
                 except (json.JSONDecodeError, TypeError):
                     # Unparseable → can never be stored → leave it dead-lettered.
-                    pass
-                storable = bool(bucket_id) and self._timestamp_within(ts, stale_cutoff)
-                if not storable:
+                    # is_event_storable also returns False for a non-dict, so
+                    # this None needs no separate branch below.
+                    ev = None
+                # THE shared classifier — never a local re-implementation of it.
+                # A hand-rolled `bucket_id AND timestamp-in-window` pair (what
+                # this was) silently omits the duration bound, so the exact
+                # poison ``evict_unstorable`` had just removed — an over-long
+                # weekend lid-close span — was resurrected a cooldown later,
+                # AFTER that cycle's eviction gate had already run. It then
+                # 4xx-rejected the whole batch it rode in, and _process_queue's
+                # whole-batch retry bump dragged its healthy neighbours to the
+                # drop ceiling; the re-eviction restamped ``dropped_at``, which
+                # restarted the cooldown, so the loop repeated every 30 min for
+                # the full retention window.
+                if not is_event_storable(ev, stale_cutoff=stale_cutoff):
                     continue
                 move_ids.append(dead_id)
                 # Re-enter with a fresh created_at and default retry_count (0).

@@ -1,11 +1,16 @@
 """Tests for offline queue."""
 
+import json
 import pytest
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from src.sync.queue import OfflineQueue, QueuedEvent
+from src.sync.queue import (
+    MAX_EVENT_DURATION_SECONDS,
+    OfflineQueue,
+    QueuedEvent,
+)
 
 
 class TestOfflineQueue:
@@ -160,10 +165,10 @@ class TestOfflineQueue:
 
     def test_requeue_storable_dead_letter_resurrects_only_storable(self):
         """The bounded dead-letter replay must resurrect a dead-lettered row that
-        is storable AGAIN (has a bucket AND a timestamp within retention) while
-        leaving genuinely-unstorable rows (no bucket, or stale past retention)
-        in the dead-letter table. Mirrors evict_unstorable's classification, so a
-        row the server would still reject is never resurrected."""
+        is storable AGAIN (bucket + timestamp within retention + duration inside
+        the server's bounds) while leaving genuinely-unstorable rows in the
+        dead-letter table. Mirrors evict_unstorable's classification, so a row the
+        server would still reject is never resurrected."""
         now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
         recent_ts = (now - timedelta(hours=1)).isoformat()
         stale_ts = (now - timedelta(days=30)).isoformat()
@@ -177,12 +182,25 @@ class TestOfflineQueue:
             "id": "stale-1", "bucket_id": "aw-watcher-window_host",
             "timestamp": stale_ts, "data": {},
         }
+        # The weekend lid-close span: recent AND routable, so the bucket+timestamp
+        # pair alone calls it storable — but its duration is past the server's
+        # accepted bound, which is exactly why evict_unstorable dead-lettered it.
+        # Resurrecting it re-poisons the batch it rides in and drags its healthy
+        # neighbours to the drop ceiling, then re-evicts with a fresh dropped_at
+        # so the cooldown restarts and the loop runs every 30 min for the whole
+        # retention window.
+        over_long = {
+            "id": "overlong-1", "bucket_id": "bf-status_host",
+            "timestamp": recent_ts,
+            "duration": MAX_EVENT_DURATION_SECONDS + 3600,
+            "data": {"status": "sleep"},
+        }
 
         # Drive them to the retry ceiling and let remove_failed dead-letter all
-        # three (a poison batch bumps storable + unstorable together — exactly
+        # four (a poison batch bumps storable + unstorable together — exactly
         # what evict_unstorable/#130 exists to prevent, but historical rows and
         # genuine 4xx-rejected storable events still land here).
-        self.queue.enqueue([storable, no_bucket, stale])
+        self.queue.enqueue([storable, no_bucket, stale, over_long])
         queued = self.queue.dequeue(batch_size=10)
         for _ in range(5):
             self.queue.increment_retry([q.id for q in queued])
@@ -192,7 +210,7 @@ class TestOfflineQueue:
         self.queue.remove_failed(
             max_retries=5, last_error="poison batch", now=now
         )
-        assert self.queue.dead_letter_count() == 3
+        assert self.queue.dead_letter_count() == 4
         assert self.queue.is_empty()
 
         # min_dead_age_seconds=0 isolates the storable/unstorable classification
@@ -201,10 +219,14 @@ class TestOfflineQueue:
 
         # Only the storable row returned to the live queue.
         assert result["requeued"] == 1
-        assert result["skipped_unstorable"] == 2
+        assert result["skipped_unstorable"] == 3
         assert self.queue.size() == 1
-        # The two unstorable rows stay dead-lettered — not resurrected, not lost.
-        assert self.queue.dead_letter_count() == 2
+        # The three unstorable rows stay dead-lettered — not resurrected, not lost.
+        assert self.queue.dead_letter_count() == 3
+        assert {
+            json.loads(row["event_data"])["id"]
+            for row in self.queue.get_dead_letter_events()
+        } == {"nobucket-1", "stale-1", "overlong-1"}
         # The resurrected event is the storable one, retry_count reset so it gets
         # a fresh delivery attempt (not instantly re-dropped at the ceiling).
         back = self.queue.dequeue(batch_size=10)
