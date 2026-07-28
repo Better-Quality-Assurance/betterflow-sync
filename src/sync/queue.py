@@ -564,7 +564,11 @@ class OfflineQueue:
         return _timestamp_within(ts, cutoff)
 
     def remove_failed(
-        self, max_retries: int = 5, *, last_error: Optional[str] = None
+        self,
+        max_retries: int = 5,
+        *,
+        last_error: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> int:
         """Move events that have exceeded max retries to the dead-letter table.
 
@@ -587,11 +591,20 @@ class OfflineQueue:
         Args:
             max_retries: Maximum retry attempts
             last_error: Optional context recorded on each dead-lettered row
+            now: Injectable clock for deterministic tests (defaults to UTC now),
+                matching ``evict_unstorable`` and ``requeue_storable_dead_letter``.
+                Load-bearing, not a convenience: ``dropped_at`` is the column the
+                replay's cooldown filters on (``WHERE dropped_at <= cutoff``).
+                Stamping it from the real clock while a caller injects ``now``
+                into the reader makes the two drift apart the moment wall-clock
+                passes the fixture's date — every dead-lettered row then sorts
+                AFTER the cutoff, the replay selects nothing, and the failure
+                looks like a broken feature rather than a stale fixture.
 
         Returns:
             Number of events moved out of the queue
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = (now or datetime.now(timezone.utc)).isoformat()
         with self._cursor() as cursor:
             cursor.execute(
                 """

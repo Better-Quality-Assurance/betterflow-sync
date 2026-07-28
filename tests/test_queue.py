@@ -186,7 +186,12 @@ class TestOfflineQueue:
         queued = self.queue.dequeue(batch_size=10)
         for _ in range(5):
             self.queue.increment_retry([q.id for q in queued])
-        self.queue.remove_failed(max_retries=5, last_error="poison batch")
+        # now= is REQUIRED, not tidiness: dropped_at is what the replay's
+        # cooldown filters on, so a real-clock stamp against an injected reader
+        # clock makes this test fail on a date, not on a defect.
+        self.queue.remove_failed(
+            max_retries=5, last_error="poison batch", now=now
+        )
         assert self.queue.dead_letter_count() == 3
         assert self.queue.is_empty()
 
@@ -221,7 +226,7 @@ class TestOfflineQueue:
         queued = self.queue.dequeue(batch_size=10)
         for _ in range(5):
             self.queue.increment_retry([q.id for q in queued])
-        self.queue.remove_failed(max_retries=5)
+        self.queue.remove_failed(max_retries=5, now=now)
         assert self.queue.dead_letter_count() == 5
 
         first = self.queue.requeue_storable_dead_letter(
