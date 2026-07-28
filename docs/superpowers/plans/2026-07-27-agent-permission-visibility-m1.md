@@ -714,37 +714,86 @@ rows means no-rows can never masquerade as no-input."
 **Interfaces:**
 - Consumes: `category: "permissions_degraded"` and reasons `window_titles_blind` / `idle_tracker_blind` / `input_counters_dead` from Tasks 3-5.
 
-- [ ] **Step 1: Write the failing tests**
+> **Reality check (2026-07-28, read against `origin/main` @ `3a55679`).** This task
+> was drafted without reading the current file and four of its assumptions are
+> wrong. Corrected below; do not restore the originals.
+>
+> 1. **`case "window_titles_blind"` ALREADY EXISTS** (`:292-295`), added with the
+>    server-side `ALERT_ON_BLIND_WINDOW_TITLES` work. Only two cases are new. A
+>    second `case` for the same literal is unreachable code and an ESLint
+>    `no-duplicate-case` error — **replace the existing text, do not add.**
+> 2. **`reasonText` / `severityFor` are not exported and the test file does not
+>    call them.** There is no `baseDevice` fixture; the house fixture is
+>    `degradedDevice(overrides)` and every test drives the public
+>    `checkBetterflowDeviceHealth()` with `mockFetchJson` + a mocked `db`. Follow
+>    the house style — it asserts the CONSUMER (the Slack line that actually
+>    ships) rather than the producer, which is strictly stronger per
+>    `test-fixture-discipline.md` Phantom 7. **Do not export internals to satisfy
+>    the original draft.**
+> 3. **`severityFor` is unreachable for a warning-pin test via the public path
+>    unless the device is live and on-schedule** — see item 4.
+> 4. **A `permissions_degraded` device keeps BOTH liveness gates.**
+>    `isStaleOfflineFalsePositive` (`last_seen_at` older than
+>    `LIVE_RECENT_MINUTES`) and `isOffScheduleFalsePositive` (`off_schedule ===
+>    true`) exempt only `category === "ingest_stalled"`. This is left as-is and is
+>    the correct default: a standing config fault on a laptop nobody is using is
+>    not worth waking anyone for, and the 72h cooldown from Task 7 already makes
+>    it at most one ping per 3 days once the machine IS in use. **Consequence for
+>    Task 9:** the server-side acceptance count (3 title-blind, 2 input-dead) is
+>    an upper bound on what reaches Slack — offline or off-schedule devices are
+>    correctly filtered before alerting. Do not read a smaller Slack count as a
+>    bug without checking `last_seen_at` and `off_schedule` first.
+> 5. **Name collision to avoid.** The existing `case "idle_while_active"`
+>    (`:270-273`) already opens its Slack line with the literal words *"idle
+>    tracker blind"*, and the new reason is spelled `idle_tracker_blind`. Two
+>    different reasons must not produce near-identical prose or triage becomes
+>    guesswork. The new case's text below opens "idle tracker is blind — it has
+>    stayed stale across repeated restarts", which is distinguishable; leave the
+>    `idle_while_active` text alone but do not paraphrase it closer.
+
+- [ ] **Step 1: Write the failing tests** (house style — public entry point)
 
 ```ts
-  it("describes every permissions_degraded reason without falling through to default", () => {
-    for (const reason of ["window_titles_blind", "idle_tracker_blind", "input_counters_dead"]) {
-      const text = reasonText({ ...baseDevice, category: "permissions_degraded", reason } as FlaggedDevice);
-      expect(text).not.toContain("no description for that reason yet");
-      expect(text.length).toBeGreaterThan(40);
+  it("describes both new permissions_degraded reasons instead of falling through", async () => {
+    for (const reason of ["idle_tracker_blind", "input_counters_dead"]) {
+      mockFetchJson({ flagged: [degradedDevice({ category: "permissions_degraded", reason })] });
+      const alerts = await checkBetterflowDeviceHealth();
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]!.message).not.toContain("no description for that reason yet");
     }
   });
 
-  it("never escalates a permissions fault to critical, however long it persists", () => {
-    const severity = severityFor({
-      ...baseDevice,
+  it("names the remedial action for a title-blind device", async () => {
+    mockFetchJson({ flagged: [degradedDevice({ category: "permissions_degraded", reason: "window_titles_blind" })] });
+    const alerts = await checkBetterflowDeviceHealth();
+    expect(alerts[0]!.message).toContain("Accessibility");
+  });
+
+  it("never escalates a permissions fault to critical, however long it persists", async () => {
+    mockFetchJson({ flagged: [degradedDevice({
       category: "permissions_degraded",
       reason: "window_titles_blind",
       tracking_degraded_since: new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
-    } as FlaggedDevice);
-    expect(severity).toBe("warning");
+    })] });
+    const alerts = await checkBetterflowDeviceHealth();
+    expect(alerts[0]!.severity).toBe("warning");
   });
 ```
 
-Read the existing test file first: reuse its `baseDevice` fixture and match how it imports the internals. If `reasonText` / `severityFor` are not exported, export them for test only, following whatever pattern the file already uses for the other internals it tests.
+`degradedDevice()` already sets a fresh `last_seen_at` and no `off_schedule`, so
+these devices pass both liveness gates. Keep it that way — a stale `last_seen_at`
+here would make the test pass for the wrong reason (Phantom 4).
 
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cd /Users/brad/Code2/betterqa-bot && npx vitest run src/__tests__/betterflow-device-health.test.ts
+cd /Users/brad/Code2/betterqa-bot-permvis && npx vitest run src/__tests__/betterflow-device-health.test.ts
 ```
 
-Expected: FAIL — the first on the default-branch text, the second on `critical`.
+Expected: FAIL — test 1 on the default-branch text for both new reasons, test 2
+on the absent "Accessibility" remedial text, test 3 on `critical`. Test 2 failing
+is what proves the existing `window_titles_blind` case is being *replaced* rather
+than left alone.
 
 - [ ] **Step 3: Widen the category union**
 
@@ -752,11 +801,17 @@ Expected: FAIL — the first on the default-branch text, the second on `critical
   category: "telemetry_degraded" | "heartbeat_stale" | "ingest_stalled" | "permissions_degraded";
 ```
 
-- [ ] **Step 4: Add the three `reasonText()` cases**
+- [ ] **Step 4: Add two cases, replace one**
 
-Insert before `default:`. Each names the exact remedial action, because there is no UI to click through to:
+`case "window_titles_blind"` already exists at `:292-295` — **replace its return
+statement and keep its comment**, then insert the two genuinely new cases before
+`default:`. Each names the exact remedial action, because there is no UI to click
+through to:
 
 ```ts
+    // REPLACES the existing text at :292-295. The old line said only that titles
+    // were blank; it never said what to DO about it, which is the whole point of
+    // the category.
     case "window_titles_blind":
       return `window titles are empty — the agent is recording app names and durations but no titles, so meeting detection and categorisation are degraded. On macOS this is a missing Accessibility grant (System Settings > Privacy & Security > Accessibility > enable BetterFlow); on Windows the bf-window-tracker is blind; on Linux the X11 watcher is dead`;
     case "idle_tracker_blind":
@@ -901,14 +956,22 @@ The bot's `default:` branch is honest, but it is the drift point. This is the gu
     "input_counters_dead",
   ];
 
-  it("has a description for every permissions reason the server can emit", () => {
-    const undescribed = SERVER_PERMISSION_REASONS.filter((reason) =>
-      reasonText({ ...baseDevice, category: "permissions_degraded", reason } as FlaggedDevice)
-        .includes("no description for that reason yet")
-    );
+  it("has a description for every permissions reason the server can emit", async () => {
+    const undescribed: string[] = [];
+    for (const reason of SERVER_PERMISSION_REASONS) {
+      mockFetchJson({ flagged: [degradedDevice({ category: "permissions_degraded", reason })] });
+      const alerts = await checkBetterflowDeviceHealth();
+      if (alerts[0]!.message.includes("no description for that reason yet")) {
+        undescribed.push(reason);
+      }
+    }
     expect(undescribed).toEqual([]);
   });
 ```
+
+Same correction as Task 6: no `reasonText`/`baseDevice` to call. Driving the
+public entry point also makes this guard stronger — it fails if a reason loses
+its text OR if a liveness gate starts silently swallowing the whole category.
 
 - [ ] **Step 2: Verify the guard is witnessed**
 
