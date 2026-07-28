@@ -301,6 +301,87 @@ class TestOfflineQueue:
         assert self.queue.dead_letter_count() == 0
         assert self.queue.size() == 1
 
+    def _dead_letter_storable(self, queue, count: int, now: datetime) -> None:
+        """Drive ``count`` storable events to the ceiling and dead-letter them."""
+        recent_ts = (now - timedelta(hours=1)).isoformat()
+        queue.enqueue([
+            {"id": f"dl{i}", "bucket_id": "aw-watcher-afk_h",
+             "timestamp": recent_ts, "duration": 30, "data": {}}
+            for i in range(count)
+        ])
+        queued = queue.dequeue(batch_size=1000)
+        for _ in range(5):
+            queue.increment_retry([q.id for q in queued])
+        queue.remove_failed(max_retries=5, now=now)
+
+    def test_requeue_storable_dead_letter_respects_max_size(self):
+        """The replay raw-INSERTs into queued_events, skipping the max_size check
+        and oldest-eviction that enqueue() performs. dead_letter_events is never
+        pruned, so on the first post-upgrade drain a device carrying weeks of
+        dead letters resurrects up to `limit` rows per cycle straight past
+        max_size — and capacity_percent() then pins at 1.0 permanently.
+
+        The replay must take only the headroom that exists. It must NOT reuse
+        enqueue()'s oldest-eviction: that would delete live, never-rejected
+        events to make room for already-rejected ones.
+        """
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        path = Path(self.temp_dir) / "cap.db"
+        queue = OfflineQueue(db_path=path, max_size=10)
+        try:
+            self._dead_letter_storable(queue, 8, now)
+            assert queue.dead_letter_count() == 8
+
+            # 8 live events already in the queue: headroom is 2, not 8.
+            live = [
+                {"id": f"live{i}", "bucket_id": "aw-watcher-window_h",
+                 "timestamp": (now - timedelta(minutes=5)).isoformat(),
+                 "duration": 10, "data": {}}
+                for i in range(8)
+            ]
+            queue.enqueue(live)
+            assert queue.size() == 8
+
+            result = queue.requeue_storable_dead_letter(now=now, min_dead_age_seconds=0)
+
+            assert queue.size() <= 10, (
+                "the replay resurrected past max_size; capacity_percent() now "
+                "pins at 1.0 and every capacity signal is dead"
+            )
+            assert result["requeued"] == 2
+            # The 6 that did not fit are still preserved, not lost.
+            assert queue.dead_letter_count() == 6
+            # And no live event was evicted to make room for a dead-lettered one.
+            back = queue.dequeue(batch_size=100)
+            assert sum(1 for q in back if q.event_data["id"].startswith("live")) == 8
+        finally:
+            queue.close()
+
+    def test_requeue_storable_dead_letter_at_capacity_resurrects_nothing(self):
+        """No headroom at all → the replay is a clean no-op. Rows stay
+        dead-lettered for a later cycle; nothing is dropped to make room."""
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        path = Path(self.temp_dir) / "full.db"
+        queue = OfflineQueue(db_path=path, max_size=5)
+        try:
+            self._dead_letter_storable(queue, 4, now)
+            queue.enqueue([
+                {"id": f"live{i}", "bucket_id": "aw-watcher-window_h",
+                 "timestamp": (now - timedelta(minutes=5)).isoformat(),
+                 "duration": 10, "data": {}}
+                for i in range(5)
+            ])
+            assert queue.size() == 5
+            assert queue.capacity_percent() == 1.0
+
+            result = queue.requeue_storable_dead_letter(now=now, min_dead_age_seconds=0)
+
+            assert result["requeued"] == 0
+            assert queue.size() == 5
+            assert queue.dead_letter_count() == 4
+        finally:
+            queue.close()
+
     def test_requeue_storable_dead_letter_empty_is_noop(self):
         """Nothing dead-lettered → a clean zero result, no error."""
         result = self.queue.requeue_storable_dead_letter()

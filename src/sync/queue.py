@@ -1009,6 +1009,12 @@ class OfflineQueue:
           server-side condition time to clear before the retry.
         - **Bounded** — at most ``limit`` rows per call (oldest dead-letter
           first), so a large table can't flood one cycle.
+        - **Capacity-respecting** — bounded a second time by the live queue's
+          remaining headroom (``max_size`` minus current size), so the replay
+          can approach ``max_size`` but never cross it. It does NOT reuse
+          ``enqueue``'s oldest-eviction: evicting live, never-rejected events to
+          make room for already-rejected ones is the wrong trade for billed
+          time. Rows that don't fit stay dead-lettered for a later cycle.
         - **MOVE, not copy** — the candidate SELECT, the ``queued_events``
           INSERT and the ``dead_letter_events`` DELETE all run inside ONE
           ``BEGIN IMMEDIATE`` transaction, so a row can never be resurrected
@@ -1044,6 +1050,40 @@ class OfflineQueue:
         # immediate=True: the SELECT below CHOOSES the rows the INSERT/DELETE act
         # on, so it must be inside the write transaction, not ahead of it.
         with self._cursor(immediate=True) as cursor:
+            # Capacity first, and read INSIDE this transaction so it can't go
+            # stale before the INSERT below acts on it. ``enqueue`` enforces
+            # max_size by evicting the OLDEST queued events; this raw-INSERT
+            # path bypassed that entirely, and dead_letter_events is never
+            # pruned — so on the first post-upgrade drain a device carrying
+            # weeks of dead letters resurrects up to ``limit`` rows per cycle
+            # straight past max_size, and capacity_percent() pins at 1.0 for
+            # good, killing every capacity signal built on it.
+            #
+            # We deliberately do NOT reuse enqueue()'s oldest-eviction here.
+            # That would delete LIVE, never-rejected events to make room for
+            # ALREADY-REJECTED ones — and resurrected rows re-enter with a fresh
+            # created_at, so they would be the newest rows and the live events
+            # would be the ones evicted. Strictly the wrong trade for billed
+            # time. Instead the replay takes only the headroom that exists: it
+            # can approach max_size but never cross it, and the rows that don't
+            # fit stay preserved in dead_letter_events for a later cycle rather
+            # than costing anything. (Keeping the capacity read here rather than
+            # calling enqueue() also preserves the MOVE atomicity — enqueue()
+            # opens its own _cursor()/transaction, which would split the INSERT
+            # from the dead-letter DELETE and reintroduce the double-send this
+            # function's BEGIN IMMEDIATE exists to close.)
+            cursor.execute("SELECT COUNT(*) FROM queued_events")
+            headroom = self.max_size - cursor.fetchone()[0]
+            if headroom <= 0:
+                logger.info(
+                    "Dead-letter replay skipped: live queue at capacity "
+                    "(%d/%d). Preserved rows stay dead-lettered for a later "
+                    "cycle — never dropped to make room.",
+                    self.max_size - headroom, self.max_size,
+                )
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+            effective_limit = min(limit, headroom)
+
             # Only rows that have sat past the cooldown are candidates. The
             # lexical comparison on ISO-8601 strings is chronological (every
             # dropped_at is a tz-aware UTC isoformat), matching set_checkpoint_forward.
@@ -1054,7 +1094,7 @@ class OfflineQueue:
                 ORDER BY dropped_at ASC, id ASC
                 LIMIT ?
                 """,
-                (cooldown_cutoff, limit),
+                (cooldown_cutoff, effective_limit),
             )
             rows = cursor.fetchall()
             if not rows:
