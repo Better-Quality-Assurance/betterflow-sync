@@ -3535,8 +3535,18 @@ class SyncEngine:
         # behind). Resurrected rows fall into the same drain loop below.
         try:
             self.queue.requeue_storable_dead_letter()
-        except Exception:  # noqa: BLE001
-            logger.debug("dead-letter replay failed", exc_info=True)
+        except Exception as e:  # noqa: BLE001
+            # WARNING, not debug. This is the only signal the replay ever emits
+            # on failure, and debug is off in the shipped build — a replay that
+            # never runs (locked DB, schema drift, disk full) is invisible while
+            # dead_letter_count climbs and the operator has nothing to correlate
+            # it against. Swallowed deliberately: a broken replay must never
+            # cost the drain that follows it.
+            logger.warning(
+                "Dead-letter replay failed (%s: %s) — preserved events will not "
+                "be retried this cycle; dead_letter_count will keep climbing",
+                type(e).__name__, e, exc_info=True,
+            )
 
         # Process queue in batches
         deadline = time.monotonic() + self._QUEUE_PROCESS_TIMEOUT

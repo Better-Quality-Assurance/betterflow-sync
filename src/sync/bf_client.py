@@ -487,6 +487,16 @@ class BetterFlowClient(BaseApiClient):
         # see a blind idle tracker but never a blind window tracker. Same
         # category as its sibling — the agent reporting on its own watchers.
         "window_tracker_blind",
+        # Fourth field of the same shape. Size of the local dead-letter table:
+        # events that exhausted their retries and were PRESERVED rather than
+        # deleted. A climbing value is real, captured, never-delivered billable
+        # activity sitting on one laptop. main._build_health_telemetry has
+        # always computed it (reported unconditionally, even at 0) and this
+        # allowlist dropped it — so no device has ever reported a backlog, and
+        # the "a growing backlog is visible to ops" requirement the whole
+        # preserve-don't-delete design exists for was never actually met.
+        # int, always present: 0 is an explicit healthy signal, not an omission.
+        "dead_letter_count",
     )
 
     def heartbeat(
