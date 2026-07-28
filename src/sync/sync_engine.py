@@ -33,7 +33,7 @@ try:
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
-    from .queue import is_event_storable, normalized_project_id
+    from .queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -46,7 +46,7 @@ except ImportError:
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
-    from sync.queue import is_event_storable, normalized_project_id
+    from sync.queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -3685,7 +3685,9 @@ class SyncEngine:
         eviction/real-loss verdict — a stuck head holding genuine recent activity
         is held, never dropped."""
         now = now or datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=7)  # matches the queue's stale_after_days
+        # ONE definition of the window, imported — not a local literal that
+        # silently drifts from the queue's eviction/replay pair.
+        cutoff = now - timedelta(days=EVENT_RETENTION_DAYS)
         return any(is_event_storable(ev, stale_cutoff=cutoff) for ev in events)
 
     def _apply_queue_backoff(self) -> None:

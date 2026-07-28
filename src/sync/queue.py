@@ -22,6 +22,7 @@ __all__ = [
     "is_event_storable",
     "normalized_project_id",
     "MAX_EVENT_DURATION_SECONDS",
+    "EVENT_RETENTION_DAYS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 # whole-batch retry bump then drags its storable neighbours to the drop ceiling
 # in lockstep. Evicting the over-long span first keeps every batch clean.
 MAX_EVENT_DURATION_SECONDS = 86400  # 24h, mirrors the server-side validator
+
+# The server's retention window: it rejects an event whose timestamp is older
+# than this, so the agent treats such an event as unstorable rather than holding
+# it forever. ONE definition, deliberately — this was written four times (three
+# `stale_after_days` defaults here plus a bare `timedelta(days=7)` in
+# SyncEngine._batch_has_storable_activity), and eviction and the dead-letter
+# replay are now a PAIRED loop. A drift between two copies is self-sustaining,
+# not merely wrong: widen one and eviction drops a row the replay resurrects
+# every cooldown, with `dropped_at` restamped on each pass so the cooldown never
+# terminates it. Same reasoning that gave MAX_EVENT_DURATION_SECONDS its name.
+EVENT_RETENTION_DAYS = 7
 
 
 def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
@@ -524,7 +536,7 @@ class OfflineQueue:
         max_retries: int = 5,
         *,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
     ) -> dict:
         """Summarize events at/over the retry ceiling that remove_failed() is
         about to drop. Read-only — does NOT delete.
@@ -698,7 +710,7 @@ class OfflineQueue:
         self,
         *,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
         last_error: Optional[str] = None,
     ) -> dict:
         """Move events the server can NEVER accept out of the active queue and
@@ -974,7 +986,7 @@ class OfflineQueue:
         *,
         limit: int = 200,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
         min_dead_age_seconds: Optional[float] = None,
     ) -> dict:
         """Resurrect dead-lettered rows that are STORABLE again — move them back
