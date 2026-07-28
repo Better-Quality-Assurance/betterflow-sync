@@ -351,6 +351,16 @@ class SyncEngine:
         # _send_events call in a unit test) -> the budget guard is inert.
         self._cycle_start_monotonic: Optional[float] = None
 
+        # Starvation floor for the in-cycle network budget. `_cycle_delivered`
+        # records whether THIS cycle put anything on the wire at all;
+        # `_consecutive_undelivered_cycles` counts cycles in a row where the
+        # budget gate refused the drain and nothing else had delivered either.
+        # Both are touched only on the sync thread (a wedge-recovery cycle can
+        # overlap, in which case the worst case is an extra forced drain — the
+        # same failure the floor is there to cause on purpose).
+        self._cycle_delivered = False
+        self._consecutive_undelivered_cycles = 0
+
         # Queue retry backoff
         self._queue_consecutive_failures = 0
         self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
@@ -800,6 +810,7 @@ class SyncEngine:
         _send_status_span's policy for exactly this reason.
         """
         try:
+            self._note_delivery_attempt()
             result = self.bf.send_events([event])
             if getattr(result, "success", False):
                 return
@@ -995,6 +1006,9 @@ class SyncEngine:
         # Publish the cycle start so _send_events can bound the per-bucket send
         # loop to the same in-cycle network budget as the queue drain.
         self._cycle_start_monotonic = cycle_start
+        # Fresh cycle, nothing delivered yet. Feeds the drain gate's starvation
+        # floor (_drain_gate_allows).
+        self._cycle_delivered = False
 
         # Daily housekeeping before anything else, so it still runs while paused:
         # a long-running agent that never restarts across midnight would
@@ -1071,7 +1085,7 @@ class SyncEngine:
             # that were contractually not recorded.
             self.flush_engagement_detectors("capture_suppressed")
             if self.bf.is_reachable() and not self.queue.is_empty():
-                if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+                if self._drain_gate_allows():
                     self._process_queue(stats)
             with self._state_lock:
                 self._heartbeat_count += 1
@@ -1384,9 +1398,10 @@ class SyncEngine:
         # Process offline queue if we're online — but only if this cycle hasn't
         # already burned most of the watchdog budget on a slow/hung regular send
         # (else two ~94s chains stack past _DO_SYNC_DEADLINE; the queue drains
-        # next cycle).
+        # next cycle). _drain_gate_allows adds the floor that stops "next cycle"
+        # from being the answer forever — see its docstring.
         if self.bf.is_reachable() and not self.queue.is_empty():
-            if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+            if self._drain_gate_allows():
                 self._process_queue(stats)
             else:
                 # The regular send already burned most of the watchdog budget
@@ -2734,6 +2749,7 @@ class SyncEngine:
         # block was unreachable and break/idle/private events were silently
         # dropped on the first offline cycle. Inspect the result instead.
         try:
+            self._note_delivery_attempt()
             result = self.bf.send_events([event])
         except BetterFlowAuthError as e:
             # Auth errors are not retryable without re-login; queueing risks
@@ -3385,6 +3401,7 @@ class SyncEngine:
 
         for i, batch in enumerate(batches):
             try:
+                self._note_delivery_attempt()
                 result = self.bf.send_events(batch)
                 if result.success:
                     stats.events_sent += result.events_synced
@@ -3482,6 +3499,83 @@ class SyncEngine:
         (a direct call outside sync(), e.g. a unit test)."""
         start = self._cycle_start_monotonic
         return start is not None and (time.monotonic() - start) >= budget_seconds
+
+    # After this many CONSECUTIVE cycles in which the budget gate refused the
+    # drain and nothing else delivered either, one drain is forced through even
+    # with the budget spent. See _drain_gate_allows for why this exists and why
+    # the number is small.
+    _DELIVERY_STARVATION_FLOOR_CYCLES = 3
+
+    def _note_delivery_attempt(self) -> None:
+        """Record that this cycle put events on the wire.
+
+        Called at every ``bf.send_events`` site. "Attempt", not "success", is
+        deliberate: the property the floor protects is that the budget gate
+        cannot stop us from TRYING. A batch that fails has its own backoff and
+        retry-ceiling machinery; a batch that is never sent has nothing.
+        """
+        self._cycle_delivered = True
+
+    def _drain_gate_allows(self) -> bool:
+        """Whether to drain the offline queue this cycle — budget gate plus a
+        floor so it can never refuse forever.
+
+        The budget gate alone is a permanent freeze away from a real outage.
+        When the backend degrades on ``/session/start`` only, ``start_session``
+        raises, ``_session_active`` stays False, so ``need_session`` is True
+        every cycle and each cycle burns a ~94s chain there before reaching any
+        delivery gate. Both the send loop and this drain then see elapsed >= the
+        budget, so the cycle sends nothing AND drains nothing — forever, with a
+        green heartbeat ("alive but uploads frozen"). Events pile up to
+        ``max_size`` and oldest-eviction begins destroying billable time.
+
+        The floor is on the DRAIN rather than on the first send group, which is
+        what the send-side gate's own comment would suggest. Reason: a blocked
+        send is not a lost send — ``_send_events`` enqueues those events into the
+        durable queue. So the drain is the COMPLETE delivery surface; everything
+        reaches the server through it eventually. Forcing only the first send
+        group would deliver one bucket group per forced cycle while the queue
+        behind it grew without bound, which is the data-loss half of the bug
+        left intact. Forcing the drain instead moves the whole backlog: it
+        carries up to ``batch_size * 10`` events, far more than a few cycles of
+        capture, so the queue cannot run away.
+
+        Counted per CYCLE, and only when the cycle delivered NOTHING. A cycle
+        that spent the budget but still put events on the wire is the gate
+        working exactly as designed and resets the counter — otherwise a merely
+        slow-but-healthy agent would be forced into a second chain every few
+        cycles for no reason.
+
+        The cost is explicit and bounded: a forced drain can put a cycle at
+        ~94s (session chain) + ~94s (drain) ~= 188s, over the 150s "Sync hung"
+        report threshold though well under the 420s wedge ceiling — and at most
+        once every ``_DELIVERY_STARVATION_FLOOR_CYCLES + 1`` cycles, because
+        the forced drain itself resets the counter. A noisy watchdog report
+        every few cycles is the correct trade against silently losing billed
+        time; the report is also how an operator finds out this is happening.
+        """
+        if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+            self._consecutive_undelivered_cycles = 0
+            return True
+        if self._cycle_delivered:
+            return False
+        self._consecutive_undelivered_cycles += 1
+        if self._consecutive_undelivered_cycles < self._DELIVERY_STARVATION_FLOOR_CYCLES:
+            return False
+        logger.warning(
+            "Delivery starvation floor engaged: %d consecutive cycles delivered "
+            "NOTHING because the %ds in-cycle network budget was already spent "
+            "before any upload could start (queue_size=%d). Forcing one queue "
+            "drain through — this cycle may exceed the sync watchdog, which is "
+            "the intended trade against a permanently frozen upload path. "
+            "Something ahead of the upload (session start / config fetch) is "
+            "burning the whole budget every cycle; that is the real fault.",
+            self._consecutive_undelivered_cycles,
+            self._QUEUE_SKIP_IF_CYCLE_ELAPSED,
+            self.queue.size(),
+        )
+        self._consecutive_undelivered_cycles = 0
+        return True
 
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
@@ -3590,6 +3684,7 @@ class SyncEngine:
             event_ids = [q.id for q in queued]
 
             try:
+                self._note_delivery_attempt()
                 result = self.bf.send_events(events)
                 if result.success:
                     self.queue.remove(event_ids)
