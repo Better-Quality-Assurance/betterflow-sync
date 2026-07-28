@@ -36,6 +36,60 @@ logger = logging.getLogger(__name__)
 
 AGENT_VERSION = __version__
 
+# Bounds on the per-event rejection reasons echoed into the local log. The
+# server's `error` string is an exception message, so it is attacker-free but
+# arbitrarily long and may quote a row (window title included) — cap both the
+# number of entries and each string so a pathological batch cannot flood the
+# log file the 30-day retention policy caps.
+MAX_LOGGED_REJECTIONS = 5
+MAX_REJECTION_REASON_CHARS = 200
+
+
+def _clip_for_log(value: str) -> str:
+    """Cap one server-supplied string so the bound above actually holds."""
+    if len(value) > MAX_REJECTION_REASON_CHARS:
+        return value[:MAX_REJECTION_REASON_CHARS] + "…"
+    return value
+
+
+def _log_server_rejections(errors: object) -> None:
+    """Log the server's per-event rejection reasons for a batch, if any.
+
+    The BetterFlow API answers a batch with ``{processed, failed, errors:
+    [{event, error}, ...], accepted_ids}``. An event that lands in ``errors``
+    is deliberately NOT acknowledged, so the offline queue retries it every
+    cycle and eventually drops it at the retry ceiling. Without this the drop
+    is reported with no cause: the server said why and the agent threw it away.
+
+    LOCAL LOG ONLY — deliberately not attached to the ops report. Drop reports
+    go to the cross-tenant BetterQA ops ingest, which by policy carries bucket
+    TYPES and coarse ages, never event content (privacy F3/F4); a server
+    exception message can embed a window title. The tenant's own admin already
+    has a path to this text: the ``logs_requested`` log upload.
+    """
+    if not isinstance(errors, list) or not errors:
+        return
+    shown = []
+    for entry in errors[:MAX_LOGGED_REJECTIONS]:
+        if isinstance(entry, dict):
+            # `or` not a .get default: an explicit null id must not print "None".
+            event_id = str(entry.get("event") or "unknown")
+            reason = str(entry.get("error") or "unspecified")
+        else:
+            event_id, reason = "unknown", str(entry)
+        # Both halves are server-supplied and neither is length-bounded by the
+        # API contract, so clip the id as well — capping only the reason leaves
+        # the flood this bound exists to prevent wide open.
+        shown.append(f"{_clip_for_log(event_id)}: {_clip_for_log(reason)}")
+    omitted = len(errors) - len(shown)
+    suffix = f" (+{omitted} more)" if omitted > 0 else ""
+    logger.warning(
+        "Server rejected %d event(s) in this batch — %s%s",
+        len(errors),
+        "; ".join(shown),
+        suffix,
+    )
+
 
 @dataclass
 class DeviceInfo:
@@ -362,6 +416,17 @@ class BetterFlowClient(BaseApiClient):
             accepted_ids = payload.get("accepted_ids") or []
             synced = payload.get("processed", payload.get("synced"))
             queued = payload.get("failed", payload.get("queued", 0))
+
+            # The server already tells us WHY it refused each event
+            # (AgentEventController returns `errors: [{event, error}, ...]`
+            # alongside `failed`), and until now nothing read it. A refused
+            # event is never in accepted_ids, so the queue retries it every
+            # cycle until it crosses the ceiling and is reported as
+            # "Dropped N queued event(s) after max retries" — with the one
+            # piece of evidence that names the cause discarded at this line.
+            # That is why the recurring buckets=bf-status drop has no known
+            # mechanism across five releases.
+            _log_server_rejections(payload.get("errors"))
 
             # No delivery confirmation — do not assume anything persisted. The
             # server was reached but gave no per-event verdict, so this is
