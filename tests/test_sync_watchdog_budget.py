@@ -165,3 +165,29 @@ def test_queue_drain_skip_keeps_dual_chain_under_watchdog():
         f"queue-skip budget {budget}s + one chain {worst_chain:.1f}s = "
         f"{budget + worst_chain:.1f}s must stay under the {deadline}s watchdog"
     )
+
+
+def test_two_stacked_upload_chains_would_exceed_watchdog():
+    """Documents WHY the send loop's first group must respect the budget: a
+    session-start chain and a first-send chain are each ~94s, so two stacked
+    UNCONDITIONAL chains (~188s) would blow the 150s watchdog. The fix ensures at
+    most ONE chain runs past the budget cut (asserted in
+    tests/test_sync_send_budget.py::
+    test_session_start_chain_then_send_does_not_stack_past_watchdog), keeping the
+    worst-case cycle network cost at budget + one chain < deadline."""
+    from src.sync.sync_engine import SyncEngine
+
+    cfg = BaseApiClient.DEFAULT_RETRY_CONFIG
+    worst = _worst_case_chain_seconds(cfg, _client_default_timeout())
+    deadline = SyncCoordinator._DO_SYNC_DEADLINE
+
+    assert 2 * worst > deadline, (
+        f"two stacked chains {2 * worst:.1f}s must exceed the {deadline}s "
+        f"watchdog — that overrun is the residual the first-send-group budget "
+        f"gate closes"
+    )
+    assert SyncEngine._SEND_SKIP_IF_CYCLE_ELAPSED + worst < deadline, (
+        f"but budget {SyncEngine._SEND_SKIP_IF_CYCLE_ELAPSED}s + one chain "
+        f"{worst:.1f}s stays under {deadline}s — so gating every group (incl. the "
+        f"first) on the budget bounds the cycle to one surviving chain"
+    )

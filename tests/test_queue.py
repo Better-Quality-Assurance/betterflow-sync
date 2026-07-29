@@ -1,11 +1,16 @@
 """Tests for offline queue."""
 
+import json
 import pytest
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from src.sync.queue import OfflineQueue, QueuedEvent
+from src.sync.queue import (
+    MAX_EVENT_DURATION_SECONDS,
+    OfflineQueue,
+    QueuedEvent,
+)
 
 
 class TestOfflineQueue:
@@ -157,6 +162,231 @@ class TestOfflineQueue:
         assert self.queue.remove_failed(max_retries=5) == 0
         assert self.queue.dead_letter_count() == 0
         assert self.queue.size() == 1
+
+    def test_requeue_storable_dead_letter_resurrects_only_storable(self):
+        """The bounded dead-letter replay must resurrect a dead-lettered row that
+        is storable AGAIN (bucket + timestamp within retention + duration inside
+        the server's bounds) while leaving genuinely-unstorable rows in the
+        dead-letter table. Mirrors evict_unstorable's classification, so a row the
+        server would still reject is never resurrected."""
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        recent_ts = (now - timedelta(hours=1)).isoformat()
+        stale_ts = (now - timedelta(days=30)).isoformat()
+
+        storable = {
+            "id": "storable-1", "bucket_id": "aw-watcher-afk_host",
+            "timestamp": recent_ts, "duration": 42, "data": {"status": "not-afk"},
+        }
+        no_bucket = {"id": "nobucket-1", "timestamp": recent_ts, "data": {}}
+        stale = {
+            "id": "stale-1", "bucket_id": "aw-watcher-window_host",
+            "timestamp": stale_ts, "data": {},
+        }
+        # The weekend lid-close span: recent AND routable, so the bucket+timestamp
+        # pair alone calls it storable — but its duration is past the server's
+        # accepted bound, which is exactly why evict_unstorable dead-lettered it.
+        # Resurrecting it re-poisons the batch it rides in and drags its healthy
+        # neighbours to the drop ceiling, then re-evicts with a fresh dropped_at
+        # so the cooldown restarts and the loop runs every 30 min for the whole
+        # retention window.
+        over_long = {
+            "id": "overlong-1", "bucket_id": "bf-status_host",
+            "timestamp": recent_ts,
+            "duration": MAX_EVENT_DURATION_SECONDS + 3600,
+            "data": {"status": "sleep"},
+        }
+
+        # Drive them to the retry ceiling and let remove_failed dead-letter all
+        # four (a poison batch bumps storable + unstorable together — exactly
+        # what evict_unstorable/#130 exists to prevent, but historical rows and
+        # genuine 4xx-rejected storable events still land here).
+        self.queue.enqueue([storable, no_bucket, stale, over_long])
+        queued = self.queue.dequeue(batch_size=10)
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+        # now= is REQUIRED, not tidiness: dropped_at is what the replay's
+        # cooldown filters on, so a real-clock stamp against an injected reader
+        # clock makes this test fail on a date, not on a defect.
+        self.queue.remove_failed(
+            max_retries=5, last_error="poison batch", now=now
+        )
+        assert self.queue.dead_letter_count() == 4
+        assert self.queue.is_empty()
+
+        # min_dead_age_seconds=0 isolates the storable/unstorable classification
+        # from the cooldown gate (exercised separately below).
+        result = self.queue.requeue_storable_dead_letter(now=now, min_dead_age_seconds=0)
+
+        # Only the storable row returned to the live queue.
+        assert result["requeued"] == 1
+        assert result["skipped_unstorable"] == 3
+        assert self.queue.size() == 1
+        # The three unstorable rows stay dead-lettered — not resurrected, not lost.
+        assert self.queue.dead_letter_count() == 3
+        assert {
+            json.loads(row["event_data"])["id"]
+            for row in self.queue.get_dead_letter_events()
+        } == {"nobucket-1", "stale-1", "overlong-1"}
+        # The resurrected event is the storable one, retry_count reset so it gets
+        # a fresh delivery attempt (not instantly re-dropped at the ceiling).
+        back = self.queue.dequeue(batch_size=10)
+        assert len(back) == 1
+        assert back[0].event_data["id"] == "storable-1"
+        assert back[0].retry_count == 0
+
+    def test_requeue_storable_dead_letter_bounded_and_no_double_resurrect(self):
+        """Bounded by ``limit``; MOVE semantics mean a resurrected row leaves the
+        dead-letter table, so it can never be requeued twice (no double-send)."""
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        recent_ts = (now - timedelta(hours=1)).isoformat()
+        events = [
+            {"id": f"s{i}", "bucket_id": "aw-watcher-afk_h",
+             "timestamp": recent_ts, "data": {}}
+            for i in range(5)
+        ]
+        self.queue.enqueue(events)
+        queued = self.queue.dequeue(batch_size=10)
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+        self.queue.remove_failed(max_retries=5, now=now)
+        assert self.queue.dead_letter_count() == 5
+
+        first = self.queue.requeue_storable_dead_letter(
+            now=now, limit=2, min_dead_age_seconds=0
+        )
+        assert first["requeued"] == 2
+        assert self.queue.dead_letter_count() == 3  # 2 moved out
+        assert self.queue.size() == 2
+
+        # Drain the requeued ones, then resurrect the rest. Total resurrected
+        # across both calls is exactly 5 — the first two are never re-moved.
+        self.queue.clear()
+        second = self.queue.requeue_storable_dead_letter(
+            now=now, limit=100, min_dead_age_seconds=0
+        )
+        assert second["requeued"] == 3
+        assert self.queue.dead_letter_count() == 0
+        assert self.queue.size() == 3
+
+    def test_requeue_storable_dead_letter_cooldown_holds_fresh_drops(self):
+        """A row must sit past the cooldown before the replay retries it — so a
+        batch ``remove_failed`` JUST dropped for a genuine definitive rejection is
+        not instantly resurrected into the same 4xx (which would re-block the
+        queue head and thrash drop→resurrect→drop). Once the cooldown elapses the
+        SAME storable row IS resurrected."""
+        event = {
+            "id": "storable-cd", "bucket_id": "aw-watcher-afk_h",
+            "timestamp": datetime.now(timezone.utc).isoformat(), "data": {},
+        }
+        self.queue.enqueue([event])
+        queued = self.queue.dequeue(batch_size=10)
+        for _ in range(5):
+            self.queue.increment_retry([q.id for q in queued])
+        self.queue.remove_failed(max_retries=5)  # dropped_at ~= real now
+        assert self.queue.dead_letter_count() == 1
+
+        # Immediately (well within the 30-min cooldown): held, not resurrected.
+        held = self.queue.requeue_storable_dead_letter(min_dead_age_seconds=1800)
+        assert held["requeued"] == 0
+        assert self.queue.dead_letter_count() == 1
+        assert self.queue.is_empty()
+
+        # After the cooldown has elapsed (evaluate with a future `now`): the same
+        # storable row is resurrected for another attempt.
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        aged = self.queue.requeue_storable_dead_letter(
+            now=future, min_dead_age_seconds=1800
+        )
+        assert aged["requeued"] == 1
+        assert self.queue.dead_letter_count() == 0
+        assert self.queue.size() == 1
+
+    def _dead_letter_storable(self, queue, count: int, now: datetime) -> None:
+        """Drive ``count`` storable events to the ceiling and dead-letter them."""
+        recent_ts = (now - timedelta(hours=1)).isoformat()
+        queue.enqueue([
+            {"id": f"dl{i}", "bucket_id": "aw-watcher-afk_h",
+             "timestamp": recent_ts, "duration": 30, "data": {}}
+            for i in range(count)
+        ])
+        queued = queue.dequeue(batch_size=1000)
+        for _ in range(5):
+            queue.increment_retry([q.id for q in queued])
+        queue.remove_failed(max_retries=5, now=now)
+
+    def test_requeue_storable_dead_letter_respects_max_size(self):
+        """The replay raw-INSERTs into queued_events, skipping the max_size check
+        and oldest-eviction that enqueue() performs. dead_letter_events is never
+        pruned, so on the first post-upgrade drain a device carrying weeks of
+        dead letters resurrects up to `limit` rows per cycle straight past
+        max_size — and capacity_percent() then pins at 1.0 permanently.
+
+        The replay must take only the headroom that exists. It must NOT reuse
+        enqueue()'s oldest-eviction: that would delete live, never-rejected
+        events to make room for already-rejected ones.
+        """
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        path = Path(self.temp_dir) / "cap.db"
+        queue = OfflineQueue(db_path=path, max_size=10)
+        try:
+            self._dead_letter_storable(queue, 8, now)
+            assert queue.dead_letter_count() == 8
+
+            # 8 live events already in the queue: headroom is 2, not 8.
+            live = [
+                {"id": f"live{i}", "bucket_id": "aw-watcher-window_h",
+                 "timestamp": (now - timedelta(minutes=5)).isoformat(),
+                 "duration": 10, "data": {}}
+                for i in range(8)
+            ]
+            queue.enqueue(live)
+            assert queue.size() == 8
+
+            result = queue.requeue_storable_dead_letter(now=now, min_dead_age_seconds=0)
+
+            assert queue.size() <= 10, (
+                "the replay resurrected past max_size; capacity_percent() now "
+                "pins at 1.0 and every capacity signal is dead"
+            )
+            assert result["requeued"] == 2
+            # The 6 that did not fit are still preserved, not lost.
+            assert queue.dead_letter_count() == 6
+            # And no live event was evicted to make room for a dead-lettered one.
+            back = queue.dequeue(batch_size=100)
+            assert sum(1 for q in back if q.event_data["id"].startswith("live")) == 8
+        finally:
+            queue.close()
+
+    def test_requeue_storable_dead_letter_at_capacity_resurrects_nothing(self):
+        """No headroom at all → the replay is a clean no-op. Rows stay
+        dead-lettered for a later cycle; nothing is dropped to make room."""
+        now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        path = Path(self.temp_dir) / "full.db"
+        queue = OfflineQueue(db_path=path, max_size=5)
+        try:
+            self._dead_letter_storable(queue, 4, now)
+            queue.enqueue([
+                {"id": f"live{i}", "bucket_id": "aw-watcher-window_h",
+                 "timestamp": (now - timedelta(minutes=5)).isoformat(),
+                 "duration": 10, "data": {}}
+                for i in range(5)
+            ])
+            assert queue.size() == 5
+            assert queue.capacity_percent() == 1.0
+
+            result = queue.requeue_storable_dead_letter(now=now, min_dead_age_seconds=0)
+
+            assert result["requeued"] == 0
+            assert queue.size() == 5
+            assert queue.dead_letter_count() == 4
+        finally:
+            queue.close()
+
+    def test_requeue_storable_dead_letter_empty_is_noop(self):
+        """Nothing dead-lettered → a clean zero result, no error."""
+        result = self.queue.requeue_storable_dead_letter()
+        assert result["requeued"] == 0
+        assert result["skipped_unstorable"] == 0
 
     def test_failed_event_summary_reports_buckets_and_span(self):
         """The drop summary carries enough to diagnose the loss: count, the

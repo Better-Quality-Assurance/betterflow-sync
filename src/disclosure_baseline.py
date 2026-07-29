@@ -535,6 +535,21 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # fact about whether a watcher on this machine is working, never about what
     # the person did.
     "window_tracker_blind",
+    # How many events this device captured but failed to DELIVER — they
+    # exhausted their retries and were preserved locally rather than deleted.
+    # A single integer, and only ever a count: it carries no event, no bucket,
+    # no timestamp, no window title, and nothing that distinguishes one
+    # person's activity from another's. It says "this machine is holding N
+    # undelivered records", which is the delivery-health counterpart of
+    # consecutive_sync_failures and sync_stale_seconds, both already here.
+    #
+    # It reports a delivery FAILURE, so it can only ever describe the agent
+    # doing LESS than the notice says, never more. It was already computed on
+    # every heartbeat and filtered out at this gate, which is why no device has
+    # ever reported a backlog. Same reading as tracker_download_failed above:
+    # if the category is ever contested, the safe answer is to keep the field
+    # and update the notice text, not to drop it and go back to blind.
+    "dead_letter_count",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so

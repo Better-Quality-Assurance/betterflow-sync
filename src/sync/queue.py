@@ -22,6 +22,7 @@ __all__ = [
     "is_event_storable",
     "normalized_project_id",
     "MAX_EVENT_DURATION_SECONDS",
+    "EVENT_RETENTION_DAYS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,17 @@ logger = logging.getLogger(__name__)
 # whole-batch retry bump then drags its storable neighbours to the drop ceiling
 # in lockstep. Evicting the over-long span first keeps every batch clean.
 MAX_EVENT_DURATION_SECONDS = 86400  # 24h, mirrors the server-side validator
+
+# The server's retention window: it rejects an event whose timestamp is older
+# than this, so the agent treats such an event as unstorable rather than holding
+# it forever. ONE definition, deliberately — this was written four times (three
+# `stale_after_days` defaults here plus a bare `timedelta(days=7)` in
+# SyncEngine._batch_has_storable_activity), and eviction and the dead-letter
+# replay are now a PAIRED loop. A drift between two copies is self-sustaining,
+# not merely wrong: widen one and eviction drops a row the replay resurrects
+# every cooldown, with `dropped_at` restamped on each pass so the cooldown never
+# terminates it. Same reasoning that gave MAX_EVENT_DURATION_SECONDS its name.
+EVENT_RETENTION_DAYS = 7
 
 
 def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
@@ -189,11 +201,34 @@ class OfflineQueue:
         return self._local.connection
 
     @contextmanager
-    def _cursor(self) -> Iterator[sqlite3.Cursor]:
-        """Context manager for database cursor."""
+    def _cursor(self, *, immediate: bool = False) -> Iterator[sqlite3.Cursor]:
+        """Context manager for database cursor.
+
+        ``immediate=True`` opens the transaction with ``BEGIN IMMEDIATE`` BEFORE
+        the first statement runs. Required for every read-then-write sequence
+        that claims atomicity, because pysqlite's implicit transaction does not
+        begin until the first DML statement — so a ``SELECT`` that CHOOSES the
+        rows a later ``INSERT``/``DELETE`` acts on runs in autocommit, outside
+        the transaction, and is not protected by it.
+
+        Connections are per-thread here, so two threads reach the same file with
+        two connections and can both read the same rows before either writes.
+        That is reachable in production, not theoretical:
+        ``main._acquire_sync_slot`` abandons a wedged cycle after 420s and starts
+        a fresh ``_do_sync`` while the zombie thread is still inside
+        ``_process_queue``.
+
+        This does not add a new way to fail. Every caller that needs it already
+        had to take the same write lock for its ``INSERT``; ``BEGIN IMMEDIATE``
+        only takes it earlier, so the contention window shrinks rather than
+        grows. A conflicting writer blocks for the connection's busy timeout
+        exactly as it did before.
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
+            if immediate:
+                cursor.execute("BEGIN IMMEDIATE")
             yield cursor
             conn.commit()
         except Exception:
@@ -365,8 +400,13 @@ class OfflineQueue:
             logger.warning(f"Batch larger than max_size, truncated to {len(events)} events")
 
         now = datetime.now(timezone.utc).isoformat()
-        with self._cursor() as cursor:
-            # Atomic: check size + evict + insert in a single transaction
+        with self._cursor(immediate=True) as cursor:
+            # Atomic: check size + evict + insert in a single transaction.
+            # immediate=True is what makes that claim TRUE — the COUNT decides
+            # how many rows to evict, so it has to be inside the transaction the
+            # eviction runs in. Without it two concurrent enqueues both read the
+            # same count, both decide there is room, and the queue overshoots
+            # max_size.
             cursor.execute("SELECT COUNT(*) FROM queued_events")
             current_size = cursor.fetchone()[0]
             if current_size + len(events) > self.max_size:
@@ -496,7 +536,7 @@ class OfflineQueue:
         max_retries: int = 5,
         *,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
     ) -> dict:
         """Summarize events at/over the retry ceiling that remove_failed() is
         about to drop. Read-only — does NOT delete.
@@ -564,7 +604,11 @@ class OfflineQueue:
         return _timestamp_within(ts, cutoff)
 
     def remove_failed(
-        self, max_retries: int = 5, *, last_error: Optional[str] = None
+        self,
+        max_retries: int = 5,
+        *,
+        last_error: Optional[str] = None,
+        now: Optional[datetime] = None,
     ) -> int:
         """Move events that have exceeded max retries to the dead-letter table.
 
@@ -576,23 +620,40 @@ class OfflineQueue:
         out for queryability), created_at, retry_count, an optional last_error,
         and a dropped_at stamp — nothing is silently lost.
 
-        The INSERT and the matching DELETE run inside the SAME ``_cursor()``
-        transaction (committed atomically on exit), so a crash can never both
-        drop the events from the queue AND fail to record the dead letter. The
-        DELETE targets the exact ids that were moved (not the ``>= max_retries``
-        predicate) so a concurrent writer that pushes another event over the
-        ceiling between the SELECT and the DELETE can't have it deleted without
-        first being dead-lettered.
+        The selecting SELECT, the INSERT and the matching DELETE all run inside
+        the SAME ``BEGIN IMMEDIATE`` ``_cursor()`` transaction (committed
+        atomically on exit), so a crash can never both drop the events from the
+        queue AND fail to record the dead letter. The DELETE targets the exact
+        ids that were moved (not the ``>= max_retries`` predicate) so a
+        concurrent writer that pushes another event over the ceiling between the
+        SELECT and the DELETE can't have it deleted without first being
+        dead-lettered.
+
+        ``immediate=True`` is load-bearing for the same reason as in
+        ``requeue_storable_dead_letter``: pysqlite opens the implicit
+        transaction at the first DML, so the SELECT that CHOOSES the rows used
+        to run in autocommit. Two threads then both selected the same event and
+        wrote TWO dead-letter rows for it — and the replay resurrects both, so
+        the same billable span is delivered twice.
 
         Args:
             max_retries: Maximum retry attempts
             last_error: Optional context recorded on each dead-lettered row
+            now: Injectable clock for deterministic tests (defaults to UTC now),
+                matching ``evict_unstorable`` and ``requeue_storable_dead_letter``.
+                Load-bearing, not a convenience: ``dropped_at`` is the column the
+                replay's cooldown filters on (``WHERE dropped_at <= cutoff``).
+                Stamping it from the real clock while a caller injects ``now``
+                into the reader makes the two drift apart the moment wall-clock
+                passes the fixture's date — every dead-lettered row then sorts
+                AFTER the cutoff, the replay selects nothing, and the failure
+                looks like a broken feature rather than a stale fixture.
 
         Returns:
             Number of events moved out of the queue
         """
-        now = datetime.now(timezone.utc).isoformat()
-        with self._cursor() as cursor:
+        now = (now or datetime.now(timezone.utc)).isoformat()
+        with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 """
                 SELECT id, event_data, created_at, retry_count
@@ -649,7 +710,7 @@ class OfflineQueue:
         self,
         *,
         now: Optional[datetime] = None,
-        stale_after_days: int = 7,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
         last_error: Optional[str] = None,
     ) -> dict:
         """Move events the server can NEVER accept out of the active queue and
@@ -702,7 +763,11 @@ class OfflineQueue:
             "unstorable_count": 0,
         }
 
-        with self._cursor() as cursor:
+        # immediate=True: same shape as remove_failed — the SELECT chooses which
+        # rows get MOVED, so it belongs inside the write transaction. Two
+        # concurrent evictions would otherwise both select the same event and
+        # write it to dead_letter twice.
+        with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 "SELECT id, event_data, created_at, retry_count FROM queued_events"
             )
@@ -903,6 +968,207 @@ class OfflineQueue:
                 (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    # A dead-lettered row must sit at least this long before the replay retries
+    # it. Two reasons: (1) it keeps the replay from immediately re-resurrecting a
+    # row that ``remove_failed`` JUST dropped for a genuine definitive 4xx —
+    # without it, a poison-but-storable batch would drop→resurrect→drop every
+    # cycle and re-block the queue head (defeating the head-of-line-block drop).
+    # (2) the case the replay exists for — a brief bad-deploy / server-validation
+    # window that 4xx-rejected good events — has passed by the time the cooldown
+    # elapses, so the retry lands after the transient condition cleared. Longer
+    # than the bad-deploy windows seen in the incident history (~1-2h would still
+    # get a retry every cooldown until it succeeds or ages out of retention).
+    _DEAD_LETTER_REPLAY_COOLDOWN_SECONDS = 1800  # 30 min
+
+    def requeue_storable_dead_letter(
+        self,
+        *,
+        limit: int = 200,
+        now: Optional[datetime] = None,
+        stale_after_days: int = EVENT_RETENTION_DAYS,
+        min_dead_age_seconds: Optional[float] = None,
+    ) -> dict:
+        """Resurrect dead-lettered rows that are STORABLE again — move them back
+        into the live queue for another delivery attempt.
+
+        Dead-lettering preserves rejected events (``remove_failed`` /
+        ``evict_unstorable``) but nothing re-enqueued them, so real activity that
+        hit a transient-looking-definitive 4xx (a server-side validation bug, a
+        brief bad-deploy window) sat in ``dead_letter_events`` forever. This is
+        the bounded, conservative replay path.
+
+        A row is eligible only if it is storable NOW by the shared
+        ``is_event_storable`` — the SAME function (not "the same rule") that
+        ``evict_unstorable``, ``failed_event_summary`` and
+        ``_batch_has_storable_activity`` call, so the replay can never resurrect
+        something eviction would immediately remove again. That requires a
+        ``bucket_id`` to route to, a ``timestamp`` still within the server's
+        retention window (``stale_after_days``), AND a ``duration`` inside the
+        server's accepted 0..``MAX_EVENT_DURATION_SECONDS`` bounds. Rows with no
+        bucket, an unparseable payload, an over-long duration, or a timestamp
+        that has since aged past retention are genuinely unstorable and are LEFT
+        in the dead-letter table — never resurrected into a batch the server
+        would only reject again.
+
+        Conservative by construction:
+        - **Cooldown** — a row is skipped until it has sat in the dead-letter
+          table for ``min_dead_age_seconds`` (default
+          ``_DEAD_LETTER_REPLAY_COOLDOWN_SECONDS``). This stops the replay from
+          instantly re-resurrecting a row ``remove_failed`` just dropped for a
+          genuine definitive rejection (which would re-block the queue head and
+          thrash drop→resurrect→drop every cycle), and gives a transient
+          server-side condition time to clear before the retry.
+        - **Bounded** — at most ``limit`` rows per call (oldest dead-letter
+          first), so a large table can't flood one cycle.
+        - **Capacity-respecting** — bounded a second time by the live queue's
+          remaining headroom (``max_size`` minus current size), so the replay
+          can approach ``max_size`` but never cross it. It does NOT reuse
+          ``enqueue``'s oldest-eviction: evicting live, never-rejected events to
+          make room for already-rejected ones is the wrong trade for billed
+          time. Rows that don't fit stay dead-lettered for a later cycle.
+        - **MOVE, not copy** — the candidate SELECT, the ``queued_events``
+          INSERT and the ``dead_letter_events`` DELETE all run inside ONE
+          ``BEGIN IMMEDIATE`` transaction, so a row can never be resurrected
+          twice (no double-send), and a crash can't both drop it from the
+          dead-letter table and fail to re-enqueue it. The SELECT has to be
+          inside it: pysqlite's implicit transaction does not open until the
+          first DML, so a plain ``_cursor()`` left the row-choosing read in
+          autocommit and two threads could both select the same ids and both
+          INSERT a copy. Reachable via ``main._acquire_sync_slot``, which
+          abandons a wedged cycle after 420s and starts a fresh ``_do_sync``
+          while the zombie is still inside ``_process_queue``.
+        - **Fresh retry budget** — the row re-enters with ``retry_count`` reset
+          to 0 (the default), so it isn't instantly re-dropped at the ceiling.
+        - **Self-limiting churn** — a genuinely-poison row that keeps getting
+          re-rejected is retried at most once per cooldown, and only until its
+          timestamp ages past the retention window, after which it's classified
+          unstorable and left alone. The server also upserts by event id, so a
+          resurrected event that was actually already stored is deduped, not
+          duplicated.
+
+        Returns ``{examined, requeued, skipped_unstorable}`` — ``examined``
+        counts only rows past the cooldown (younger rows aren't looked at).
+
+        ``now`` is injectable for deterministic tests (defaults to UTC now).
+        """
+        now = now or datetime.now(timezone.utc)
+        if min_dead_age_seconds is None:
+            min_dead_age_seconds = self._DEAD_LETTER_REPLAY_COOLDOWN_SECONDS
+        stale_cutoff = now - timedelta(days=stale_after_days)
+        cooldown_cutoff = (now - timedelta(seconds=min_dead_age_seconds)).isoformat()
+        requeued_at = now.isoformat()
+
+        # immediate=True: the SELECT below CHOOSES the rows the INSERT/DELETE act
+        # on, so it must be inside the write transaction, not ahead of it.
+        with self._cursor(immediate=True) as cursor:
+            # Capacity first, and read INSIDE this transaction so it can't go
+            # stale before the INSERT below acts on it. ``enqueue`` enforces
+            # max_size by evicting the OLDEST queued events; this raw-INSERT
+            # path bypassed that entirely, and dead_letter_events is never
+            # pruned — so on the first post-upgrade drain a device carrying
+            # weeks of dead letters resurrects up to ``limit`` rows per cycle
+            # straight past max_size, and capacity_percent() pins at 1.0 for
+            # good, killing every capacity signal built on it.
+            #
+            # We deliberately do NOT reuse enqueue()'s oldest-eviction here.
+            # That would delete LIVE, never-rejected events to make room for
+            # ALREADY-REJECTED ones — and resurrected rows re-enter with a fresh
+            # created_at, so they would be the newest rows and the live events
+            # would be the ones evicted. Strictly the wrong trade for billed
+            # time. Instead the replay takes only the headroom that exists: it
+            # can approach max_size but never cross it, and the rows that don't
+            # fit stay preserved in dead_letter_events for a later cycle rather
+            # than costing anything. (Keeping the capacity read here rather than
+            # calling enqueue() also preserves the MOVE atomicity — enqueue()
+            # opens its own _cursor()/transaction, which would split the INSERT
+            # from the dead-letter DELETE and reintroduce the double-send this
+            # function's BEGIN IMMEDIATE exists to close.)
+            cursor.execute("SELECT COUNT(*) FROM queued_events")
+            headroom = self.max_size - cursor.fetchone()[0]
+            if headroom <= 0:
+                logger.info(
+                    "Dead-letter replay skipped: live queue at capacity "
+                    "(%d/%d). Preserved rows stay dead-lettered for a later "
+                    "cycle — never dropped to make room.",
+                    self.max_size - headroom, self.max_size,
+                )
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+            effective_limit = min(limit, headroom)
+
+            # Only rows that have sat past the cooldown are candidates. The
+            # lexical comparison on ISO-8601 strings is chronological (every
+            # dropped_at is a tz-aware UTC isoformat), matching set_checkpoint_forward.
+            cursor.execute(
+                """
+                SELECT id, event_data FROM dead_letter_events
+                WHERE dropped_at <= ?
+                ORDER BY dropped_at ASC, id ASC
+                LIMIT ?
+                """,
+                (cooldown_cutoff, effective_limit),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+
+            move_ids: list[int] = []
+            new_rows: list[tuple] = []
+            for row in rows:
+                dead_id, raw = row[0], row[1]
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    # Unparseable → can never be stored → leave it dead-lettered.
+                    # is_event_storable also returns False for a non-dict, so
+                    # this None needs no separate branch below.
+                    ev = None
+                # THE shared classifier — never a local re-implementation of it.
+                # A hand-rolled `bucket_id AND timestamp-in-window` pair (what
+                # this was) silently omits the duration bound, so the exact
+                # poison ``evict_unstorable`` had just removed — an over-long
+                # weekend lid-close span — was resurrected a cooldown later,
+                # AFTER that cycle's eviction gate had already run. It then
+                # 4xx-rejected the whole batch it rode in, and _process_queue's
+                # whole-batch retry bump dragged its healthy neighbours to the
+                # drop ceiling; the re-eviction restamped ``dropped_at``, which
+                # restarted the cooldown, so the loop repeated every 30 min for
+                # the full retention window.
+                if not is_event_storable(ev, stale_cutoff=stale_cutoff):
+                    continue
+                move_ids.append(dead_id)
+                # Re-enter with a fresh created_at and default retry_count (0).
+                new_rows.append((raw, requeued_at))
+
+            if not move_ids:
+                return {
+                    "examined": len(rows),
+                    "requeued": 0,
+                    "skipped_unstorable": len(rows),
+                }
+
+            cursor.executemany(
+                "INSERT INTO queued_events (event_data, created_at) VALUES (?, ?)",
+                new_rows,
+            )
+            placeholders = ",".join("?" * len(move_ids))
+            cursor.execute(
+                f"DELETE FROM dead_letter_events WHERE id IN ({placeholders})",
+                move_ids,
+            )
+            requeued = len(move_ids)
+
+        if requeued > 0:
+            logger.info(
+                "Resurrected %d storable dead-lettered event(s) back into the "
+                "queue for another delivery attempt",
+                requeued,
+            )
+        return {
+            "examined": len(rows),
+            "requeued": requeued,
+            "skipped_unstorable": len(rows) - requeued,
+        }
 
     def size(self) -> int:
         """Get the current queue size."""

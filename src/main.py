@@ -1777,6 +1777,16 @@ class SyncCoordinator:
         last_ok = self._last_successful_sync
         if last_ok is not None:
             telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
+        # Surface the dead-letter table size so a growing backlog of preserved
+        # (but never-delivered) events is visible to ops. Nothing else reported
+        # it, so a silently climbing dead_letter_events — real lost activity —
+        # was invisible. Reported unconditionally (even 0) as an explicit health
+        # signal. Best-effort: a queue that can't answer must never block the
+        # heartbeat.
+        try:
+            telemetry["dead_letter_count"] = self.queue.dead_letter_count()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("dead_letter_count telemetry failed: %s", e)
         try:
             telemetry.update(self.aw_manager.health_snapshot())
         except Exception as e:  # noqa: BLE001
