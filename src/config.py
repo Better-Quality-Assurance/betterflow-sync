@@ -280,10 +280,12 @@ class SyncSettings:
     # / macOS CGEventTap) instead of relying on the external aw-watcher-input
     # tracker. Same convergence move as in_process_window, for machines where
     # aw-watcher-input's low-level hook is blocked (UIPI / AV) and reports ZERO
-    # keystrokes/clicks for hours (Fraud Risk 75). Default OFF — ships
-    # dormant/opt-in; when on AND an in-process backend is usable, the external
-    # input bucket is skipped so the two sources never double-count.
-    in_process_input: bool = False
+    # keystrokes/clicks for hours (Fraud Risk 75). Windows defaults ON because
+    # the external tracker is the known-bad path there; macOS stays opt-in under
+    # its Input Monitoring grant. A server config value can still explicitly
+    # switch it either way, and when on AND an in-process backend is usable, the
+    # external input bucket is skipped so the two sources never double-count.
+    in_process_input: bool = field(default_factory=lambda: sys.platform == "win32")
 
 
 @dataclass
@@ -454,28 +456,110 @@ DEFER_UNAPPLIED_SERVER_SETTINGS = True
 
 
 @lru_cache(maxsize=8)
-def _resolve_schedule_tz(name: str):
-    """Resolve a schedule timezone, logging an unresolvable one ONCE.
+def _resolve_zone(name: str):
+    """Resolve an IANA timezone name to a ZoneInfo, or None — QUIET (no logging).
 
-    allows() runs per event, so logging inside it flooded the log on a single
-    misconfigured timezone. lru_cache makes the body — and therefore the log line —
-    run once per distinct name for the life of the process.
+    The one place a name becomes a zone. Callers decide whether a miss is
+    noteworthy: a bad SCHEDULE anchor is (``_resolve_schedule_tz`` logs it); a
+    machine that only has a "+03:00" offset string is expected on a tz-database-less
+    host and must NOT log a schedule error (``_localize`` uses this directly).
+    lru_cache keeps ZoneInfo construction off the per-event/per-minute path.
     """
     if not name:
-        return None  # normal: production sends no timezone; use machine-local.
+        return None
     try:
         return ZoneInfo(name)
-    except Exception:
-        # SET but unresolvable means the tz database is missing (Windows without
-        # tzdata, which we now bundle). The machine-local fallback then evaluates the
-        # window in a clock the employee can change, so say so — but keep the
-        # fallback: failing closed here would silently stop tracking a whole platform.
+    except Exception:  # noqa: BLE001 — unresolvable/offset-string/missing tzdata
+        return None
+
+
+@lru_cache(maxsize=8)
+def _resolve_schedule_tz(name: str):
+    """Resolve a SCHEDULE anchor timezone, logging an unresolvable one ONCE.
+
+    A set-but-unresolvable anchor is a real config problem (missing tz database,
+    backend typo), so it is worth a one-time ERROR — unlike the machine's own tz,
+    which falls back silently. lru_cache makes the log line run once per name.
+    """
+    zone = _resolve_zone(name)
+    if name and zone is None:
         logger.error(
-            "Working-hours timezone %r could not be resolved (missing tz database?) "
-            "— falling back to machine-local time, which the user can change",
+            "Working-hours anchor timezone %r could not be resolved (missing tz "
+            "database?) — the window is judged in machine-local time instead",
             name,
         )
-        return None
+    return zone
+
+
+def _detect_machine_timezone_uncached() -> str:
+    """Actual OS timezone detection — see detect_machine_timezone for the cache."""
+    # macOS/Linux: /etc/localtime is a symlink into the zoneinfo database.
+    try:
+        link = os.readlink("/etc/localtime")
+        if "zoneinfo/" in link:
+            return link.split("zoneinfo/")[1]
+    except (OSError, IndexError):
+        pass
+
+    # Windows: tzlocal maps the registry zone to an IANA name.
+    try:
+        from tzlocal import get_localzone
+
+        return str(get_localzone())
+    except Exception:  # noqa: BLE001 — ImportError, or a tzlocal resolution failure
+        # Not fatal: the offset fallback below still yields a usable value; a debug
+        # line keeps this from being a fully silent swallow without flooding logs.
+        logger.debug("tzlocal unavailable/failed; using UTC-offset fallback for tz")
+
+    # Last resort: a fixed offset like "+03:00". Not an IANA name (so _resolve_zone
+    # returns None and _localize falls back to the raw machine clock), but it is what
+    # the heartbeat reports upstream.
+    offset = datetime.now(timezone.utc).astimezone().strftime("%z")  # "+0300"
+    return f"{offset[:3]}:{offset[3:]}" if offset else "UTC"
+
+
+_MACHINE_TZ_CACHE_SECONDS = 60.0
+
+
+@lru_cache(maxsize=2)
+def _detect_machine_timezone_bucketed(_bucket: int) -> str:
+    """Cached by a coarse monotonic time bucket so detect_machine_timezone serves a
+    single readlink/tzlocal result for the whole bucket. maxsize=2 keeps the current
+    and previous bucket; lru_cache is internally locked, so this is thread-safe."""
+    return _detect_machine_timezone_uncached()
+
+
+def detect_machine_timezone() -> str:
+    """The device's own local IANA timezone name, falling back to a UTC-offset
+    string. The SINGLE source of truth for "what timezone is this machine in" for
+    WINDOW EVALUATION and the HEARTBEAT report — so ``timezone_mismatch`` compares
+    the schedule anchor against the exact zone the agent reports, with no second
+    implementation to drift from it (BetterFlowClient._detect_timezone delegates
+    here). NB: other machine-local reasoning (date bucketing in sync_engine /
+    activity_analyzer) still uses raw ``.astimezone()``; this is not a global
+    machine-tz authority, only for the window+heartbeat.
+
+    Cached for ~``_MACHINE_TZ_CACHE_SECONDS`` because ``_localize`` calls it on every
+    ``allows()`` — i.e. once per event in the upload gate and up to thousands of
+    times in ``next_boundary_after``'s minute walk. A live readlink (and, on Windows,
+    a tzlocal registry lookup) on each of those was a needless syscall storm. The
+    staleness ceiling is harmless: enforcement re-evaluates every 60s anyway, so a
+    corrected OS clock still self-heals within a tick.
+    """
+    return _detect_machine_timezone_bucketed(int(time.monotonic() // _MACHINE_TZ_CACHE_SECONDS))
+
+
+@lru_cache(maxsize=8)
+def _warn_timezone_drift_once(anchor: str, machine: str) -> None:
+    """One WARNING per distinct (anchor, machine) pair — mirrors the once-logging of
+    _resolve_schedule_tz, since timezone_mismatch is polled every heartbeat."""
+    logger.warning(
+        "Working-hours anchor timezone %r differs from this device's timezone %r — "
+        "evaluating the window in the device's local time (self-healing) and "
+        "flagging the drift on the heartbeat so the schedule can be re-anchored.",
+        anchor,
+        machine,
+    )
 
 
 def _normalize_working_days(value) -> list:
@@ -515,6 +599,69 @@ class WorkingHoursConfig:
     timezone: str = ""
     known: bool = False
 
+    def _localize(self, when: "datetime") -> "datetime":
+        """Convert a UTC instant to the wall clock the window is evaluated on — the
+        ONE place every consumer (allows / window_close_after / next_boundary_after)
+        gets its local time, so they can never disagree.
+
+        The device's own local timezone is AUTHORITATIVE. It is resolved live on
+        every call (``detect_machine_timezone``) so that correcting a machine whose
+        zone was wrong takes effect immediately — the failure that silently zeroed
+        tracking was a schedule anchored to a stale/wrong reported zone that then
+        stuck. ``self.timezone`` (the server anchor) is deliberately NOT consulted
+        here; it survives only for drift DETECTION (``timezone_mismatch``).
+
+        Accepted trade-off (2026-07-22): the window now follows a clock the employee
+        can change, so someone could set their OS timezone to sit permanently
+        outside the window and avoid recording. That divergence is reported on the
+        heartbeat (``timezone_mismatch``) so the fleet can catch it — a signal the
+        previous silent-anchor behaviour never emitted, while it mis-tracked honest
+        misconfigurations far more often than it stopped abuse.
+
+        A detected value that is not a resolvable IANA name (the "+03:00" offset
+        fallback on a machine without a tz database) yields ``None`` here, and
+        ``when.astimezone()`` falls back to the raw system clock — the same last
+        resort as before. Resolved QUIETLY (via ``_resolve_zone``, not
+        ``_resolve_schedule_tz``): an offset-only machine is expected on a
+        tz-database-less host and must not log a schedule-anchor error.
+        """
+        zone = _resolve_zone(detect_machine_timezone())
+        return when.astimezone(zone) if zone else when.astimezone()
+
+    def timezone_mismatch(self) -> "Optional[str]":
+        """The schedule's anchored timezone when it currently evaluates the window at
+        a DIFFERENT UTC offset than this machine's own timezone — i.e. the anchor has
+        drifted from reality and the fleet should re-anchor it. Returns ``None`` when
+        there is nothing to report: schedule unknown or unrestricted, no anchor set
+        (machine-local is already the only clock), an unresolvable anchor (already
+        falls back to machine-local), or the two offsets agree right now.
+
+        Compares live UTC OFFSETS, not zone names, so equal-offset aliases
+        (``UTC``/``Etc/UTC``) and two zones that happen to share an offset today do
+        not false-positive, while a real gap (Los_Angeles vs Bucharest) does. Offsets
+        are DST-dependent, hence evaluated at the current instant.
+
+        Deliberately not a pure predicate: on a genuine drift it also emits a
+        once-per-(anchor, machine) WARNING via ``_warn_timezone_drift_once``. This is
+        the one place that both KNOWS a drift just occurred and holds the once-guard,
+        so "detect and announce the drift" is treated as one responsibility rather
+        than duplicating the guard in the sole caller (``_build_health_telemetry``).
+        All detection here is cache-served (see ``detect_machine_timezone``).
+        """
+        if not (self.known and self.enforced) or not self.timezone:
+            return None
+        anchor = _resolve_schedule_tz(self.timezone)
+        if anchor is None:
+            return None
+        now = datetime.now(timezone.utc)
+        # Machine offset via the SAME path _localize uses (detect_machine_timezone),
+        # NOT the raw system clock — otherwise a mocked/overridden machine zone would
+        # be compared against the real OS clock and disagree with what allows() does.
+        if now.astimezone(anchor).utcoffset() == self._localize(now).utcoffset():
+            return None
+        _warn_timezone_drift_once(self.timezone, detect_machine_timezone())
+        return self.timezone
+
     def allows(self, when: "datetime") -> bool:
         """True if this instant may be recorded at all — the single source of
         truth for both capture suppression (main) and the upload gate (sync).
@@ -529,8 +676,7 @@ class WorkingHoursConfig:
         if not self.enforced:
             return True
 
-        tz = _resolve_schedule_tz(self.timezone)
-        local = when.astimezone(tz) if tz else when.astimezone()
+        local = self._localize(when)
         hhmm = local.strftime("%H:%M")
 
         # An empty working_days is treated as "no working day at all", not "every
@@ -578,8 +724,7 @@ class WorkingHoursConfig:
         if not self.known or not self.enforced:
             return None
 
-        tz = _resolve_schedule_tz(self.timezone)
-        local = start.astimezone(tz) if tz else start.astimezone()
+        local = self._localize(start)
         end_h, end_m = (int(p) for p in self.work_end.split(":"))
         # NB: this clamps to work_end:00 exactly, which is ONE MINUTE EARLIER than
         # the instant allows() stops permitting recording. allows() compares HH:MM
@@ -716,14 +861,46 @@ class Config:
         if env_api_url:
             data["api_url"] = env_api_url.rstrip("/")
 
-        aw_data = data.pop("aw", {})
-        sync_data = data.pop("sync", {})
-        privacy_data = data.pop("privacy", {})
-        reminders_data = data.pop("reminders", {})
-        engagement_data = data.pop("engagement", {})
-        fraud_detection_data = data.pop("fraud_detection", {})
-        call_detection_data = data.pop("call_detection", {})
-        foreground_activity_data = data.pop("foreground_activity", {})
+        def _block(key: str) -> dict:
+            """Pop a nested settings block as a defensive COPY.
+
+            Two traps, closed for every block rather than the one that happened
+            to need it:
+
+            (a) `data = dict(data)` above is a TOP-LEVEL copy only, so popping a
+            key out of a nested block reaches through and mutates the CALLER's
+            dict — which the drops below (foreground_activity.enabled,
+            sync.in_process_input) do exactly.
+
+            (b) A hand-edited or corrupt block that is not a mapping (null, a
+            list, a string) used to reach `_safe()` as a non-mapping and raise.
+            `_from_dict` runs inside load()'s `except`, so ONE bad block silently
+            discarded the WHOLE config — api_url, working_hours, engagement, the
+            lot — and fell back to full defaults. Anything that is not a mapping
+            now degrades to {}, i.e. that block's defaults, and leaves the rest
+            of the file intact.
+            """
+            value = data.pop(key, None)
+            if isinstance(value, dict):
+                return dict(value)
+            if value is not None:
+                # Log it: degrading to defaults silently is how a partially
+                # reverted config looks identical to a healthy one.
+                logger.warning(
+                    "Config block %r is %s, not an object — using that block's "
+                    "defaults and keeping the rest of the file",
+                    key, type(value).__name__,
+                )
+            return {}
+
+        aw_data = _block("aw")
+        sync_data = _block("sync")
+        privacy_data = _block("privacy")
+        reminders_data = _block("reminders")
+        engagement_data = _block("engagement")
+        fraud_detection_data = _block("fraud_detection")
+        call_detection_data = _block("call_detection")
+        foreground_activity_data = _block("foreground_activity")
         # working_hours was missing from this list until 2026-07-14, so it fell
         # through to the **data splat below and was rebuilt as a plain dict. A
         # dict has no attributes: update_from_server's `self.working_hours.
@@ -732,7 +909,7 @@ class Config:
         # "enforced", False)` read False. Net effect: on EVERY device that had
         # ever written a config.json, working-hours enforcement was silently and
         # permanently off, and restricted users were recorded around the clock.
-        working_hours_data = data.pop("working_hours", {})
+        working_hours_data = _block("working_hours")
         # Ignore any persisted foreground_activity.enabled — it's server-driven
         # and default-OFF. A device that ran a default-ON beta build already has
         # enabled=true on disk; honouring it would override the safe default on
@@ -744,6 +921,22 @@ class Config:
             logger.info(
                 "Ignoring persisted foreground_activity.enabled=true on load; it "
                 "is server-driven and default-OFF (server re-enables per-session)"
+            )
+        # Same trap, opposite direction: in_process_input is PLATFORM-defaulted
+        # (True on Windows, where there is no external input tracker at all) and
+        # server-overridable. update_from_server ends with save(), so every agent
+        # that ever fetched config has "in_process_input": false on disk from the
+        # builds where it shipped dormant fleet-wide — and honouring that would
+        # pin the Windows default OFF on upgrade, leaving exactly the devices
+        # this exists for reporting zero keystrokes forever. Only a FRESH install
+        # would have gotten the fix. Drop it so the platform default wins on
+        # load; the server still switches it either way per session.
+        persisted_inproc_input = sync_data.pop("in_process_input", None)
+        if persisted_inproc_input is not None:
+            logger.info(
+                "Ignoring persisted sync.in_process_input=%s on load; it is "
+                "platform-defaulted and server-driven",
+                persisted_inproc_input,
             )
         data.pop("screenshots", None)
 
@@ -792,6 +985,12 @@ class Config:
         # devices that never saved it. Drop it so the code default always wins on
         # load and only the server can switch it on.
         data.get("foreground_activity", {}).pop("enabled", None)
+        # Never persist sync.in_process_input either — same reason, and this is
+        # the write side of the _from_dict drop above. It is platform-defaulted
+        # (Windows True: no external input tracker ships there) and server-
+        # overridable, so a value on disk can only ever outrank both and pin a
+        # Windows device at zero keystrokes across an upgrade.
+        data.get("sync", {}).pop("in_process_input", None)
         tmp_file = config_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:

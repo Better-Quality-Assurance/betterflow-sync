@@ -200,3 +200,92 @@ def test_is_input_like_only_matches_input_type():
     assert _is_input_like(BUCKET_TYPE_INPUT) is True
     assert _is_input_like(BUCKET_TYPE_WINDOW) is False
     assert _is_input_like(BUCKET_TYPE_AFK) is False
+
+
+# -- Private Time / pause must not bill the keystrokes typed inside it --------
+
+
+def _engine_with_live_input():
+    engine = _engine(True)
+    engine.input_source = _source()
+    engine.aw.get_window_buckets = Mock(return_value=[])
+    engine.aw.get_web_buckets = Mock(return_value=[])
+    engine.aw.get_afk_buckets = Mock(return_value=[])
+    engine.aw.get_input_buckets = Mock(return_value=[])
+    return engine
+
+
+def test_private_time_keystrokes_are_discarded_not_billed():
+    """_advance_checkpoints_to_now exists to stop events buffered during a
+    pause/private window reaching the server. It advanced the AFK and window
+    in-process checkpoints and forgot the INPUT one, and never cleared the
+    counters — so every keystroke typed during Private Time drained into the
+    first span after resume and was billed. Private Time contractually records
+    nothing.
+
+    Dormant until now only because in_process_input was off fleet-wide; the
+    Windows default-ON in this change set is what makes it live.
+    """
+    engine = _engine_with_live_input()
+    engine._input_inproc_checkpoint = T0
+
+    engine.input_source._on_press(500)   # typed during Private Time
+    engine.input_source._on_click(40)
+
+    engine._advance_checkpoints_to_now("private_leave")
+
+    assert engine.input_source.counts == (0, 0, 0), (
+        "counts accrued inside the private window must be discarded"
+    )
+    assert engine._input_inproc_checkpoint > T0, (
+        "and the checkpoint must skip the window, so the next drain cannot "
+        "reconstruct it"
+    )
+
+    # The real proof: the next drain emits nothing for the private span.
+    assert engine._build_inproc_input(
+        engine._input_inproc_checkpoint + timedelta(seconds=60)
+    )[0] is None
+
+
+def test_discarding_private_counts_does_not_touch_a_later_keystroke():
+    """Negative control: the discard must be bounded to the window, not a
+    blanket 'input never counts after a pause'."""
+    engine = _engine_with_live_input()
+    engine._input_inproc_checkpoint = T0
+    engine.input_source._on_press(500)
+
+    engine._advance_checkpoints_to_now("private_leave")
+
+    engine.input_source._on_press(7)  # typed AFTER resuming — real work
+    event, pending = engine._build_inproc_input(
+        engine._input_inproc_checkpoint + timedelta(seconds=60)
+    )
+    assert event is not None, "post-resume input must still be counted"
+    assert event["data"]["presses"] == 7
+
+
+def test_counts_are_discarded_even_when_the_backend_is_already_stopped():
+    """The discard must NOT be gated on available(): the working-hours close
+    stops the watchers first, so by the time the checkpoint advance runs the
+    backend already reports unavailable. A drain-based clear would no-op there
+    and strand the counts until counting resumed, which is the whole bug. Both
+    tests above run with a live backend, so neither would notice the gate.
+    """
+    engine = _engine(True)
+    engine.input_source = InputSource(hostname="host", backend=None,
+                                      frontmost_app_getter=None)
+    engine.aw.get_window_buckets = Mock(return_value=[])
+    engine.aw.get_web_buckets = Mock(return_value=[])
+    engine.aw.get_afk_buckets = Mock(return_value=[])
+    engine.aw.get_input_buckets = Mock(return_value=[])
+    engine._input_inproc_checkpoint = T0
+    engine.input_source._on_press(9)
+    assert engine.input_source.available() is False
+    assert engine.input_source.counts == (9, 0, 0)  # not vacuous: they are there
+
+    engine._advance_checkpoints_to_now("capture_resume")
+
+    assert engine.input_source.counts == (0, 0, 0), (
+        "counts stranded in a stopped source must still be discarded"
+    )

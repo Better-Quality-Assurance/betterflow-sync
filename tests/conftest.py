@@ -19,6 +19,17 @@ import pytest
 import src.config as config_module
 from src.config import Config
 
+# The zone the whole suite treats as "this machine" unless a test overrides it.
+# Working-hours evaluation is now machine-local (config.WorkingHoursConfig._localize
+# resolves detect_machine_timezone() live), so the tests must pin the detected zone
+# or they would read the CI runner's real clock — UTC on ubuntu, the developer's
+# zone locally — and disagree across platforms. The existing working-hours fixtures
+# were all written against Europe/Bucharest schedules with Bucharest instants, so
+# pinning the machine to Bucharest reproduces their pre-change (schedule==machine)
+# behaviour exactly. A test exercising DRIFT re-patches detect_machine_timezone to a
+# different zone.
+TEST_MACHINE_TZ = "Europe/Bucharest"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_agent_config(tmp_path, monkeypatch):
@@ -49,6 +60,26 @@ def _isolate_agent_config(tmp_path, monkeypatch):
     config_module._machine_uuid_cache = None
     yield
     config_module._machine_uuid_cache = None
+
+
+@pytest.fixture(autouse=True)
+def _pin_machine_timezone(monkeypatch):
+    """Make the machine's detected timezone deterministic across CI platforms.
+
+    _localize() resolves detect_machine_timezone() on every call, which reads the
+    real OS /etc/localtime (or tzlocal). Left unpinned, working-hours assertions
+    would depend on the runner's own clock (UTC on ubuntu-latest, whatever locally).
+    Pin it to Europe/Bucharest — the zone every existing working-hours fixture was
+    authored in — so machine-local evaluation lands exactly where schedule-anchored
+    evaluation used to. One setattr on config is authoritative: both _localize and
+    bf_client._detect_timezone reach the detector through the config module, so a
+    test that wants a different machine zone re-patches only this one attribute
+    (see _machine_tz in test_working_hours_capture.py).
+
+    NB this is an OPT-OUT default: a test that means to exercise a non-Bucharest
+    machine-local path must override it explicitly, or it silently runs as Bucharest.
+    """
+    monkeypatch.setattr(config_module, "detect_machine_timezone", lambda: TEST_MACHINE_TZ)
 
 
 @pytest.fixture(autouse=True)

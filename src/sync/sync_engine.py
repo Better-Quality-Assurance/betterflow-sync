@@ -336,11 +336,10 @@ class SyncEngine:
         # enabled by config, and an in-process counting backend is usable
         # (Windows ctypes hooks / macOS CGEventTap; off on Linux), the agent
         # uploads its own input-count stream and the external aw-watcher-input
-        # bucket is skipped so the two never double-count. Ships dormant
-        # (in_process_input defaults False). Counts accrue continuously on the
-        # backend listener thread; the sync thread only DRAINS them into an event
-        # each cycle. Checkpoint committed only after a confirmed send, mirroring
-        # AFK/window. Mutated only on the sync thread.
+        # bucket is skipped so the two never double-count. Counts accrue
+        # continuously on the backend listener thread; the sync thread only
+        # DRAINS them into an event each cycle. Checkpoint committed only after a
+        # confirmed send, mirroring AFK/window. Mutated only on the sync thread.
         self.input_source = None
         self._input_inproc_checkpoint: Optional[datetime] = None
 
@@ -3233,8 +3232,11 @@ class SyncEngine:
 
         Note: unlike the window source, the input backend has no per-sample
         "blind" fallback — a period with no keystrokes is a legitimate gap, not a
-        blind probe. If the backend fails to install at all, ``available()`` never
-        latches on and this returns False, so the external tracker keeps its job.
+        blind probe. If the backend fails to install at all, ``available()``
+        reports False and this returns False, so the external tracker keeps its
+        job — and since ``available()`` caches nothing, a backend that dies
+        AFTER a good start flips this back to False on the very next cycle
+        rather than going on suppressing the external bucket.
         """
         return self._should_use_inproc_input()
 
@@ -3405,6 +3407,7 @@ class SyncEngine:
                 result = self.bf.send_events(batch)
                 if result.success:
                     stats.events_sent += result.events_synced
+                    self._clear_queue_backoff("live batch accepted")
                 else:
                     if result.accepted_ids:
                         # True partial success: re-queue only the events the
@@ -3412,6 +3415,7 @@ class SyncEngine:
                         accepted_set = set(result.accepted_ids)
                         failed = [e for e in batch if e.get("id") not in accepted_set]
                         stats.events_sent += len(batch) - len(failed)
+                        self._clear_queue_backoff("live batch partially accepted")
                         if failed:
                             self.queue.enqueue(failed)
                             stats.events_queued += len(failed)
@@ -3690,7 +3694,7 @@ class SyncEngine:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
                     processed += len(events)
-                    self._queue_consecutive_failures = 0
+                    self._clear_queue_backoff("queue batch accepted")
                 elif result.accepted_ids and not result.transient:
                     # A per-event verdict and a transient (no-verdict) failure are
                     # mutually exclusive in send_events today. The `and not
@@ -3714,7 +3718,7 @@ class SyncEngine:
                     if succeeded_ids:
                         self.queue.remove(succeeded_ids)
                         stats.events_sent += len(succeeded_ids)
-                        self._queue_consecutive_failures = 0
+                        self._clear_queue_backoff("queue batch partially accepted")
                     if failed_ids:
                         self.queue.increment_retry(failed_ids)
                     processed += len(succeeded_ids)
@@ -3792,6 +3796,22 @@ class SyncEngine:
         delay = min(60 * (2 ** (self._queue_consecutive_failures - 1)), 600)
         self._queue_backoff_until = datetime.now(timezone.utc) + timedelta(seconds=delay)
         logger.info(f"Queue backoff: retry in {delay}s (failure #{self._queue_consecutive_failures})")
+
+    def _clear_queue_backoff(self, reason: str) -> None:
+        """Clear stale queue backoff after confirmed events-route delivery.
+
+        Queue backoff is correct while the events route is failing, but a later
+        successful live upload proves the route is accepting writes again. Keep
+        draining immediately instead of leaving older queued events parked until
+        a previous 60s-600s backoff expires.
+        """
+        if (
+            self._queue_consecutive_failures > 0
+            or self._queue_backoff_until > datetime.now(timezone.utc)
+        ):
+            logger.info("Queue backoff cleared: %s", reason)
+        self._queue_consecutive_failures = 0
+        self._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
 
     def send_heartbeat_if_due(self, stats: "SyncStats") -> Optional["BetterFlowAuthError"]:
         """Public entry point: send heartbeat iff the sync stats marked it due.
@@ -4177,6 +4197,36 @@ class SyncEngine:
         # an in-flight cycle from rewinding past this reset.)
         if self._window_inproc_checkpoint is not None:
             self._window_inproc_checkpoint = now
+
+        # And the in-process INPUT stream. Two steps, both required: advancing
+        # the checkpoint alone would leave the counters holding every keystroke
+        # typed inside the window, and the next drain bills them against the
+        # first span after it. Private Time records nothing — that is the
+        # contract, not a tuning choice — so the counts are DISCARDED rather
+        # than re-attributed. discard_counts() ignores available() on purpose:
+        # the source is normally already stopped by the time we get here (the
+        # capture policy stops the watchers first), and a drain-based clear
+        # would no-op and strand them until counting resumed.
+        if self._input_inproc_checkpoint is not None:
+            self._input_inproc_checkpoint = now
+        if self.input_source is not None:
+            try:
+                dropped = self.input_source.discard_counts()
+                if any(dropped):
+                    # WHETHER a discard happened, never HOW MUCH. Every reason
+                    # that reaches this method names a window this machine
+                    # contractually does not record — private time, a pause,
+                    # outside working hours — and betterflow.log is uploaded to
+                    # the server on admin request (_upload_requested_logs). An
+                    # exact keystroke/click/scroll volume in that tail is a
+                    # low-resolution recording of the window we just refused to
+                    # record. The reason alone is what a reader needs to debug
+                    # the mechanism.
+                    logger.info(
+                        "Discarded buffered in-process input counts on %s", reason
+                    )
+            except Exception as e:
+                logger.warning("Discarding in-process input counts failed: %s", e)
 
         bucket_ids: set[str] = set()
         buckets: list = []

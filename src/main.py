@@ -202,10 +202,13 @@ class SyncCoordinator:
         # transient — a backend deploy, a momentary token-lookup blip — so
         # logging out on the first one needlessly stops tracking and leaves the
         # user "idle" until they re-login. Only treat the session as lost after
-        # this many CONSECUTIVE failures; any successful sync resets the streak.
+        # enough consecutive failures over a sustained time window; any
+        # successful sync resets both.
         # Mutated only inside _do_sync's call chain (sync thread), no extra lock.
         self._consecutive_auth_failures = 0
         self._AUTH_FAILURE_LOGOUT_THRESHOLD = 3
+        self._first_auth_failure_monotonic: Optional[float] = None
+        self._AUTH_FAILURE_LOGOUT_MIN_SECONDS = 15 * 60
 
         # Consecutive cycles where the LOCAL ActivityWatch server is unreachable.
         # is_running() already resets+retries the HTTP session internally, so a
@@ -342,6 +345,7 @@ class SyncCoordinator:
         # transient 401 doesn't immediately re-cross the logout threshold.
         if value:
             self._consecutive_auth_failures = 0
+            self._first_auth_failure_monotonic = None
 
     @property
     def paused_by_network(self) -> bool:
@@ -1633,6 +1637,7 @@ class SyncCoordinator:
                 # A successful authenticated round-trip means the token is fine,
                 # so any earlier 401/403 was transient — clear the auth streak.
                 self._consecutive_auth_failures = 0
+                self._first_auth_failure_monotonic = None
                 # Partial success: some buckets may fail but data still syncs
                 if stats.errors:
                     for err in stats.errors:
@@ -1777,6 +1782,17 @@ class SyncCoordinator:
         last_ok = self._last_successful_sync
         if last_ok is not None:
             telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
+        # Surface a working-hours anchor that has drifted from this device's real
+        # timezone: allows() self-heals by evaluating in machine-local time, but the
+        # fleet still needs to see (and re-anchor) the stale schedule. Included only
+        # when there IS drift, so the backend reads absence as "aligned". Best-effort
+        # — never let a tz lookup block the heartbeat.
+        try:
+            drift = self.config.working_hours.timezone_mismatch()
+            if drift:
+                telemetry["schedule_timezone_mismatch"] = drift
+        except Exception as e:  # noqa: BLE001
+            logger.debug("timezone_mismatch check failed: %s", e)
         # Surface the dead-letter table size so a growing backlog of preserved
         # (but never-delivered) events is visible to ops. Nothing else reported
         # it, so a silently climbing dead_letter_events — real lost activity —
@@ -1819,28 +1835,38 @@ class SyncCoordinator:
 
         Logging out on the FIRST auth error is what froze users at "idle" after
         a backend deploy or a momentary token blip: one 401 → wipe session →
-        tracking stops. We instead require several CONSECUTIVE failures before
-        treating the session as lost. Until the threshold, we keep the session
-        and keep tracking/queuing — the next sync retries, and a success resets
-        the streak (see _do_sync). Only a sustained failure (genuine
-        revoke/logout) crosses the threshold and prompts re-login.
+        tracking stops. We instead require several consecutive failures over a
+        sustained time window before treating the session as lost. Until then,
+        we keep the session and keep tracking/queuing — the next sync retries,
+        and a success resets the streak (see _do_sync). Only a sustained failure
+        (genuine revoke/logout) crosses the threshold and prompts re-login.
         """
+        now = time.monotonic()
         self._consecutive_auth_failures += 1
-        if self._consecutive_auth_failures < self._AUTH_FAILURE_LOGOUT_THRESHOLD:
+        if self._first_auth_failure_monotonic is None:
+            self._first_auth_failure_monotonic = now
+        auth_failure_age = now - self._first_auth_failure_monotonic
+        if (
+            self._consecutive_auth_failures < self._AUTH_FAILURE_LOGOUT_THRESHOLD
+            or auth_failure_age < self._AUTH_FAILURE_LOGOUT_MIN_SECONDS
+        ):
             logger.warning(
-                "Auth error during %s (%d/%d consecutive): %s — tolerating as "
-                "likely transient; keeping session, will retry",
+                "Auth error during %s (%d/%d consecutive, %.0fs/%.0fs): %s — "
+                "tolerating as likely transient; keeping session, will retry",
                 source,
                 self._consecutive_auth_failures,
                 self._AUTH_FAILURE_LOGOUT_THRESHOLD,
+                auth_failure_age,
+                self._AUTH_FAILURE_LOGOUT_MIN_SECONDS,
                 e,
             )
             return
 
         logger.warning(
-            "Auth error during %s — %d consecutive failures, session lost: %s",
+            "Auth error during %s — %d consecutive failures over %.0fs, session lost: %s",
             source,
             self._consecutive_auth_failures,
+            auth_failure_age,
             e,
         )
         self.logged_in = False
@@ -1878,6 +1904,15 @@ class BetterFlowApp:
 
     def __init__(self):
         """Initialize the application."""
+        # Logging FIRST, at the default level, because Config.load() itself
+        # logs: it reports every persisted setting it deliberately drops
+        # (foreground_activity.enabled, sync.in_process_input) and every
+        # migration it applies. Loading before any handler existed sent all of
+        # that to nowhere — the comments in config.py promise a trail for
+        # exactly the "my setting silently changed after an update" question,
+        # and there was none. setup_logging is documented safe to call twice;
+        # the second call re-runs it at the user's real debug level.
+        setup_logging()
         self.config = Config.load()
         setup_logging(self.config.debug_mode)
 
@@ -3151,6 +3186,7 @@ class BetterFlowApp:
         """Handle server config update — apply AFK timeout, then the working-hours
         capture policy the server just told us about."""
         self.aw_manager.set_afk_timeout(self.config.aw.afk_timeout_minutes * 60)
+        self._sync_window_sample_job()
 
         # The schedule is already on disk by now: update_from_server() ends with
         # self.save(), which is what lets the NEXT cold start know the window
@@ -3162,6 +3198,35 @@ class BetterFlowApp:
         # The schedule may have just changed or first resolved — re-align the
         # one-shot boundary trigger to the new next edge.
         self.coordinator.arm_capture_boundary()
+
+    def _sync_window_sample_job(self) -> None:
+        """Keep the fast in-process window sampler aligned with live config.
+
+        The scheduler is created before the first server config fetch. If
+        in_process_window is enabled later, relying on the initial add_job branch
+        leaves Windows with only one coarse sample per sync cycle until restart.
+        """
+        if not getattr(self, "coordinator", None):
+            return
+        scheduler = self.coordinator.scheduler
+        if not scheduler.running:
+            return
+        if self.config.sync.in_process_window:
+            scheduler.add_job(
+                self.coordinator._sample_window,
+                trigger=IntervalTrigger(
+                    seconds=self.coordinator.WINDOW_SAMPLE_INTERVAL_SECONDS
+                ),
+                id="window_sample_job",
+                replace_existing=True,
+            )
+        else:
+            try:
+                job = scheduler.get_job("window_sample_job")
+                if job is not None:
+                    scheduler.remove_job("window_sample_job")
+            except Exception as e:
+                logger.debug("window sample job sync failed: %s", e)
 
     def _on_preferences(self, key: str, value) -> None:
         """Handle a preference change from tray menu."""

@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from src.config import Config
+import src.config as config_module
 from src.sync.queue import OfflineQueue
 from src.sync.sync_engine import SyncEngine
 
@@ -95,9 +96,15 @@ def test_capture_and_billing_blocks_do_not_apply_on_upgrade():
 
 
 def test_in_process_input_server_flag_round_trip():
-    # Un-deferred but still strictly server-driven and string-safe.
+    # Un-deferred, string-safe, and still remotely kill-switchable. Deliberately
+    # platform-INDEPENDENT: the default is the subject of the two tests around
+    # this one, so this case starts from a known-off flag instead of patching
+    # the real sys.platform process-wide. (It also used to read the RUNNER's
+    # platform, which passes on the ubuntu PR job and fails on the
+    # windows-latest leg of the release-tag matrix — a red release build days
+    # after a green PR.)
     cfg = Config()
-    assert cfg.sync.in_process_input is False, "ships dormant"
+    cfg.sync.in_process_input = False
 
     cfg.update_from_server({"sync": {"in_process_input": "false"}})
     assert cfg.sync.in_process_input is False, 'STRING "false" must not enable'
@@ -107,6 +114,29 @@ def test_in_process_input_server_flag_round_trip():
 
     cfg.update_from_server({"sync": {"in_process_input": False}})
     assert cfg.sync.in_process_input is False, "server can also switch it back off"
+
+
+def test_in_process_input_defaults_on_for_windows(monkeypatch):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+
+    cfg = Config()
+
+    assert cfg.sync.in_process_input is True
+
+    cfg.update_from_server({"sync": {"in_process_input": False}})
+    assert cfg.sync.in_process_input is False, "server kill-switch must still win"
+
+
+def test_in_process_input_ships_dormant_off_windows(monkeypatch):
+    """The other half of the platform default, and the half that has to stay
+    OFF. Making the round-trip test above platform-independent removed the only
+    assertion that macOS/Linux ship dormant — and on those platforms "enabled"
+    means installing a CGEventTap under the user's Input Monitoring grant, so
+    it must be opt-in (server) and never a default. Pinned to a patched
+    platform, not the CI runner's, so it holds on every leg of the matrix."""
+    for plat in ("darwin", "linux"):
+        monkeypatch.setattr(config_module.sys, "platform", plat)
+        assert Config().sync.in_process_input is False, f"{plat} must ship dormant"
 
 
 def test_working_hours_and_sync_tuning_still_apply():
@@ -249,3 +279,165 @@ def test_sync_gates_config_fetch_on_config_refetch_due():
     with _patch.object(engine, "_config_refetch_due", return_value=True):
         engine.sync()
         assert bf.get_config.called, "due → sync() must re-fetch (proves the gate is wired)"
+
+
+# -- the persisted-config override that would have made the rollout a no-op ---
+#
+# Origin 2026-07-23: flipping in_process_input's default ON for Windows fixes
+# nothing on a device that already has a config.json — update_from_server() ends
+# with self.save(), so every Windows agent in the fleet has written
+# "in_process_input": false to disk, and _from_dict rebuilds SyncSettings from
+# that. The new default only ever reaches FRESH installs. Same trap, same file,
+# as foreground_activity.enabled (see save()/_from_dict).
+
+
+def test_persisted_in_process_input_does_not_override_platform_default(monkeypatch):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+
+    # What every upgraded Windows device has on disk, written by <=1.5.116.
+    cfg = Config._from_dict({"sync": {"in_process_input": False, "batch_size": 250}})
+
+    assert cfg.sync.in_process_input is True, (
+        "a stale persisted false must not pin the Windows default off on upgrade"
+    )
+    assert cfg.sync.batch_size == 250, "unrelated persisted sync tuning still loads"
+
+    # The server keeps both directions: it can still switch it off per device.
+    cfg.update_from_server({"sync": {"in_process_input": False}})
+    assert cfg.sync.in_process_input is False
+
+
+def test_in_process_input_is_never_persisted(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+    monkeypatch.setattr(Config, "get_config_file",
+                        classmethod(lambda cls: tmp_path / "config.json"))
+
+    cfg = Config()
+    cfg.update_from_server({"sync": {"in_process_input": True}})  # ends in save()
+
+    import json
+    written = json.loads((tmp_path / "config.json").read_text())
+
+    assert "in_process_input" not in written.get("sync", {}), (
+        "the flag is platform-defaulted and server-driven; persisting it lets a "
+        "stale disk value outrank both"
+    )
+    assert "batch_size" in written.get("sync", {}), "sibling sync settings still persist"
+
+
+# -- _from_dict must not damage the caller's dict, or lose the file to one bad
+#    block. Both traps applied to every nested block, not just the one that
+#    happened to need a fix.
+
+
+def test_from_dict_does_not_mutate_the_callers_nested_blocks():
+    """`data = dict(data)` is a TOP-LEVEL copy, so popping a key out of a nested
+    block reached through to the caller's dict — which the in_process_input and
+    foreground_activity.enabled drops both do."""
+    original = {
+        "sync": {"in_process_input": False, "batch_size": 250},
+        "foreground_activity": {"enabled": True, "max_credit_minutes": 90},
+    }
+    snapshot = {k: dict(v) for k, v in original.items()}
+
+    Config._from_dict(original)
+
+    assert original == snapshot, "_from_dict must leave the caller's dict intact"
+
+
+def test_one_corrupt_block_does_not_discard_the_whole_config():
+    """_from_dict runs inside load()'s except, so a block that is not a mapping
+    used to raise and take the ENTIRE config with it — api_url, working_hours,
+    engagement — silently falling back to defaults."""
+    for bad in (None, [], "nonsense", 42):
+        cfg = Config._from_dict({
+            "api_url": "https://app.betterflow.eu/api/agent",
+            "sync": bad,
+            "working_hours": {"enforced": True, "work_start": "07:30"},
+        })
+        assert cfg.api_url == "https://app.betterflow.eu/api/agent", (
+            f"a {type(bad).__name__} sync block must not cost us the rest of the file"
+        )
+        assert cfg.working_hours.work_start == "07:30", "sibling blocks survive"
+        assert cfg.sync.batch_size == Config().sync.batch_size, "bad block -> defaults"
+
+
+def test_load_time_drops_are_actually_logged(tmp_path, monkeypatch, caplog):
+    """The drop-on-load messages must reach a handler.
+
+    Config.load() used to run BEFORE setup_logging(), so every line it emitted
+    — including "I am ignoring the setting you have on disk" — went nowhere.
+    The comments in config.py promise a trail for exactly the "my setting
+    changed after an update" question; without a handler there was none. This
+    pins the messages themselves, so the ordering fix in main.py cannot be
+    undone without a red test.
+    """
+    import json
+    import logging
+
+    monkeypatch.setattr(config_module.sys, "platform", "win32")
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "sync": {"in_process_input": False},
+        "foreground_activity": {"enabled": True},
+    }))
+    monkeypatch.setattr(Config, "get_config_file", classmethod(lambda cls: cfg_file))
+
+    with caplog.at_level(logging.INFO, logger="src.config"):
+        cfg = Config.load()
+
+    assert cfg.sync.in_process_input is True, "the drop happened"
+    text = caplog.text
+    assert "in_process_input" in text, (
+        "a dropped persisted setting must say so where someone can read it"
+    )
+    assert "foreground_activity.enabled" in text
+
+
+def test_logging_is_configured_before_config_is_loaded():
+    """Callsite guard for the test above.
+
+    The message test uses caplog, which attaches its OWN handler — so it passes
+    whatever order main.py does things in, and on its own it is a phantom. The
+    behaviour that actually matters is the ordering in BetterFlowApp.__init__,
+    and only reading the source can pin it: importing main here would build a
+    tray.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+    tree = ast.parse(src)
+
+    init = next(
+        node
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "BetterFlowApp"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+    first_setup = first_load = None
+    for node in ast.walk(init):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "setup_logging":
+            if first_setup is None or node.lineno < first_setup:
+                first_setup = node.lineno
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "load"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "Config"
+        ):
+            if first_load is None or node.lineno < first_load:
+                first_load = node.lineno
+
+    assert first_setup is not None, "probe found no setup_logging call at all"
+    assert first_load is not None, "probe found no Config.load call at all"
+    assert first_setup < first_load, (
+        f"setup_logging (line {first_setup}) must run BEFORE Config.load "
+        f"(line {first_load}) — load() logs the settings it drops, and with no "
+        f"handler attached yet those lines are discarded"
+    )
