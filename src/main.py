@@ -218,6 +218,12 @@ class SyncCoordinator:
         # than on one transient blip. Mutated only inside _do_sync (sync thread).
         self._aw_unreachable_streak = 0
         self._AW_UNREACHABLE_ERROR_THRESHOLD = 2
+        # monotonic timestamp of the FIRST unreachable observation in the
+        # current outage, or None when ActivityWatch last answered. Time-based
+        # because the consecutive-tick counter it replaces was reset by any
+        # suppressed tick and so never reached its threshold in the field.
+        self._aw_unreachable_since: Optional[float] = None
+        self._AW_UNREACHABLE_ESCALATE_SECONDS = 180.0
 
         # Consecutive cycles where AW answered is_running() (/info) but the bucket
         # fetch (/buckets/) failed — a half-hung bf-data-service the is_running()
@@ -1151,6 +1157,64 @@ class SyncCoordinator:
         if self._tick_failure_counts.pop(label, None):
             self._tick_failure_reported.discard(label)
 
+    def _note_aw_unreachable(self, now: Optional[float] = None) -> bool:
+        """Record an unreachable observation. True once the grace period is up.
+
+        Time-based, not a consecutive-tick counter. The counter it replaces was
+        reset by ANY tick where capture happened to be suppressed — a break,
+        private time, an out-of-hours minute — so on a real device it rarely got
+        past 1 and the escalation below was effectively dead code. Measured over
+        the 47 agent logs from 2026-07-22/23: reached 1 nine times, reached 2
+        never, across four hours of a completely dead ActivityWatch.
+        """
+        now = time.monotonic() if now is None else now
+        if self._aw_unreachable_since is None:
+            self._aw_unreachable_since = now
+        self._aw_unreachable_streak += 1
+        elapsed = now - self._aw_unreachable_since
+        if elapsed >= self._AW_UNREACHABLE_ESCALATE_SECONDS:
+            return True
+        logger.info(
+            "ActivityWatch unreachable for %.0fs (escalating at %.0fs)",
+            elapsed, self._AW_UNREACHABLE_ESCALATE_SECONDS,
+        )
+        return False
+
+    def _note_aw_capture_suppressed(self) -> None:
+        """Capture is deliberately off. Leave the unreachable clock untouched."""
+
+    def _note_aw_reachable(self) -> None:
+        """ActivityWatch answered. This is the ONLY thing that counts as recovery."""
+        self._aw_unreachable_since = None
+        self._aw_unreachable_streak = 0
+
+    def _escalate_aw_unreachable(self, now: Optional[float] = None) -> None:
+        """Rebuild the tracker stack and surface the fault.
+
+        The rebuild is NOT gated on aw_manager.is_managing. That property is
+        `bool(self._processes)`, which is false exactly when every component
+        failed to start — the case where a rebuild is the only thing that can
+        help, and the one case the old gate skipped. Fabian's device never
+        started a single component, so it stayed empty and force_restart was
+        unreachable for the entire outage.
+        """
+        now = time.monotonic() if now is None else now
+        since = self._aw_unreachable_since or now
+        logger.warning(
+            "ActivityWatch unreachable for %.0fs — rebuilding the tracker stack",
+            now - since,
+        )
+        try:
+            # force_restart also reclaims a hung-but-listening server (port held,
+            # HTTP dead); a plain stop()+start() only cycles the watchers and
+            # leaves the dead server in place.
+            self.aw_manager.force_restart(reason="server unreachable")
+        except Exception:
+            # A rebuild that fails must not swallow the escalation below — that
+            # would hide the very fault it was trying to report.
+            logger.warning("force_restart failed during escalation", exc_info=True)
+        self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+
     def _handle_aw_bucket_failure(self) -> None:
         """AW answers is_running() (/info) but the bucket fetch (/buckets/) keeps
         failing — a half-hung bf-data-service. is_running() can't see this, so the
@@ -1161,13 +1225,22 @@ class SyncCoordinator:
         133 failures, ~75 min of tracking lost."""
         self._aw_buckets_failed_streak += 1
         if self._aw_buckets_failed_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
-            if self.aw_manager.is_managing:
-                logger.warning(
-                    "ActivityWatch responding but bucket fetch failing for %d "
-                    "cycles — forcing tracker+server restart (hung bf-data-service)",
-                    self._aw_buckets_failed_streak,
-                )
+            logger.warning(
+                "ActivityWatch responding but bucket fetch failing for %d "
+                "cycles — forcing tracker+server restart (hung bf-data-service)",
+                self._aw_buckets_failed_streak,
+            )
+            # Not gated on is_managing, for the same reason as
+            # _escalate_aw_unreachable: that property is bool(_processes), so it
+            # is false exactly when every component failed to start — the case
+            # where a rebuild is the only thing that can help. force_restart
+            # rebuilds the whole stack, including a server this process does not
+            # own but which is holding the port dead.
+            try:
                 self.aw_manager.force_restart(reason="bucket fetch failing (server hung)")
+            except Exception:
+                # A failing rebuild must not swallow the tray escalation below.
+                logger.warning("force_restart failed on bucket-fetch escalation", exc_info=True)
             self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
         else:
             logger.info(
@@ -1356,6 +1429,80 @@ class SyncCoordinator:
             return TrayState.PAUSED, "Idle"
         return TrayState.SYNCING, None
 
+    def _monitor_capture_health(self) -> bool:
+        """Self-heal the local tracker stack and escalate a real AW outage.
+
+        Local-only: it restarts/rebuilds trackers and updates the reachability
+        clock, but never uploads. That is exactly why it is factored out of the
+        inline sync path and shared with the paused_by_network branch: capture
+        continues during a network outage, but that branch used to ``return``
+        before any of this ran, so a tracker that died (or never started)
+        mid-outage was never restarted until the network came back.
+
+        Returns True if the caller should proceed to ``sync_engine.sync()``,
+        False if it should skip the upload this cycle (AW unreachable, escalated).
+        """
+        if self.aw_manager.is_managing:
+            self.aw_manager.restart_if_needed()
+            # Escalate a non-converging restart loop: repeated forced restarts
+            # mean the restart isn't fixing it (orphan tracker / missing Input
+            # Monitoring permission). Capture so it surfaces instead of looping
+            # silently; error_reporter dedup throttles.
+            try:
+                restarts = self.aw_manager.stale_restart_count()
+                if (
+                    restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
+                    and not self._restart_loop_escalated
+                    and self.error_reporter is not None
+                ):
+                    self.error_reporter.capture(
+                        f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
+                        level="warning",
+                        tags={"component": "idle-tracker"},
+                        context={"stale_restarts": restarts},
+                        fingerprint="idle-tracker-restart-loop",
+                    )
+                    # Once per session — the restart count is monotonic, so
+                    # without this latch the capture would re-fire every cycle
+                    # (only the reporter's dedup window kept it from flooding).
+                    self._restart_loop_escalated = True
+            except Exception:
+                # WARNING, not debug: if the reporter itself is broken (bad DSN,
+                # etc.) the escalation we built to surface this loop must not fail
+                # silently every cycle.
+                logger.warning("restart-loop escalation check failed", exc_info=True)
+
+        # Outside working hours the trackers are stopped ON PURPOSE, so
+        # aw.is_running() is False and escalating it would (a) flip the tray to
+        # "ActivityWatch not responding" every night and (b) rebuild a stack that
+        # is meant to be down. Hold the unreachable clock instead. The online
+        # caller still falls through to sync() on this path — that is where the
+        # offline queue drains, the heartbeat is sent, AND fetch_server_config()
+        # retries (a device whose first config fetch failed has known=False, so
+        # capture is suppressed, so the tracker is down; only reaching sync()
+        # re-fetches it). The offline caller returns regardless.
+        capture_suppressed = not self.config.working_hours.allows(
+            datetime.now(timezone.utc)
+        )
+
+        if capture_suppressed:
+            # Deliberately down. Hold the unreachable clock where it is rather
+            # than clearing it: suppression is not evidence that ActivityWatch
+            # recovered, and clearing here is what made the escalation unreachable
+            # in practice (see _note_aw_unreachable).
+            self._note_aw_capture_suppressed()
+        elif not self.aw.is_running():
+            # is_running() already reset+retried the HTTP session, so this is a
+            # real stall, not a stale-socket blip. Grace period before escalating:
+            # a single missed cycle usually self-heals.
+            if self._note_aw_unreachable():
+                self._escalate_aw_unreachable()
+            return False
+        else:
+            # AW actually answered — the only thing that counts as recovery.
+            self._note_aw_reachable()
+        return True
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         my_lock = self._acquire_sync_slot()
@@ -1454,82 +1601,24 @@ class SyncCoordinator:
             if self.paused_by_network:
                 self.tray.set_state(TrayState.QUEUED, "Offline")
                 self.tray.update_stats(queue_size=self.queue.size())
+                # A network outage suspends UPLOAD, not capture: suspend_upload()
+                # keeps the trackers recording and queueing locally, often for
+                # hours. So the capture stack must still be health-checked and
+                # self-healed here — every restart/rebuild path lives below this
+                # gate and used to be skipped for the ENTIRE outage, so a tracker
+                # that crashed (or never started) recorded nothing until the
+                # network returned: the exact blind capture this release exists
+                # to prevent. Only the upload sync is skipped (it cannot land
+                # while offline); _monitor_capture_health is local-only, and its
+                # sync-gate return is intentionally ignored on this path.
+                self._monitor_capture_health()
                 return
 
-            if self.aw_manager.is_managing:
-                self.aw_manager.restart_if_needed()
-                # Escalate a non-converging restart loop: repeated forced
-                # restarts mean the restart isn't fixing it (orphan tracker /
-                # missing Input Monitoring permission). Capture so it surfaces
-                # instead of looping silently; error_reporter dedup throttles.
-                try:
-                    restarts = self.aw_manager.stale_restart_count()
-                    if (
-                        restarts >= self._RESTART_LOOP_ALERT_THRESHOLD
-                        and not self._restart_loop_escalated
-                        and self.error_reporter is not None
-                    ):
-                        self.error_reporter.capture(
-                            f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
-                            level="warning",
-                            tags={"component": "idle-tracker"},
-                            context={"stale_restarts": restarts},
-                            fingerprint="idle-tracker-restart-loop",
-                        )
-                        # Once per session — the restart count is monotonic, so
-                        # without this latch the capture would re-fire every cycle
-                        # (only the reporter's dedup window kept it from flooding).
-                        self._restart_loop_escalated = True
-                except Exception:
-                    # WARNING, not debug: if the reporter itself is broken (bad
-                    # DSN, etc.) the escalation we built to surface this loop must
-                    # not fail silently every cycle.
-                    logger.warning("restart-loop escalation check failed", exc_info=True)
-
-            # Outside working hours the trackers are stopped ON PURPOSE, so
-            # aw.is_running() is False and the branch below would (a) escalate a
-            # deliberate silence to "ActivityWatch not responding" in the tray every
-            # single night, and (b) `return` before sync_engine.sync() — which is
-            # where the offline queue gets drained, the heartbeat is sent, AND
-            # fetch_server_config() retries. That last one is a trap: a device whose
-            # first config fetch failed has known=False, so capture is suppressed, so
-            # the tracker is down, so sync() is never reached, so the config is never
-            # re-fetched — suppressed forever, zero tracking, until someone restarts
-            # the app AND the network happens to be up. Fall through instead: sync()
-            # has its own suppressed path that skips the AW reads.
-            capture_suppressed = not self.config.working_hours.allows(
-                datetime.now(timezone.utc)
-            )
-
-            if not capture_suppressed and not self.aw.is_running():
-                # is_running() already reset+retried the HTTP session, so this
-                # is a real stall, not a stale-socket blip. Debounce before
-                # escalating: one missed cycle stays silent (it usually
-                # self-heals next cycle); only after consecutive failures do we
-                # force-restart and surface an Error.
-                self._aw_unreachable_streak += 1
-                if self._aw_unreachable_streak >= self._AW_UNREACHABLE_ERROR_THRESHOLD:
-                    if self.aw_manager.is_managing:
-                        logger.warning(
-                            "ActivityWatch unreachable for %d cycles — forcing tracker+server restart",
-                            self._aw_unreachable_streak,
-                        )
-                        # force_restart also reclaims a hung-but-listening server
-                        # (port held, HTTP dead); a plain stop()+start() only
-                        # cycles the watchers and leaves the dead server in place.
-                        self.aw_manager.force_restart(reason="server unreachable")
-                    self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
-                else:
-                    logger.info(
-                        "ActivityWatch unreachable (%d/%d) — retrying next cycle before escalating",
-                        self._aw_unreachable_streak, self._AW_UNREACHABLE_ERROR_THRESHOLD,
-                    )
+            # Health-check + self-heal the local tracker stack. Returns False when
+            # the caller should skip the upload sync this cycle (AW unreachable and
+            # escalated); True to proceed.
+            if not self._monitor_capture_health():
                 return
-
-            # Reachable (or deliberately down) — clear the streak. A suppressed
-            # night must not leave a stale streak that escalates the moment the
-            # window reopens.
-            self._aw_unreachable_streak = 0
 
             stats = self.sync_engine.sync()
 
@@ -1704,6 +1793,16 @@ class SyncCoordinator:
                 telemetry["schedule_timezone_mismatch"] = drift
         except Exception as e:  # noqa: BLE001
             logger.debug("timezone_mismatch check failed: %s", e)
+        # Surface the dead-letter table size so a growing backlog of preserved
+        # (but never-delivered) events is visible to ops. Nothing else reported
+        # it, so a silently climbing dead_letter_events — real lost activity —
+        # was invisible. Reported unconditionally (even 0) as an explicit health
+        # signal. Best-effort: a queue that can't answer must never block the
+        # heartbeat.
+        try:
+            telemetry["dead_letter_count"] = self.queue.dead_letter_count()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("dead_letter_count telemetry failed: %s", e)
         try:
             telemetry.update(self.aw_manager.health_snapshot())
         except Exception as e:  # noqa: BLE001
@@ -2565,29 +2664,47 @@ class BetterFlowApp:
     def _show_privacy_notice_if_needed(self) -> None:
         """Show the one-time data-collection notice, once, and record it.
 
-        The whole method is best-effort. A machine with no display, a Tk that
-        will not initialise, a read-only config dir — each of those costs the
-        notice and nothing else. Unrecorded means "retry next launch", which is
-        also what a user who closes the window without pressing the button gets:
-        an acknowledgement has to mean somebody dismissed the text deliberately,
-        or it is not evidence of anything.
+        The notice is rendered in a SEPARATE child process, not inline. Tk and
+        pystray both contend for macOS's single shared ``NSApplication``; once
+        Tk's ``mainloop()`` had created and torn down its ``NSApp`` on the main
+        thread, the ``NSStatusItem`` pystray created immediately afterwards went
+        unstable and the agent force-exited (the "ghost process" crash, #158).
+        Handing the notice to a throwaway process leaves this process a pristine
+        ``NSApplication`` for ``tray.run_blocking()``.
+
+        Behaviour is otherwise unchanged. The whole method is best-effort: a
+        machine with no display, a Tk that will not initialise, a read-only
+        config dir — each costs the notice and nothing else. Only exit code 0
+        (the user pressed the button) records an acknowledgement; a dismissal or
+        a render failure leaves it unrecorded, which re-shows next launch, so an
+        acknowledgement always means somebody dismissed the text deliberately.
 
         The decision and the record both live in ``privacy_notice`` so the
-        version comparison exists exactly once.
+        version comparison exists exactly once, and the persisted-flag write
+        stays on the parent, exactly where the inline path had it.
         """
         try:
             if not needs_acknowledgement(self.config):
                 return
-            try:
-                from .ui.privacy_notice_window import show_privacy_notice
-            except ImportError:
-                from ui.privacy_notice_window import show_privacy_notice  # type: ignore[no-redef]
 
-            logger.info("Showing the one-time privacy notice")
-            if show_privacy_notice():
+            argv, cwd = _privacy_notice_child_argv()
+            logger.info("Showing the one-time privacy notice in a child process")
+            # Blocks until the user responds — identical to the old inline
+            # mainloop, and background startup is already running on its own
+            # thread, so tracking/syncing/billing are unaffected. No timeout:
+            # the window is modal and must wait for a person to read it.
+            result = subprocess.run(argv, cwd=cwd)  # noqa: S603
+
+            if result.returncode == PRIVACY_NOTICE_ACKNOWLEDGED:
                 record_acknowledgement(self.config)
-            else:
+            elif result.returncode == PRIVACY_NOTICE_DISMISSED:
                 logger.info("Privacy notice dismissed without acknowledgement")
+            else:
+                logger.warning(
+                    "Privacy notice child exited with %s — not recorded, "
+                    "will retry next launch",
+                    result.returncode,
+                )
         except Exception as e:  # noqa: BLE001 — a notice is never worth a crash
             logger.warning("Privacy notice could not be shown: %s", e, exc_info=True)
 
@@ -3250,17 +3367,29 @@ class BetterFlowApp:
         never return from the dead Cocoa event loop.
         """
         logger.critical("Tray icon died — force-exiting to prevent ghost process")
-        # Block so the report leaves the machine before os._exit kills the
-        # daemon sender thread.
-        self.error_reporter.capture(
-            "Tray icon died — agent force-exiting (ghost process)",
-            level="fatal",
-            tags={"component": "tray"},
-            fingerprint="tray-died",
-            block=True,
-        )
-        self._shutdown()
-        os._exit(1)
+        # Arm an unconditional hard exit FIRST. This handler runs on an
+        # APScheduler worker thread, and _shutdown() below stops that same
+        # scheduler with wait=True — a self-join that deadlocks and never
+        # reaches os._exit(), wedging the very ghost process this guard exists to
+        # kill (reproduced 2026-07-23). The backstop guarantees the exit even if
+        # the capture or the shutdown never returns.
+        _arm_hard_exit(_TRAY_DIED_HARD_EXIT_SECONDS)
+        try:
+            # Block so the report leaves the machine before os._exit kills the
+            # daemon sender thread.
+            self.error_reporter.capture(
+                "Tray icon died — agent force-exiting (ghost process)",
+                level="fatal",
+                tags={"component": "tray"},
+                fingerprint="tray-died",
+                block=True,
+            )
+            # drain=False: we ARE the scheduler worker thread, so draining it
+            # self-joins and hangs. Undrained, _shutdown returns and the finally
+            # below fires promptly; the backstop above only covers a hung report.
+            self._shutdown(drain=False)
+        finally:
+            os._exit(1)
 
     # -- Failure reporting ------------------------------------------------
 
@@ -3302,8 +3431,16 @@ class BetterFlowApp:
 
     # -- Lifecycle --------------------------------------------------------
 
-    def _shutdown(self) -> None:
-        """Shutdown the application. Safe to call multiple times."""
+    def _shutdown(self, drain: bool = True) -> None:
+        """Shutdown the application. Safe to call multiple times.
+
+        ``drain`` controls whether we wait for the scheduler's in-flight jobs to
+        finish (``coordinator.stop(wait=drain)``). It MUST be False when called
+        from the scheduler's own worker thread — as ``_on_tray_died`` is —
+        because ``scheduler.shutdown(wait=True)`` there self-joins the pool and
+        hangs, wedging the process (reproduced 2026-07-23). Normal shutdown keeps
+        draining so an in-flight sync completes before the queue closes.
+        """
         with self._shutdown_lock:
             if self._shutdown_done:
                 return
@@ -3316,9 +3453,11 @@ class BetterFlowApp:
         # Flush idle event before stopping (otherwise idle period is lost)
         self.coordinator.flush_idle_event()
         clear_notifications()
-        # wait=True so an in-flight scheduled sync completes BEFORE we close the
-        # offline queue below — otherwise it dies on a closed SQLite handle.
-        self.coordinator.stop(wait=True)
+        # Draining (wait=True) lets an in-flight scheduled sync complete BEFORE
+        # we close the offline queue below — otherwise it dies on a closed SQLite
+        # handle. But from the scheduler's OWN worker thread (_on_tray_died) a
+        # drain self-joins the pool and hangs, so that caller passes drain=False.
+        self.coordinator.stop(wait=drain)
         self.sync_engine.shutdown()
         if self.window_watcher:
             self.window_watcher.stop()
@@ -3434,8 +3573,98 @@ class SingleInstanceLock:
 _instance_lock = SingleInstanceLock()
 
 
+# Seconds a dying agent allows for graceful cleanup before forcing the process
+# down unconditionally. _on_tray_died runs on an APScheduler worker thread and
+# its _shutdown() stops that SAME scheduler (wait=True) — a self-join that
+# deadlocks and never reaches os._exit(), wedging the very ghost process the
+# guard exists to kill (reproduced 2026-07-23). The backstop below makes the
+# exit unconditional even when cleanup hangs.
+_TRAY_DIED_HARD_EXIT_SECONDS = 10.0
+
+
+def _arm_hard_exit(timeout: float) -> None:
+    """Guarantee the process exits ``timeout`` seconds from now, no matter what
+    the caller does next.
+
+    os._exit works from any thread, so a daemon timer cannot be blocked by a
+    hung error-report send or a deadlocked _shutdown running on another thread.
+    """
+
+    def _hard_exit() -> None:
+        time.sleep(timeout)
+        os._exit(1)
+
+    threading.Thread(target=_hard_exit, name="tray-died-hard-exit", daemon=True).start()
+
+
+# Exit codes for the isolated ``--privacy-notice`` child process. The parent
+# maps these back to the acknowledge/dismiss decision; ONLY an acknowledgement
+# (0) is recorded, so both a deliberate dismissal (2) and a render failure (3)
+# leave the record unwritten and re-show the notice next launch — the same
+# best-effort, retry-next-launch semantics the inline path had.
+PRIVACY_NOTICE_ACKNOWLEDGED = 0
+PRIVACY_NOTICE_DISMISSED = 2
+PRIVACY_NOTICE_RENDER_ERROR = 3
+
+
+def _privacy_notice_child_argv() -> "tuple[list[str], Optional[str]]":
+    """Command (and cwd) that re-launches THIS app in ``--privacy-notice`` mode.
+
+    Must work both frozen and unfrozen. Frozen: ``sys.executable`` IS the app
+    binary, so run it directly with the flag — a direct exec passes argv
+    reliably, unlike the macOS ``open`` that ``_relaunch`` uses, which routes
+    through Apple Events and would silently drop ``--privacy-notice``. Unfrozen
+    dev: re-run the module exactly as the Makefile does (``python -m src.main``)
+    from the repo root so the package-relative imports resolve; a bare
+    ``python <path>/main.py`` would break them.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--privacy-notice"], None
+    repo_root = str(Path(__file__).resolve().parents[1])
+    return [sys.executable, "-m", "src.main", "--privacy-notice"], repo_root
+
+
+def _run_privacy_notice_child() -> int:
+    """Render the one-time privacy notice in THIS (isolated) process, then exit.
+
+    Spawned by the running agent as a SEPARATE process (see
+    ``BetterFlowApp._show_privacy_notice_if_needed``) so Tk creates and tears
+    down its ``NSApplication`` in a throwaway process, leaving the parent a
+    pristine ``NSApplication`` for pystray's status item. Running Tk's
+    ``mainloop()`` in the same process that then calls ``tray.run_blocking()``
+    destabilised the macOS ``NSStatusItem`` — its ``button()`` went nil, the
+    tray-health probe failed two consecutive ticks and the agent force-exited
+    with ``os._exit(1)`` (the "ghost process" crash introduced by #158).
+
+    Deliberately minimal: it does NOT take the single-instance lock (the parent
+    already holds it) and does NOT touch config. The PARENT records the
+    acknowledgement from this process's exit code, so the persisted-flag write
+    stays on exactly the one code path it lived on before.
+    """
+    try:
+        try:
+            from .ui.privacy_notice_window import show_privacy_notice
+        except ImportError:
+            from ui.privacy_notice_window import show_privacy_notice  # type: ignore[no-redef]
+        acknowledged = show_privacy_notice()
+    except Exception:
+        logger.warning("Privacy notice child failed to render", exc_info=True)
+        return PRIVACY_NOTICE_RENDER_ERROR
+    return (
+        PRIVACY_NOTICE_ACKNOWLEDGED if acknowledged else PRIVACY_NOTICE_DISMISSED
+    )
+
+
 def main() -> None:
     """Main entry point."""
+    # Isolated child process that renders ONLY the one-time privacy notice and
+    # exits. Handled BEFORE the single-instance lock (the parent agent already
+    # holds it, so contending would just print "already running" and never show
+    # the notice) and BEFORE any app construction — this process must stay a
+    # throwaway Tk host so the parent keeps a pristine NSApplication.
+    if "--privacy-notice" in sys.argv[1:]:
+        sys.exit(_run_privacy_notice_child())
+
     if not _instance_lock.acquire():
         print("BetterFlow is already running.")
         sys.exit(0)

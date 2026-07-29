@@ -557,6 +557,45 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # forwards proof the notice was shown; it is compliance evidence, not
     # a new fact gathered about the machine or the person.
     "disclosure_acknowledgement",
+    # Two booleans about the AGENT'S OWN health, not about the person: whether
+    # the tracker binaries failed to install, and whether this process has any
+    # managed watchers of its own. Neither describes what the employee did —
+    # they describe whether this machine is capable of recording anything at
+    # all. They join the operational-health keys this allowlist already carries
+    # (restart counts, blind flags, event ages, sync staleness) — no NOTICE
+    # bullet names any of those individually; the notice's technical-details
+    # bullet covers only the agent version and the time zone. So this adds no
+    # new CATEGORY, but do not read it as "the notice already lists it": it
+    # does not. Both flags were already computed and simply filtered out before
+    # egress, which is why a device that recorded zero for two consecutive days
+    # still reported itself healthy.
+    #
+    # Adding a field that reports LESS capture, and cannot distinguish one
+    # person's activity from another's, does not widen what is collected about
+    # anyone. If that reading is ever contested, the safe answer is to keep the
+    # field and update the notice text, not to drop it and go back to blind.
+    "tracker_download_failed",
+    "managed_components_unavailable",
+    # The window watcher has stayed blind across repeated restarts. Exactly the
+    # same category as idle_tracker_blind, which this list already carries: a
+    # fact about whether a watcher on this machine is working, never about what
+    # the person did.
+    "window_tracker_blind",
+    # How many events this device captured but failed to DELIVER — they
+    # exhausted their retries and were preserved locally rather than deleted.
+    # A single integer, and only ever a count: it carries no event, no bucket,
+    # no timestamp, no window title, and nothing that distinguishes one
+    # person's activity from another's. It says "this machine is holding N
+    # undelivered records", which is the delivery-health counterpart of
+    # consecutive_sync_failures and sync_stale_seconds, both already here.
+    #
+    # It reports a delivery FAILURE, so it can only ever describe the agent
+    # doing LESS than the notice says, never more. It was already computed on
+    # every heartbeat and filtered out at this gate, which is why no device has
+    # ever reported a backlog. Same reading as tracker_download_failed above:
+    # if the category is ever contested, the safe answer is to keep the field
+    # and update the notice text, not to drop it and go back to blind.
+    "dead_letter_count",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so

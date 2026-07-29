@@ -43,6 +43,10 @@ class UpdateHandler:
         # Version we last toasted the user about, so the 30-min re-checks notify
         # once per version instead of on every check.
         self._notified_version: Optional[str] = None
+        # Same once-per-version latch for the "this managed install can't
+        # self-update" warning, so a root-owned (.pkg) machine gets told once,
+        # not every 30-min check.
+        self._managed_warned_version: Optional[str] = None
         self._staged_lock = threading.Lock()
         self._update_jobs_started = False
         self._update_jobs_lock = threading.Lock()
@@ -133,6 +137,35 @@ class UpdateHandler:
         # No-op if nothing valid is staged.
         self._apply_staged_update()
 
+    def _managed_install_ok(self) -> bool:
+        """False when the running bundle can't be replaced by this user (a
+        root-owned / MDM .pkg install). Never raises — on any doubt it returns
+        True so a normal install is never blocked (the apply path still guards)."""
+        try:
+            try:
+                from .self_updater import app_bundle_replaceable
+            except ImportError:
+                from self_updater import app_bundle_replaceable
+            return app_bundle_replaceable()
+        except Exception:
+            logger.debug("app_bundle_replaceable check failed; assuming replaceable", exc_info=True)
+            return True
+
+    def _report_managed_blocked(self, version: str) -> None:
+        """Report once that a managed install is stuck (so ops can push via MDM)."""
+        reporter = getattr(self.coordinator, "error_reporter", None)
+        if reporter is None:
+            return
+        try:
+            reporter.capture(
+                f"Self-update blocked: managed/root-owned install can't self-update to {version}",
+                level="warning",
+                tags={"component": "update-handler"},
+                fingerprint="update-managed-install-blocked",
+            )
+        except Exception:
+            logger.warning("managed-install-blocked report failed", exc_info=True)
+
     def _on_update_available(
         self, version: str, url: str, asset_url: Optional[str] = None, apply_now: bool = False
     ) -> None:
@@ -140,6 +173,25 @@ class UpdateHandler:
         stage it (and maybe apply)."""
         logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
+
+        # A managed (.pkg / root-owned) install can't replace itself — the
+        # self-update rename EPERMs every cycle (see
+        # self_updater.app_bundle_replaceable). Detect it up front: tell the user
+        # once how to fix it, report to ops once, and do NOT loop on a doomed
+        # download+apply. Gate before the normal notify/stage so we don't offer an
+        # "Install & Restart" that can only fail.
+        if asset_url and not self._managed_install_ok():
+            if version != self._managed_warned_version:
+                self._managed_warned_version = version
+                send_notification(
+                    "BetterFlow update needs a manual step",
+                    f"Version {version} is available, but this managed install "
+                    "can't update itself. Reinstall from github.com/"
+                    "Better-Quality-Assurance/betterflow-sync/releases/latest, "
+                    "or contact IT.",
+                )
+                self._report_managed_blocked(version)
+            return
 
         # Notify ONCE per version, at detection — so the user always learns an
         # update is available, including on the otherwise-silent auto-apply path,

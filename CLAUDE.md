@@ -132,7 +132,13 @@ not the person using it:
   surface. A VM, a container or a locked-down Linux box legitimately reports
   `null`.
 - `timezone`, `agent_version`, and the tracker-health telemetry (restart counts,
-  event ages, sync staleness).
+  event ages, sync staleness, `dead_letter_count` — how many captured events
+  this device failed to DELIVER and is holding locally, a bare integer carrying
+  no event, bucket, timestamp or title — and the two capture-dead flags
+  `tracker_download_failed` / `managed_components_unavailable`, which say the
+  tracker binaries could not be installed and that this process has no managed
+  watchers of its own). All of it describes whether the machine is capable of
+  recording and delivering, never what was recorded.
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.

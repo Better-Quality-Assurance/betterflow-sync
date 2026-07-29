@@ -60,15 +60,44 @@ class TestReadableFgFor:
         assert fg in ("#1a1a1a", "#FFFFFF")
 
 
-def _tray_with_dead_icon(monkeypatch, died):
-    """A TrayIcon whose health probe always fails, wired to record death."""
+def _tray_with_dead_icon(monkeypatch, died, started=True):
+    """A TrayIcon whose health probe always fails, wired to record death.
+
+    ``started`` marks whether the tray has begun its lifecycle (run_blocking /
+    start has created a status item at least once). A failing probe may declare
+    death only once the tray has started; before that, a None status item just
+    means "not started yet" (e.g. the one-time privacy notice is still blocking
+    the main thread), never "died".
+    """
     from src.ui.tray import TrayIcon
 
     with patch("src.ui.tray.pystray"):
         tray = TrayIcon(on_tray_died=lambda: died.append(True))
+    tray._tray_started = started
     monkeypatch.setattr(tray, "_check_tray_health", lambda: False)
     monkeypatch.setattr(tray, "_update_icon", lambda: None)
     return tray
+
+
+def test_health_failures_before_tray_start_never_declare_death(monkeypatch):
+    """Before the tray starts, a failing probe means "not started yet", not
+    "died", and must never declare death no matter how many ticks accrue.
+
+    The 60s tick calls tick_clock from the moment background startup runs, while
+    the one-time privacy notice still blocks run_blocking on the main thread, so
+    the status item is legitimately None. Counting those ticks reached
+    _TRAY_HEALTH_FAILURES_TO_DIE at ~2 minutes and force-exited a HEALTHY agent
+    while the notice was on screen — the exact ghost-process crash this check
+    exists to prevent (reproduced on a real Mac 2026-07-23: notice held open,
+    force-exit at +123s).
+    """
+    died = []
+    tray = _tray_with_dead_icon(monkeypatch, died, started=False)
+
+    for _ in range(tray._TRAY_HEALTH_FAILURES_TO_DIE + 5):
+        tray.tick_clock()
+
+    assert died == []
 
 
 def test_single_health_failure_does_not_kill_the_agent(monkeypatch):

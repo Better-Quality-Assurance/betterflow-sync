@@ -476,6 +476,37 @@ class BetterFlowClient(BaseApiClient):
         # the payload deliberately carries no device id. See
         # src/privacy_notice.py.
         "disclosure_acknowledgement",
+        # The two "this device records NOTHING" flags. aw_manager computes both
+        # (see its health payload) precisely to catch a device that heartbeats,
+        # authenticates and looks healthy while capturing zero — and they were
+        # absent from this tuple, so they never left the machine and the backend
+        # could not grade the device degraded. Laszlo Fabian Raul's device 50 sat
+        # in exactly that state for two full days on 1.5.116: bf-data-service
+        # could not start at all ([Errno 86] Bad CPU type), both work days
+        # recorded 0 seconds, and tracking_degraded stayed 0 the whole time.
+        #
+        # Forwarded as tri-state, like window_titles_captured_recently above: the
+        # membership test below is `in`, not truthiness, so a False survives the
+        # wire and can CLEAR a degraded episode rather than latching it.
+        "tracker_download_failed",
+        "managed_components_unavailable",
+        # Third field of the same shape, found while fixing the two above: the
+        # window watcher has stayed blind across repeated restarts (the macOS
+        # Accessibility counterpart of idle_tracker_blind, which IS forwarded).
+        # Computed into health_snapshot() and dropped here, so the backend could
+        # see a blind idle tracker but never a blind window tracker. Same
+        # category as its sibling — the agent reporting on its own watchers.
+        "window_tracker_blind",
+        # Fourth field of the same shape. Size of the local dead-letter table:
+        # events that exhausted their retries and were PRESERVED rather than
+        # deleted. A climbing value is real, captured, never-delivered billable
+        # activity sitting on one laptop. main._build_health_telemetry has
+        # always computed it (reported unconditionally, even at 0) and this
+        # allowlist dropped it — so no device has ever reported a backlog, and
+        # the "a growing backlog is visible to ops" requirement the whole
+        # preserve-don't-delete design exists for was never actually met.
+        # int, always present: 0 is an explicit healthy signal, not an omission.
+        "dead_letter_count",
     )
 
     def heartbeat(

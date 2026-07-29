@@ -553,6 +553,15 @@ class TrayIcon:
         self._tray_health_lock = threading.Lock()
         self._tray_health_failures = 0
 
+        # Whether the tray has begun its lifecycle — run_blocking()/start() has
+        # been entered and is responsible for a live status item. Until then a
+        # None status item means "not started yet", NOT "died": the 60s tick
+        # calls tick_clock from the moment background startup runs, while the
+        # one-time privacy notice still blocks run_blocking on the main thread,
+        # so counting those ticks force-exited a HEALTHY agent mid-notice (the
+        # ghost-process crash reproduced 2026-07-23). Set once, never cleared.
+        self._tray_started = False
+
         self.model = TrayModel()
 
         self._icon: Optional[pystray.Icon] = None
@@ -1404,6 +1413,14 @@ class TrayIcon:
 
     def tick_clock(self) -> None:
         """Called periodically to advance the clock-face icon hands."""
+        if not self._tray_started:
+            # The tray has not begun its lifecycle yet — run_blocking()/start()
+            # has not created a status item. A None status item here means "not
+            # started" (e.g. the one-time privacy notice is still blocking the
+            # main thread), never "died", so a failing probe must not accrue
+            # toward death. Without this gate the 60s tick force-exited a healthy
+            # agent ~2 minutes into an open notice window (reproduced 2026-07-23).
+            return
         if not self._check_tray_health():
             # Require consecutive failures before declaring death: this path
             # shuts the agent down and stops capture for the rest of the day,
@@ -1613,6 +1630,10 @@ class TrayIcon:
         if self._icon is not None:
             return
 
+        # The tray's lifecycle has begun (see run_blocking): a None status item
+        # from here on is a real fault, not the not-yet-started state.
+        self._tray_started = True
+
         # A fresh icon gets a fresh streak: stop() nulls _icon, so a tick landing
         # in a stop→start window (logout/re-login) counts a failure that has
         # nothing to do with the new status item.
@@ -1650,6 +1671,9 @@ class TrayIcon:
         which can happen on macOS when NSApplication fails to initialise.
         """
         _prevent_termination()
+        # The tray's lifecycle has begun: from here a None status item is a
+        # failure to keep alive, not the not-yet-started state tick_clock skips.
+        self._tray_started = True
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):

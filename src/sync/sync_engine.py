@@ -33,7 +33,7 @@ try:
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
-    from .queue import is_event_storable, normalized_project_id
+    from .queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -46,13 +46,19 @@ except ImportError:
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
-    from sync.queue import is_event_storable, normalized_project_id
+    from sync.queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
 
 logger = logging.getLogger(__name__)
 
 # Sentinel for "no project id has been rejected yet" — distinct from None,
 # which is itself a rejectable value (a project dict with no "id").
 _NO_REJECTED_PROJECT_ID = object()
+
+
+#: Reasons that mark the START of an excluded window. Only these flush the
+#: pre-window tail before advancing checkpoints — on the LEAVE side `now` is the
+#: end of the window, so flushing there would upload the span being excluded.
+_FLUSH_TAIL_ON_ENTER = frozenset({"pause", "private_time"})
 
 
 def _is_window_like(bucket_type: str) -> bool:
@@ -230,6 +236,10 @@ class SyncEngine:
         self._display_tracker = display_tracker
         self._browser_tracker = browser_tracker
         self._paused = False
+        # "cannot upload right now", NOT "must not record". Distinct from
+        # _paused on purpose: _paused discards the window, this one keeps it.
+        # See suspend_upload().
+        self._upload_suspended = False
         self._private_mode = False
         self._private_start: Optional[datetime] = None
         self._current_project: Optional[dict] = None
@@ -339,6 +349,16 @@ class SyncEngine:
         # past the _do_sync watchdog. None outside a sync() cycle (e.g. a direct
         # _send_events call in a unit test) -> the budget guard is inert.
         self._cycle_start_monotonic: Optional[float] = None
+
+        # Starvation floor for the in-cycle network budget. `_cycle_delivered`
+        # records whether THIS cycle put anything on the wire at all;
+        # `_consecutive_undelivered_cycles` counts cycles in a row where the
+        # budget gate refused the drain and nothing else had delivered either.
+        # Both are touched only on the sync thread (a wedge-recovery cycle can
+        # overlap, in which case the worst case is an extra forced drain — the
+        # same failure the floor is there to cause on purpose).
+        self._cycle_delivered = False
+        self._consecutive_undelivered_cycles = 0
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -497,6 +517,70 @@ class SyncEngine:
         # advance to pause-START doesn't cover it). See Lucian, 2026-06-22.
         if was_paused:
             self._advance_checkpoints_to_now("resume")
+
+    def suspend_upload(self, reason: str) -> None:
+        """Record that uploads can't land right now. NOT the same as pause().
+
+        This is deliberately an observable marker, NOT an egress gate: it is
+        written here and read only by is_upload_suspended (tray/diagnostics).
+        Upload is already gated by `bf.is_reachable()` at every send site, with
+        the offline queue as the durability layer, so the network outage stops
+        the sends on its own — this flag adds nothing to that and must not
+        become a second gate. If it ever gates a send, an outage the OS network
+        monitor never reports as recovered (see
+        BetterFlowApp._set_sync_failure_state: Wi-Fi "connected" with no route
+        is exactly that case) latches it True for the rest of the process and
+        the device stops uploading with a healthy network.
+
+        pause() means "this window must never be recorded" — private time, a
+        manual break, a working-hours close — and it enforces that by advancing
+        every checkpoint past the window so the events can never be fetched.
+
+        A network outage is the opposite: the work happened, it is billable, we
+        simply cannot upload it yet. Routing it through pause() deleted it. The
+        offline queue never saw those events because they were never fetched —
+        which is why "0 queued" was reported all the way through outages that
+        lost real time. Reproduced against this engine: 8 min offline lost 6 min,
+        20 min lost 18, 95 min lost 93 (duration minus the 2-minute lookback),
+        with send_events never called once.
+
+        Livia Cimpeanu described it on 2026-06-16, five weeks before it was
+        found in the code: "I was tracked before my break. It isn't anymore."
+        """
+        with self._state_lock:
+            already = self._upload_suspended
+            self._upload_suspended = True
+        if not already:
+            logger.info("Upload suspended (%s) — still capturing and queueing", reason)
+
+    def resume_upload(self, reason: str) -> None:
+        """Clear the marker. Deliberately does NOT touch checkpoints.
+
+        That is the whole point: nothing is skipped on the way back, so the
+        next normal "since checkpoint" fetch picks up everything recorded
+        during the outage and the queue drains on the usual sync path.
+
+        It DOES drop the session flag, though. pause() used to do that on the
+        way into an outage (end_session + _session_active = False), so the
+        first cycle back always re-established the session. Nothing heartbeats
+        during an outage, so the server's 30-min cleanup marks the session
+        'crashed' — and without this the agent would never call
+        sessions/start again and tracking would not resume on return. Only the
+        local flag is cleared: end_session is pointless mid-outage and the next
+        cycle's start_session is the same call the pre-outage path made.
+        """
+        with self._state_lock:
+            was = self._upload_suspended
+            self._upload_suspended = False
+            if was:
+                self._session_active = False
+        if was:
+            logger.info("Upload resumed (%s) — draining the queue", reason)
+
+    @property
+    def is_upload_suspended(self) -> bool:
+        with self._state_lock:
+            return self._upload_suspended
 
     @property
     def is_paused(self) -> bool:
@@ -725,6 +809,7 @@ class SyncEngine:
         _send_status_span's policy for exactly this reason.
         """
         try:
+            self._note_delivery_attempt()
             result = self.bf.send_events([event])
             if getattr(result, "success", False):
                 return
@@ -920,6 +1005,9 @@ class SyncEngine:
         # Publish the cycle start so _send_events can bound the per-bucket send
         # loop to the same in-cycle network budget as the queue drain.
         self._cycle_start_monotonic = cycle_start
+        # Fresh cycle, nothing delivered yet. Feeds the drain gate's starvation
+        # floor (_drain_gate_allows).
+        self._cycle_delivered = False
 
         # Daily housekeeping before anything else, so it still runs while paused:
         # a long-running agent that never restarts across midnight would
@@ -996,7 +1084,7 @@ class SyncEngine:
             # that were contractually not recorded.
             self.flush_engagement_detectors("capture_suppressed")
             if self.bf.is_reachable() and not self.queue.is_empty():
-                if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+                if self._drain_gate_allows():
                     self._process_queue(stats)
             with self._state_lock:
                 self._heartbeat_count += 1
@@ -1309,9 +1397,10 @@ class SyncEngine:
         # Process offline queue if we're online — but only if this cycle hasn't
         # already burned most of the watchdog budget on a slow/hung regular send
         # (else two ~94s chains stack past _DO_SYNC_DEADLINE; the queue drains
-        # next cycle).
+        # next cycle). _drain_gate_allows adds the floor that stops "next cycle"
+        # from being the answer forever — see its docstring.
         if self.bf.is_reachable() and not self.queue.is_empty():
-            if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+            if self._drain_gate_allows():
                 self._process_queue(stats)
             else:
                 # The regular send already burned most of the watchdog budget
@@ -2659,6 +2748,7 @@ class SyncEngine:
         # block was unreachable and break/idle/private events were silently
         # dropped on the first offline cycle. Inspect the result instead.
         try:
+            self._note_delivery_attempt()
             result = self.bf.send_events([event])
         except BetterFlowAuthError as e:
             # Auth errors are not retryable without re-login; queueing risks
@@ -3258,10 +3348,23 @@ class SyncEngine:
             # request chain (~94s against a hung server). Once this cycle has
             # spent the budget on network, queue the remaining groups instead of
             # starting another chain that would stack past the _do_sync watchdog
-            # ("Sync hung" / "Sync wedged"). The first group always attempts
-            # (idx == 0) so a cycle still makes forward progress. No-op when the
-            # cycle start is unset (direct _send_events call outside sync()).
-            if idx > 0 and self._cycle_network_budget_exceeded(
+            # ("Sync hung" / "Sync wedged").
+            #
+            # The check gates EVERY group, including the first (idx == 0). The
+            # first group used to attempt unconditionally "for forward progress",
+            # but the only way the budget is already spent when the send loop
+            # begins is a slow/hung PRE-send chain — a session-start (~94s) or a
+            # config-fetch, each gated only at ITS entry, so once started it runs
+            # to completion. A session-start chain (elapsed 0 -> ~94s) followed by
+            # an unconditional first-send chain (~94s) reaches ~188s, blowing the
+            # 150s watchdog even though nothing is wedged. Gating the first group
+            # too caps the cycle at one surviving chain (budget + ~94s = ~144s <
+            # 150s). Forward progress is preserved ACROSS cycles by the durable
+            # OfflineQueue; a hung server must not force an in-cycle delivery that
+            # overruns the watchdog. In a healthy cycle elapsed is ~0 here, so the
+            # first group still sends. No-op when the cycle start is unset (a
+            # direct _send_events call outside sync()).
+            if self._cycle_network_budget_exceeded(
                 self._SEND_SKIP_IF_CYCLE_ELAPSED
             ):
                 logger.warning(
@@ -3300,6 +3403,7 @@ class SyncEngine:
 
         for i, batch in enumerate(batches):
             try:
+                self._note_delivery_attempt()
                 result = self.bf.send_events(batch)
                 if result.success:
                     stats.events_sent += result.events_synced
@@ -3400,6 +3504,83 @@ class SyncEngine:
         start = self._cycle_start_monotonic
         return start is not None and (time.monotonic() - start) >= budget_seconds
 
+    # After this many CONSECUTIVE cycles in which the budget gate refused the
+    # drain and nothing else delivered either, one drain is forced through even
+    # with the budget spent. See _drain_gate_allows for why this exists and why
+    # the number is small.
+    _DELIVERY_STARVATION_FLOOR_CYCLES = 3
+
+    def _note_delivery_attempt(self) -> None:
+        """Record that this cycle put events on the wire.
+
+        Called at every ``bf.send_events`` site. "Attempt", not "success", is
+        deliberate: the property the floor protects is that the budget gate
+        cannot stop us from TRYING. A batch that fails has its own backoff and
+        retry-ceiling machinery; a batch that is never sent has nothing.
+        """
+        self._cycle_delivered = True
+
+    def _drain_gate_allows(self) -> bool:
+        """Whether to drain the offline queue this cycle — budget gate plus a
+        floor so it can never refuse forever.
+
+        The budget gate alone is a permanent freeze away from a real outage.
+        When the backend degrades on ``/session/start`` only, ``start_session``
+        raises, ``_session_active`` stays False, so ``need_session`` is True
+        every cycle and each cycle burns a ~94s chain there before reaching any
+        delivery gate. Both the send loop and this drain then see elapsed >= the
+        budget, so the cycle sends nothing AND drains nothing — forever, with a
+        green heartbeat ("alive but uploads frozen"). Events pile up to
+        ``max_size`` and oldest-eviction begins destroying billable time.
+
+        The floor is on the DRAIN rather than on the first send group, which is
+        what the send-side gate's own comment would suggest. Reason: a blocked
+        send is not a lost send — ``_send_events`` enqueues those events into the
+        durable queue. So the drain is the COMPLETE delivery surface; everything
+        reaches the server through it eventually. Forcing only the first send
+        group would deliver one bucket group per forced cycle while the queue
+        behind it grew without bound, which is the data-loss half of the bug
+        left intact. Forcing the drain instead moves the whole backlog: it
+        carries up to ``batch_size * 10`` events, far more than a few cycles of
+        capture, so the queue cannot run away.
+
+        Counted per CYCLE, and only when the cycle delivered NOTHING. A cycle
+        that spent the budget but still put events on the wire is the gate
+        working exactly as designed and resets the counter — otherwise a merely
+        slow-but-healthy agent would be forced into a second chain every few
+        cycles for no reason.
+
+        The cost is explicit and bounded: a forced drain can put a cycle at
+        ~94s (session chain) + ~94s (drain) ~= 188s, over the 150s "Sync hung"
+        report threshold though well under the 420s wedge ceiling — and at most
+        once every ``_DELIVERY_STARVATION_FLOOR_CYCLES + 1`` cycles, because
+        the forced drain itself resets the counter. A noisy watchdog report
+        every few cycles is the correct trade against silently losing billed
+        time; the report is also how an operator finds out this is happening.
+        """
+        if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+            self._consecutive_undelivered_cycles = 0
+            return True
+        if self._cycle_delivered:
+            return False
+        self._consecutive_undelivered_cycles += 1
+        if self._consecutive_undelivered_cycles < self._DELIVERY_STARVATION_FLOOR_CYCLES:
+            return False
+        logger.warning(
+            "Delivery starvation floor engaged: %d consecutive cycles delivered "
+            "NOTHING because the %ds in-cycle network budget was already spent "
+            "before any upload could start (queue_size=%d). Forcing one queue "
+            "drain through — this cycle may exceed the sync watchdog, which is "
+            "the intended trade against a permanently frozen upload path. "
+            "Something ahead of the upload (session start / config fetch) is "
+            "burning the whole budget every cycle; that is the real fault.",
+            self._consecutive_undelivered_cycles,
+            self._QUEUE_SKIP_IF_CYCLE_ELAPSED,
+            self.queue.size(),
+        )
+        self._consecutive_undelivered_cycles = 0
+        return True
+
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
 
@@ -3441,6 +3622,29 @@ class SyncEngine:
         now = datetime.now(timezone.utc)
         if now < self._queue_backoff_until:
             return
+
+        # Bounded dead-letter replay: resurrect rows that are storable AGAIN into
+        # the live queue for another delivery attempt. Done here — past the
+        # backoff gate, so only when we're actually about to drain (server
+        # presumed reachable) — so we never resurrect into an outage. The queue
+        # method is conservative (bounded batch, MOVE-not-copy so no double-send,
+        # same storable/retention classification as evict_unstorable, and rows
+        # that are genuinely unstorable or have aged past retention are left
+        # behind). Resurrected rows fall into the same drain loop below.
+        try:
+            self.queue.requeue_storable_dead_letter()
+        except Exception as e:  # noqa: BLE001
+            # WARNING, not debug. This is the only signal the replay ever emits
+            # on failure, and debug is off in the shipped build — a replay that
+            # never runs (locked DB, schema drift, disk full) is invisible while
+            # dead_letter_count climbs and the operator has nothing to correlate
+            # it against. Swallowed deliberately: a broken replay must never
+            # cost the drain that follows it.
+            logger.warning(
+                "Dead-letter replay failed (%s: %s) — preserved events will not "
+                "be retried this cycle; dead_letter_count will keep climbing",
+                type(e).__name__, e, exc_info=True,
+            )
 
         # Process queue in batches
         deadline = time.monotonic() + self._QUEUE_PROCESS_TIMEOUT
@@ -3484,6 +3688,7 @@ class SyncEngine:
             event_ids = [q.id for q in queued]
 
             try:
+                self._note_delivery_attempt()
                 result = self.bf.send_events(events)
                 if result.success:
                     self.queue.remove(event_ids)
@@ -3579,7 +3784,9 @@ class SyncEngine:
         eviction/real-loss verdict — a stuck head holding genuine recent activity
         is held, never dropped."""
         now = now or datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=7)  # matches the queue's stale_after_days
+        # ONE definition of the window, imported — not a local literal that
+        # silently drifts from the queue's eviction/replay pair.
+        cutoff = now - timedelta(days=EVENT_RETENTION_DAYS)
         return any(is_event_storable(ev, stale_cutoff=cutoff) for ev in events)
 
     def _apply_queue_backoff(self) -> None:
@@ -3943,6 +4150,7 @@ class SyncEngine:
         with self._state_lock:
             paused = self._paused
             session_active = self._session_active
+            upload_suspended = self._upload_suspended
         aw_running = self.aw.is_running()
         bf_reachable = self.bf.is_reachable() if not paused else False
         queue_size = self.queue.size()
@@ -3950,6 +4158,10 @@ class SyncEngine:
 
         return {
             "paused": paused,
+            # The one reader of the suspend marker: without it the flag is a
+            # write nothing consumes, and "offline but still capturing" is
+            # indistinguishable from "paused" in diagnostics.
+            "upload_suspended": upload_suspended,
             "session_active": session_active,
             "aw_running": aw_running,
             "bf_reachable": bf_reachable,
@@ -4017,11 +4229,14 @@ class SyncEngine:
                 logger.warning("Discarding in-process input counts failed: %s", e)
 
         bucket_ids: set[str] = set()
+        buckets: list = []
 
         def _collect(fetcher) -> None:
             try:
                 for bucket in fetcher():
-                    bucket_ids.add(bucket.id)
+                    if bucket.id not in bucket_ids:
+                        bucket_ids.add(bucket.id)
+                        buckets.append(bucket)
             except (AWClientError, TypeError, AttributeError) as e:
                 logger.debug(f"_advance_checkpoints_to_now: {getattr(fetcher, '__name__', '?')}: {e}")
 
@@ -4033,12 +4248,86 @@ class SyncEngine:
         if not bucket_ids:
             return
 
+        # On the way IN, rescue the tail of real work first.
+        #
+        # This method's own contract is that "the enter call only drops
+        # pre-window buffered events" — but those events are not part of the
+        # window being excluded. They are seconds the person actually worked in
+        # the up-to-60s since the last fetch, immediately before they locked the
+        # screen, started a break or turned on Private Time. Losing them was
+        # never the intent of any of those three features; it was collateral,
+        # and it happened on every single one, fleet-wide.
+        #
+        # ENTER only. On the way out `now` is the END of the window, so flushing
+        # there would upload the very span the caller is excluding — that is the
+        # Private Time contract, not a tuning choice.
+        if reason in _FLUSH_TAIL_ON_ENTER:
+            self._flush_pre_window_tail(buckets, now, reason)
+
         for bucket_id in bucket_ids:
             self.queue.set_checkpoint(bucket_id, now)
 
         logger.info(
             f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
         )
+
+    def _flush_pre_window_tail(self, buckets: list, boundary: datetime, reason: str) -> None:
+        """Queue whatever AW recorded between each bucket's checkpoint and
+        ``boundary``, so the checkpoint advance that follows discards only the
+        window itself.
+
+        Deliberately mirrors _reconcile_backlog, which does the same
+        fetch-transform-enqueue and is the proven path: the backend upserts by
+        AW event id so re-enqueuing is deduped, window events go through the
+        counted-time cache so an already-counted event is a no-op, and
+        non-window events pass skip_time_tracking so the daily total is never
+        touched twice. A fresh, empty _SyncCycleContext is used for the same
+        reason it is there — deterministic, never inherits a prior cycle.
+
+        Bounded and local: the range is normally the ~60s since the last sync,
+        ActivityWatch is on localhost and the queue is SQLite, so this adds no
+        backend network to a path that runs on the tray thread. Never raises —
+        every failure degrades to exactly the old behaviour, never worse.
+        """
+        cycle = _SyncCycleContext()
+        enqueued = 0
+        for bucket in buckets:
+            try:
+                checkpoint = self.queue.get_checkpoint(bucket.id)
+                if checkpoint is None or checkpoint >= boundary:
+                    continue
+                events = self.aw.get_events(
+                    bucket.id,
+                    start=checkpoint,
+                    end=boundary,
+                    limit=self._BACKLOG_FETCH_LIMIT,
+                )
+                if not events:
+                    continue
+                events.sort(key=lambda e: e.timestamp)  # AW is newest-first
+                batch: list[dict] = []
+                for event in events:
+                    if _is_window_like(bucket.type):
+                        batch.extend(
+                            self._transform_window_event_with_timeout(
+                                event, bucket.id, bucket.type, cycle
+                            )
+                        )
+                    else:
+                        transformed = self._transform_event(
+                            event, bucket.id, bucket.type,
+                            skip_time_tracking=True, cycle=cycle,
+                        )
+                        if transformed:
+                            batch.append(transformed)
+                if batch:
+                    enqueued += self.queue.enqueue(batch)
+            except Exception as e:
+                logger.debug("pre-%s tail flush failed for %s: %s", reason, bucket.id, e)
+        if enqueued:
+            logger.info(
+                "Queued %d event(s) captured before %s took effect", enqueued, reason
+            )
 
     def get_today_active_time(self) -> timedelta:
         """Get cumulative active work time for today.
