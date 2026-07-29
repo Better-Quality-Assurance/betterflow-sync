@@ -33,25 +33,39 @@ def test_unknown_layout_is_replaceable():
         assert su.app_bundle_replaceable() is True
 
 
+# These three force the darwin branch via the platform patch, so they exercise
+# macOS logic on EVERY runner — including Windows, where `os.getuid` does not
+# exist at all. Two consequences, both load-bearing:
+#   * use a literal uid, never `os.getuid()`, or the test file raises
+#     AttributeError on Windows before any assertion runs;
+#   * patch `su.os.getuid` with `create=True`, because patch.object refuses by
+#     default to patch an attribute the target module does not have.
+# Dropping either one turns the whole Windows build red — and since the release
+# job needs every platform green, that blocks the release rather than just
+# failing a test (v1.5.119's first tag build, 2026-07-29).
+_A_NORMAL_UID = 501
+_ROOT_UID = 0
+
+
 def test_user_owned_bundle_is_replaceable():
     with patch.object(su.sys, "platform", "darwin"), \
-         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(os.getuid())), \
-         patch.object(su.os, "getuid", return_value=os.getuid()):
+         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(_A_NORMAL_UID)), \
+         patch.object(su.os, "getuid", create=True, return_value=_A_NORMAL_UID):
         assert su.app_bundle_replaceable() is True
 
 
 def test_root_owned_bundle_is_not_replaceable():
     # The reported failure: bundle owned by root (uid 0), we are a normal user.
     with patch.object(su.sys, "platform", "darwin"), \
-         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(0)), \
-         patch.object(su.os, "getuid", return_value=501):
+         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(_ROOT_UID)), \
+         patch.object(su.os, "getuid", create=True, return_value=_A_NORMAL_UID):
         assert su.app_bundle_replaceable() is False
 
 
 def test_running_as_root_can_replace_anything():
     with patch.object(su.sys, "platform", "darwin"), \
-         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(0)), \
-         patch.object(su.os, "getuid", return_value=0):
+         patch.object(su, "_get_app_bundle_path", return_value=_FakeApp(_ROOT_UID)), \
+         patch.object(su.os, "getuid", create=True, return_value=_ROOT_UID):
         assert su.app_bundle_replaceable() is True
 
 
