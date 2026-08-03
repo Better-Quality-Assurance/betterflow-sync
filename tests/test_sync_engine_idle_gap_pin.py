@@ -111,3 +111,69 @@ def test_post_gap_events_are_eventually_fetched():
         assert engine.queue.get_checkpoint(BUCKET) >= resume
     finally:
         engine.queue.close()
+
+
+def test_multi_day_gap_crossed_in_single_cycle():
+    """A weekend-sized gap must be crossed within ONE _fetch_bucket_events call.
+
+    Incident (PiratesMac / device 14, 2026-08-03): the gap-jump fix above works
+    but advanced only one _BACKLOG_WINDOW (2h) per 60s sync cycle, so a Monday
+    morning after a ~24h weekend gap spent ~30 minutes uploading nothing but the
+    afk heartbeat — empty dashboard graph, "--:--" Arrival, and an
+    active_seconds=0 "Unknown" aggregate until the walker caught up. Consecutive
+    EMPTY windows are provably safe to skip, so they must all be walked inside
+    the same cycle."""
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(hours=49)        # Fri evening -> Mon morning gap
+    resume = now - timedelta(minutes=30)    # Monday work has begun
+
+    events = [AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})]
+    events += [
+        AWEvent(id=100 + i, timestamp=resume + timedelta(seconds=30 * i),
+                duration=10.0, data={"app": "Terminal"})
+        for i in range(3)
+    ]
+    aw = _aw_serving(events)
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+
+        assert [e for e in batch if e.timestamp >= resume], (
+            "one cycle crossed only one empty window — post-gap events would "
+            "wait ~1 min per 2h of gap before first upload"
+        )
+    finally:
+        engine.queue.close()
+
+
+def test_empty_window_walk_is_bounded_per_cycle():
+    """The in-cycle walk must stop at _BACKLOG_MAX_EMPTY_WINDOWS_PER_CYCLE so a
+    months-parked device cannot stall a sync cycle probing its whole history at
+    once. Progress persists via the checkpoint, so the next cycle resumes."""
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(days=30)  # long-parked device, nothing since
+
+    aw = _aw_serving([AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})])
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+        cp = engine.queue.get_checkpoint(BUCKET)
+
+        assert batch == []
+        # Loop ran: the cap's worth of windows was crossed in one cycle
+        # (48 windows x ~1h58m net advance each ~= 94h).
+        assert cp >= tail + timedelta(hours=90), (
+            f"walk did not run inside the cycle (cp={cp.isoformat()})"
+        )
+        # Cap held: the 30-day span was NOT consumed in one cycle.
+        assert cp < now - timedelta(days=20), (
+            f"walk was unbounded within a single cycle (cp={cp.isoformat()})"
+        )
+    finally:
+        engine.queue.close()
