@@ -177,3 +177,125 @@ def test_empty_window_walk_is_bounded_per_cycle():
         )
     finally:
         engine.queue.close()
+
+
+def test_walk_stops_at_mid_gap_event_cluster():
+    """The walk must STOP at the first non-empty window, not blind-skip to the
+    newest activity. A Saturday work blip inside a Fri->Mon gap is real billable
+    time; skipping past it persists the checkpoint beyond it (monotonic), and
+    _reconcile_backlog only replays local-midnight->now — the blip would be
+    unrecoverable."""
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(hours=49)      # Friday evening
+    blip = now - timedelta(hours=35)      # Saturday afternoon blip
+    resume = now - timedelta(minutes=30)  # Monday morning
+
+    events = [AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})]
+    events += [
+        AWEvent(id=50 + i, timestamp=blip + timedelta(seconds=30 * i),
+                duration=10.0, data={"app": "Terminal"})
+        for i in range(3)
+    ]
+    events += [
+        AWEvent(id=100 + i, timestamp=resume + timedelta(seconds=30 * i),
+                duration=10.0, data={"app": "Terminal"})
+        for i in range(3)
+    ]
+    aw = _aw_serving(events)
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+
+        got = {e.id for e in batch}
+        assert {50, 51, 52} <= got, (
+            f"mid-gap Saturday events were skipped (batch ids: {sorted(got)})"
+        )
+        assert not {100, 101, 102} & got, (
+            "walk overshot the first non-empty window to Monday's events"
+        )
+        assert engine.queue.get_checkpoint(BUCKET) < blip, (
+            "checkpoint persisted past an unfetched mid-gap cluster"
+        )
+    finally:
+        engine.queue.close()
+
+
+def test_error_mid_walk_keeps_per_skip_progress():
+    """Each skipped window persists BEFORE the next probe, so a probe that
+    errors at window N leaves the checkpoint N windows forward. Persisting only
+    at loop exit would re-walk (and re-fail) the same span every cycle —
+    reincarnating the stall this fix exists to cure."""
+    from src.sync.aw_client import AWClientError
+
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(days=30)
+
+    calls = {"n": 0}
+
+    def get_events(bucket_id, start=None, end=None, limit=1000):
+        calls["n"] += 1
+        if calls["n"] >= 4:  # initial probe + 3 loop probes, then the AW dies
+            raise AWClientError("aw went away mid-walk")
+        e = AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})
+        return [e] if (start is None or e.timestamp >= start) and (end is None or e.timestamp < end) else []
+
+    aw = Mock()
+    aw.get_events.side_effect = get_events
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        try:
+            engine._fetch_bucket_events(BUCKET, SyncStats())
+        except AWClientError:
+            pass  # propagates to the per-bucket handler in _sync_window_buckets
+
+        cp = engine.queue.get_checkpoint(BUCKET)
+        # 3 completed skips of ~1h58m each were persisted before the failing probe.
+        assert cp >= tail + timedelta(hours=5), (
+            f"progress before the failing probe was lost (cp={cp.isoformat()})"
+        )
+        assert cp <= tail + timedelta(hours=8), f"overshot past the failure point (cp={cp.isoformat()})"
+    finally:
+        engine.queue.close()
+
+
+def test_walk_wall_clock_budget_bounds_slow_probes():
+    """The iteration cap bounds probes, not time: a degraded local AW server can
+    take seconds per probe without raising. The walk must also stop at
+    _BACKLOG_WALK_BUDGET_SECONDS so one bucket cannot eat the sync watchdog's
+    150s deadline."""
+    from unittest.mock import patch
+
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(days=30)
+
+    aw = _aw_serving([AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})])
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        # Each monotonic() read advances 3 "seconds": deadline = t+5, so the
+        # loop's second condition check reads past the deadline after ~2 skips.
+        t = {"v": 1000.0}
+
+        def fake_monotonic():
+            t["v"] += 3.0
+            return t["v"]
+
+        with patch("src.sync.sync_engine.time.monotonic", side_effect=fake_monotonic):
+            batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+
+        cp = engine.queue.get_checkpoint(BUCKET)
+        assert batch == []
+        assert cp > tail, "walk never ran"
+        assert cp <= tail + timedelta(hours=10), (
+            f"slow-probe walk was not time-bounded (cp={cp.isoformat()})"
+        )
+    finally:
+        engine.queue.close()

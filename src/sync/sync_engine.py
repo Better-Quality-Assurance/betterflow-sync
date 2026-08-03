@@ -223,6 +223,14 @@ class SyncEngine:
     # ~4 days of history per cycle; the checkpoint persists each skip, so the
     # walk resumes where it left off.
     _BACKLOG_MAX_EMPTY_WINDOWS_PER_CYCLE = 48
+    # Wall-clock budget for that walk, per bucket. The iteration cap alone does
+    # not bound TIME: a degraded-but-answering local AW server can take up to
+    # the client's 10s timeout per probe without raising, and 48 probes x 4
+    # backlogged buckets would blow the 150s sync watchdog deadline (false
+    # "Sync hung" ERROR) and even the 420s wedge ceiling (concurrent cycles).
+    # Healthy probes run ~5ms, so this never triggers in the normal case; when
+    # it does, progress is already persisted and the next cycle resumes.
+    _BACKLOG_WALK_BUDGET_SECONDS = 5.0
 
     def __init__(
         self,
@@ -1864,10 +1872,12 @@ class SyncEngine:
         # loses no progress — the next cycle resumes from the last empty span.
         new_events = [e for e in events if e.timestamp > checkpoint]
         empty_windows_skipped = 0
+        walk_deadline = time.monotonic() + self._BACKLOG_WALK_BUDGET_SECONDS
         while (
             not new_events
             and fetch_end < now
             and empty_windows_skipped < self._BACKLOG_MAX_EMPTY_WINDOWS_PER_CYCLE
+            and time.monotonic() < walk_deadline
         ):
             self.queue.set_checkpoint_forward(bucket_id, fetch_end)
             checkpoint = fetch_end
