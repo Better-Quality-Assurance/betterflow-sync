@@ -111,3 +111,73 @@ def test_post_gap_events_are_eventually_fetched():
         assert engine.queue.get_checkpoint(BUCKET) >= resume
     finally:
         engine.queue.close()
+
+
+def test_multi_day_gap_crossed_in_single_cycle():
+    """A weekend-sized EMPTY gap must be crossed inside ONE fetch call.
+
+    Advancing one _BACKLOG_WINDOW (2h) per 60s sync cycle crosses a 62h weekend
+    in ~31 cycles = ~31 minutes, during which the morning's window/input events
+    sit captured-but-unsent and the server's 15-min window-ingest-stall alert
+    fires (device 14, 2026-08-03 — every Monday, every device with a weekend
+    gap). The empty-window walk must happen inside the cycle, not across cycles.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(hours=62)        # Friday-evening pre-weekend tail
+    resume = now - timedelta(minutes=10)    # Monday-morning work
+
+    events = [AWEvent(id=1, timestamp=tail, duration=10.0, data={"app": "Terminal"})]
+    events += [
+        AWEvent(id=100 + i, timestamp=resume + timedelta(seconds=30 * i),
+                duration=10.0, data={"app": "Terminal"})
+        for i in range(3)
+    ]
+    aw = _aw_serving(events)
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+
+        post_gap = [e for e in batch if e.timestamp >= resume]
+        assert post_gap, (
+            "one fetch cycle returned no post-gap events — the empty weekend "
+            "span is being crossed one 2h window per cycle, stalling upload "
+            "~31 min and tripping the server's window-ingest-stall alert"
+        )
+    finally:
+        engine.queue.close()
+
+
+def test_empty_gap_walk_is_bounded_per_cycle():
+    """The in-cycle walk must terminate after a bounded number of empty windows
+    (each is a local HTTP call), resuming from the advanced checkpoint next
+    cycle — an ancient checkpoint must not turn one cycle into thousands of
+    fetches."""
+    tmp = Path(tempfile.mkdtemp())
+    now = datetime.now(timezone.utc)
+    tail = now - timedelta(days=400)
+
+    aw = _aw_serving([])  # nothing to find, ever
+    engine = _engine(tmp, aw)
+    try:
+        engine.queue.set_checkpoint(BUCKET, tail)
+
+        batch, _lb = engine._fetch_bucket_events(BUCKET, SyncStats())
+
+        assert batch == []
+        cp = engine.queue.get_checkpoint(BUCKET)
+        max_walk = (
+            engine._EMPTY_GAP_MAX_WINDOWS_PER_CYCLE * engine._BACKLOG_WINDOW
+            + engine._BACKLOG_WINDOW  # the pre-loop first window
+        )
+        assert cp > tail, "cursor did not advance at all"
+        assert cp <= tail + max_walk, (
+            f"cursor advanced {(cp - tail)} in one cycle — the per-cycle bound "
+            "on empty-window fetches is not being enforced"
+        )
+        # And the number of AW round-trips this cycle is the bound, not the gap size.
+        assert aw.get_events.call_count <= engine._EMPTY_GAP_MAX_WINDOWS_PER_CYCLE + 1
+    finally:
+        engine.queue.close()

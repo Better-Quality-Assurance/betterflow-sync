@@ -215,6 +215,14 @@ class SyncEngine:
     # (~300 input/h), so the slice keeps the true oldest events.
     _BACKLOG_WINDOW = timedelta(hours=2)
     _BACKLOG_FETCH_LIMIT = 1000
+    # An EMPTY span (weekend, leave) is walked window-by-window INSIDE one
+    # cycle, not one window per cycle — at one 2h step per 60s cycle a 62h
+    # weekend takes ~31 min, during which the morning's window/input events sit
+    # captured-but-unsent and the server's 15-min window-ingest-stall alert
+    # fires (device 14, 2026-08-03). Each empty step is one cheap local AW
+    # query; the cap bounds a cycle when the checkpoint is ancient (64 × 2h =
+    # ~5.3 days per cycle, so any realistic gap clears in 1-2 cycles).
+    _EMPTY_GAP_MAX_WINDOWS_PER_CYCLE = 64
 
     def __init__(
         self,
@@ -1847,8 +1855,30 @@ class SyncEngine:
         # (fetch_end == now) the jump never fires, so the lookback's heartbeat-
         # grown re-send is preserved.
         new_events = [e for e in events if e.timestamp > checkpoint]
-        if not new_events and fetch_end < now:
+        # Walk consecutive empty windows within THIS cycle (each is one local AW
+        # query) so a multi-day empty span is crossed in seconds, not one window
+        # per 60s cycle. The checkpoint advances per step, so an interrupted walk
+        # resumes where it left off; the per-cycle cap keeps an ancient
+        # checkpoint from turning one cycle into thousands of fetches.
+        empty_steps = 0
+        while (
+            not new_events
+            and fetch_end < now
+            and empty_steps < self._EMPTY_GAP_MAX_WINDOWS_PER_CYCLE
+        ):
+            empty_steps += 1
             self.queue.set_checkpoint_forward(bucket_id, fetch_end)
+            checkpoint = fetch_end
+            lookback_start = fetch_end
+            fetch_end = min(now, lookback_start + self._BACKLOG_WINDOW)
+            events = self.aw.get_events(
+                bucket_id, start=lookback_start, end=fetch_end, limit=self._BACKLOG_FETCH_LIMIT
+            )
+            events.sort(key=lambda e: e.timestamp)
+            new_events = [e for e in events if e.timestamp > checkpoint]
+        if not new_events and fetch_end < now:
+            # Cap reached mid-gap — the next cycle resumes from the advanced
+            # checkpoint.
             return [], lookback_start
 
         if len(events) > self.config.sync.batch_size:
