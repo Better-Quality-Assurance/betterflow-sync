@@ -215,6 +215,22 @@ class SyncEngine:
     # (~300 input/h), so the slice keeps the true oldest events.
     _BACKLOG_WINDOW = timedelta(hours=2)
     _BACKLOG_FETCH_LIMIT = 1000
+    # How many consecutive EMPTY backlog windows one cycle may skip. Each probe
+    # is a cheap local AW query, so a weekend/overnight gap is crossed inside a
+    # single cycle (48 x ~2h ~= 4 days) instead of one window per 60s cycle —
+    # which left the dashboard graph empty for ~30 min every Monday morning
+    # (device 14, 2026-08-03). Bounded so a months-parked device probes at most
+    # ~4 days of history per cycle; the checkpoint persists each skip, so the
+    # walk resumes where it left off.
+    _BACKLOG_MAX_EMPTY_WINDOWS_PER_CYCLE = 48
+    # Wall-clock budget for that walk, per bucket. The iteration cap alone does
+    # not bound TIME: a degraded-but-answering local AW server can take up to
+    # the client's 10s timeout per probe without raising, and 48 probes x 4
+    # backlogged buckets would blow the 150s sync watchdog deadline (false
+    # "Sync hung" ERROR) and even the 420s wedge ceiling (concurrent cycles).
+    # Healthy probes run ~5ms, so this never triggers in the normal case; when
+    # it does, progress is already persisted and the next cycle resumes.
+    _BACKLOG_WALK_BUDGET_SECONDS = 5.0
 
     def __init__(
         self,
@@ -1846,9 +1862,35 @@ class SyncEngine:
         # the checkpoint so an idle gap can't pin the cursor. In steady state
         # (fetch_end == now) the jump never fires, so the lookback's heartbeat-
         # grown re-send is preserved.
+        # Walk ALL consecutive empty windows inside this cycle (bounded), not
+        # one per cycle: a provably-empty span is safe to skip immediately, and
+        # skipping it at one window per 60s cycle left a weekend-sized gap
+        # uncrossed for ~30 minutes after Monday-morning startup while only the
+        # afk heartbeat reached the server (device 14, 2026-08-03). Each skip
+        # persists via set_checkpoint_forward, so an AWClientError mid-walk (it
+        # propagates to _sync_window_buckets' handler) or the per-cycle cap
+        # loses no progress — the next cycle resumes from the last empty span.
         new_events = [e for e in events if e.timestamp > checkpoint]
-        if not new_events and fetch_end < now:
+        empty_windows_skipped = 0
+        walk_deadline = time.monotonic() + self._BACKLOG_WALK_BUDGET_SECONDS
+        while (
+            not new_events
+            and fetch_end < now
+            and empty_windows_skipped < self._BACKLOG_MAX_EMPTY_WINDOWS_PER_CYCLE
+            and time.monotonic() < walk_deadline
+        ):
             self.queue.set_checkpoint_forward(bucket_id, fetch_end)
+            checkpoint = fetch_end
+            lookback_start = checkpoint - timedelta(minutes=2)
+            fetch_end = min(now, lookback_start + self._BACKLOG_WINDOW)
+            events = self.aw.get_events(
+                bucket_id, start=lookback_start, end=fetch_end, limit=self._BACKLOG_FETCH_LIMIT
+            )
+            events.sort(key=lambda e: e.timestamp)
+            new_events = [e for e in events if e.timestamp > checkpoint]
+            empty_windows_skipped += 1
+        if not new_events and fetch_end < now:
+            # Cap reached with the span still empty — resume next cycle.
             return [], lookback_start
 
         if len(events) > self.config.sync.batch_size:
