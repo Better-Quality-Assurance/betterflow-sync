@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 from .browser_auth import BrowserAuthFlow
-from .keychain import KeychainManager, StoredCredentials
+from .keychain import KeychainManager, KeychainUnavailableError, StoredCredentials
 
 try:
     from ..sync.bf_client import (
@@ -40,17 +40,38 @@ class LoginState:
     device_id: Optional[str] = None
     error: Optional[str] = None
     # True when login failed for a TRANSIENT reason (server unreachable —
-    # timeout / 5xx / connection drop) with the stored credentials left
-    # intact. The caller must NOT prompt re-auth in this case (the session is
-    # still valid; a re-auth flow can't even complete while the server is
-    # down) — it should retry auto-login in the background. False for a
-    # genuine logged-out state (no credentials, or credentials cleared after
-    # a definitive auth failure).
+    # timeout / 5xx / connection drop, an auth blip inside the tolerance
+    # window, or a keychain we could not read) with the stored credentials
+    # left intact. The caller must NOT prompt re-auth in this case (the
+    # session is still valid; a re-auth flow can't even complete while the
+    # server is down) — it should retry auto-login in the background. False
+    # for a genuine logged-out state (no credentials, or credentials cleared
+    # after a sustained auth failure).
     transient: bool = False
+    # True when the failure was "the keychain would not open", not "there is
+    # no session". The credential is still on the machine and still valid;
+    # nothing may delete it on this path. Set on both the tolerated and the
+    # escalated outcome, so the user-facing message can say what is actually
+    # wrong instead of implying the session expired.
+    credentials_unreadable: bool = False
 
 
 class LoginManager:
     """Manages authentication flow."""
+
+    # How long a restore failure is tolerated before the user is asked to sign
+    # in again. Deliberately the SAME window SyncCoordinator applies to a
+    # running agent (_AUTH_FAILURE_LOGOUT_MIN_SECONDS): the startup path used
+    # to give up after three attempts ~6 seconds apart and delete the token,
+    # which is ~150x more trigger-happy than the identical decision made one
+    # minute later by the running agent. A six-second backend blip during
+    # launch is not evidence that a session is over.
+    #
+    # The window is measured ACROSS calls, not within one: BetterFlowApp's
+    # reconnect loop re-invokes try_auto_login every 30s while a failure is
+    # tolerated, so the tolerance accumulates naturally and needs no sleeping
+    # here.
+    AUTH_TOLERANCE_SECONDS = 15 * 60
 
     def __init__(
         self,
@@ -69,6 +90,12 @@ class LoginManager:
         self._on_logout_callback: Optional[Callable[[], None]] = None
         self._active_flow: Optional[BrowserAuthFlow] = None
         self._flow_lock = threading.Lock()
+        # Monotonic timestamp of the first failure in the current streak, or
+        # None when the last restore attempt succeeded. Injectable so tests
+        # drive the whole window with one clock — a partially-injected clock
+        # is a time bomb that passes today and fails on a calendar boundary.
+        self._time_source: Callable[[], float] = time.monotonic
+        self._first_restore_failure: Optional[float] = None
 
     def set_login_callback(self, callback: Callable[[LoginState], None]) -> None:
         """Set callback for login state changes."""
@@ -81,11 +108,38 @@ class LoginManager:
     def try_auto_login(self) -> LoginState:
         """Try to log in with stored credentials.
 
+        Three distinguishable outcomes, because they need three different
+        responses from the caller:
+
+        - logged in.
+        - a GENUINE logged-out state — we read the keychain and it holds
+          nothing usable. Prompt immediately.
+        - a failure we cannot yet attribute to the session being over: the
+          keychain would not open, or the server rejected the token. Both are
+          reported transient until they have persisted for
+          AUTH_TOLERANCE_SECONDS, and the stored credential is left alone
+          until then.
+
         Returns:
             LoginState with result
         """
-        credentials = self.keychain.load()
+        try:
+            credentials = self.keychain.load()
+        except KeychainUnavailableError as e:
+            # NOT a logged-out user. The credential is still on this machine;
+            # we cannot see it this launch (on macOS, most often because the
+            # bundle was re-signed). Deleting it or prompting on the first
+            # failure is what put valid sessions through a browser login.
+            return self._restore_failed(
+                reason=f"Stored credentials could not be read: {e}",
+                credentials_unreadable=True,
+            )
+
         if not credentials:
+            # The one state that is knowable immediately: the keychain opened
+            # and holds nothing usable. Reset the streak so a later real
+            # failure starts its own window.
+            self._first_restore_failure = None
             return LoginState(logged_in=False)
 
         # Set credentials on client
@@ -93,9 +147,9 @@ class LoginManager:
 
         # Verify credentials are still valid. A single 401 is often transient
         # (the agent started mid-deploy, or a momentary backend token-lookup
-        # blip) — clearing credentials on the first failure forces a needless
-        # full re-login. Retry a few times with backoff and only treat the token
-        # as genuinely invalid (and clear it) after the failures persist.
+        # blip). These in-call retries just shorten recovery for a blip that
+        # clears within seconds; the decision to give up belongs to
+        # _restore_failed and its cross-call window.
         auth_attempts = 3
         auth_backoff = [2.0, 4.0]  # waits between the attempts
         for attempt in range(auth_attempts):
@@ -108,6 +162,7 @@ class LoginManager:
                     user_role=credentials.user_role,
                     device_id=credentials.device_id,
                 )
+                self._first_restore_failure = None
                 # device_id, not email — the log is uploaded on logs_requested;
                 # keep PII out of the uploaded tail (privacy F5).
                 logger.info(f"Auto-login successful for device {credentials.device_id}")
@@ -122,20 +177,73 @@ class LoginManager:
                     )
                     time.sleep(auth_backoff[attempt])
                     continue
-                logger.warning(f"Auto-login failed (auth) after {auth_attempts} attempts: {e}")
-                self.bf.clear_credentials()
-                return LoginState(logged_in=False, error="Stored credentials are invalid")
+                return self._restore_failed(
+                    reason=f"Stored credentials rejected: {e}",
+                    clear_credentials=True,
+                )
             except BetterFlowClientError as e:
                 logger.warning(f"Auto-login failed (network): {e}")
                 # Don't clear credentials on network error - might be temporary.
                 # transient=True tells the caller to retry in the background
                 # rather than kick the (still-authenticated) user to a re-auth
                 # prompt that can't complete while the server is unreachable.
+                #
+                # Deliberately does NOT touch the failure streak in either
+                # direction: an unreachable server is no evidence about the
+                # credential, so it must neither start the give-up clock nor
+                # reset one an auth failure already started.
                 return LoginState(
                     logged_in=False,
                     transient=True,
                     error="Network error - check your connection",
                 )
+
+    def _restore_failed(
+        self,
+        *,
+        reason: str,
+        credentials_unreadable: bool = False,
+        clear_credentials: bool = False,
+    ) -> LoginState:
+        """Decide whether a failed session restore is still worth retrying.
+
+        Tolerated until the streak reaches AUTH_TOLERANCE_SECONDS, then
+        escalated to a real prompt — the user has to be able to act eventually,
+        because a signature-change keychain denial never clears on its own.
+
+        Escalation asks the user; it never deletes the keychain item. We could
+        not read that item, so we know nothing about it, and destroying it
+        would turn a recoverable state into a permanent one.
+        """
+        now = self._time_source()
+        if self._first_restore_failure is None:
+            self._first_restore_failure = now
+        age = now - self._first_restore_failure
+
+        if age < self.AUTH_TOLERANCE_SECONDS:
+            logger.warning(
+                "Session restore failed (%.0fs/%.0fs tolerated) — keeping the "
+                "stored session and retrying: %s",
+                age, self.AUTH_TOLERANCE_SECONDS, reason,
+            )
+            return LoginState(
+                logged_in=False,
+                transient=True,
+                credentials_unreadable=credentials_unreadable,
+                error=reason,
+            )
+
+        logger.warning(
+            "Session restore has failed for %.0fs — asking the user to sign in: %s",
+            age, reason,
+        )
+        if clear_credentials:
+            self.bf.clear_credentials()
+        return LoginState(
+            logged_in=False,
+            credentials_unreadable=credentials_unreadable,
+            error=reason,
+        )
 
     def login_via_browser(self) -> LoginState:
         """Log in via browser-based OAuth flow.
@@ -203,6 +311,12 @@ class LoginManager:
         # Set credentials on client
         self.bf.set_credentials(result.api_token, result.device_id)
 
+        # A fresh session ends any restore-failure streak. Leaving a stale
+        # first-failure timestamp here would make the NEXT single 401 look
+        # 15 minutes old and clear the token on the first try — the exact
+        # trigger-happy behaviour AUTH_TOLERANCE_SECONDS exists to stop.
+        self._first_restore_failure = None
+
         state = LoginState(
             logged_in=True,
             user_email=user_email,
@@ -259,6 +373,14 @@ class LoginManager:
         return self.bf.token is not None
 
     def get_current_user(self) -> Optional[str]:
-        """Get current user's email."""
-        credentials = self.keychain.load()
+        """Get current user's email, or None if it cannot be determined.
+
+        Display-only. An unreadable keychain is None here rather than an
+        exception — this feeds tray labels, and a menu must not raise.
+        """
+        try:
+            credentials = self.keychain.load()
+        except KeychainUnavailableError as e:
+            logger.warning("Could not read stored credentials: %s", e)
+            return None
         return credentials.user_email if credentials else None

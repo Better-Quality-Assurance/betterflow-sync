@@ -20,6 +20,14 @@ from zoneinfo import ZoneInfo
 
 from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
+# Both spellings, as everywhere else in src/: relative under `python -m src.main`,
+# absolute inside the PyInstaller bundle. hardware_serial imports only stdlib, so
+# this cannot cycle back into config.
+try:
+    from .hardware_serial import get_hardware_serial
+except ImportError:
+    from hardware_serial import get_hardware_serial
+
 __all__ = [
     "Config",
     "PrivacySettings",
@@ -120,13 +128,34 @@ _UUID_RE = re.compile(
 )
 
 
+# Namespace for deriving a machine UUID from a hardware serial. A fixed,
+# project-specific namespace means the derivation is reproducible on this
+# machine forever and cannot collide with a UUID5 minted by anything else.
+_MACHINE_ID_NAMESPACE = uuid.UUID("6f9f4a1e-6a1f-5f2d-9c1b-3a0e7b5d8c42")
+
+
 def get_machine_uuid() -> str:
     """Return a persistent UUID for this machine.
 
     On first call, reads from (or generates and writes to) a `.machine_id`
     file in the config directory. Subsequent calls return the in-memory
-    cache. The UUID survives app updates and hostname changes; it is only
-    lost on full uninstall.
+    cache. The UUID survives app updates and hostname changes.
+
+    When the file is absent, the id is DERIVED from the hardware serial rather
+    than randomly generated, so losing the file does not silently create a
+    second identity for one laptop. The server keys a device as
+    sha256(machine_id . platform) (AgentDevice::generateDeviceId), so a fresh
+    random id there means a fresh device row: verified on 2026-08-04, two
+    macOS users ended up with two ACTIVE, concurrently-syncing device rows
+    each, which is the input shape behind cross-device hour double-counting.
+
+    A machine with no readable serial (a VM, a container, a hardened Linux
+    box) falls back to a random UUID — the previous behaviour, and the only
+    honest one when the machine offers nothing stable to derive from.
+
+    An existing file ALWAYS wins, including over the derived value. Every
+    machine in the fleet already holds a random id, and preferring the derived
+    one would re-register the entire fleet as new devices.
 
     Thread-safe: uses double-checked locking so the hot path (cache hit)
     is lock-free while the one-time generation is serialized.
@@ -155,8 +184,9 @@ def get_machine_uuid() -> str:
         except (OSError, UnicodeDecodeError) as e:
             logger.debug(f"No existing machine ID file: {e}")
 
-        # Generate and persist a new UUID (atomic write: tmp + rename).
-        new_id = str(uuid.uuid4())
+        # Derive from the hardware serial where possible so a lost file is
+        # recoverable, else fall back to random (atomic write: tmp + rename).
+        new_id = _derive_machine_uuid()
         try:
             config_dir.mkdir(parents=True, exist_ok=True)
             tmp_file = id_file.with_suffix(".tmp")
@@ -171,6 +201,34 @@ def get_machine_uuid() -> str:
 
         _machine_uuid_cache = new_id
         return new_id
+
+
+def _derive_machine_uuid() -> str:
+    """A UUID for this machine that survives losing the config directory.
+
+    Derived from the hardware serial the agent already reports for MDM asset
+    correlation. Random when no serial is available — a shared constant would
+    merge unrelated machines onto one device row, which is worse than the
+    duplicate this exists to prevent.
+
+    Never raises: this is on the launch path, and get_hardware_serial's promise
+    not to raise belongs to another module.
+    """
+    try:
+        serial = get_hardware_serial()
+    except Exception as e:  # noqa: BLE001 — a serial is never worth a failed launch
+        logger.warning("Hardware serial probe failed, using a random machine id: %s", e)
+        serial = None
+
+    if not serial:
+        logger.info("No hardware serial available — machine id will be random")
+        return str(uuid.uuid4())
+
+    derived = str(uuid.uuid5(_MACHINE_ID_NAMESPACE, serial))
+    # The serial itself is never logged: it is a device identifier, and this
+    # log is uploaded on logs_requested.
+    logger.info("Derived machine id from the hardware serial")
+    return derived
 
 
 @dataclass

@@ -22,6 +22,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 try:
     from .__init__ import __version__
     from .auth import KeychainManager, LoginManager
+    from .auth.keychain import KeychainUnavailableError
     from .aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from .config import Config, setup_logging
     from . import error_reporter
@@ -53,6 +54,7 @@ try:
 except ImportError:
     from src import __version__
     from auth import KeychainManager, LoginManager
+    from auth.keychain import KeychainUnavailableError
     from aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from config import Config, setup_logging
     import error_reporter
@@ -116,6 +118,52 @@ def _day_greeting() -> str:
     elif day >= 5:
         return "Enjoy your weekend!"
     return "Have a productive day!"
+
+
+def should_show_setup_wizard(
+    *,
+    setup_complete: bool,
+    has_credentials: bool,
+    credentials_readable: bool,
+) -> bool:
+    """Decide whether to put this launch through first-run setup.
+
+    Three inputs, because "is this user onboarded?" has an UNKNOWN answer as
+    well as yes and no. `setup_complete` has been observed getting knocked
+    false across a self-update relaunch, so stored credentials are the better
+    evidence — but when the keychain will not open we have no evidence at all,
+    and the two wrong guesses are not symmetric:
+
+    - guess "new user" wrongly  -> an onboarded user is dropped into first-run
+      setup and re-registers, minting a duplicate device row. Observed on the
+      fleet, 2026-08-04.
+    - guess "onboarded" wrongly -> a genuinely new user sees the tray in its
+      waiting-for-login state, which says what to do and is one click from it.
+
+    So an unknown answer skips the wizard. It deliberately does NOT repair the
+    setup_complete flag: we have not established anything, and persisting a
+    guess would make this launch's uncertainty permanent.
+    """
+    if setup_complete:
+        return False
+    if has_credentials:
+        return False
+    return credentials_readable
+
+
+def waiting_auth_message(credentials_unreadable: bool) -> str:
+    """Tray text for the state that asks the user to sign in.
+
+    One implementation, because BOTH prompt sites need it: the startup path and
+    the reconnect loop, which is where a keychain denial actually escalates (the
+    first failure of a launch is always inside the tolerance window, so startup
+    reports transient and hands off). Telling that user "waiting for browser
+    login" hides the only fact they can act on.
+    """
+    if credentials_unreadable:
+        return "Can't read saved sign-in — please sign in again"
+    return "Waiting for browser login..."
+
 
 # Resolve version string once (handles both str and module forms from PyInstaller)
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
@@ -2445,11 +2493,18 @@ class BetterFlowApp:
             return
 
         self.coordinator.logged_in = False
+        unreadable = getattr(state, "credentials_unreadable", False)
         if getattr(state, "transient", False):
-            self.tray.set_state(TrayState.QUEUED, "Offline — reconnecting...")
+            # Say which kind of "not right now" this is. A keychain we cannot
+            # open is not an offline agent, and telling the user it is sends
+            # them to check their wifi.
+            self.tray.set_state(
+                TrayState.QUEUED,
+                "Reading saved sign-in..." if unreadable else "Offline — reconnecting...",
+            )
             self._start_reconnect_retry()
         else:
-            self.tray.set_state(TrayState.WAITING_AUTH, "Waiting for browser login...")
+            self.tray.set_state(TrayState.WAITING_AUTH, waiting_auth_message(unreadable))
             self.coordinator._maybe_warn_login_required(source="startup")
         self._ensure_update_checks_started()
 
@@ -2494,10 +2549,15 @@ class BetterFlowApp:
                     send_notification(greeting, _day_greeting())
                     return
                 if not getattr(state, "transient", False):
-                    # Credentials are genuinely gone now — prompt re-auth.
+                    # Credentials are genuinely gone now — prompt re-auth. This
+                    # is also where an unreadable keychain lands once it has
+                    # outlived the tolerance window, so say which it was.
                     self.coordinator.logged_in = False
                     self.tray.set_state(
-                        TrayState.WAITING_AUTH, "Waiting for browser login..."
+                        TrayState.WAITING_AUTH,
+                        waiting_auth_message(
+                            getattr(state, "credentials_unreadable", False)
+                        ),
                     )
                     self.coordinator._maybe_warn_login_required(source="reconnect")
                     return
@@ -2575,9 +2635,21 @@ class BetterFlowApp:
         # repair it and continue straight to auto-login below.
         wizard_login_state = None
         has_credentials = False
+        credentials_readable = True
         try:
             has_credentials = self.keychain.load() is not None
+        except KeychainUnavailableError as e:
+            # We cannot see the keychain, so we cannot know whether this user
+            # is onboarded. Do not guess "new user" — that puts an onboarded
+            # user through first-run setup, which is how a keychain denial
+            # presented to the fleet on 2026-08-04.
+            credentials_readable = False
+            logger.warning("Stored credentials unreadable at startup: %s", e)
         except Exception as e:
+            # Same unknown answer as above, for the same reason: a keyring
+            # backend can fail with something that is not a KeyringError, and
+            # "we could not read it" must never be guessed as "new user".
+            credentials_readable = False
             logger.warning("Could not read stored credentials at startup: %s", e)
 
         if not self.config.setup_complete and has_credentials:
@@ -2588,7 +2660,11 @@ class BetterFlowApp:
             self.config.setup_complete = True
             self.config.save()
 
-        if not self.config.setup_complete:
+        if should_show_setup_wizard(
+            setup_complete=self.config.setup_complete,
+            has_credentials=has_credentials,
+            credentials_readable=credentials_readable,
+        ):
             try:
                 from .ui.setup_wizard import show_setup_wizard
             except ImportError:
