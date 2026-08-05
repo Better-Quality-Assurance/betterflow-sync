@@ -167,6 +167,56 @@ class TestTryAutoLoginRetries:
         assert mgr._first_restore_failure is None
         bf.clear_credentials.assert_not_called()
 
+    def test_a_browser_login_resets_the_window_too(self):
+        """The streak has TWO ways to end, and only one of them was watched.
+
+        A user who signs in through the browser after an escalation must not
+        inherit the old first-failure timestamp: the next single 401 would
+        then look 15 minutes old and clear the fresh token on the first try —
+        the exact trigger-happy behaviour the window exists to stop.
+
+        Asserted through the CONSUMER (the next failure is tolerated), not by
+        reading the private timestamp, so it fails if the reset stops having
+        an effect rather than merely if the assignment moves.
+        """
+        clock = _FakeClock()
+        mgr, bf = self._mgr([BetterFlowAuthError("401")] * 3)
+        mgr._time_source = clock
+        bf.web_base_url = "https://app.betterflow.eu"
+
+        # Burn the tolerance window down to an escalation.
+        with patch("src.auth.login.time.sleep"):
+            mgr.try_auto_login()
+            clock.advance(LoginManager.AUTH_TOLERANCE_SECONDS + 1)
+
+        # Precondition: the streak really is running and really is past the
+        # window. Without this the closing assertions ("tolerated", "not
+        # cleared") are exactly what a fixture that never started a streak
+        # would produce, and the test would pass while proving nothing.
+        assert mgr._first_restore_failure is not None
+        assert clock() - mgr._first_restore_failure > LoginManager.AUTH_TOLERANCE_SECONDS
+
+        flow = MagicMock()
+        flow.start.return_value = MagicMock(success=True, code="c", code_verifier="v")
+        # DeviceInfo.collect() resolves the persistent machine id for real,
+        # which reads the hardware serial and WRITES .machine_id into the live
+        # config dir. Stub it the way the rest of the suite does — a unit test
+        # must not mint this machine's identity as a side effect.
+        with patch("src.auth.login.BrowserAuthFlow", return_value=flow), patch(
+            "src.sync.bf_client.get_machine_uuid",
+            return_value="aaaabbbb-1111-2222-3333-444455556666",
+        ):
+            assert mgr.login_via_browser().logged_in is True
+
+        # A single 401 straight after that login must be tolerated, not fatal.
+        bf.get_status.side_effect = [BetterFlowAuthError("401")] * 3
+        bf.clear_credentials.reset_mock()
+        with patch("src.auth.login.time.sleep"):
+            state = mgr.try_auto_login()
+
+        assert state.transient is True
+        bf.clear_credentials.assert_not_called()
+
     def test_network_error_never_clears(self):
         mgr, bf = self._mgr([BetterFlowClientError("network")])
         with patch("src.auth.login.time.sleep"):
