@@ -98,13 +98,74 @@ class TestTryAutoLoginRetries:
         assert state.logged_in is True
         bf.clear_credentials.assert_not_called()
 
-    def test_persistent_auth_error_clears_after_retries(self):
+    def test_persistent_auth_error_is_tolerated_before_the_window(self):
+        """A rejection at LAUNCH is not more conclusive than the same rejection
+        a minute later, so it no longer gets a 6-second death sentence.
+
+        Startup used to wipe the token after 3 attempts ~6s apart, while the
+        running agent tolerates the identical 401 for 15 minutes
+        (SyncCoordinator._AUTH_FAILURE_LOGOUT_MIN_SECONDS). Two rules for one
+        decision, and the trigger-happy one owned the credential.
+        """
         mgr, bf = self._mgr([BetterFlowAuthError("401")] * 3)
         with patch("src.auth.login.time.sleep"):
             state = mgr.try_auto_login()
         assert state.logged_in is False
+        assert state.transient is True  # keep retrying, do not prompt yet
+        bf.clear_credentials.assert_not_called()
+
+    def test_persistent_auth_error_clears_once_the_window_passes(self):
+        """...but it must still END. A revoked token that is tolerated forever
+        is an agent that never tracks and never says why."""
+        clock = _FakeClock()
+        mgr, bf = self._mgr([BetterFlowAuthError("401")] * 6)
+        mgr._time_source = clock
+
+        with patch("src.auth.login.time.sleep"):
+            assert mgr.try_auto_login().transient is True
+            clock.advance(LoginManager.AUTH_TOLERANCE_SECONDS + 1)
+            state = mgr.try_auto_login()
+
+        assert state.logged_in is False
         assert state.transient is False  # definitive: caller should prompt re-auth
         bf.clear_credentials.assert_called_once()
+
+    def test_a_successful_restore_resets_the_window(self):
+        clock = _FakeClock()
+        # One call consumes up to 3 side effects (the in-call retries): three
+        # 401s exhaust call 1, the None satisfies call 2, three more 401s make
+        # call 3 fail. Pairing these by hand rather than by count is what keeps
+        # a rejected call from silently succeeding on the next entry.
+        mgr, bf = self._mgr(
+            [BetterFlowAuthError("401")] * 3 + [None] + [BetterFlowAuthError("401")] * 3
+        )
+        mgr._time_source = clock
+
+        with patch("src.auth.login.time.sleep"):
+            assert mgr.try_auto_login().transient is True
+            clock.advance(60)
+            assert mgr.try_auto_login().logged_in is True
+            # Long after the ORIGINAL failure — but the streak was reset, so
+            # this new one opens its own window instead of escalating at once.
+            clock.advance(LoginManager.AUTH_TOLERANCE_SECONDS * 3)
+            assert mgr.try_auto_login().transient is True
+
+        bf.clear_credentials.assert_not_called()
+
+    def test_a_network_outage_does_not_advance_the_auth_window(self):
+        """An unreachable server says nothing about the credential. It must
+        neither start the give-up clock nor reset one already running."""
+        clock = _FakeClock()
+        mgr, bf = self._mgr([BetterFlowClientError("network")] * 3)
+        mgr._time_source = clock
+
+        with patch("src.auth.login.time.sleep"):
+            mgr.try_auto_login()
+            clock.advance(LoginManager.AUTH_TOLERANCE_SECONDS * 2)
+            mgr.try_auto_login()
+
+        assert mgr._first_restore_failure is None
+        bf.clear_credentials.assert_not_called()
 
     def test_network_error_never_clears(self):
         mgr, bf = self._mgr([BetterFlowClientError("network")])
@@ -116,3 +177,17 @@ class TestTryAutoLoginRetries:
         # wrongly kicked to a browser login that couldn't complete).
         assert state.transient is True
         bf.clear_credentials.assert_not_called()
+
+
+class _FakeClock:
+    """A monotonic clock the test drives, so the whole tolerance window is
+    exercised without sleeping and without racing the real clock."""
+
+    def __init__(self, now: float = 1000.0):
+        self._now = now
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds

@@ -23,10 +23,13 @@ ACCOUNT_NAME = "api_credentials"
 
 
 class KeychainUnavailableError(RuntimeError):
-    """Raised when the system keychain cannot be written to.
+    """Raised when the system keychain cannot be reached — read or write.
 
     We deliberately do not fall back to a plaintext file — credentials must
     live in the OS keychain (macOS Keychain / Windows Credential Manager).
+
+    It means "we could not look", never "there is nothing there". Callers that
+    decide whether to prompt a user MUST keep the two apart; see load().
     """
 
 
@@ -124,12 +127,38 @@ class KeychainManager:
         return True
 
     def load(self) -> Optional[StoredCredentials]:
-        """Load credentials from the system keychain."""
+        """Load credentials from the system keychain.
+
+        Returns None when this user genuinely has no usable stored session —
+        nothing saved, or a payload we cannot parse. Both mean "log in again".
+
+        Raises KeychainUnavailableError when the keychain could not be READ at
+        all. That is a different question with a different answer, and
+        collapsing the two into None is what logged three users out on
+        2026-08-04 while their tokens were still valid server-side. On macOS a
+        read fails with errSecAuthFailed whenever the app bundle's code
+        signature no longer matches the item's ACL — a re-signed build, an
+        ad-hoc CI build, the MDM .pkg — and keyring's own message for it is
+        "make sure executable is signed with codesign util". The credential is
+        still there and still good; we just cannot see it this launch, so the
+        caller must retry rather than send the user through a browser login.
+
+        Every read failure comes out as KeychainUnavailableError, including the
+        ones that are not KeyringError. Backends leak their own types — the
+        SecretService backend surfaces dbus/SecretStorage errors and a missing
+        D-Bus raises a bare RuntimeError, the Windows backend surfaces OSError.
+        Narrowing this to KeyringError would let those escape past
+        try_auto_login's handler and kill the startup thread outright, stranding
+        the tray on "Restoring session..." with no reconnect loop — a worse
+        outcome than the logout this method exists to prevent. The normalisation
+        belongs here, at the one call that touches the backend, so every caller
+        gets the same two-outcome contract.
+        """
         try:
             data = keyring.get_password(self.service_name, ACCOUNT_NAME)
-        except KeyringError as e:
+        except Exception as e:  # noqa: BLE001 — backends raise non-KeyringError
             logger.warning("Keychain read failed: %s", e)
-            return None
+            raise KeychainUnavailableError(str(e)) from e
         if not data:
             return None
         try:
@@ -153,5 +182,15 @@ class KeychainManager:
         return True
 
     def has_credentials(self) -> bool:
-        """Check if credentials are stored."""
-        return self.load() is not None
+        """Check if credentials are stored.
+
+        An unreadable keychain answers False here — the honest answer to "can I
+        see a credential right now?". Callers that must distinguish *unreadable*
+        from *absent* (anything that decides whether to prompt the user) call
+        load() and handle KeychainUnavailableError; this convenience wrapper is
+        for callers where both answers lead to the same place.
+        """
+        try:
+            return self.load() is not None
+        except KeychainUnavailableError:
+            return False

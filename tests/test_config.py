@@ -21,14 +21,33 @@ class TestGetMachineUuid:
         """Clear the cache to avoid leaking into other test modules."""
         config_module._machine_uuid_cache = None
 
-    def test_generates_valid_uuid4(self, tmp_path, monkeypatch):
-        """First call with no file generates a valid UUID4."""
+    def test_generates_valid_uuid_with_no_serial(self, tmp_path, monkeypatch):
+        """First call with no file and no hardware serial generates a UUID4.
+
+        Patches the serial explicitly. Left unpatched this test asserted
+        whatever the HOST machine happens to expose — v4 on a CI container with
+        no readable serial, v5 on a laptop — so it passed or failed by
+        geography once the id became derivable (see
+        tests/test_machine_uuid_stability.py).
+        """
         monkeypatch.setattr(
             "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
         )
+        monkeypatch.setattr("src.config.get_hardware_serial", lambda: None)
         result = config_module.get_machine_uuid()
         parsed = uuid.UUID(result, version=4)
         assert str(parsed) == result
+
+    def test_generates_valid_uuid_from_a_serial(self, tmp_path, monkeypatch):
+        """The derived branch is a well-formed UUID too — it is written to the
+        same file and hashed into the same server-side device_id."""
+        monkeypatch.setattr(
+            "src.config.user_config_dir", lambda *a, **kw: str(tmp_path)
+        )
+        monkeypatch.setattr("src.config.get_hardware_serial", lambda: "C02ABC123DEF")
+        result = config_module.get_machine_uuid()
+        assert str(uuid.UUID(result)) == result
+        assert config_module._UUID_RE.match(result)
 
     def test_persists_to_file(self, tmp_path, monkeypatch):
         """Generated UUID is written to .machine_id file."""

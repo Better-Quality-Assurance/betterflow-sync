@@ -142,8 +142,10 @@ def test_the_notice_is_not_hidden_behind_the_consent_screen():
     """macOS never runs _show_consent. Gating on it would re-ship the bug."""
     source = inspect.getsource(BetterFlowApp.run)
     notice = source.index("self._show_privacy_notice_if_needed()")
-    # It must not sit inside the `if not self.config.setup_complete:` block.
-    setup_gate = source.index("if not self.config.setup_complete:")
+    # It must not sit inside the setup-wizard block. The gate's spelling moved
+    # from `if not self.config.setup_complete:` to should_show_setup_wizard()
+    # (2026-08-05, keychain-unreadable fix); the property it guards did not.
+    setup_gate = source.index("if should_show_setup_wizard(")
     tray = source.index("self.tray.run_blocking()")
     assert setup_gate < notice < tray
     line = [
