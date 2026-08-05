@@ -4,7 +4,20 @@ A beta build must be distinguishable in the tray. __version__ stays numeric (for
 CFBundleVersion), so the -beta.N/-rc.N suffix is recovered from the release tag
 at build time and shown as RELEASE_VERSION.
 """
+import re
+
+from src import __version__ as APP_VERSION
 from src.release_version import format_release_version
+
+
+def test_app_version_stays_a_plain_dotted_number():
+    """build.spec feeds __version__ straight into CFBundleVersion /
+    CFBundleShortVersionString, which macOS rejects when non-numeric. A
+    prerelease suffix belongs on the git tag only (see the tests below)."""
+    assert re.fullmatch(r"\d+\.\d+\.\d+", APP_VERSION), (
+        f"__version__ must be MAJOR.MINOR.PATCH, got {APP_VERSION!r} — "
+        "put the -beta.N/-rc.N suffix on the release tag instead"
+    )
 
 
 def test_ci_beta_tag_keeps_suffix():
