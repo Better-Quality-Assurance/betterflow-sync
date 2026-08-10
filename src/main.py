@@ -1884,19 +1884,29 @@ class SyncCoordinator:
         if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
             return
         headline_phase = phase_at_deadline if phase_at_deadline is not None else "unknown"
-        self.error_reporter.capture(
-            f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
-            f"finished at {elapsed:.1f}s in phase '{headline_phase}'",
-            level="warning",
-            tags={"component": "sync-watchdog"},
-            context={
-                "elapsed_seconds": round(elapsed, 1),
-                "phase_at_deadline": headline_phase,
-                "phase_at_exit": phase_at_exit,
-                "deadline_seconds": self._DO_SYNC_DEADLINE,
-            },
-            fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
-        )
+        # capture() documents "never raises", but its final threading.Thread(...)
+        # .start() is unguarded and can raise RuntimeError on a resource-starved
+        # machine — exactly the machine that overruns its deadline. Unguarded,
+        # that would propagate out of _do_sync's finally block, replace any
+        # in-flight exception, and skip the heartbeat call right after it: a
+        # struggling device would also stop reporting that it is alive. Mirror
+        # _note_tick_failure's guard on the same call.
+        try:
+            self.error_reporter.capture(
+                f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
+                f"finished at {elapsed:.1f}s in phase '{headline_phase}'",
+                level="warning",
+                tags={"component": "sync-watchdog"},
+                context={
+                    "elapsed_seconds": round(elapsed, 1),
+                    "phase_at_deadline": headline_phase,
+                    "phase_at_exit": phase_at_exit,
+                    "deadline_seconds": self._DO_SYNC_DEADLINE,
+                },
+                fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
+            )
+        except Exception:
+            logger.debug("overrun-outcome report failed", exc_info=True)
 
     def _set_sync_failure_state(self, error_message: str) -> None:
         """Pick the right tray state for a failed sync.
