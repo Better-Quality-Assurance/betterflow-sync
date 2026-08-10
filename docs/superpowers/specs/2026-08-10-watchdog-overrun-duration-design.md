@@ -74,16 +74,30 @@ to ride in the fingerprint.
 Deriving it from elapsed rather than from a `watchdog_fired` Event avoids a race
 against the in-flight Timer thread: a watchdog that has passed its cancelled
 check but not yet set a flag would otherwise leave `finally` reading "did not
-fire" for a cycle that did. It also means **no test needs the 150s timer to
-fire** — advancing a fake clock is sufficient.
+fire" for a cycle that did. It also means **no test needs the Timer to fire at
+all** — a sub-second sleep past a shrunk deadline is sufficient, so the tests
+never depend on thread scheduling to produce their result.
 
 ### 2. Bucketed fingerprints carry the distribution
 
-| elapsed | fingerprint | level |
-|---|---|---|
-| 150s ≤ e < 180s | `sync-watchdog-overrun-150-180` | `warning` |
-| 180s ≤ e < 300s | `sync-watchdog-overrun-180-300` | `warning` |
-| e ≥ 300s | `sync-watchdog-overrun-300plus` | `warning` |
+Bands are expressed as **multiples of the deadline**, not absolute seconds.
+
+| elapsed | fingerprint | at the 150s deadline | level |
+|---|---|---|---|
+| 1.0× ≤ e < 1.2× | `sync-watchdog-overrun-marginal` | 150–180s | `warning` |
+| 1.2× ≤ e < 2.0× | `sync-watchdog-overrun-moderate` | 180–300s | `warning` |
+| e ≥ 2.0× | `sync-watchdog-overrun-severe` | ≥300s | `warning` |
+
+Ratios rather than absolute seconds for two concrete reasons. The deadline has
+already moved once (120s → 150s), and absolute bands would have quietly become
+wrong rather than failing. And `tests/test_sync_watchdog_outcome_classification.py`
+shrinks the deadline to 0.3s through an instance override, so absolute bands
+would put every test cycle in the first bucket and leave the other two
+unreachable without a five-minute sleep — the measurement would ship untested.
+
+Selection lives in a pure module-level `_overrun_fingerprint(elapsed, deadline)`,
+which is what makes the boundaries testable *exactly*: a timed cycle cannot land
+on 1.2× reliably, a unit test can.
 
 The digest then reads as a distribution without any backend change:
 
@@ -161,27 +175,50 @@ Against the real `SyncCoordinator._do_sync` with stub clients, asserting on
 captured reports — never on arguments forwarded between functions
 (`rules/test-fixture-discipline.md`).
 
-**Clock:** patch `time.monotonic` at the `main` module level so *every* clock
-read in the cycle moves together. This repo has already shipped a partial-clock
-bomb — #131, where the reader took an injected `now=` but the sibling
-`remove_failed` that wrote the timestamp did not, so the test broke the day wall
-clock passed the fixture date. A whole-module fake has no such seam.
+**Clock: no fake clock, and deliberately so.** The obvious move is to patch
+`time.monotonic`, and the repo has already shipped a partial-clock bomb doing
+something adjacent — #131, where the reader took an injected `now=` but the
+sibling `remove_failed` that wrote the timestamp did not, so the test broke the
+day wall clock passed the fixture date. The existing harness avoids the whole
+class instead: it shrinks `_DO_SYNC_DEADLINE` to 0.3s via an *instance* override
+and sleeps for real. Every clock read in the cycle then comes from one real
+clock, so there is no seam to be partially injected. Reuse that pattern; it is
+also why the bands have to be ratios.
 
-Required cases:
+Split by what each level of test can actually prove:
 
-1. Overrun finishing at 151s → exactly one capture at
-   `sync-watchdog-overrun-150-180`, level `warning`.
-2. Overrun finishing at 246s → `sync-watchdog-overrun-180-300`.
-3. Overrun finishing at 903s → `sync-watchdog-overrun-300plus`.
-4. **Boundary: exactly 180.0s lands in `180-300`, not `150-180`.** Both ends of
-   the range get a case (`diagnosis-discipline.md` Rule 3).
-5. **Critical negative: a cycle finishing at 149s emits ZERO outcome captures.**
-   This is the assertion that catches the predicate being implemented backwards,
-   and it must be paired with a positive assertion that the capture list is
-   non-empty in the overrun cases — an empty list satisfies "no outcome capture"
-   for the wrong reason.
-6. Phase attribution: an overrun stalled in `_monitor_capture_health` reports
-   `capture_health`; one stalled in `sync_engine.sync()` reports `sync`.
+**Unit, against the pure band function** — exact boundaries, no timing:
+
+1. 150.0 → marginal; 151.2 → marginal; 179.9 → marginal.
+2. **Exactly 180.0 (1.2×) → moderate, NOT marginal**, and exactly 300.0 (2.0×)
+   → severe. Both ends of every range get a case
+   (`diagnosis-discipline.md` Rule 3). A timed cycle cannot land on 1.2×
+   reliably, which is the whole reason this function is extracted.
+3. The three bands are distinct strings — a band silently aliasing another
+   would turn two counts into one and look like a real distribution.
+
+**Integration, driving the real `_do_sync`** — wiring, not arithmetic:
+
+4. A cycle at ~1.1× emits exactly one capture at the marginal fingerprint,
+   `level="warning"`, `tags={"component": "sync-watchdog"}`; ~1.5× the moderate
+   one; ~2.5× the severe one.
+5. The report carries `elapsed_seconds`, `phase` and `deadline_seconds` in
+   `context`, with elapsed asserted as a *range* around the real sleep rather
+   than an equality — a constant would satisfy an equality against a stub.
+6. **Critical negative: a cycle finishing well inside the deadline emits ZERO
+   outcome captures.** This catches the predicate being implemented backwards,
+   whose failure mode is an outcome report on every healthy cycle — flooding
+   the ingest this change exists to quieten.
+7. **The negative's own vacuity control.** A cycle that never ran also produces
+   zero outcome captures, so the same harness must be shown producing exactly
+   one when it overruns. Without this, test 6 passes for the wrong reason
+   forever.
+8. Phase attribution: an overrun stalled in `_monitor_capture_health` reports
+   `capture_health`; one stalled in `sync_engine.sync()` reports `sync`. The
+   second alone is not enough — every fixture in the outcome tests overruns
+   inside `sync`, so a hardcoded `"sync"` would satisfy all of them.
+9. An overrun still emits its fire-time `sync-watchdog-timeout` error. The
+   outcome report is additive, not a replacement.
 
 **Guard witnessing.** Per `test-fixture-discipline.md` Phantom 5, each mechanism
 gets its own mutant and must redden a distinct named test: (a) invert the
