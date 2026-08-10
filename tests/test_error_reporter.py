@@ -125,6 +125,52 @@ class TestDedup:
             assert post.call_count == 2
 
 
+class TestDedupWindowOverride:
+    """`capture(dedup_window=...)` exists for reports whose OCCURRENCE COUNT is
+    the measurement. A shared per-fingerprint cooldown throttles a
+    short-interval fingerprint harder than a long-interval one, so once one
+    fingerprint is split into severity bands the suppression stops being
+    uniform and silently skews the distribution the counts are supposed to
+    publish. `None` must remain indistinguishable from omitting it, or every
+    existing caller's behaviour changes with it."""
+
+    def test_a_caller_that_omits_the_window_gets_the_instance_default(self) -> None:
+        r = _reporter(dedup_window=10_000)
+        with patch("src.error_reporter.requests.post") as post:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            r.capture("repeat", fingerprint="same", block=True)
+            r.capture("repeat", fingerprint="same", block=True)
+            assert post.call_count == 1
+
+    def test_passing_none_is_identical_to_omitting_it(self) -> None:
+        r = _reporter(dedup_window=10_000)
+        with patch("src.error_reporter.requests.post") as post:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            r.capture("repeat", fingerprint="same", block=True, dedup_window=None)
+            r.capture("repeat", fingerprint="same", block=True, dedup_window=None)
+            assert post.call_count == 1
+
+    def test_explicit_zero_disables_suppression_for_that_call(self) -> None:
+        r = _reporter(dedup_window=10_000)
+        with patch("src.error_reporter.requests.post") as post:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            r.capture("repeat", fingerprint="same", block=True, dedup_window=0)
+            r.capture("repeat", fingerprint="same", block=True, dedup_window=0)
+            assert post.call_count == 2
+
+    def test_the_override_does_not_leak_to_later_default_calls(self) -> None:
+        """A zero-window call still stamps the fingerprint, so the NEXT caller
+        — one that asked for nothing — is suppressed by the instance default
+        exactly as it was before this parameter existed. The override is
+        per-call, and it fails toward fewer sends, not more."""
+        r = _reporter(dedup_window=10_000)
+        with patch("src.error_reporter.requests.post") as post:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            r.capture("repeat", fingerprint="same", block=True, dedup_window=0)
+            r.capture("repeat", fingerprint="same", block=True)
+            assert post.call_count == 1
+
+
 class TestNeverRaises:
     def test_transport_error_is_swallowed(self) -> None:
         r = _reporter()

@@ -169,6 +169,67 @@ def waiting_auth_message(credentials_unreadable: bool) -> str:
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
 
 
+# Watchdog overrun severity bands, as multiples of _DO_SYNC_DEADLINE.
+#
+# Ratios rather than absolute seconds, for two reasons. The deadline has moved
+# once already (120s -> 150s) and absolute bands would have quietly become
+# wrong. And the watchdog tests shrink the deadline to sub-second, where
+# absolute bands would put every test cycle in the first bucket and leave the
+# other two unreachable without a five-minute sleep.
+#
+# The band rides in the FINGERPRINT because that is the only thing the ingest
+# aggregates: betterqa-bot stores `context` but overwrites it newest-wins per
+# fingerprint, and the daily digest selects message + occurrences only. An
+# elapsed time in `context` alone would survive one occurrence and appear in no
+# report; a band in the fingerprint turns the occurrence counter into the
+# distribution.
+_OVERRUN_BANDS = (
+    (1.2, "sync-watchdog-overrun-marginal"),
+    (2.0, "sync-watchdog-overrun-moderate"),
+)
+_OVERRUN_BAND_SEVERE = "sync-watchdog-overrun-severe"
+
+
+def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
+    """Dedup key for a cycle that ran `elapsed` against `deadline`.
+
+    Upper bounds are exclusive, so exactly 1.2x is moderate and exactly 2.0x is
+    severe. Callers must only reach here when elapsed >= deadline.
+    """
+    if deadline <= 0:
+        return _OVERRUN_BAND_SEVERE
+    ratio = elapsed / deadline
+    for limit, fingerprint in _OVERRUN_BANDS:
+        if ratio < limit:
+            return fingerprint
+    return _OVERRUN_BAND_SEVERE
+
+
+class _CyclePhase:
+    """The stage _do_sync is currently in, as a per-cycle mutable box.
+
+    Deliberately NOT an attribute on SyncCoordinator. A cycle abandoned by
+    _acquire_sync_slot's takeover keeps running to completion, and an instance
+    attribute would let that zombie overwrite the phase of the cycle that
+    replaced it. Same reasoning the transient-failure counter is captured
+    per-thread rather than re-read from the Timer thread.
+
+    `at_deadline` is a second, one-shot snapshot: the phase as it stood the
+    moment the watchdog fired. `name` keeps moving after that (the cycle
+    finishes whatever it was doing), so it answers "what was slow?" where
+    `name` at cycle-end only ever answers "what ran last?". Stays None when
+    the outcome report fires without the Timer having run yet (elapsed can
+    cross the deadline before the Timer thread is scheduled) — that is
+    reported honestly as unknown, never backfilled from `name`.
+    """
+
+    __slots__ = ("name", "at_deadline")
+
+    def __init__(self) -> None:
+        self.name = "startup"
+        self.at_deadline = None
+
+
 class SyncCoordinator:
     """Owns the sync scheduler, sync loop, and hours tracking.
 
@@ -1566,6 +1627,11 @@ class SyncCoordinator:
         # for cases where the sleep notification was missed.
         watchdog_cancelled = threading.Event()
 
+        # Cycle start, for the cycle-end outcome report. The watchdog fires AT
+        # the deadline, so elapsed measured inside it is always ~150s however
+        # long the cycle really runs — the true duration is only knowable here.
+        cycle_started_at = time.monotonic()
+
         # Snapshot the transient-failure counter so the watchdog can tell WHY the
         # cycle ran long. An unreachable API makes a healthy cycle overrun (the
         # retry chain plus the send budget legitimately eat ~150s) — that is slow,
@@ -1583,9 +1649,24 @@ class SyncCoordinator:
         cycle_transients = transient_failure_counter()
         transient_at_cycle_start = cycle_transients.value
 
+        # Where the cycle is right now, for the watchdog and the cycle-end
+        # outcome report. Per-cycle box, never an instance attribute — see
+        # _CyclePhase.
+        phase = _CyclePhase()
+
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
+            # Snapshot the phase AT THE MOMENT the deadline was breached —
+            # phase.name keeps moving as the cycle finishes up, so this is the
+            # only record of what was actually slow. See _CyclePhase.
+            #
+            # Every capture below reads phase.at_deadline, NOT phase.name.
+            # Re-reading phase.name here would let a sync() returning between
+            # this line and the capture give a fire-time report naming a later
+            # stage than the outcome report's — two reports about one cycle,
+            # disagreeing, for no reason a reader could ever reconstruct.
+            phase.at_deadline = phase.name
             # Deliberately permissive: ANY transient failure during the cycle
             # downgrades it. A genuine wedge that coincides with one flaky request
             # is downgraded at the deadline — acceptable, because
@@ -1606,6 +1687,7 @@ class SyncCoordinator:
                         f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
                         level="warning",
                         tags={"component": "sync-watchdog"},
+                        context={"phase": phase.at_deadline},
                         fingerprint="sync-watchdog-timeout-offline",
                     )
             else:
@@ -1618,6 +1700,7 @@ class SyncCoordinator:
                         f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
                         level="error",
                         tags={"component": "sync-watchdog"},
+                        context={"phase": phase.at_deadline},
                         fingerprint="sync-watchdog-timeout",
                     )
             # Unchanged by design: both resets run in BOTH branches. Discarding
@@ -1659,17 +1742,21 @@ class SyncCoordinator:
                 # to prevent. Only the upload sync is skipped (it cannot land
                 # while offline); _monitor_capture_health is local-only, and its
                 # sync-gate return is intentionally ignored on this path.
+                phase.name = "capture_health"
                 self._monitor_capture_health()
                 return
 
             # Health-check + self-heal the local tracker stack. Returns False when
             # the caller should skip the upload sync this cycle (AW unreachable and
             # escalated); True to proceed.
+            phase.name = "capture_health"
             if not self._monitor_capture_health():
                 return
 
+            phase.name = "sync"
             stats = self.sync_engine.sync()
 
+            phase.name = "post_sync"
             if stats.aw_bucket_fetch_failed:
                 # AW answers /info but 503s on /buckets/ — is_running() above
                 # passed, so only this path can recover the hung server.
@@ -1721,6 +1808,7 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed"
                 )
 
+            phase.name = "hours_fetch"
             hours = self._fetch_hours_today()
             self.tray.update_stats(
                 hours_today=hours if hours is not None else "---",
@@ -1756,6 +1844,9 @@ class SyncCoordinator:
             watchdog_cancelled.set()
             watchdog.cancel()
             my_lock.release()
+            self._report_overrun_outcome(
+                time.monotonic() - cycle_started_at, phase.at_deadline, phase.name
+            )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
         # the lock during a blocking HTTP call that can take 30s on timeout.
@@ -1765,6 +1856,79 @@ class SyncCoordinator:
         auth_err = self.sync_engine.send_heartbeat_if_due(stats)
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="heartbeat")
+
+    def _report_overrun_outcome(
+        self, elapsed: float, phase_at_deadline: Optional[str], phase_at_exit: str
+    ) -> None:
+        """Record how long a cycle that breached the deadline actually ran.
+
+        Gated on elapsed rather than on "did the watchdog fire" so it cannot
+        race the in-flight Timer thread: a watchdog past its cancelled check but
+        not yet flagged would leave this reading "did not fire" for a cycle that
+        did.
+
+        Level is always warning. The fire-time report already paged this same
+        cycle at the deadline as an error; a second error here would add no
+        paging value and double the volume this change exists to reduce.
+
+        A cycle abandoned by _acquire_sync_slot's takeover reaches here late,
+        with its true elapsed — that is the "is it unbounded?" evidence
+        sync-wedged cannot give, since sync-wedged records only that we gave up
+        at the ceiling.
+
+        phase_at_deadline is the diagnostic value — the stage that was
+        actually slow, snapshotted by the watchdog the instant it fired.
+        phase_at_exit (phase.name at cycle end) is not a substitute: it is
+        whatever stage the cycle finished in, which for a normally-completing
+        cycle is almost always a later, fast stage — "stuck in sync, exited in
+        hours_fetch" is the useful pair, not "hours_fetch" alone. When
+        phase_at_deadline is still None (elapsed crossed the deadline before
+        the Timer thread ran), report that honestly as "unknown" rather than
+        silently falling back to phase_at_exit, which would misattribute the
+        overrun to whichever stage happened to be running last.
+        """
+        if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
+            return
+        headline_phase = phase_at_deadline if phase_at_deadline is not None else "unknown"
+        # capture() documents "never raises", but its final threading.Thread(...)
+        # .start() is unguarded and can raise RuntimeError on a resource-starved
+        # machine — exactly the machine that overruns its deadline. Unguarded,
+        # that would propagate out of _do_sync's finally block, replace any
+        # in-flight exception, and skip the heartbeat call right after it: a
+        # struggling device would also stop reporting that it is alive. Mirror
+        # _note_tick_failure's guard on the same call.
+        try:
+            self.error_reporter.capture(
+                f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
+                f"finished at {elapsed:.1f}s in phase '{headline_phase}'",
+                level="warning",
+                tags={"component": "sync-watchdog"},
+                context={
+                    "elapsed_seconds": round(elapsed, 1),
+                    "phase_at_deadline": headline_phase,
+                    "phase_at_exit": phase_at_exit,
+                    "deadline_seconds": self._DO_SYNC_DEADLINE,
+                },
+                fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
+                # The occurrence counter IS the measurement here — the digest
+                # reads message + count and never reads context, so a band's
+                # count is the only thing that publishes the distribution.
+                # The reporter's default 300s window dedups PER FINGERPRINT,
+                # so splitting one fingerprint into three bands made the
+                # throttle non-uniform: a marginal cycle (150-180s) puts the
+                # next tick ~180s later and loses roughly 40% of its reports,
+                # while a severe cycle (>=300s) can never be throttled at all.
+                # That overstates severe's share by ~1.5-2x — the wrong
+                # direction for a question whose known failure mode is a false
+                # "hung" (the confirmed 150.86s false fire above). Volume is
+                # bounded by construction: this fires only on an overrun, an
+                # overrun is >=150s, and overlapping ticks are skipped by
+                # _acquire_sync_slot, so ~24/hour/device at warning level,
+                # none of it paging.
+                dedup_window=0,
+            )
+        except Exception:
+            logger.debug("overrun-outcome report failed", exc_info=True)
 
     def _set_sync_failure_state(self, error_message: str) -> None:
         """Pick the right tray state for a failed sync.

@@ -1,8 +1,13 @@
 # Watchdog outcome classification — design
 
-Status: **designed, not scheduled.** Deliberately parked on 2026-07-22 in favour
-of higher-value work (see "Priority" below). Pick this up when the noise or the
-autofix spend justifies it.
+Status: **implemented.** Parked on 2026-07-22, built later; the classification
+described here is live in `SyncCoordinator._watchdog` (`src/main.py`, fingerprints
+`sync-watchdog-timeout` / `sync-watchdog-timeout-offline`) and guarded by
+`tests/test_sync_watchdog_outcome_classification.py`. The "Priority" section
+below is preserved as the record of why it waited, not as current status.
+
+What this design does NOT do is say how long an overrunning cycle ran, which is
+issue #179 — see `2026-08-10-watchdog-overrun-duration-design.md`.
 
 ## Problem
 

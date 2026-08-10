@@ -95,6 +95,7 @@ class ErrorReporter:
         context: Optional[dict] = None,
         fingerprint: Optional[str] = None,
         block: bool = False,
+        dedup_window: Optional[float] = None,
     ) -> None:
         """Report a failure. Safe to call from any thread; never raises.
 
@@ -106,13 +107,20 @@ class ErrorReporter:
             context: Freeform diagnostic data (merged with user/device context).
             fingerprint: Stable dedup key; defaults to level + message.
             block: Send synchronously (only for the about-to-exit fatal path).
+            dedup_window: Per-call cooldown override in seconds. ``None`` (the
+                default, and what every caller gets unless it says otherwise)
+                means "use the instance default". ``0`` disables suppression
+                for this call, for reports whose OCCURRENCE COUNT is the
+                measurement — a shared window throttles short-interval
+                fingerprints harder than long-interval ones, which silently
+                skews the very distribution such a report exists to publish.
         """
         if not self.enabled:
             return
 
         try:
             key = fingerprint or f"{level}:{message}"
-            if not self._should_send(key):
+            if not self._should_send(key, dedup_window):
                 logger.debug("Error report suppressed by client-side dedup: %s", key)
                 return
 
@@ -132,8 +140,14 @@ class ErrorReporter:
                 daemon=True,
             ).start()
 
-    def _should_send(self, key: str) -> bool:
-        """True if this fingerprint hasn't been sent within the cooldown window."""
+    def _should_send(self, key: str, dedup_window: Optional[float] = None) -> bool:
+        """True if this fingerprint hasn't been sent within the cooldown window.
+
+        ``dedup_window`` overrides the instance default for this call only;
+        ``None`` means use the default. Pruning always uses the instance
+        default, since it only exists to bound the dict's growth.
+        """
+        window = self._dedup_window if dedup_window is None else dedup_window
         now = time.monotonic()
         with self._lock:
             # Prune stale entries so the dict can't grow without bound.
@@ -142,7 +156,7 @@ class ErrorReporter:
                 del self._recent[k]
 
             last = self._recent.get(key)
-            if last is not None and now - last < self._dedup_window:
+            if last is not None and now - last < window:
                 return False
             self._recent[key] = now
             return True
