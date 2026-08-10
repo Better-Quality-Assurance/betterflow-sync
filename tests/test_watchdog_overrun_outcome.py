@@ -9,9 +9,11 @@ fire": deriving it from elapsed avoids racing the in-flight Timer thread, and
 means these tests never need the timer to fire at all.
 """
 
+import threading
 import time
 
 import src.main as main_module
+from src.error_reporter import ErrorReporter
 from tests._watchdog_harness import CoordinatorHarness, _ok_stats
 
 MARGINAL = "sync-watchdog-overrun-marginal"
@@ -36,7 +38,16 @@ class _Harness(CoordinatorHarness):
 
 class TestOverrunIsMeasured(_Harness):
     def test_a_marginal_overrun_reports_the_marginal_band(self):
-        self.run_cycle_taking(0.33)  # ~1.1x of 0.3
+        # 1.05x of 0.3. The marginal/moderate boundary is 1.2x = 0.360s, and
+        # the previous 0.33 sleep measured 0.3404s idle / 0.3573s under load —
+        # 2.7ms from flipping to MODERATE, at which point this reads as a
+        # band-selection defect rather than the timing artifact it is. At
+        # 0.315 the worst of 10 idle runs was 0.3212s (38.8ms of margin), and
+        # the same ~27ms of harness overhead seen under load lands ~0.342s,
+        # still clear. The exact boundaries are pinned by
+        # tests/test_watchdog_overrun_bands.py against the pure function, so
+        # this fixture only has to exercise the wiring.
+        self.run_cycle_taking(0.315)
 
         got = self.recorder.by_fingerprint(MARGINAL)
         assert len(got) == 1, self.recorder.captures
@@ -74,17 +85,31 @@ class TestOverrunIsMeasured(_Harness):
         sleep durations and require elapsed_seconds to track EACH one within
         a tight tolerance; no single constant can satisfy both, and the two
         reported values must move apart by roughly the gap between the
-        sleeps."""
+        sleeps.
+
+        The same demand is made of the MESSAGE, and that half is the one
+        that matters operationally: the daily digest renders `message` and
+        the occurrence count and reads `context` never, so a message frozen
+        to `finished at 0.5s` would publish a fixed number to every operator
+        while every context assertion above stayed green."""
         self.run_cycle_taking(0.45)
-        short = self.recorder.by_fingerprint(MODERATE)[0]["context"]["elapsed_seconds"]
+        short_capture = self.recorder.by_fingerprint(MODERATE)[0]
+        short = short_capture["context"]["elapsed_seconds"]
+        short_message = short_capture["message"]
         assert abs(short - 0.45) < 0.15
 
         self.recorder.captures.clear()
         self.run_cycle_taking(0.75)
-        long = self.recorder.by_fingerprint(SEVERE)[0]["context"]["elapsed_seconds"]
+        long_capture = self.recorder.by_fingerprint(SEVERE)[0]
+        long = long_capture["context"]["elapsed_seconds"]
+        long_message = long_capture["message"]
         assert abs(long - 0.75) < 0.15
 
         assert long - short > 0.2
+        # Two materially different cycles must not produce one string. A
+        # frozen figure in the message satisfies every other assertion in
+        # this file — this is the only one it cannot.
+        assert short_message != long_message, (short_message, long_message)
 
     def test_the_report_also_carries_the_exit_phase_and_the_two_differ(self):
         """phase_at_deadline and phase_at_exit are genuinely different fields:
@@ -118,6 +143,13 @@ class TestOverrunIsMeasured(_Harness):
         # here), so the exit phase has moved on — same pair shape as the
         # sync-overrun fixtures above, different deadline phase.
         assert got["context"]["phase_at_exit"] == "hours_fetch"
+        # And the MESSAGE has to carry it. The digest reads message + count
+        # and never reads context, so the phase reaching an operator depends
+        # entirely on this line — deleting `in phase '...'` from the message
+        # leaves every context assertion in this file green. This is also the
+        # only fixture whose deadline phase is not 'sync', so it is the only
+        # one that can tell a real phase in the message from a constant.
+        assert "capture_health" in got["message"], got["message"]
 
     def test_an_aw_bucket_failure_exits_at_post_sync_not_hours_fetch(self):
         """The discriminating fixture for phase_at_exit. Every other test in
@@ -207,6 +239,79 @@ class TestExistingReportsAreUnchanged(_Harness):
 
         for capture in _outcome_captures(self.recorder):
             assert capture["level"] == "warning"
+
+
+class TestEveryOverrunIsCounted(_Harness):
+    """The design's central claim is that the occurrence counter IS the
+    distribution — the digest reads message + count and never reads context,
+    so a band's count is the only thing that publishes how the population is
+    shaped. That claim is only true if no overrun is ever suppressed.
+
+    This has to drive the REAL ErrorReporter. `_Recorder` (used by every other
+    class in this file) has no dedup at all, so it cannot see the client-side
+    cooldown and would pass whatever the production code did."""
+
+    def setup_method(self):
+        super().setup_method()
+        self.posted = []
+        posted_lock = threading.Lock()
+        outer = self
+
+        class _CapturingReporter(ErrorReporter):
+            def _post(self, payload):  # noqa: N805 - matches the base signature
+                with posted_lock:
+                    outer.posted.append(payload)
+
+        self.coord.error_reporter = _CapturingReporter(
+            endpoint="https://bot.example/notify/error",
+            dsn="dsn-token-1234567890",
+            release="test",
+            # Deliberately huge: with the shipped 300s default this fixture
+            # would be timing-dependent. A window this size means any
+            # suppression at all is a hard failure rather than a race.
+            dedup_window=10_000,
+        )
+
+    def _drain(self):
+        for t in threading.enumerate():
+            if t.name == "error-report":
+                t.join(timeout=5)
+
+    def _overrun_payloads(self):
+        return [p for p in self.posted if p["message"].startswith("Sync overran")]
+
+    def test_two_consecutive_overruns_in_one_band_are_both_reported(self):
+        """Both cycles land in the same band, so they share a fingerprint —
+        the exact case the reporter's per-fingerprint cooldown suppresses.
+        Suppressed, the second overrun is invisible to the counter and the
+        band's count stops being its population.
+
+        The bias this closes is not uniform: the marginal band (150-180s at
+        the real deadline) puts the next tick ~180s later and loses roughly
+        40% of its reports to a 300s window, while the severe band (>=300s)
+        can never be throttled at all — so the digest overstates severe's
+        share, the wrong direction for a question whose known failure mode is
+        a false 'hung'."""
+        self.run_cycle_taking(0.45)
+        self.run_cycle_taking(0.45)
+        self._drain()
+
+        got = self._overrun_payloads()
+        assert len(got) == 2, [p["message"] for p in self.posted]
+        assert all(p["level"] == "warning" for p in got)
+
+    def test_the_fire_time_report_keeps_its_default_dedup(self):
+        """The vacuity control, and a scope check in one. If `dedup_window=0`
+        had been applied to the reporter or to every capture rather than to
+        the outcome report alone, this would post twice — and the fire-time
+        group is the one that pages, whose volume this change exists to leave
+        exactly as it was."""
+        self.run_cycle_taking(0.45)
+        self.run_cycle_taking(0.45)
+        self._drain()
+
+        hung = [p for p in self.posted if p["message"].startswith("Sync hung")]
+        assert len(hung) == 1, [p["message"] for p in self.posted]
 
 
 class TestOutcomeReportFailureIsContained(_Harness):

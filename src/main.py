@@ -1660,6 +1660,12 @@ class SyncCoordinator:
             # Snapshot the phase AT THE MOMENT the deadline was breached —
             # phase.name keeps moving as the cycle finishes up, so this is the
             # only record of what was actually slow. See _CyclePhase.
+            #
+            # Every capture below reads phase.at_deadline, NOT phase.name.
+            # Re-reading phase.name here would let a sync() returning between
+            # this line and the capture give a fire-time report naming a later
+            # stage than the outcome report's — two reports about one cycle,
+            # disagreeing, for no reason a reader could ever reconstruct.
             phase.at_deadline = phase.name
             # Deliberately permissive: ANY transient failure during the cycle
             # downgrades it. A genuine wedge that coincides with one flaky request
@@ -1681,7 +1687,7 @@ class SyncCoordinator:
                         f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
                         level="warning",
                         tags={"component": "sync-watchdog"},
-                        context={"phase": phase.name},
+                        context={"phase": phase.at_deadline},
                         fingerprint="sync-watchdog-timeout-offline",
                     )
             else:
@@ -1694,7 +1700,7 @@ class SyncCoordinator:
                         f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
                         level="error",
                         tags={"component": "sync-watchdog"},
-                        context={"phase": phase.name},
+                        context={"phase": phase.at_deadline},
                         fingerprint="sync-watchdog-timeout",
                     )
             # Unchanged by design: both resets run in BOTH branches. Discarding
@@ -1852,7 +1858,7 @@ class SyncCoordinator:
             self._handle_auth_error(auth_err, source="heartbeat")
 
     def _report_overrun_outcome(
-        self, elapsed: float, phase_at_deadline, phase_at_exit: str
+        self, elapsed: float, phase_at_deadline: Optional[str], phase_at_exit: str
     ) -> None:
         """Record how long a cycle that breached the deadline actually ran.
 
@@ -1904,6 +1910,22 @@ class SyncCoordinator:
                     "deadline_seconds": self._DO_SYNC_DEADLINE,
                 },
                 fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
+                # The occurrence counter IS the measurement here — the digest
+                # reads message + count and never reads context, so a band's
+                # count is the only thing that publishes the distribution.
+                # The reporter's default 300s window dedups PER FINGERPRINT,
+                # so splitting one fingerprint into three bands made the
+                # throttle non-uniform: a marginal cycle (150-180s) puts the
+                # next tick ~180s later and loses roughly 40% of its reports,
+                # while a severe cycle (>=300s) can never be throttled at all.
+                # That overstates severe's share by ~1.5-2x — the wrong
+                # direction for a question whose known failure mode is a false
+                # "hung" (the confirmed 150.86s false fire above). Volume is
+                # bounded by construction: this fires only on an overrun, an
+                # overrun is >=150s, and overlapping ticks are skipped by
+                # _acquire_sync_slot, so ~24/hour/device at warning level,
+                # none of it paging.
+                dedup_window=0,
             )
         except Exception:
             logger.debug("overrun-outcome report failed", exc_info=True)

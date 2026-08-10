@@ -1,7 +1,12 @@
 # Watchdog overrun duration and phase — design
 
-Status: **designed, ready to implement.** Closes the measurement half of
-issue #179.
+Status: **implemented.** Closes the measurement half of issue #179. The bands
+and the cycle-end outcome report are live in `SyncCoordinator._do_sync` /
+`_report_overrun_outcome` and the module-level `_overrun_fingerprint`
+(`src/main.py`, fingerprints `sync-watchdog-overrun-marginal` /
+`-moderate` / `-severe`), guarded by `tests/test_watchdog_overrun_bands.py`,
+`tests/test_watchdog_cycle_phase.py` and
+`tests/test_watchdog_overrun_outcome.py`.
 
 ## Problem
 
@@ -121,6 +126,20 @@ pages.
 Exact seconds also go in `context` (`elapsed_seconds`, `phase`) for the
 `errors_detail` path, accepting that only the newest survives.
 
+**The outcome report opts out of the client-side dedup** (`dedup_window=0` on
+its `capture` call). `ErrorReporter` suppresses a repeated fingerprint within
+300s, which was uniform while every overrun shared one fingerprint. Split into
+three bands it is not: the marginal band (150–180s) puts the next tick roughly
+180s later and loses about 40% of its reports to that window, while the severe
+band (≥300s) can never be throttled at all. The digest would then overstate
+severe's share by ~1.5–2× — the wrong direction for a question whose known
+failure mode is a *false* "hung" (the 150.86s false fire above). Since the
+counter is the whole measurement, throttling it non-uniformly is not a volume
+control, it is a corrupted statistic. Volume stays bounded by construction: the
+report fires only on an overrun, an overrun is ≥150s, and overlapping ticks are
+skipped by `_acquire_sync_slot` — so ~24/hour/device at worst, all `warning`,
+none of it paging. The fire-time report keeps the default window.
+
 ### 3. Phase
 
 A per-cycle mutable holder, captured by the watchdog closure and read in
@@ -156,6 +175,14 @@ is precisely the "is it unbounded?" evidence #179 asks for, and `sync-wedged`
 alone cannot supply it — `sync-wedged` records only that we gave up at 420s,
 never what the real duration turned out to be.
 
+**But this argument holds only for cycles that eventually RETURN.** A true
+deadlock never reaches `finally`, so it emits no outcome report at all and is
+counted in no band. The severe band therefore sizes the population of *slow but
+finishing* cycles, never the wedged population — which is the half of #179 most
+worth counting. `sync-wedged` remains the only signal for that, and the two have
+to be read together: `severe = 1` means one cycle ran past 300s **and came
+back**, not that one device wedged.
+
 ## Unchanged by design
 
 Called out so they read as deliberate:
@@ -166,6 +193,16 @@ Called out so they read as deliberate:
 - **Both fire-time fingerprints and levels keep their identity**
   (`sync-watchdog-timeout` / `sync-watchdog-timeout-offline`), so the existing
   34-occurrence group stays continuous and comparable across the change.
+
+  Worth saying out loud: once the bands exist, the fire-time report is
+  **strictly redundant** as a measurement — every cycle it fires on also
+  reports a band, with strictly more information. It is kept for continuity
+  (an unbroken 34-occurrence series across the change is what makes
+  before/after comparable) and because it is the report that *pages* while the
+  bands only measure. Once the bands have a few weeks of history and the
+  paging role has been moved onto one of them, the fire-time report can be
+  retired. That is a follow-up with evidence behind it, not something to do in
+  this change.
 - `bf.reset_session()` / `aw.reset_session()` keep running in both watchdog
   branches.
 
