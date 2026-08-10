@@ -1618,6 +1618,11 @@ class SyncCoordinator:
         # for cases where the sleep notification was missed.
         watchdog_cancelled = threading.Event()
 
+        # Cycle start, for the cycle-end outcome report. The watchdog fires AT
+        # the deadline, so elapsed measured inside it is always ~150s however
+        # long the cycle really runs — the true duration is only knowable here.
+        cycle_started_at = time.monotonic()
+
         # Snapshot the transient-failure counter so the watchdog can tell WHY the
         # cycle ran long. An unreachable API makes a healthy cycle overrun (the
         # retry chain plus the send budget legitimately eat ~150s) — that is slow,
@@ -1820,6 +1825,9 @@ class SyncCoordinator:
             watchdog_cancelled.set()
             watchdog.cancel()
             my_lock.release()
+            self._report_overrun_outcome(
+                time.monotonic() - cycle_started_at, phase.name
+            )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
         # the lock during a blocking HTTP call that can take 30s on timeout.
@@ -1829,6 +1837,38 @@ class SyncCoordinator:
         auth_err = self.sync_engine.send_heartbeat_if_due(stats)
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="heartbeat")
+
+    def _report_overrun_outcome(self, elapsed: float, phase_name: str) -> None:
+        """Record how long a cycle that breached the deadline actually ran.
+
+        Gated on elapsed rather than on "did the watchdog fire" so it cannot
+        race the in-flight Timer thread: a watchdog past its cancelled check but
+        not yet flagged would leave this reading "did not fire" for a cycle that
+        did.
+
+        Level is always warning. The fire-time report already paged this same
+        cycle at the deadline as an error; a second error here would add no
+        paging value and double the volume this change exists to reduce.
+
+        A cycle abandoned by _acquire_sync_slot's takeover reaches here late,
+        with its true elapsed — that is the "is it unbounded?" evidence
+        sync-wedged cannot give, since sync-wedged records only that we gave up
+        at the ceiling.
+        """
+        if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
+            return
+        self.error_reporter.capture(
+            f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
+            f"finished at {elapsed:.1f}s in phase '{phase_name}'",
+            level="warning",
+            tags={"component": "sync-watchdog"},
+            context={
+                "elapsed_seconds": round(elapsed, 1),
+                "phase": phase_name,
+                "deadline_seconds": self._DO_SYNC_DEADLINE,
+            },
+            fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
+        )
 
     def _set_sync_failure_state(self, error_message: str) -> None:
         """Pick the right tray state for a failed sync.

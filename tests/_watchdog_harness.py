@@ -23,6 +23,12 @@ def _ok_stats():
         gaps_filled=0,
         errors=[],
         aw_bucket_fetch_failed=False,
+        # Real SyncStats (sync/sync_engine.py) defaults this False. Missing
+        # here made _select_tray_state raise AttributeError for any test that
+        # runs a cycle to natural completion rather than just past the
+        # watchdog firing — masked previously because nothing read phase.name
+        # past that exception until the cycle-end outcome report did.
+        capture_suppressed=False,
     )
 
 
