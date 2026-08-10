@@ -169,6 +169,42 @@ def waiting_auth_message(credentials_unreadable: bool) -> str:
 _VERSION: str = __version__ if isinstance(__version__, str) else __version__.__version__
 
 
+# Watchdog overrun severity bands, as multiples of _DO_SYNC_DEADLINE.
+#
+# Ratios rather than absolute seconds, for two reasons. The deadline has moved
+# once already (120s -> 150s) and absolute bands would have quietly become
+# wrong. And the watchdog tests shrink the deadline to sub-second, where
+# absolute bands would put every test cycle in the first bucket and leave the
+# other two unreachable without a five-minute sleep.
+#
+# The band rides in the FINGERPRINT because that is the only thing the ingest
+# aggregates: betterqa-bot stores `context` but overwrites it newest-wins per
+# fingerprint, and the daily digest selects message + occurrences only. An
+# elapsed time in `context` alone would survive one occurrence and appear in no
+# report; a band in the fingerprint turns the occurrence counter into the
+# distribution.
+_OVERRUN_BANDS = (
+    (1.2, "sync-watchdog-overrun-marginal"),
+    (2.0, "sync-watchdog-overrun-moderate"),
+)
+_OVERRUN_BAND_SEVERE = "sync-watchdog-overrun-severe"
+
+
+def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
+    """Dedup key for a cycle that ran `elapsed` against `deadline`.
+
+    Upper bounds are exclusive, so exactly 1.2x is moderate and exactly 2.0x is
+    severe. Callers must only reach here when elapsed >= deadline.
+    """
+    if deadline <= 0:
+        return _OVERRUN_BAND_SEVERE
+    ratio = elapsed / deadline
+    for limit, fingerprint in _OVERRUN_BANDS:
+        if ratio < limit:
+            return fingerprint
+    return _OVERRUN_BAND_SEVERE
+
+
 class SyncCoordinator:
     """Owns the sync scheduler, sync loop, and hours tracking.
 
