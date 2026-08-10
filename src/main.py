@@ -1612,6 +1612,24 @@ class SyncCoordinator:
             self._note_aw_reachable()
         return True
 
+    def _monotonic(self) -> float:
+        """The clock a cycle's measured duration is derived from.
+
+        BOTH reads that define that duration go through here — the start stamp
+        at the top of _do_sync and the elapsed computed in its finally — so a
+        test can script the reported duration exactly instead of betting on how
+        fast the machine is. One seam covering both reads is the point: a
+        half-injected clock (reader scripted, writer on the real clock) is how
+        issue #131's dead-letter fixture rotted, and it presents as a defect in
+        the feature rather than in the fixture.
+
+        Deliberately NOT used for the watchdog Timer, which must keep real time
+        (it is what makes a cycle overrun observable at all), nor for
+        _last_successful_sync, which stamps wall-clock staleness telemetry
+        rather than this cycle's duration.
+        """
+        return time.monotonic()
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         my_lock = self._acquire_sync_slot()
@@ -1630,7 +1648,7 @@ class SyncCoordinator:
         # Cycle start, for the cycle-end outcome report. The watchdog fires AT
         # the deadline, so elapsed measured inside it is always ~150s however
         # long the cycle really runs — the true duration is only knowable here.
-        cycle_started_at = time.monotonic()
+        cycle_started_at = self._monotonic()
 
         # Snapshot the transient-failure counter so the watchdog can tell WHY the
         # cycle ran long. An unreachable API makes a healthy cycle overrun (the
@@ -1845,7 +1863,7 @@ class SyncCoordinator:
             watchdog.cancel()
             my_lock.release()
             self._report_overrun_outcome(
-                time.monotonic() - cycle_started_at, phase.at_deadline, phase.name
+                self._monotonic() - cycle_started_at, phase.at_deadline, phase.name
             )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
