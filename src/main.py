@@ -205,6 +205,22 @@ def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
     return _OVERRUN_BAND_SEVERE
 
 
+class _CyclePhase:
+    """The stage _do_sync is currently in, as a per-cycle mutable box.
+
+    Deliberately NOT an attribute on SyncCoordinator. A cycle abandoned by
+    _acquire_sync_slot's takeover keeps running to completion, and an instance
+    attribute would let that zombie overwrite the phase of the cycle that
+    replaced it. Same reasoning the transient-failure counter is captured
+    per-thread rather than re-read from the Timer thread.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self) -> None:
+        self.name = "startup"
+
+
 class SyncCoordinator:
     """Owns the sync scheduler, sync loop, and hours tracking.
 
@@ -1619,6 +1635,11 @@ class SyncCoordinator:
         cycle_transients = transient_failure_counter()
         transient_at_cycle_start = cycle_transients.value
 
+        # Where the cycle is right now, for the watchdog and the cycle-end
+        # outcome report. Per-cycle box, never an instance attribute — see
+        # _CyclePhase.
+        phase = _CyclePhase()
+
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
@@ -1642,6 +1663,7 @@ class SyncCoordinator:
                         f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
                         level="warning",
                         tags={"component": "sync-watchdog"},
+                        context={"phase": phase.name},
                         fingerprint="sync-watchdog-timeout-offline",
                     )
             else:
@@ -1654,6 +1676,7 @@ class SyncCoordinator:
                         f"Sync hung — exceeded {self._DO_SYNC_DEADLINE}s watchdog deadline",
                         level="error",
                         tags={"component": "sync-watchdog"},
+                        context={"phase": phase.name},
                         fingerprint="sync-watchdog-timeout",
                     )
             # Unchanged by design: both resets run in BOTH branches. Discarding
@@ -1695,17 +1718,21 @@ class SyncCoordinator:
                 # to prevent. Only the upload sync is skipped (it cannot land
                 # while offline); _monitor_capture_health is local-only, and its
                 # sync-gate return is intentionally ignored on this path.
+                phase.name = "capture_health"
                 self._monitor_capture_health()
                 return
 
             # Health-check + self-heal the local tracker stack. Returns False when
             # the caller should skip the upload sync this cycle (AW unreachable and
             # escalated); True to proceed.
+            phase.name = "capture_health"
             if not self._monitor_capture_health():
                 return
 
+            phase.name = "sync"
             stats = self.sync_engine.sync()
 
+            phase.name = "post_sync"
             if stats.aw_bucket_fetch_failed:
                 # AW answers /info but 503s on /buckets/ — is_running() above
                 # passed, so only this path can recover the hung server.
@@ -1757,6 +1784,7 @@ class SyncCoordinator:
                     stats.errors[0] if stats.errors else "Sync failed"
                 )
 
+            phase.name = "hours_fetch"
             hours = self._fetch_hours_today()
             self.tray.update_stats(
                 hours_today=hours if hours is not None else "---",
