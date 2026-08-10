@@ -58,18 +58,45 @@ class TestOverrunIsMeasured(_Harness):
         self.run_cycle_taking(0.45)
 
         got = self.recorder.by_fingerprint(MODERATE)[0]
-        # Not "sync": the outcome report reads phase.name in the finally
-        # block, by which point a normally-completing cycle has already
-        # advanced past sync/post_sync to the last stamp before it returns
-        # ("hours_fetch") — even though sync() was the phase that overran.
-        # Verified empirically; see task-3-report.md "Deviations from the
-        # brief" for why this differs from the brief's literal assertion.
-        assert got["context"]["phase"] == "hours_fetch"
+        assert got["context"]["phase_at_deadline"] == "sync"
         assert got["context"]["deadline_seconds"] == self.TEST_DEADLINE
         # A real measurement, not a constant: at least the sleep, and not
         # absurdly more.
         assert 0.45 <= got["context"]["elapsed_seconds"] < 5.0
         assert "0.4" in got["message"] or "0.5" in got["message"]
+
+    def test_the_report_also_carries_the_exit_phase_and_the_two_differ(self):
+        """phase_at_deadline and phase_at_exit are genuinely different fields:
+        the watchdog fires mid-sync (deadline snapshot: 'sync'), but the cycle
+        goes on to complete normally, so the LAST stamp before the cycle ends
+        is a later stage. Proving they differ is what stops someone
+        'simplifying' the pair back into one field."""
+        self.run_cycle_taking(0.45)
+
+        got = self.recorder.by_fingerprint(MODERATE)[0]
+        assert got["context"]["phase_at_exit"] == "hours_fetch"
+        assert got["context"]["phase_at_deadline"] != got["context"]["phase_at_exit"]
+
+    def test_a_capture_health_overrun_reports_that_phase_at_deadline(self):
+        """The discriminating fixture. Every other test in this file overruns
+        inside sync(), so phase_at_deadline == 'sync' everywhere else — a
+        mutant that hardcodes 'sync' is invisible to all of them (the
+        agreement-region trap: test-fixture-discipline.md Phantom 12). This is
+        the one fixture where the deadline is breached in a DIFFERENT phase,
+        so only this test can tell a real snapshot from a constant."""
+        def _slow_health():
+            time.sleep(0.45)
+            return True
+
+        self.coord._monitor_capture_health = _slow_health
+        self.coord._do_sync()
+
+        got = self.recorder.by_fingerprint(MODERATE)[0]
+        assert got["context"]["phase_at_deadline"] == "capture_health"
+        # It still completes the cycle normally afterwards (sync() is instant
+        # here), so the exit phase has moved on — same pair shape as the
+        # sync-overrun fixtures above, different deadline phase.
+        assert got["context"]["phase_at_exit"] == "hours_fetch"
 
 
 class TestHealthyCyclesStaySilent(_Harness):

@@ -213,12 +213,21 @@ class _CyclePhase:
     attribute would let that zombie overwrite the phase of the cycle that
     replaced it. Same reasoning the transient-failure counter is captured
     per-thread rather than re-read from the Timer thread.
+
+    `at_deadline` is a second, one-shot snapshot: the phase as it stood the
+    moment the watchdog fired. `name` keeps moving after that (the cycle
+    finishes whatever it was doing), so it answers "what was slow?" where
+    `name` at cycle-end only ever answers "what ran last?". Stays None when
+    the outcome report fires without the Timer having run yet (elapsed can
+    cross the deadline before the Timer thread is scheduled) — that is
+    reported honestly as unknown, never backfilled from `name`.
     """
 
-    __slots__ = ("name",)
+    __slots__ = ("name", "at_deadline")
 
     def __init__(self) -> None:
         self.name = "startup"
+        self.at_deadline = None
 
 
 class SyncCoordinator:
@@ -1648,6 +1657,10 @@ class SyncCoordinator:
         def _watchdog():
             if watchdog_cancelled.is_set():
                 return
+            # Snapshot the phase AT THE MOMENT the deadline was breached —
+            # phase.name keeps moving as the cycle finishes up, so this is the
+            # only record of what was actually slow. See _CyclePhase.
+            phase.at_deadline = phase.name
             # Deliberately permissive: ANY transient failure during the cycle
             # downgrades it. A genuine wedge that coincides with one flaky request
             # is downgraded at the deadline — acceptable, because
@@ -1826,7 +1839,7 @@ class SyncCoordinator:
             watchdog.cancel()
             my_lock.release()
             self._report_overrun_outcome(
-                time.monotonic() - cycle_started_at, phase.name
+                time.monotonic() - cycle_started_at, phase.at_deadline, phase.name
             )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
@@ -1838,7 +1851,9 @@ class SyncCoordinator:
         if auth_err is not None:
             self._handle_auth_error(auth_err, source="heartbeat")
 
-    def _report_overrun_outcome(self, elapsed: float, phase_name: str) -> None:
+    def _report_overrun_outcome(
+        self, elapsed: float, phase_at_deadline, phase_at_exit: str
+    ) -> None:
         """Record how long a cycle that breached the deadline actually ran.
 
         Gated on elapsed rather than on "did the watchdog fire" so it cannot
@@ -1854,17 +1869,30 @@ class SyncCoordinator:
         with its true elapsed — that is the "is it unbounded?" evidence
         sync-wedged cannot give, since sync-wedged records only that we gave up
         at the ceiling.
+
+        phase_at_deadline is the diagnostic value — the stage that was
+        actually slow, snapshotted by the watchdog the instant it fired.
+        phase_at_exit (phase.name at cycle end) is not a substitute: it is
+        whatever stage the cycle finished in, which for a normally-completing
+        cycle is almost always a later, fast stage — "stuck in sync, exited in
+        hours_fetch" is the useful pair, not "hours_fetch" alone. When
+        phase_at_deadline is still None (elapsed crossed the deadline before
+        the Timer thread ran), report that honestly as "unknown" rather than
+        silently falling back to phase_at_exit, which would misattribute the
+        overrun to whichever stage happened to be running last.
         """
         if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
             return
+        headline_phase = phase_at_deadline if phase_at_deadline is not None else "unknown"
         self.error_reporter.capture(
             f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
-            f"finished at {elapsed:.1f}s in phase '{phase_name}'",
+            f"finished at {elapsed:.1f}s in phase '{headline_phase}'",
             level="warning",
             tags={"component": "sync-watchdog"},
             context={
                 "elapsed_seconds": round(elapsed, 1),
-                "phase": phase_name,
+                "phase_at_deadline": headline_phase,
+                "phase_at_exit": phase_at_exit,
                 "deadline_seconds": self._DO_SYNC_DEADLINE,
             },
             fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
