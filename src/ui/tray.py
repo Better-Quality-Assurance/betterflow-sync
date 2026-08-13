@@ -242,6 +242,19 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# Windows reports "AMD64", Linux "x86_64"/"aarch64", Windows-on-ARM "ARM64" —
+# four spellings of two instruction sets. Lower-cased keys, because the
+# spelling is the platform's choice and not something a user should have to
+# decode. Anything absent renders as its raw token: an unknown architecture is
+# better shown verbatim than guessed at.
+_NON_DARWIN_ARCH_ISAS = {
+    "amd64": "64-bit x86",
+    "x86_64": "64-bit x86",
+    "arm64": "64-bit ARM",
+    "aarch64": "64-bit ARM",
+}
+
+
 def arch_menu_label(
     system: Optional[str] = None,
     machine: Optional[str] = None,
@@ -265,6 +278,23 @@ def arch_menu_label(
     The mismatch case names the remedy, not just the state: a user reading
     "Intel build" has no reason to know that is the wrong one.
 
+    Off macOS the row reads "<instruction set> (<raw>)" to match the macOS
+    rows, which are prose rather than a bare token. Two things it deliberately
+    does NOT claim there, because only the Darwin branch resolves hardware:
+
+    - **No CPU vendor.** Every x86_64 Mac really is an Intel Mac, so the Darwin
+      row can say "Intel". ``AMD64`` on Windows names the x86-64 instruction
+      set and says nothing about who made the chip, so copying that wording
+      would be a plain factual error on a Ryzen.
+    - **No hardware family.** These names describe the ISA this PROCESS
+      executes, which is all ``platform.machine()`` reports. An x64 build under
+      Windows-on-ARM emulation genuinely is executing x86-64, so "64-bit x86"
+      stays true where "this is an x86 machine" would not. Seeing through that
+      emulation needs a Windows equivalent of ``proc_translated``, which
+      ``machine_arch`` deliberately does not model.
+
+    An unrecognised value falls back to the raw token rather than guessing.
+
     Args:
         system: Override ``platform.system()`` for testing.
         machine: Override ``platform.machine()`` for testing.
@@ -276,7 +306,10 @@ def arch_menu_label(
         translated = is_rosetta_translated(system=system)
 
     if system != "Darwin":
-        return f"Architecture: {machine}"
+        isa = _NON_DARWIN_ARCH_ISAS.get(machine.lower())
+        if not isa:
+            return f"Architecture: {machine}"
+        return f"Architecture: {isa} ({machine})"
 
     arch = true_machine_arch(system=system, machine=machine, translated=translated)
     if translated:

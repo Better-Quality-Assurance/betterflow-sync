@@ -150,10 +150,46 @@ def test_label_for_genuine_intel_mac_is_not_a_warning():
     assert "switch" not in label.lower()
 
 
-def test_label_off_macos_is_plain():
+@pytest.mark.parametrize(
+    "system,machine,expected",
+    [
+        ("Linux", X86_64, "Architecture: 64-bit x86 (x86_64)"),
+        ("Linux", "aarch64", "Architecture: 64-bit ARM (aarch64)"),
+        ("Windows", "AMD64", "Architecture: 64-bit x86 (AMD64)"),
+        ("Windows", "ARM64", "Architecture: 64-bit ARM (ARM64)"),
+    ],
+)
+def test_label_off_macos_reads_like_the_macos_rows(system, machine, expected):
+    """The row is prose on macOS; a bare "AMD64" beside it looked unfinished.
+
+    The raw token stays in parentheses because it is the value a support
+    conversation actually needs.
+    """
+    assert arch_menu_label(system=system, machine=machine, translated=False) == expected
+
+
+def test_label_off_macos_never_claims_a_cpu_vendor():
+    """"Intel" is right on macOS and wrong everywhere else.
+
+    Every x86_64 Mac is an Intel Mac, so the Darwin row can say so. ``AMD64``
+    is the name of the *instruction set*; on Windows it is just as likely to be
+    a Ryzen. Naming a vendor there would be a plain factual error, and the
+    macOS wording is the tempting thing to copy.
+    """
+    for system, machine in [("Windows", "AMD64"), ("Linux", X86_64)]:
+        label = arch_menu_label(system=system, machine=machine, translated=False)
+        assert "intel" not in label.lower(), label
+        assert "apple" not in label.lower(), label
+
+
+def test_label_falls_back_to_the_raw_token_for_an_unknown_arch():
+    """An architecture we have no name for is shown verbatim, not guessed at.
+
+    Without the fallback the lookup would render "Architecture: None (riscv64)".
+    """
     assert (
-        arch_menu_label(system="Linux", machine=X86_64, translated=False)
-        == "Architecture: x86_64"
+        arch_menu_label(system="Linux", machine="riscv64", translated=False)
+        == "Architecture: riscv64"
     )
 
 
