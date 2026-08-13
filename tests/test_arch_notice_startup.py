@@ -9,28 +9,39 @@ It is ALSO the first caller of ``machine_arch``'s memoised ``sysctl`` probe —
 but read the next paragraph before pricing that, because the obvious reading is
 wrong and was in this file's first draft.
 
-The tray rebuilds its menu on every stats update and ``_create_menu()`` runs
-under ``_menu_lock`` (``tray.py:1665``/``:1679``), so an UN-MEMOISED probe would
-fork ``sysctl`` (``timeout=2``) under that lock for the life of the process.
-That is real, and the memo is what prevents it. The warm-up ordering is not:
-``_update_menu`` returns early while ``self._icon`` is ``None``, and the first
-``_create_menu()`` in production is a constructor argument inside
-``run_blocking()`` (``tray.py:1785``), evaluated before ``_icon`` is assigned
-and while no menu lock is held. So dropping the warm-up costs exactly one
-lock-free fork on the main thread at startup — not an ongoing cost, and not a
-cost under the lock.
+The tray rebuilds its menu on every stats update, and ``_create_menu()`` runs
+under ``_menu_lock`` (built at ``tray.py:1675`` and ``:1689``, under the locks
+taken at ``:1666`` and ``:1685``). The menu is built EAGERLY — ``_arch_menu_item``
+calls ``arch_menu_label()`` and hands the finished string to ``Item`` — so an
+UN-MEMOISED probe really would fork ``sysctl`` (``timeout=2``) under that lock
+for the life of the process. The memo is what prevents it.
+
+The warm-up ordering is NOT what prevents it, though that was this file's first
+draft: ``_update_menu`` returns early while ``self._icon`` is ``None``, and the
+first ``_create_menu()`` in production is a constructor argument
+(``tray.py:1795``) inside ``run_blocking()``, evaluated before ``_icon`` is
+assigned at ``:1791`` and holding no menu lock. So dropping the warm-up costs
+exactly one lock-free fork on the main thread at startup — not an ongoing cost,
+and not a cost under the lock.
 
 Hence two independent guards, failing for different reasons: the ordering tests
 catch the call moving or being deleted, and the fork-counting pair catches the
 MEMO being removed. Do not merge their rationales; they are not the same claim.
 
-Every test here injects ``system="Darwin"`` rather than reading the host's.
-Both short-circuit before the probe off macOS (``machine_arch.py:120``,
-``tray.py:298``), so a host-dependent version of these tests counts zero forks
-and fails on the ubuntu runner that gates every PR — and on three of the four
-platforms of the tag build, which produces no release when any leg is red. A
-``skipif`` would be worse than useless: only tag builds run a macOS job, so the
-guard would then execute in no PR-gating job at all.
+Every test here injects ``system="Darwin"`` rather than reading the host's. The
+short-circuit is in ``machine_arch.py:120`` — ``is_rosetta_translated`` returns
+``False`` for a non-Darwin system without ever consulting the reader. Note that
+``arch_menu_label`` does NOT itself short-circuit first: it calls
+``is_rosetta_translated`` unconditionally (``tray.py:306``) and only then takes
+its non-Darwin branch (``:308``). The net effect is the same — no fork off
+macOS — but the mechanism lives in one place, not two, and this file exists to
+stop the next reader inheriting a mechanism that is not there.
+
+Either way a host-dependent version of these tests counts zero forks and fails
+on the ubuntu runner that gates every PR — and on three of the four platforms
+of the tag build, which produces no release when any leg is red. A ``skipif``
+would be worse than useless: only tag builds run a macOS job, so the guard
+would then execute in no PR-gating job at all.
 """
 
 import inspect
