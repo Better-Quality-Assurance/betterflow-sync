@@ -242,6 +242,19 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# Windows reports "AMD64", Linux "x86_64"/"aarch64", and Windows-on-ARM
+# "ARM64" — three spellings of two families. Lower-cased keys, because the
+# spelling is the platform's choice and not something a user should have to
+# decode. Anything absent renders as its raw token: an unknown architecture is
+# better shown verbatim than guessed at.
+_NON_DARWIN_ARCH_FAMILIES = {
+    "amd64": "64-bit x86",
+    "x86_64": "64-bit x86",
+    "arm64": "64-bit ARM",
+    "aarch64": "64-bit ARM",
+}
+
+
 def arch_menu_label(
     system: Optional[str] = None,
     machine: Optional[str] = None,
@@ -265,6 +278,13 @@ def arch_menu_label(
     The mismatch case names the remedy, not just the state: a user reading
     "Intel build" has no reason to know that is the wrong one.
 
+    Off macOS the row reads "<family> (<raw>)" to match the macOS rows, which
+    are prose rather than a bare token. It deliberately does NOT say "Intel"
+    there: on macOS every x86_64 machine really is Intel, but ``AMD64`` on
+    Windows is the x86-64 *instruction set* and says nothing about the vendor,
+    so naming Intel would be a plain factual error on an AMD CPU. An
+    unrecognised value falls back to the raw token rather than guessing.
+
     Args:
         system: Override ``platform.system()`` for testing.
         machine: Override ``platform.machine()`` for testing.
@@ -276,7 +296,10 @@ def arch_menu_label(
         translated = is_rosetta_translated(system=system)
 
     if system != "Darwin":
-        return f"Architecture: {machine}"
+        family = _NON_DARWIN_ARCH_FAMILIES.get(machine.lower())
+        if not family:
+            return f"Architecture: {machine}"
+        return f"Architecture: {family} ({machine})"
 
     arch = true_machine_arch(system=system, machine=machine, translated=translated)
     if translated:
