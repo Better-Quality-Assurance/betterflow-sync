@@ -8,9 +8,11 @@ from typing import Callable, Optional
 import requests
 
 try:
+    from .machine_arch import true_machine_arch
     from .sync.http_client import resolve_ca_bundle
     from .url_safety import assert_safe_final_url
 except ImportError:  # PyInstaller bundle (src/ is import root)
+    from machine_arch import true_machine_arch
     from sync.http_client import resolve_ca_bundle
     from url_safety import assert_safe_final_url
 
@@ -72,10 +74,14 @@ def _find_platform_asset(
     Args:
         release: GitHub release dict with "assets" list.
         system: Override platform.system() for testing (e.g. "Darwin", "Windows").
-        arch: Override platform.machine() for testing (e.g. "arm64", "x86_64").
+        arch: Override the detected architecture for testing (e.g. "arm64", "x86_64").
     """
     system = system or platform.system()
-    arch = arch or platform.machine()
+    # NOT platform.machine(): that reports the running PROCESS's architecture,
+    # so an Intel build under Rosetta 2 on Apple Silicon answers "x86_64" and
+    # re-selects the Intel DMG on every update — the wrong build could never
+    # correct itself. true_machine_arch() reports the HARDWARE. See machine_arch.
+    arch = arch or true_machine_arch(system=system)
     pattern = _ASSET_PATTERNS.get(system)
     if not pattern:
         return None

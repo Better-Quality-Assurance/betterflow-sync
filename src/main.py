@@ -29,6 +29,7 @@ try:
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .hardware_serial import get_hardware_serial
+    from .machine_arch import is_rosetta_translated
     from .privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -61,6 +62,7 @@ except ImportError:
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from hardware_serial import get_hardware_serial
+    from machine_arch import is_rosetta_translated
     from privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -2913,11 +2915,55 @@ class BetterFlowApp:
         #    Windows/Linux consent screen and would otherwise stay undisclosed.
         self._show_privacy_notice_if_needed()
 
+        # Tell Apple Silicon users running the Intel build that they are, since
+        # nothing else will — Rosetta makes it run fine, just slower.
+        self._warn_if_wrong_arch_build()
+
         logger.info("BetterFlow tray starting")
         try:
             self.tray.run_blocking()
         finally:
             self._shutdown()
+
+    def _warn_if_wrong_arch_build(self) -> None:
+        """Notify when this is the Intel build running on Apple Silicon.
+
+        Rosetta 2 runs the x86_64 build without complaint, so a user who picked
+        the wrong installer gets no symptom, no error and no clue — which is
+        exactly why it goes unnoticed for months. macOS itself uses a
+        notification for this case ("Support Ending for Intel-Based Apps"), so
+        the pattern is one users already recognise.
+
+        Fires once per launch rather than once ever. This is not a notice to be
+        acknowledged and filed away like the privacy text; it reports a live
+        misconfiguration that stays true until somebody reinstalls, and it stops
+        by itself the moment they do. A notification is also safe here where the
+        privacy notice was not — it goes through NSUserNotification/osascript
+        and never touches Tk, so there is no NSApplication contention with
+        pystray (#158).
+
+        Best-effort: a machine with notifications disabled or no sysctl loses
+        the warning and nothing else.
+        """
+        try:
+            if not is_rosetta_translated():
+                return
+            logger.warning(
+                "Running the x86_64 build under Rosetta 2 on Apple Silicon — "
+                "the Apple Silicon build should be installed instead"
+            )
+            # Mirrors Apple's own wording for the same situation ("Support
+            # Ending for Intel-Based Apps ... Learn how to update to an Apple
+            # silicon version") — users have been trained on that phrasing by
+            # macOS itself.
+            send_notification(
+                "Intel version on an Apple Silicon Mac",
+                "BetterFlow is running the Intel build through Rosetta. "
+                "Reinstall the Apple Silicon version for better performance "
+                "and battery life.",
+            )
+        except Exception as exc:
+            logger.warning(f"Architecture check failed, skipping the notice: {exc}")
 
     def _show_privacy_notice_if_needed(self) -> None:
         """Show the one-time data-collection notice, once, and record it.

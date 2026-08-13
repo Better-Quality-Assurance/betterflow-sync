@@ -62,10 +62,16 @@ except ImportError:
 try:
     from ..clipboard import clipboard_available, copy_to_clipboard
     from ..hardware_serial import get_hardware_serial
+    from ..machine_arch import ARM64, is_rosetta_translated, true_machine_arch
     from ..notifications import send_notification
 except ImportError:
     from clipboard import clipboard_available, copy_to_clipboard  # type: ignore[no-redef]
     from hardware_serial import get_hardware_serial  # type: ignore[no-redef]
+    from machine_arch import (  # type: ignore[no-redef]
+        ARM64,
+        is_rosetta_translated,
+        true_machine_arch,
+    )
     from notifications import send_notification  # type: ignore[no-redef]
 
 
@@ -234,6 +240,50 @@ except Exception:
             Item = None
 
 logger = logging.getLogger(__name__)
+
+
+def arch_menu_label(
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+    translated: Optional[bool] = None,
+) -> str:
+    """Build the label for the tray's architecture row.
+
+    Pure and pystray-free for the same reason as ``serial_menu_row()`` below:
+    the backend binds at import time and is unavailable on a headless CI runner,
+    so a rule reachable only through a live TrayIcon could not be exercised in
+    the environment that gates merges. The UI copy lives here rather than in
+    ``machine_arch`` because that module's job is resolving the architecture,
+    not wording a menu — the same split ``serial_menu_row``/``hardware_serial``
+    already uses.
+
+    The architecture itself comes from ``true_machine_arch()``, never re-derived
+    here: this row and the updater's DMG choice are two halves of one promise,
+    and a second copy of the mapping is how the tray ends up naming one
+    architecture while the updater downloads another.
+
+    The mismatch case names the remedy, not just the state: a user reading
+    "Intel build" has no reason to know that is the wrong one.
+
+    Args:
+        system: Override ``platform.system()`` for testing.
+        machine: Override ``platform.machine()`` for testing.
+        translated: Override the Rosetta determination for testing.
+    """
+    system = system or platform.system()
+    machine = machine or platform.machine()
+    if translated is None:
+        translated = is_rosetta_translated(system=system)
+
+    if system != "Darwin":
+        return f"Architecture: {machine}"
+
+    arch = true_machine_arch(system=system, machine=machine, translated=translated)
+    if translated:
+        return "Architecture: Intel build on Apple Silicon — switch to the Apple Silicon version"
+    if arch == ARM64:
+        return "Architecture: Apple Silicon (native)"
+    return f"Architecture: Intel ({arch})"
 
 
 def serial_menu_row() -> tuple:
@@ -771,6 +821,7 @@ class TrayIcon:
             Item(f"Last sync: {s['last_sync']}", None, enabled=False),
             Item("─" * 20, None, enabled=False),
             self._serial_menu_item(),
+            self._arch_menu_item(),
             Item("Privacy Policy", self._handle_open_privacy),
         ]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
@@ -829,6 +880,26 @@ class TrayIcon:
         items.append(Item("Quit", self._handle_quit))
 
         return pystray.Menu(*items)
+
+    def _arch_menu_item(self) -> "Item":
+        """The architecture row: which build of BetterFlow is actually running.
+
+        Sits in Diagnostics because it answers a question users could not
+        otherwise answer about their own machine — an Intel build runs happily
+        on Apple Silicon through Rosetta, so there is no symptom to notice and
+        no way to tell from the app which one was installed. Before this row the
+        only answer was `lipo -archs` on the bundle.
+
+        The label lives in the module-level arch_menu_label() so it can be
+        asserted without a live pystray backend; this method only wraps it in a
+        MenuItem. Do not re-derive the label here — a second copy is how the test
+        and the menu drift apart.
+
+        arch_menu_label() reads the memoised probe in src/machine_arch.py, so
+        rebuilding the menu on every state change costs nothing — the row must
+        never fork sysctl under _menu_lock on the sync cycle.
+        """
+        return Item(arch_menu_label(), None, enabled=False)
 
     def _serial_menu_item(self) -> "Item":
         """The device-serial row: readable value, copyable when we can copy.
