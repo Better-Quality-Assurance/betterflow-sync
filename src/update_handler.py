@@ -14,8 +14,10 @@ import time
 from typing import Optional
 
 try:
+    from .machine_arch import true_machine_arch
     from .update_checker import _version_tuple
-except ImportError:
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from machine_arch import true_machine_arch
     from update_checker import _version_tuple
 
 try:
@@ -47,6 +49,10 @@ class UpdateHandler:
         # self-update" warning, so a root-owned (.pkg) machine gets told once,
         # not every 30-min check.
         self._managed_warned_version: Optional[str] = None
+        # And the same latch for "we could not determine this Mac's architecture,
+        # so we are withholding every arch-suffixed build". Reported once per
+        # version rather than every 30-min check.
+        self._arch_undetermined_version: Optional[str] = None
         self._staged_lock = threading.Lock()
         self._update_jobs_started = False
         self._update_jobs_lock = threading.Lock()
@@ -166,6 +172,35 @@ class UpdateHandler:
         except Exception:
             logger.warning("managed-install-blocked report failed", exc_info=True)
 
+    def _report_arch_undetermined(self, version: str) -> None:
+        """Report once per version that this Mac is being offered no build.
+
+        The sibling of `_report_managed_blocked`, and it exists for the same
+        reason: the machine is now permanently un-auto-updatable and the only
+        person who can see that is whoever opens the tray menu.
+
+        Reachable when the Rosetta probe never got an answer (a Mac congested
+        past the whole retry budget, a sandbox/EDR denial). `true_machine_arch`
+        then returns "", the updater correctly refuses every arch-suffixed
+        asset, and since this repo's releases publish ONLY arm64 and x86_64
+        DMGs — no universal DMG, no macOS ZIP — that means no asset at all, for
+        every release, until the process restarts. The user still gets the
+        release-page notification; ops otherwise gets nothing, and this device
+        would sit at a stale version looking healthy.
+        """
+        reporter = getattr(self.coordinator, "error_reporter", None)
+        if reporter is None:
+            return
+        try:
+            reporter.capture(
+                f"Self-update withheld: machine architecture undetermined, no asset for v{version}",
+                level="warning",
+                tags={"component": "update-handler"},
+                fingerprint="update-arch-undetermined",
+            )
+        except Exception:
+            logger.warning("arch-undetermined report failed", exc_info=True)
+
     def _on_update_available(
         self, version: str, url: str, asset_url: Optional[str] = None, apply_now: bool = False
     ) -> None:
@@ -173,6 +208,21 @@ class UpdateHandler:
         stage it (and maybe apply)."""
         logger.info(f"Update available: v{version} | {url} (asset: {asset_url})")
         self.tray.set_update_available(version, url, asset_url)
+
+        # No asset AND no architecture: this Mac's Rosetta probe never got an
+        # answer, so the updater is refusing every arch-suffixed build on
+        # purpose. Correct, and invisible — tell ops, or the device sits at a
+        # stale version indistinguishable from a healthy one. Checked before the
+        # managed-install gate below, which only fires when an asset EXISTS.
+        # `true_machine_arch()` is last so it is only reached once per version:
+        # it is memoised, but the two cheap latches say the same thing sooner.
+        if (
+            not asset_url
+            and version != self._arch_undetermined_version
+            and not true_machine_arch()
+        ):
+            self._arch_undetermined_version = version
+            self._report_arch_undetermined(version)
 
         # A managed (.pkg / root-owned) install can't replace itself — the
         # self-update rename EPERMs every cycle (see

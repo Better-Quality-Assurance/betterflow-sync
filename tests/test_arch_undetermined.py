@@ -16,7 +16,9 @@ These pin the distinction that makes it real: mid-backoff is NOT undetermined
 (the retry schedule covers a briefly-busy machine), settled-with-no-answer is.
 """
 
-from unittest.mock import patch
+import errno
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -41,7 +43,7 @@ def _exhaust_the_budget():
     — the same path a permanently congested Mac takes.
     """
     clock = [0.0]
-    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, conclusive=False)), \
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=False, conclusive=False)), \
          patch.object(ma, "_monotonic", lambda: clock[0]):
         for _ in range(len(ma._RETRY_BACKOFF_SECONDS) + 2):
             ma._read_proc_translated_cached()
@@ -61,7 +63,7 @@ def test_mid_backoff_is_not_undetermined():
     merely mid-boot-storm — a worse trade than the one this feature guards
     against, and the reason `probe_settled_unresolved` is not just "has failed".
     """
-    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, conclusive=False)):
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=False, conclusive=False)):
         ma._read_proc_translated_cached()  # one transient failure, budget intact
 
     assert ma.probe_settled_unresolved() is False
@@ -70,11 +72,144 @@ def test_mid_backoff_is_not_undetermined():
 
 def test_a_conclusive_answer_is_never_undetermined():
     """The control. A real Intel Mac has no proc_translated key, forever."""
-    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, conclusive=True)):
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=True, conclusive=True)):
         ma._read_proc_translated_cached()
 
     assert ma.probe_settled_unresolved() is False
     assert true_machine_arch(system="Darwin", machine=X86_64) == X86_64
+
+
+# --- "stop asking" and "we found out" are different claims -----------------
+#
+# The first cut of this fix read ProbeResult.conclusive, which is the RETRY
+# decision. Several outcomes are conclusive-but-unanswered, and each of them
+# reinstated the whole #196 defect through a side door: a confident "x86_64"
+# for a machine the kernel never spoke to. One witness per door.
+
+
+def _settle_by_raising(exc):
+    """Drive the real probe to its settled state with `exc` from every fork.
+
+    Goes through `subprocess.run` rather than stubbing `_read_proc_translated`,
+    because the classification under test IS `_read_proc_translated`'s. Stubbing
+    it would assert the mapping the test itself supplied.
+    """
+    clock = [0.0]
+
+    def _boom(*a, **k):
+        raise exc
+
+    with patch.object(ma.subprocess, "run", _boom), patch.object(ma, "_monotonic", lambda: clock[0]):
+        for _ in range(len(ma._RETRY_BACKOFF_SECONDS) + 2):
+            ma._read_proc_translated_cached()
+            clock[0] += 100000.0
+
+
+def test_a_fork_refused_with_emfile_is_undetermined_not_intel():
+    """EMFILE is congestion, and it used to take the "permanent" branch.
+
+    The old classifier asked `exc.errno in {EAGAIN, ENOMEM}`. A full file-
+    descriptor table refuses posix_spawn with EMFILE, not EAGAIN — the same
+    overloaded machine, one table along — so it fell through to conclusive,
+    memoised as though the hardware had answered, and an Apple Silicon Mac
+    running the Intel build was handed the Intel DMG again. The set of ways a
+    busy machine can refuse a fork is not enumerable, which is why the module
+    now lists the PERMANENT cases instead.
+    """
+    _settle_by_raising(OSError(errno.EMFILE, "Too many open files"))
+
+    assert ma.probe_settled_unresolved() is True
+    assert true_machine_arch(system="Darwin", machine=X86_64) == ""
+    with patch("platform.machine", lambda: X86_64):
+        assert _find_platform_asset(RELEASE, system="Darwin") is None
+
+
+def test_a_sandbox_denial_is_undetermined_while_staying_memoised():
+    """Both halves, because they pull in opposite directions.
+
+    A denied call will not lift mid-session, so the retry policy must still
+    stop after ONE fork — retrying costs a fork per menu rebuild and buys
+    nothing. But it is not an answer about the hardware, so the arch must come
+    back undetermined. `conclusive=True, determined=False` is exactly this
+    cell, and collapsing the two fields loses it.
+    """
+    calls = []
+
+    def _denied(*a, **k):
+        calls.append(1)
+        raise PermissionError(errno.EACCES, "Operation not permitted")
+
+    clock = [0.0]
+    with patch.object(ma.subprocess, "run", _denied), patch.object(ma, "_monotonic", lambda: clock[0]):
+        for _ in range(5):
+            clock[0] += 100000.0
+            ma._read_proc_translated_cached()
+
+    assert len(calls) == 1, "a permanent denial must still be memoised on the first probe"
+    assert ma.probe_settled_unresolved() is True
+    assert true_machine_arch(system="Darwin", machine=X86_64) == ""
+
+
+def test_a_missing_sysctl_is_undetermined_while_staying_memoised():
+    """The same cell reached the other way, and the one that guards Windows.
+
+    `FileNotFoundError("sysctl not found")` carries no errno at all, so any
+    errno-keyed classifier reads `exc.errno is None`, calls it congestion, and
+    reinstates the fork-per-menu-rebuild regression that once broke the
+    windows-latest leg of a tagged release. Matching on the exception TYPE is
+    what makes this stable.
+    """
+    calls = []
+
+    def _absent(*a, **k):
+        calls.append(1)
+        raise FileNotFoundError("sysctl not found")
+
+    clock = [0.0]
+    with patch.object(ma.subprocess, "run", _absent), patch.object(ma, "_monotonic", lambda: clock[0]):
+        for _ in range(5):
+            clock[0] += 100000.0
+            ma._read_proc_translated_cached()
+
+    assert len(calls) == 1, "a permanently absent sysctl must be memoised on the first probe"
+    assert ma.probe_settled_unresolved() is True
+
+
+def test_a_real_intel_mac_is_determined_by_the_answer_it_gets():
+    """The control for all three above, through the same real code path.
+
+    sysctl exits non-zero because the key does not exist — and that IS the
+    answer. If this ever reported undetermined, every genuine Intel Mac would
+    stop being offered its own build, which is the failure mode that makes
+    "withhold when unsure" dangerous rather than free.
+    """
+    clock = [0.0]
+    with patch.object(
+        ma.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="invalid")
+    ), patch.object(ma, "_monotonic", lambda: clock[0]):
+        ma._read_proc_translated_cached()
+
+    assert ma.probe_settled_unresolved() is False
+    assert true_machine_arch(system="Darwin", machine=X86_64) == X86_64
+    with patch("platform.machine", lambda: X86_64):
+        assert _find_platform_asset(RELEASE, system="Darwin") == "https://x/x86_64.dmg"
+
+
+def test_an_injected_reader_is_never_answered_from_this_process_memo():
+    """The `sysctl_reader is None` guard, which nothing witnessed.
+
+    An injected reader REPLACES the probe, so this process's memo describes a
+    different one and must not be mixed in. Injecting `translated=` is the
+    opposite case — no reader ran, so the memo is the only record of whether
+    this process got an answer — and the tray depends on exactly that, which
+    `test_the_tray_row_says_it_could_not_determine` pins.
+    """
+    _exhaust_the_budget()
+    assert ma.probe_settled_unresolved() is True
+
+    # Same settled-unresolved memo, but the caller brought its own probe.
+    assert true_machine_arch(system="Darwin", machine=X86_64, sysctl_reader=lambda: "0") == X86_64
+    assert true_machine_arch(system="Darwin", machine=X86_64, sysctl_reader=lambda: "1") == ARM64
 
 
 def test_undetermined_is_macos_only():
@@ -113,7 +248,7 @@ def test_an_undetermined_mac_is_offered_no_arch_suffixed_build():
 
 def test_a_determined_mac_still_gets_its_build():
     """The permissive direction. Withholding from everyone would also 'pass'."""
-    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult("1", conclusive=True)):
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult("1", determined=True, conclusive=True)):
         ma._read_proc_translated_cached()
 
     with patch("platform.machine", lambda: X86_64):
@@ -169,8 +304,68 @@ def test_the_tray_row_says_it_could_not_determine():
     assert X86_64 in label
 
 
+# --- and ops has to be able to see it --------------------------------------
+
+
+def _update_handler():
+    """Hand-built like the other UpdateHandler suites — see test_update_handler.py."""
+    import threading
+
+    from src.update_handler import UpdateHandler
+
+    h = UpdateHandler.__new__(UpdateHandler)
+    h.tray = MagicMock()
+    h.config = MagicMock()
+    h.config.auto_install_updates = True
+    h.coordinator = MagicMock()
+    h._version = "1.5.123"
+    h._notified_version = None
+    h._managed_warned_version = None
+    h._arch_undetermined_version = None
+    h._staged_version = None
+    h._staged_lock = threading.Lock()
+    return h
+
+
+def test_a_mac_left_with_no_asset_by_an_undetermined_arch_is_reported_once():
+    """Withholding correctly is not the same as withholding visibly.
+
+    This repo publishes ONLY arm64 and x86_64 DMGs — no universal DMG, no macOS
+    ZIP — so an undetermined Mac gets no asset for EVERY release until the
+    process restarts. The user still sees the release-page toast; without this,
+    ops sees a device quietly stuck on an old version and nothing else.
+    """
+    _exhaust_the_budget()
+    h = _update_handler()
+
+    with patch.object(h, "_report_arch_undetermined") as report:
+        h._on_update_available("1.5.124", "http://rel", asset_url=None)
+        h._on_update_available("1.5.124", "http://rel", asset_url=None)  # 30-min re-check
+
+    report.assert_called_once()
+
+
+def test_no_asset_for_an_ordinary_reason_is_not_reported_as_undetermined():
+    """The control, and the one that keeps the fingerprint meaningful.
+
+    A release with nothing this platform can use also arrives here with
+    `asset_url=None`. Reporting that as an architecture failure would make the
+    signal fire on healthy machines, and the error ingest aggregates by
+    fingerprint alone — so a noisy fingerprint is not a smaller signal, it is
+    no signal.
+    """
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=True, conclusive=True)):
+        ma._read_proc_translated_cached()
+    h = _update_handler()
+
+    with patch.object(h, "_report_arch_undetermined") as report:
+        h._on_update_available("1.5.124", "http://rel", asset_url=None)
+
+    report.assert_not_called()
+
+
 def test_the_tray_row_is_unchanged_when_the_probe_resolved():
-    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, conclusive=True)):
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=True, conclusive=True)):
         ma._read_proc_translated_cached()
 
     assert arch_menu_label(system="Darwin", machine=X86_64, translated=False) == (
