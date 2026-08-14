@@ -77,6 +77,11 @@ class MacOSWindowWatcher:
         # emit a one-shot log on each transition.
         self._last_accessibility: Optional[bool] = None
         self._last_accessibility_check_ts: float = 0.0
+        # Whether the user has been TOLD, this launch, that Accessibility is
+        # denied. Distinct from the log warning above, which fires every 60s
+        # and reaches nobody. Cleared on a grant so a later revocation warns
+        # again — see _notify_accessibility_required_once.
+        self._accessibility_notified: bool = False
         # One-shot flag: the AX messaging-timeout symbol is either present for
         # the whole process lifetime or never, so warn about it only once.
         self._ax_timeout_warned = False
@@ -112,6 +117,8 @@ class MacOSWindowWatcher:
             trusted = AXIsProcessTrusted()
             if not trusted:
                 logger.warning("Process does NOT have Accessibility permission — window titles will be empty")
+                # A log line is not a channel to a user who cannot see the log.
+                self._notify_accessibility_required_once()
         except ImportError:
             logger.error("Cannot start MacOSWindowWatcher: pyobjc-framework-ApplicationServices not installed")
             return False
@@ -375,11 +382,55 @@ class MacOSWindowWatcher:
             logger.info(
                 "Accessibility permission now granted — window titles will be tracked"
             )
+            # Re-arm: if the grant is ever taken away again the user must be
+            # told again. A latch that only ever sets would make the SECOND
+            # revocation as silent as the first one was.
+            self._accessibility_notified = False
         elif not trusted and self._last_accessibility:
             logger.warning(
                 "Accessibility permission revoked — window titles will be empty"
             )
+            self._notify_accessibility_required_once()
         self._last_accessibility = trusted
+
+    def _notify_accessibility_required_once(self) -> None:
+        """Ask the user to grant Accessibility. Once per launch, not once per check.
+
+        The warning this accompanies has been logged once a MINUTE, for nine
+        days on one device and ~15 on two others, and changed nothing: the log
+        is on the user's disk and nobody reads it (#194). The grant can only be
+        given by the person sitting at the machine, so they are the one who has
+        to be asked.
+
+        Once per launch rather than once ever, and the reasoning is the same as
+        ``aw_manager._notify_rosetta_required_once``: this reports a live
+        misconfiguration that stays true until someone acts, and it stops by
+        itself when they do. Repeating it every 60s alongside the log line would
+        train them to dismiss it, which is how a notice becomes as useless as
+        the log.
+
+        Best-effort. A machine with notifications disabled loses the prompt and
+        nothing else — capture is unaffected either way, since app names and
+        durations do not need this grant.
+        """
+        if self._accessibility_notified:
+            return
+        self._accessibility_notified = True
+        try:
+            try:
+                from ..notifications import send_notification
+            except ImportError:
+                from notifications import send_notification  # type: ignore[no-redef]
+
+            send_notification(
+                "BetterFlow can't read window titles",
+                "Grant Accessibility to BetterFlow in System Settings > "
+                "Privacy & Security > Accessibility. App names and time are "
+                "still being tracked.",
+            )
+        except Exception as e:
+            # Never let a failed notification stop the watcher starting.
+            logger.debug("Accessibility notification failed: %s", e)
 
     def _note_emit(self) -> None:
         """A window heartbeat was posted — clear any no-emit streak (and log a
