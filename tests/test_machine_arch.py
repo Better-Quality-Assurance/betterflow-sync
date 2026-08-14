@@ -10,6 +10,7 @@ would serve it an arm64 build it physically cannot execute.
 
 import inspect
 import platform
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -78,8 +79,66 @@ def test_probe_runs_at_most_once_per_process(monkeypatch):
     other thread's menu update for as long as the probe takes, and the answer
     cannot change while the process lives.
 
-    A FAILING probe must be cached too: on a genuine Intel Mac the key does not
-    exist, so a retrying probe spawns a subprocess on every rebuild forever.
+    A CONCLUSIVE failure must be cached too: on a genuine Intel Mac the key does
+    not exist, so a retrying probe spawns a subprocess on every rebuild forever.
+
+    Note the fixture models that Mac the way the machine actually behaves — a
+    NON-ZERO EXIT, printing "second level name 'proc_translated' ... is
+    invalid". It previously raised OSError, which is a different failure
+    entirely (see the transient test below), so this test asserted the right
+    rule about the wrong case.
+    """
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        return MagicMock(returncode=1, stdout="")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    for _ in range(3):
+        assert is_rosetta_translated(system="Darwin") is False
+    assert len(calls) == 1
+
+
+def test_a_transient_probe_failure_is_not_memoised(monkeypatch):
+    """A timeout says nothing about the hardware, so it must not pin the answer.
+
+    THE DEFECT: caching the None from an exception marks the machine
+    untranslated for the whole session. On the Mac this module exists for, that
+    means the Diagnostics row states "Intel" about Apple Silicon and the next
+    update check re-selects the Intel DMG — the original bug, silently back.
+    The warm-up runs at the busiest moment of launch, in a process that in this
+    very case is running through Rosetta, so a 2s timeout is the plausible
+    outcome rather than the exotic one.
+    """
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd="sysctl", timeout=2)
+        return MagicMock(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    # The timed-out probe degrades to "not translated" and must NOT be kept.
+    assert is_rosetta_translated(system="Darwin") is False
+    # The retry gets the real answer: this machine IS translated.
+    assert is_rosetta_translated(system="Darwin") is True
+    assert len(calls) == 2
+
+    # And that answer is memoised like any other conclusive one.
+    assert is_rosetta_translated(system="Darwin") is True
+    assert len(calls) == 2
+
+
+def test_a_permanently_broken_sysctl_still_stops_forking(monkeypatch):
+    """The retry is bounded, or the fix above trades one bug for a worse one.
+
+    Without the cap, a sandbox that blocks sysctl outright would fork on every
+    menu rebuild forever — under _menu_lock, which is exactly the cost the memo
+    exists to prevent.
     """
     calls = []
 
@@ -89,9 +148,9 @@ def test_probe_runs_at_most_once_per_process(monkeypatch):
 
     monkeypatch.setattr(ma.subprocess, "run", _probe)
 
-    for _ in range(3):
+    for _ in range(5):
         assert is_rosetta_translated(system="Darwin") is False
-    assert len(calls) == 1
+    assert len(calls) == ma._MAX_PROBE_ATTEMPTS
 
 
 # --- true_machine_arch -----------------------------------------------------
