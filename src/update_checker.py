@@ -59,25 +59,47 @@ _ASSET_PATTERNS = {
     "Linux": "BetterFlow-linux",
 }
 
-# The arch token that must NOT appear in an asset we offer this machine. An
-# asset naming no architecture at all is still fair game for the fallback (it
-# may be universal); one naming the OTHER architecture is a build we already
-# know this Mac cannot run, and handing it over is strictly worse than not
-# updating — EBADARCH/ENOEXEC on Apple Silicon without Rosetta 2, and no
-# recovery at all in the Intel direction, where there is no reverse Rosetta.
+# The arch token that must NOT appear in a macOS asset we offer this machine.
+#
+# Two different reasons, depending on which Mac is asking, and they are worth
+# keeping apart because only one of them is a compatibility fact:
+#
+#   * NATIVE arm64 (proc_translated == "0"): Rosetta 2 may not be installed, and
+#     without it an x86_64 binary dies EBADARCH/ENOEXEC and capture stops dead —
+#     the production fault on record for Ardiel Plata's device (internal-tool2
+#     #2298, an Apple Silicon machine with no Rosetta).
+#   * TRANSLATED (proc_translated == "1"): Rosetta demonstrably IS installed,
+#     because we are running under it right now, so the Intel DMG would execute.
+#     We refuse it anyway — offering it re-pins the machine to Rosetta for
+#     another release cycle, which is precisely the self-perpetuating loop #185
+#     exists to break. That is a product choice, not an inability.
+#
+# In the Intel direction there is no reverse Rosetta, so an arm64 build on a
+# genuine Intel Mac has no recovery path under any circumstances.
+#
+# Refusal is not a dead end for the user: update_handler still raises the
+# "Version X is available" notice with the release page, so a manual download
+# remains one click away while the release is repaired.
 _INCOMPATIBLE_ARCH = {ARM64: X86_64, X86_64: ARM64}
 
 
-def _is_wrong_arch(name: str, arch: str) -> bool:
+def _is_wrong_arch(name: str, arch: str, system: str) -> bool:
     """True when this asset names an architecture this machine cannot run.
 
-    Unknown ``arch`` (``platform.machine()`` is documented to return "" when it
-    cannot tell) rejects EVERY arch-suffixed asset rather than guessing: we know
-    one of them is wrong and not which, so the only safe answer is neither.
+    Scoped to macOS. The map's keys ("arm64", "x86_64") collide with a Linux
+    host's own ``platform.machine()``, and the unknown-arch branch below is
+    platform-blind by construction — so without this gate a Windows or Linux
+    host that could not determine its architecture would silently refuse assets
+    it has always accepted. Linux happens to return before ever reaching here,
+    but that is the caller's control flow rather than a property of this rule.
 
-    Windows and Linux arch tokens ("AMD64", "x86_64" from a Linux host) are not
-    keys here, so those platforms keep their existing behaviour untouched.
+    Unknown ``arch`` (``platform.machine()`` is documented to return "" when it
+    cannot tell) rejects EVERY arch-suffixed asset rather than guessing: one of
+    them is wrong and we cannot tell which, so the only safe answer is neither.
     """
+    if system != "Darwin":
+        return False
+
     if not arch:
         return any(token in name for token in (ARM64, X86_64))
 
@@ -135,7 +157,7 @@ def _find_platform_asset(
             name = asset.get("name", "")
             url = asset.get("browser_download_url")
             if pattern in name and name.endswith(".dmg") and url:
-                if _is_wrong_arch(name, arch):
+                if _is_wrong_arch(name, arch, system):
                     logger.warning(
                         f"Skipping {name}: wrong architecture for this machine "
                         f"({arch or 'undetermined'})"
@@ -151,8 +173,9 @@ def _find_platform_asset(
         if pattern in name and name.endswith(".zip") and url:
             # Same rule as the DMG fallback: this loop is reached for macOS too,
             # so a BetterFlow-macOS-x86_64.zip is the identical hazard one door
-            # along. A no-op for Windows/Linux, whose arch tokens are not keys.
-            if _is_wrong_arch(name, arch):
+            # along. _is_wrong_arch returns False outright off Darwin, so Windows
+            # keeps its existing behaviour whatever its assets are named.
+            if _is_wrong_arch(name, arch, system):
                 logger.warning(
                     f"Skipping {name}: wrong architecture for this machine "
                     f"({arch or 'undetermined'})"

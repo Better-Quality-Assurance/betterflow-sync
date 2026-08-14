@@ -23,7 +23,8 @@ import logging
 import platform
 import subprocess
 import threading
-from typing import Callable, Optional
+import time
+from typing import Callable, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +46,42 @@ _PROC_TRANSLATED_KEY = "sysctl.proc_translated"
 _lock = threading.Lock()
 _cached_raw: Optional[str] = None
 _probed = False
-
-# Set by _read_proc_translated when the probe failed for a reason that says
-# nothing about the hardware (sysctl raised — a timeout above all), as opposed
-# to answering "no such key". See _read_proc_translated_cached.
-_last_probe_transient = False
 _probe_attempts = 0
+_last_transient_at: Optional[float] = None
 
-# A permanently broken sysctl must still stop forking. Two attempts covers the
-# one-off timeout this exists for without turning a hard failure into a loop.
-_MAX_PROBE_ATTEMPTS = 2
+
+class ProbeResult(NamedTuple):
+    """What the probe said, and whether it is worth asking again.
+
+    ``conclusive`` is False ONLY when we never got an answer — see
+    ``_read_proc_translated``. Returned as a value rather than signalled through
+    module state so the classification cannot be read out of order, and so the
+    producer has no side effect its docstring has to warn about.
+    """
+
+    raw: Optional[str]
+    conclusive: bool
+
+
+# Only a TIMEOUT is worth retrying. A missing sysctl or a sandbox denial will not
+# resolve itself mid-session, so those are conclusive and get memoised like any
+# other answer. Classifying them as transient is what broke the Windows CI leg
+# in review: no sysctl there, so FileNotFoundError made the memo never engage and
+# the fork-counting test saw a second fork.
+_RETRY_AFTER_SECONDS = 60.0
+
+# Even a persistently timing-out sysctl has to settle, or a long session keeps
+# paying a fork per minute for an answer that is not coming.
+_MAX_PROBE_ATTEMPTS = 3
+
+
+def _monotonic() -> float:
+    """Indirected so tests can advance the clock without sleeping."""
+    return time.monotonic()
 
 
 def _read_proc_translated_cached() -> Optional[str]:
-    """``_read_proc_translated`` probed at most once per process.
+    """``_read_proc_translated`` probed at most once per process, plus retries.
 
     The answer cannot change while this process lives, so re-probing is pure
     waste. A CONCLUSIVE failure is cached too — same rule, same reason, as
@@ -66,57 +89,76 @@ def _read_proc_translated_cached() -> Optional[str]:
     not exist and never will, so a probe that retried would spawn a subprocess
     on every menu rebuild forever.
 
-    A TRANSIENT failure is a different thing wearing the same return value, and
-    memoising it silently reinstates the bug this module exists to fix. sysctl
-    raising says nothing about the hardware, but caching that ``None`` makes the
-    machine read as untranslated for the rest of the session: the Diagnostics
-    row states "Intel" about an Apple Silicon Mac, and the next update check
-    re-selects the Intel DMG. The window is not theoretical — the warm-up fires
-    at the busiest moment of launch, in a process that (in the affected case) is
-    itself running through Rosetta, i.e. the slowest fork the machine will do.
+    A TIMEOUT is a different thing wearing the same return value, and memoising
+    it silently reinstates the bug this module exists to fix: the machine reads
+    as untranslated for the rest of the session, the Diagnostics row states
+    "Intel" about an Apple Silicon Mac, and the next update check re-selects the
+    Intel DMG.
 
-    So the line is exit code vs exception, which is exactly the line between
-    "asked and answered no" and "never got an answer".
+    The retry is gated on ELAPSED TIME, not on a call count, and that distinction
+    is the whole point. The two probes of a launch are consecutive statements —
+    ``main.run`` warms the memo and then ``tray.run_blocking`` builds the menu
+    milliseconds later — so a count-based budget is spent entirely inside the
+    congested window that caused the timeout, and the retry lands in the same
+    conditions as the failure. Waiting instead puts the second attempt somewhere
+    the machine is no longer busy, which is the only place it can do any good,
+    and keeps rapid menu rebuilds fork-free in the meantime.
     """
-    global _cached_raw, _probed, _last_probe_transient, _probe_attempts
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at
 
     with _lock:
         if _probed:
             return _cached_raw
 
-        _last_probe_transient = False
-        raw = _read_proc_translated()
+        # A timed-out probe is not re-asked immediately: every menu rebuild in
+        # the interval reuses the last answer rather than forking under
+        # _menu_lock, which is the cost the memo exists to prevent.
+        if _last_transient_at is not None and _monotonic() - _last_transient_at < _RETRY_AFTER_SECONDS:
+            return _cached_raw
+
+        result = _read_proc_translated()
         _probe_attempts += 1
 
-        if not _last_probe_transient or _probe_attempts >= _MAX_PROBE_ATTEMPTS:
-            _cached_raw = raw
+        if result.conclusive or _probe_attempts >= _MAX_PROBE_ATTEMPTS:
+            _cached_raw = result.raw
             _probed = True
+            _last_transient_at = None
         else:
+            _last_transient_at = _monotonic()
             logger.debug(
-                f"{_PROC_TRANSLATED_KEY} probe failed transiently "
-                f"({_probe_attempts}/{_MAX_PROBE_ATTEMPTS}) — not memoising, "
-                "so a timeout cannot pin this process to the wrong architecture"
+                f"{_PROC_TRANSLATED_KEY} timed out "
+                f"({_probe_attempts}/{_MAX_PROBE_ATTEMPTS}) — not memoising, so a "
+                f"slow launch cannot pin this process to the wrong architecture; "
+                f"retrying no sooner than {_RETRY_AFTER_SECONDS:.0f}s from now"
             )
 
-        return raw
+        return result.raw
 
 
 def reset_cache_for_tests() -> None:
     """Drop the memo. Tests only — the architecture never changes at runtime."""
-    global _cached_raw, _probed, _last_probe_transient, _probe_attempts
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at
     with _lock:
         _cached_raw = None
         _probed = False
-        _last_probe_transient = False
         _probe_attempts = 0
+        _last_transient_at = None
 
 
-def _read_proc_translated() -> Optional[str]:
-    """Return the raw ``sysctl.proc_translated`` value, or None if unreadable.
+def _read_proc_translated() -> ProbeResult:
+    """Return the raw ``sysctl.proc_translated`` value and whether it settles it.
 
-    None means "could not determine" — a missing key (real Intel Mac), a sysctl
-    that is not on PATH, a timeout, or a sandbox that blocks the call. Callers
-    must treat None as *not translated*; see ``is_rosetta_translated``.
+    ``raw`` is None whenever the value could not be determined — a missing key
+    (real Intel Mac), a sysctl that is not on PATH, a timeout, or a sandbox that
+    blocks the call. Callers must treat None as *not translated*; see
+    ``is_rosetta_translated``.
+
+    ``conclusive`` separates "asked and answered no" from "never got an answer",
+    and only a TIMEOUT is the latter. A missing binary or a denied call is an
+    answer: sysctl will not appear mid-session and a sandbox will not lift, so
+    treating those as retryable buys nothing and costs a fork on every menu
+    rebuild — on Windows, where sysctl does not exist at all, it also breaks the
+    memo outright.
     """
     try:
         result = subprocess.run(
@@ -125,20 +167,22 @@ def _read_proc_translated() -> Optional[str]:
             text=True,
             timeout=2,
         )
+    except subprocess.TimeoutExpired as exc:
+        # The one genuinely transient case: the machine was too busy to answer,
+        # which says nothing about its hardware.
+        logger.debug(f"Timed out reading {_PROC_TRANSLATED_KEY}: {exc}")
+        return ProbeResult(None, conclusive=False)
     except (OSError, subprocess.SubprocessError) as exc:
-        # Transient: a timeout, a sandbox denial, sysctl briefly unavailable.
-        # None of these are statements about the hardware, so the memo must not
-        # keep this answer. subprocess.TimeoutExpired is a SubprocessError.
-        global _last_probe_transient
-        _last_probe_transient = True
+        # No sysctl on PATH, or the call was refused. Permanent for this process.
         logger.debug(f"Could not read {_PROC_TRANSLATED_KEY}: {exc}")
-        return None
+        return ProbeResult(None, conclusive=True)
 
     if result.returncode != 0:
         # Expected on Intel Macs: "second level name 'proc_translated' in
         # 'sysctl.proc_translated' is invalid". Not an error worth logging loudly.
-        return None
-    return result.stdout.strip()
+        return ProbeResult(None, conclusive=True)
+
+    return ProbeResult(result.stdout.strip(), conclusive=True)
 
 
 def is_rosetta_translated(

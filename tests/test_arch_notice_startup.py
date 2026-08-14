@@ -196,7 +196,7 @@ def test_a_translated_mac_actually_gets_the_notification():
     # Pin the SUBJECT rather than the wording: the notice is useless if it does
     # not name the remedy, since "Intel build" does not read as "wrong" alone.
     assert "Apple Silicon" in title or "Apple Silicon" in body
-    assert "Reinstall" in body
+    assert "reinstall" in body.lower()
 
 
 def test_the_warning_survives_a_probe_that_blows_up():

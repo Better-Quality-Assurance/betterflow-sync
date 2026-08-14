@@ -101,17 +101,28 @@ def test_probe_runs_at_most_once_per_process(monkeypatch):
     assert len(calls) == 1
 
 
-def test_a_transient_probe_failure_is_not_memoised(monkeypatch):
+def _fake_clock(monkeypatch):
+    """A monotonic clock the test advances by hand.
+
+    Never sleeps, and asserts nothing about the clock's MAGNITUDE — a fresh CI
+    runner's uptime is ~95s, so any fixture built on the real value being large
+    passes on a laptop and reds on a runner.
+    """
+    now = {"t": 1000.0}
+    monkeypatch.setattr(ma, "_monotonic", lambda: now["t"])
+
+    return now
+
+
+def test_a_timed_out_probe_is_not_memoised(monkeypatch):
     """A timeout says nothing about the hardware, so it must not pin the answer.
 
-    THE DEFECT: caching the None from an exception marks the machine
-    untranslated for the whole session. On the Mac this module exists for, that
-    means the Diagnostics row states "Intel" about Apple Silicon and the next
-    update check re-selects the Intel DMG — the original bug, silently back.
-    The warm-up runs at the busiest moment of launch, in a process that in this
-    very case is running through Rosetta, so a 2s timeout is the plausible
-    outcome rather than the exotic one.
+    THE DEFECT: caching the None from a timeout marks the machine untranslated
+    for the whole session. On the Mac this module exists for, that means the
+    Diagnostics row states "Intel" about Apple Silicon and the next update check
+    re-selects the Intel DMG — the original bug, silently back.
     """
+    clock = _fake_clock(monkeypatch)
     calls = []
 
     def _probe(*a, **k):
@@ -124,33 +135,103 @@ def test_a_transient_probe_failure_is_not_memoised(monkeypatch):
 
     # The timed-out probe degrades to "not translated" and must NOT be kept.
     assert is_rosetta_translated(system="Darwin") is False
-    # The retry gets the real answer: this machine IS translated.
+
+    # Once the machine has had time to settle, the retry gets the real answer.
+    clock["t"] += ma._RETRY_AFTER_SECONDS + 1
     assert is_rosetta_translated(system="Darwin") is True
     assert len(calls) == 2
 
     # And that answer is memoised like any other conclusive one.
+    clock["t"] += 10_000
     assert is_rosetta_translated(system="Darwin") is True
     assert len(calls) == 2
 
 
-def test_a_permanently_broken_sysctl_still_stops_forking(monkeypatch):
-    """The retry is bounded, or the fix above trades one bug for a worse one.
+def test_the_retry_waits_instead_of_re_probing_inside_the_same_launch(monkeypatch):
+    """The retry is gated on ELAPSED TIME, not on a call count.
 
-    Without the cap, a sandbox that blocks sysctl outright would fork on every
-    menu rebuild forever — under _menu_lock, which is exactly the cost the memo
-    exists to prevent.
+    The two probes of a launch are consecutive statements — main.run warms the
+    memo, then tray.run_blocking builds the menu milliseconds later. A
+    count-based budget is therefore spent entirely inside the congested window
+    that caused the timeout, so the retry lands in the same conditions as the
+    failure and buys nothing. It also costs a second fork under _menu_lock,
+    which is the exact cost the memo exists to prevent.
     """
+    clock = _fake_clock(monkeypatch)
     calls = []
 
     def _probe(*a, **k):
         calls.append(1)
-        raise OSError("sysctl not found")
+        raise subprocess.TimeoutExpired(cmd="sysctl", timeout=2)
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    assert is_rosetta_translated(system="Darwin") is False
+    assert len(calls) == 1
+
+    # Every menu rebuild in the interval reuses the answer rather than forking.
+    for _ in range(50):
+        clock["t"] += 0.5
+        assert is_rosetta_translated(system="Darwin") is False
+    assert len(calls) == 1, "a rebuild inside the retry interval must not fork sysctl"
+
+
+def test_a_missing_sysctl_is_conclusive_and_probed_once(monkeypatch):
+    """No sysctl on PATH is an ANSWER, not a failure to get one.
+
+    This is the Windows case, and classifying it as retryable is what broke the
+    windows-latest leg of the tagged-release build in review: the memo never
+    engaged, so test_the_memo_makes_every_later_menu_rebuild_free saw a second
+    fork. Invisible on any Mac, and it lands at release time rather than on the
+    PR.
+
+    A sandbox denial (PermissionError) is the same shape: it will not lift
+    mid-session, so retrying buys nothing and costs a fork per menu rebuild.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        raise FileNotFoundError("sysctl not found")
 
     monkeypatch.setattr(ma.subprocess, "run", _probe)
 
     for _ in range(5):
+        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
         assert is_rosetta_translated(system="Darwin") is False
-    assert len(calls) == ma._MAX_PROBE_ATTEMPTS
+
+    assert len(calls) == 1, "a permanently absent sysctl must be memoised on the first probe"
+
+
+def test_a_persistently_timing_out_sysctl_eventually_settles(monkeypatch):
+    """The retry is bounded, or the fix above trades one bug for a slower one.
+
+    Asserted as the PROPERTY — it stops — against an independent literal rather
+    than against ma._MAX_PROBE_ATTEMPTS alone. Comparing only to the module's own
+    constant means raising it to 50 keeps this test green while the behaviour it
+    names degrades badly: both sides of the == would trace to the same artifact.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd="sysctl", timeout=2)
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    for _ in range(20):
+        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
+        assert is_rosetta_translated(system="Darwin") is False
+
+    settled = len(calls)
+    for _ in range(20):
+        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
+        is_rosetta_translated(system="Darwin")
+
+    assert len(calls) == settled, "the probe never settled — it forks forever"
+    assert settled <= 3, "the retry bound grew; a fork per menu rebuild is the bug this memo prevents"
 
 
 # --- true_machine_arch -----------------------------------------------------
