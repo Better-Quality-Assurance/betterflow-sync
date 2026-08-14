@@ -171,6 +171,34 @@ def test_the_memo_makes_every_later_menu_rebuild_free():
     )
 
 
+def test_a_translated_mac_actually_gets_the_notification():
+    """The POSITIVE control the rest of this file was missing.
+
+    Every other assertion about ``send_notification`` here is a negative one —
+    ``assert_not_called`` on a broken probe — and the ordering tests read
+    ``run``'s source for the CALL SITE, never the method body. So emptying the
+    whole ``send_notification(...)`` block left the entire suite green: the one
+    user-facing half of #185 was witnessed by nothing.
+
+    That matters more than the usual coverage gap because this path runs on
+    essentially no developer machine and on no CI leg. It executes only on an
+    Apple Silicon Mac running the x86_64 build, which is exactly the
+    configuration nobody testing this has in front of them.
+    """
+    stub = MagicMock()
+    with patch("src.machine_arch.platform.system", return_value="Darwin"), patch.object(
+        ma, "_read_proc_translated_cached", return_value="1"
+    ), patch("src.main.send_notification") as notify:
+        BetterFlowApp._warn_if_wrong_arch_build(stub)
+
+    notify.assert_called_once()
+    title, body = notify.call_args[0][:2]
+    # Pin the SUBJECT rather than the wording: the notice is useless if it does
+    # not name the remedy, since "Intel build" does not read as "wrong" alone.
+    assert "Apple Silicon" in title or "Apple Silicon" in body
+    assert "reinstall" in body.lower()
+
+
 def test_the_warning_survives_a_probe_that_blows_up():
     """Best-effort: a broken sysctl loses the notice and nothing else.
 
