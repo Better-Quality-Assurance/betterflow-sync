@@ -384,12 +384,50 @@ class TestSyncEngine:
         """Reconcile builds its OWN fresh _SyncCycleContext (input analysis has
         not run yet), so replayed window events are deterministically classified
         'active' — never inheriting a prior cycle's state. With the per-cycle
-        context now threaded explicitly there is no instance field to leak."""
-        now = datetime.now(timezone.utc)
+        context now threaded explicitly there is no instance field to leak.
+
+        The clock is PINNED (#187). ``_reconcile_backlog`` walks
+        start-of-local-work-day -> now, so a fixture at "real now minus 5
+        minutes" lands in YESTERDAY for the first five minutes after local
+        midnight: no window covers it, nothing is enqueued, and this test failed
+        every night for five minutes with a message pointing at reconcile.
+        Production is right; the fixture was racing the boundary. On a CI runner
+        local midnight is UTC midnight, and ``release: needs: build``, so a tag
+        pushed in that window produced no release artifacts at all.
+
+        Pinning both ends together is the fix, per the house rule that an
+        absolute timestamp is fine when paired with an injected clock. Clamping
+        the event into the window instead would put a second copy of the
+        day_start computation in the test.
+        """
+        # Local midday: far from either boundary, whatever the host timezone.
+        frozen_local = (
+            datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
+        )
+        frozen_utc = frozen_local.astimezone(timezone.utc)
+
+        class _FrozenClock(datetime):
+            """Answers both shapes _reconcile_backlog reads: naive-local, aware-UTC."""
+
+            @classmethod
+            def now(cls, tz=None):
+                if tz is not None:
+                    return frozen_utc.astimezone(tz)
+                return frozen_local.replace(tzinfo=None)
+
         win_event = AWEvent(
-            id=1, timestamp=now - timedelta(minutes=5), duration=120.0,
+            id=1, timestamp=frozen_utc - timedelta(minutes=5), duration=120.0,
             data={"app": "Code", "title": "x"},
         )
+
+        # Fixture precondition: state the geometry this test depends on, so a
+        # future change to the reconcile window fails HERE, naming the cause,
+        # rather than surfacing as "reconcile stopped enqueueing".
+        assert win_event.timestamp.astimezone().date() == frozen_local.date(), (
+            "fixture precondition: the replayed event must fall inside the same "
+            "local work day as the pinned clock, or reconcile cannot reach it"
+        )
+
         # Return the event from the reconcile window that actually covers its
         # timestamp (match on the real time range, not a call counter — the
         # latter is fragile near midnight / as the day-length changes).
@@ -404,7 +442,8 @@ class TestSyncEngine:
         self.queue.enqueue.side_effect = lambda batch: (enqueued.extend(batch), len(batch))[1]
 
         bucket = Mock(id="win-bucket", type=BUCKET_TYPE_WINDOW)
-        self.engine._reconcile_backlog([bucket])
+        with patch("src.sync.sync_engine.datetime", _FrozenClock):
+            self.engine._reconcile_backlog([bucket])
 
         assert enqueued, "reconcile should enqueue the replayed window event"
         assert all(e["activity_state"] == "active" for e in enqueued)
