@@ -8,11 +8,11 @@ from typing import Callable, Optional
 import requests
 
 try:
-    from .machine_arch import true_machine_arch
+    from .machine_arch import ARM64, X86_64, true_machine_arch
     from .sync.http_client import resolve_ca_bundle
     from .url_safety import assert_safe_final_url
 except ImportError:  # PyInstaller bundle (src/ is import root)
-    from machine_arch import true_machine_arch
+    from machine_arch import ARM64, X86_64, true_machine_arch
     from sync.http_client import resolve_ca_bundle
     from url_safety import assert_safe_final_url
 
@@ -59,6 +59,32 @@ _ASSET_PATTERNS = {
     "Linux": "BetterFlow-linux",
 }
 
+# The arch token that must NOT appear in an asset we offer this machine. An
+# asset naming no architecture at all is still fair game for the fallback (it
+# may be universal); one naming the OTHER architecture is a build we already
+# know this Mac cannot run, and handing it over is strictly worse than not
+# updating — EBADARCH/ENOEXEC on Apple Silicon without Rosetta 2, and no
+# recovery at all in the Intel direction, where there is no reverse Rosetta.
+_INCOMPATIBLE_ARCH = {ARM64: X86_64, X86_64: ARM64}
+
+
+def _is_wrong_arch(name: str, arch: str) -> bool:
+    """True when this asset names an architecture this machine cannot run.
+
+    Unknown ``arch`` (``platform.machine()`` is documented to return "" when it
+    cannot tell) rejects EVERY arch-suffixed asset rather than guessing: we know
+    one of them is wrong and not which, so the only safe answer is neither.
+
+    Windows and Linux arch tokens ("AMD64", "x86_64" from a Linux host) are not
+    keys here, so those platforms keep their existing behaviour untouched.
+    """
+    if not arch:
+        return any(token in name for token in (ARM64, X86_64))
+
+    other = _INCOMPATIBLE_ARCH.get(arch)
+
+    return other is not None and other in name
+
 
 def _find_platform_asset(
     release: dict,
@@ -100,13 +126,21 @@ def _find_platform_asset(
         for asset in assets:
             name = asset.get("name", "")
             url = asset.get("browser_download_url")
-            if pattern in name and arch in name and name.endswith(".dmg") and url:
+            if pattern in name and arch and arch in name and name.endswith(".dmg") and url:
                 return url
-        # Fallback: any macOS DMG
+        # Fallback: any macOS DMG that is not a build we know this Mac cannot
+        # run. An unsuffixed (possibly universal) DMG still qualifies; the
+        # wrong-arch one does not, and no update beats a dead install.
         for asset in assets:
             name = asset.get("name", "")
             url = asset.get("browser_download_url")
             if pattern in name and name.endswith(".dmg") and url:
+                if _is_wrong_arch(name, arch):
+                    logger.warning(
+                        f"Skipping {name}: wrong architecture for this machine "
+                        f"({arch or 'undetermined'})"
+                    )
+                    continue
                 logger.debug(f"No arch-specific DMG for {arch}, using generic DMG")
                 return url
 
@@ -115,6 +149,15 @@ def _find_platform_asset(
         name = asset.get("name", "")
         url = asset.get("browser_download_url")
         if pattern in name and name.endswith(".zip") and url:
+            # Same rule as the DMG fallback: this loop is reached for macOS too,
+            # so a BetterFlow-macOS-x86_64.zip is the identical hazard one door
+            # along. A no-op for Windows/Linux, whose arch tokens are not keys.
+            if _is_wrong_arch(name, arch):
+                logger.warning(
+                    f"Skipping {name}: wrong architecture for this machine "
+                    f"({arch or 'undetermined'})"
+                )
+                continue
             return url
     return None
 
