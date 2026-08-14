@@ -19,6 +19,7 @@ Kept dependency-free and fully injectable (``machine`` / ``translated`` /
 same spirit as ``release_version.py``.
 """
 
+import errno
 import logging
 import platform
 import subprocess
@@ -63,16 +64,27 @@ class ProbeResult(NamedTuple):
     conclusive: bool
 
 
-# Only a TIMEOUT is worth retrying. A missing sysctl or a sandbox denial will not
-# resolve itself mid-session, so those are conclusive and get memoised like any
-# other answer. Classifying them as transient is what broke the Windows CI leg
-# in review: no sysctl there, so FileNotFoundError made the memo never engage and
-# the fork-counting test saw a second fork.
-_RETRY_AFTER_SECONDS = 60.0
+# CONGESTION, in every spelling it reaches us in. A timeout is the obvious one,
+# but the same overloaded machine also refuses a fork outright (EAGAIN, when the
+# per-user process table is exhausted) or has the child killed under memory
+# pressure (jetsam/OOM, which surfaces as a negative returncode). All three say
+# "the machine was too busy", none says anything about its hardware, so none may
+# be memoised.
+#
+# The distinction is NOT exception-vs-exit-code, which was this module's second
+# wrong cut at it: FileNotFoundError (no sysctl — every Windows host) and
+# PermissionError (a sandbox denial) are permanent for this process and MUST be
+# memoised, or the memo never engages and menu rebuilds fork forever.
+_TRANSIENT_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM})
 
-# Even a persistently timing-out sysctl has to settle, or a long session keeps
-# paying a fork per minute for an answer that is not coming.
-_MAX_PROBE_ATTEMPTS = 3
+# Retries back off, and that is the point rather than politeness. The congestion
+# that loses the first probe is a boot storm — Spotlight reindexing after an OS
+# update, an MDM scan, Time Machine — and those last minutes, not seconds. A flat
+# interval with a small cap spends the whole budget inside the storm and settles
+# on the wrong answer just as the machine calms down, which is the same defect as
+# a count-based budget wearing a clock. This schedule keeps trying past the hour
+# for a total of four forks.
+_RETRY_BACKOFF_SECONDS = (60.0, 300.0, 1800.0)
 
 
 def _monotonic() -> float:
@@ -89,7 +101,7 @@ def _read_proc_translated_cached() -> Optional[str]:
     not exist and never will, so a probe that retried would spawn a subprocess
     on every menu rebuild forever.
 
-    A TIMEOUT is a different thing wearing the same return value, and memoising
+    CONGESTION is a different thing wearing the same return value, and memoising
     it silently reinstates the bug this module exists to fix: the machine reads
     as untranslated for the rest of the session, the Diagnostics row states
     "Intel" about an Apple Silicon Mac, and the next update check re-selects the
@@ -100,9 +112,15 @@ def _read_proc_translated_cached() -> Optional[str]:
     ``main.run`` warms the memo and then ``tray.run_blocking`` builds the menu
     milliseconds later — so a count-based budget is spent entirely inside the
     congested window that caused the timeout, and the retry lands in the same
-    conditions as the failure. Waiting instead puts the second attempt somewhere
+    conditions as the failure. Waiting instead puts the next attempt somewhere
     the machine is no longer busy, which is the only place it can do any good,
     and keeps rapid menu rebuilds fork-free in the meantime.
+
+    The interval BACKS OFF for the same reason it exists. This is a login-item
+    daemon that then runs for days; a flat 60s with a small cap would exhaust the
+    whole budget two minutes after launch, i.e. still inside the boot storm that
+    lost the first probe, which is the very failure the previous paragraph
+    rejects. The schedule runs past the hour and then settles.
     """
     global _cached_raw, _probed, _probe_attempts, _last_transient_at
 
@@ -110,26 +128,31 @@ def _read_proc_translated_cached() -> Optional[str]:
         if _probed:
             return _cached_raw
 
-        # A timed-out probe is not re-asked immediately: every menu rebuild in
-        # the interval reuses the last answer rather than forking under
-        # _menu_lock, which is the cost the memo exists to prevent.
-        if _last_transient_at is not None and _monotonic() - _last_transient_at < _RETRY_AFTER_SECONDS:
-            return _cached_raw
+        # Inside the backoff window every menu rebuild reuses the last answer
+        # rather than forking under _menu_lock, which is the cost the memo exists
+        # to prevent. There IS no last answer yet — _cached_raw is only ever
+        # assigned alongside _probed — so this returns None, i.e. "not
+        # translated", which is the safe direction while we do not know.
+        if _last_transient_at is not None:
+            wait = _RETRY_BACKOFF_SECONDS[min(_probe_attempts, len(_RETRY_BACKOFF_SECONDS)) - 1]
+            if _monotonic() - _last_transient_at < wait:
+                return _cached_raw
 
         result = _read_proc_translated()
         _probe_attempts += 1
 
-        if result.conclusive or _probe_attempts >= _MAX_PROBE_ATTEMPTS:
+        if result.conclusive or _probe_attempts > len(_RETRY_BACKOFF_SECONDS):
             _cached_raw = result.raw
             _probed = True
             _last_transient_at = None
         else:
             _last_transient_at = _monotonic()
+            wait = _RETRY_BACKOFF_SECONDS[min(_probe_attempts, len(_RETRY_BACKOFF_SECONDS)) - 1]
             logger.debug(
-                f"{_PROC_TRANSLATED_KEY} timed out "
-                f"({_probe_attempts}/{_MAX_PROBE_ATTEMPTS}) — not memoising, so a "
-                f"slow launch cannot pin this process to the wrong architecture; "
-                f"retrying no sooner than {_RETRY_AFTER_SECONDS:.0f}s from now"
+                f"{_PROC_TRANSLATED_KEY} probe hit congestion "
+                f"({_probe_attempts}/{len(_RETRY_BACKOFF_SECONDS) + 1}) — not "
+                f"memoising, so a busy launch cannot pin this process to the "
+                f"wrong architecture; retrying no sooner than {wait:.0f}s from now"
             )
 
         return result.raw
@@ -168,14 +191,32 @@ def _read_proc_translated() -> ProbeResult:
             timeout=2,
         )
     except subprocess.TimeoutExpired as exc:
-        # The one genuinely transient case: the machine was too busy to answer,
-        # which says nothing about its hardware.
+        # The machine was too busy to answer in two seconds.
         logger.debug(f"Timed out reading {_PROC_TRANSLATED_KEY}: {exc}")
         return ProbeResult(None, conclusive=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        # No sysctl on PATH, or the call was refused. Permanent for this process.
+    except OSError as exc:
+        # Same congestion, different spelling: an overloaded machine refuses the
+        # fork itself with EAGAIN once the per-user process table is full, and
+        # returns ENOMEM under memory pressure. Reproduced under RLIMIT_NPROC as
+        # BlockingIOError, which is an OSError and was being memoised as though
+        # the hardware had answered.
+        #
+        # Everything else here IS permanent for this process — FileNotFoundError
+        # (no sysctl at all, i.e. every Windows host) and PermissionError (a
+        # sandbox denial) will not resolve mid-session, and treating them as
+        # retryable stops the memo engaging and forks on every menu rebuild.
+        transient = exc.errno in _TRANSIENT_ERRNOS
+        logger.debug(f"Could not read {_PROC_TRANSLATED_KEY} (errno={exc.errno}): {exc}")
+        return ProbeResult(None, conclusive=not transient)
+    except subprocess.SubprocessError as exc:
         logger.debug(f"Could not read {_PROC_TRANSLATED_KEY}: {exc}")
         return ProbeResult(None, conclusive=True)
+
+    if result.returncode < 0:
+        # Killed by a signal — jetsam/OOM under the same memory pressure that
+        # produces the timeout. The hardware never got a word in.
+        logger.debug(f"{_PROC_TRANSLATED_KEY} probe killed by signal {-result.returncode}")
+        return ProbeResult(None, conclusive=False)
 
     if result.returncode != 0:
         # Expected on Intel Macs: "second level name 'proc_translated' in

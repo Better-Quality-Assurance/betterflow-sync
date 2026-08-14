@@ -8,6 +8,7 @@ detection fails in, because guessing "translated" wrongly on a real Intel Mac
 would serve it an arm64 build it physically cannot execute.
 """
 
+import errno
 import inspect
 import platform
 import subprocess
@@ -137,7 +138,7 @@ def test_a_timed_out_probe_is_not_memoised(monkeypatch):
     assert is_rosetta_translated(system="Darwin") is False
 
     # Once the machine has had time to settle, the retry gets the real answer.
-    clock["t"] += ma._RETRY_AFTER_SECONDS + 1
+    clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] + 1
     assert is_rosetta_translated(system="Darwin") is True
     assert len(calls) == 2
 
@@ -175,6 +176,122 @@ def test_the_retry_waits_instead_of_re_probing_inside_the_same_launch(monkeypatc
         assert is_rosetta_translated(system="Darwin") is False
     assert len(calls) == 1, "a rebuild inside the retry interval must not fork sysctl"
 
+    # ...AND the retry must actually fire once the clock crosses the interval.
+    # Without this half the test passes against an implementation with NO retry
+    # at all — a plain memo satisfies "one fork, then none" trivially, so the
+    # name would claim a gate that nothing pins. Verified: it does.
+    clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] + 1
+    assert is_rosetta_translated(system="Darwin") is False
+    assert len(calls) == 2, "the probe never retried — the gate is a memo wearing a clock"
+
+
+def test_a_refused_fork_is_congestion_not_an_answer(monkeypatch):
+    """EAGAIN is the same "machine is too busy" as a timeout, in another spelling.
+
+    An overloaded Mac does not only make sysctl slow — once the per-user process
+    table is full it refuses the fork outright, and posix_spawn raises
+    BlockingIOError (errno EAGAIN), which is an OSError. Reproduced for real
+    under RLIMIT_NPROC during review.
+
+    Classifying it conclusive memoises None and pins the machine to the wrong
+    architecture for the session — the original bug, reached through a sibling
+    door of the one that was just closed. The hardware never answered.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+        return MagicMock(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    assert is_rosetta_translated(system="Darwin") is False
+    clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] + 1
+    assert is_rosetta_translated(system="Darwin") is True
+    assert len(calls) == 2
+
+
+def test_a_probe_killed_by_a_signal_is_congestion_too(monkeypatch):
+    """jetsam/OOM kills the child under the same memory pressure.
+
+    subprocess reports that as a NEGATIVE returncode, which the exit-code branch
+    would otherwise read as "sysctl answered no" — the Intel-Mac case. It did
+    not answer at all.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            return MagicMock(returncode=-9, stdout="")
+        return MagicMock(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    assert is_rosetta_translated(system="Darwin") is False
+    clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] + 1
+    assert is_rosetta_translated(system="Darwin") is True
+    assert len(calls) == 2
+
+
+def test_a_sandbox_denial_is_permanent_and_memoised(monkeypatch):
+    """The other side of the errno line: EACCES will not lift mid-session.
+
+    Retrying it costs a fork per menu rebuild and buys nothing, which is the
+    Windows failure in a different costume.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        raise PermissionError(errno.EACCES, "Operation not permitted")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    for _ in range(5):
+        clock["t"] += 10_000
+        assert is_rosetta_translated(system="Darwin") is False
+
+    assert len(calls) == 1, "a permanent denial must be memoised on the first probe"
+
+
+def test_the_retry_outlasts_a_boot_storm(monkeypatch):
+    """The budget must not expire inside the congestion that caused it.
+
+    This is a login-item daemon that then runs for days. A flat 60s interval with
+    a 3-attempt cap exhausts every retry 120s after launch — still inside the
+    Spotlight-reindex / MDM-scan / Time Machine window that lost the first probe
+    — and then settles on the wrong architecture permanently. That is the
+    count-based budget the design rejects, wearing a clock.
+    """
+    clock = _fake_clock(monkeypatch)
+    calls = []
+
+    def _probe(*a, **k):
+        calls.append(1)
+        # Congested for the first ten minutes, then the machine calms down.
+        if clock["t"] < 1000.0 + 600:
+            raise subprocess.TimeoutExpired(cmd="sysctl", timeout=2)
+        return MagicMock(returncode=0, stdout="1\n")
+
+    monkeypatch.setattr(ma.subprocess, "run", _probe)
+
+    # Launch, then a menu rebuild every 30s for an hour.
+    assert is_rosetta_translated(system="Darwin") is False
+    for _ in range(120):
+        clock["t"] += 30
+        is_rosetta_translated(system="Darwin")
+
+    assert is_rosetta_translated(system="Darwin") is True, (
+        "the retry budget expired inside the boot storm — this Mac is pinned to "
+        "the wrong architecture for the rest of the session"
+    )
+
 
 def test_a_missing_sysctl_is_conclusive_and_probed_once(monkeypatch):
     """No sysctl on PATH is an ANSWER, not a failure to get one.
@@ -198,7 +315,7 @@ def test_a_missing_sysctl_is_conclusive_and_probed_once(monkeypatch):
     monkeypatch.setattr(ma.subprocess, "run", _probe)
 
     for _ in range(5):
-        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
+        clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] * 2
         assert is_rosetta_translated(system="Darwin") is False
 
     assert len(calls) == 1, "a permanently absent sysctl must be memoised on the first probe"
@@ -222,16 +339,16 @@ def test_a_persistently_timing_out_sysctl_eventually_settles(monkeypatch):
     monkeypatch.setattr(ma.subprocess, "run", _probe)
 
     for _ in range(20):
-        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
+        clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] * 2
         assert is_rosetta_translated(system="Darwin") is False
 
     settled = len(calls)
     for _ in range(20):
-        clock["t"] += ma._RETRY_AFTER_SECONDS * 2
+        clock["t"] += ma._RETRY_BACKOFF_SECONDS[0] * 2
         is_rosetta_translated(system="Darwin")
 
     assert len(calls) == settled, "the probe never settled — it forks forever"
-    assert settled <= 3, "the retry bound grew; a fork per menu rebuild is the bug this memo prevents"
+    assert settled <= 4, "the retry bound grew; a fork per menu rebuild is the bug this memo prevents"
 
 
 # --- true_machine_arch -----------------------------------------------------
