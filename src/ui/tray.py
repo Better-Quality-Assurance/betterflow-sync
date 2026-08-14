@@ -316,6 +316,14 @@ def arch_menu_label(
         return "Architecture: Intel build on Apple Silicon — switch to the Apple Silicon version"
     if arch == ARM64:
         return "Architecture: Apple Silicon (native)"
+    if not arch:
+        # true_machine_arch returns "" only when the Rosetta probe gave up (see
+        # its docstring). Say so rather than falling through to the Intel label:
+        # this row exists to answer "which build am I on?", and the one thing it
+        # must never do is answer confidently when nobody established it. The
+        # updater withholds arch-suffixed builds in this state, so a user reading
+        # the row is also being told why no update has appeared.
+        return f"Architecture: could not determine (process: {machine or 'unknown'})"
     return f"Architecture: Intel ({arch})"
 
 

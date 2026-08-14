@@ -49,6 +49,12 @@ _cached_raw: Optional[str] = None
 _probed = False
 _probe_attempts = 0
 _last_transient_at: Optional[float] = None
+# Did the answer we settled on actually settle it? False means the retry budget
+# ran out with the probe still unresolved, so `_cached_raw is None` records "we
+# never found out" rather than "not translated". Those two states share a return
+# value and only one of them should make the updater withhold a build — see
+# `probe_settled_unresolved`.
+_cached_conclusive: bool = True
 
 
 class ProbeResult(NamedTuple):
@@ -122,7 +128,7 @@ def _read_proc_translated_cached() -> Optional[str]:
     lost the first probe, which is the very failure the previous paragraph
     rejects. The schedule runs past the hour and then settles.
     """
-    global _cached_raw, _probed, _probe_attempts, _last_transient_at
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at, _cached_conclusive
 
     with _lock:
         if _probed:
@@ -145,6 +151,11 @@ def _read_proc_translated_cached() -> Optional[str]:
             _cached_raw = result.raw
             _probed = True
             _last_transient_at = None
+            # Record WHY we stopped. Exhausting the budget memoises `raw=None`
+            # exactly like a genuine "no such key" does, and from here on the two
+            # are indistinguishable by return value alone — which is how a
+            # congested Mac ends up confidently reporting itself as Intel.
+            _cached_conclusive = result.conclusive
         else:
             _last_transient_at = _monotonic()
             wait = _RETRY_BACKOFF_SECONDS[min(_probe_attempts, len(_RETRY_BACKOFF_SECONDS)) - 1]
@@ -160,12 +171,31 @@ def _read_proc_translated_cached() -> Optional[str]:
 
 def reset_cache_for_tests() -> None:
     """Drop the memo. Tests only — the architecture never changes at runtime."""
-    global _cached_raw, _probed, _probe_attempts, _last_transient_at
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at, _cached_conclusive
     with _lock:
         _cached_raw = None
         _probed = False
         _probe_attempts = 0
         _last_transient_at = None
+        _cached_conclusive = True
+
+
+def probe_settled_unresolved() -> bool:
+    """True once we have STOPPED asking and still do not know.
+
+    Deliberately not "the probe has failed so far". A machine that lost one
+    sysctl to a boot storm is mid-backoff, not undetermined — the retry schedule
+    exists precisely to cover that, and reporting it as unknown would withhold
+    updates from a Mac that is merely busy. Only the exhausted-budget state
+    qualifies, and it is permanent for the life of the process.
+
+    Split out rather than folded into ``true_machine_arch`` because the tray row
+    and the updater want different things from it: the updater must refuse to
+    choose, and the row must say so out loud instead of naming an architecture
+    nobody established.
+    """
+    with _lock:
+        return _probed and not _cached_conclusive
 
 
 def _read_proc_translated() -> ProbeResult:
@@ -262,9 +292,24 @@ def true_machine_arch(
 ) -> str:
     """The architecture of the HARDWARE, not of the running process.
 
-    Returns ``platform.machine()`` unchanged everywhere except the one case it
-    gets wrong: an x86_64 process translated by Rosetta 2, which is really
-    running on arm64 silicon.
+    Returns ``platform.machine()`` unchanged everywhere except two cases: an
+    x86_64 process translated by Rosetta 2, which is really running on arm64
+    silicon; and a Mac whose Rosetta probe never resolved, which returns ``""``.
+
+    **The empty string means "we could not determine it", and callers must not
+    read it as an architecture.** ``platform.machine()`` is documented to return
+    ``""`` for the same reason, so this reuses that vocabulary rather than
+    inventing a third one, and ``update_checker._is_wrong_arch`` already refuses
+    every arch-suffixed asset when handed it. Before this, that safety branch was
+    reachable only through a ``platform.machine()`` value that does not occur on
+    macOS: the probe's own doubt was discarded one function earlier, so a
+    congested Mac reported a confident ``"x86_64"`` and was offered the Intel
+    build — the exact outcome the Rosetta work exists to prevent.
+
+    Only the SETTLED-unresolved state qualifies (see ``probe_settled_unresolved``);
+    a machine still inside its retry backoff keeps reporting its process
+    architecture, because withholding updates from a Mac that is briefly busy
+    would be a worse trade than the one this guards against.
 
     Args:
         system: Override ``platform.system()`` for testing.
@@ -280,4 +325,12 @@ def true_machine_arch(
 
     if translated:
         return ARM64
+
+    # Not translated — but on a Mac that can mean "asked and answered no" or
+    # "gave up asking". Only the second is undetermined. Skipped when the caller
+    # injected its own reader: it is simulating a probe, and the module-level
+    # memo it would consult describes a different one.
+    if system == "Darwin" and sysctl_reader is None and probe_settled_unresolved():
+        return ""
+
     return machine
