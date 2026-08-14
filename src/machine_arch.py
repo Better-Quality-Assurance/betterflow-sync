@@ -19,7 +19,6 @@ Kept dependency-free and fully injectable (``machine`` / ``translated`` /
 same spirit as ``release_version.py``.
 """
 
-import errno
 import logging
 import platform
 import subprocess
@@ -49,33 +48,64 @@ _cached_raw: Optional[str] = None
 _probed = False
 _probe_attempts = 0
 _last_transient_at: Optional[float] = None
+# Did the kernel ever answer? False means `_cached_raw is None` records "we never
+# found out" rather than "not translated". Those two states share a return value
+# and only one of them should make the updater withhold a build — see
+# `probe_settled_unresolved`. Tracks ProbeResult.determined, NOT .conclusive:
+# a sandbox denial is conclusive (stop asking) and undetermined (we know
+# nothing), and reading the retry flag here is what let an EMFILE fork failure
+# masquerade as a hardware answer.
+_cached_determined: bool = True
 
 
 class ProbeResult(NamedTuple):
-    """What the probe said, and whether it is worth asking again.
+    """What the probe said, whether the kernel answered, and whether to retry.
 
-    ``conclusive`` is False ONLY when we never got an answer — see
-    ``_read_proc_translated``. Returned as a value rather than signalled through
-    module state so the classification cannot be read out of order, and so the
-    producer has no side effect its docstring has to warn about.
+    Two INDEPENDENT questions, and collapsing them is a live defect rather than
+    a tidiness point:
+
+    - ``determined`` — did we learn the hardware's answer? True only where the
+      kernel actually replied: a value, or the "no such key" that IS the answer
+      on a genuine Intel Mac.
+    - ``conclusive`` — is another fork worth it? A retry-policy decision, and
+      deliberately True for some UNDETERMINED outcomes: no sysctl on PATH and a
+      sandbox denial will not lift mid-session, so retrying costs a fork per
+      menu rebuild and buys nothing.
+
+    They were one field until an EMFILE fork failure — the file-descriptor twin
+    of the EAGAIN case this module already reasons about — took the "permanent"
+    branch and so reported a *confident* architecture for a machine that had
+    never been asked. That is the exact shape of the bug the Rosetta work
+    exists to fix, so the epistemic question now has its own field and
+    ``probe_settled_unresolved`` reads THAT one.
+
+    Returned as a value rather than signalled through module state so the
+    classification cannot be read out of order, and so the producer has no side
+    effect its docstring has to warn about.
     """
 
     raw: Optional[str]
+    determined: bool
     conclusive: bool
 
 
-# CONGESTION, in every spelling it reaches us in. A timeout is the obvious one,
-# but the same overloaded machine also refuses a fork outright (EAGAIN, when the
-# per-user process table is exhausted) or has the child killed under memory
-# pressure (jetsam/OOM, which surfaces as a negative returncode). All three say
-# "the machine was too busy", none says anything about its hardware, so none may
-# be memoised.
+# The two OSErrors that are PERMANENT for this process. No sysctl on PATH (every
+# Windows host) and a sandbox/EDR denial will not lift mid-session, so they must
+# be memoised or the memo never engages and menu rebuilds fork forever.
 #
-# The distinction is NOT exception-vs-exit-code, which was this module's second
-# wrong cut at it: FileNotFoundError (no sysctl — every Windows host) and
-# PermissionError (a sandbox denial) are permanent for this process and MUST be
-# memoised, or the memo never engages and menu rebuilds fork forever.
-_TRANSIENT_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM})
+# Stated as an allowlist of the permanent cases, NOT as a list of the transient
+# ones. It used to be `_TRANSIENT_ERRNOS = {EAGAIN, ENOMEM}`, and the set of ways
+# a busy Mac can refuse a fork is not enumerable: EMFILE and ENFILE (the file-
+# descriptor twins of the EAGAIN case the paragraph below describes) fell
+# straight through it into "permanent", which is the wrong direction on both
+# axes — no retry AND a confident answer nobody obtained. Everything unlisted is
+# now treated as congestion: retried within the budget, and never determined.
+#
+# Matched on TYPE rather than errno on purpose. `FileNotFoundError("sysctl not
+# found")` raised without an errno has `exc.errno is None`, so an errno-keyed
+# test silently reclassifies it as congestion and reinstates the Windows
+# fork-per-rebuild regression.
+_PERMANENT_OSERRORS = (FileNotFoundError, PermissionError)
 
 # Retries back off, and that is the point rather than politeness. The congestion
 # that loses the first probe is a boot storm — Spotlight reindexing after an OS
@@ -122,7 +152,7 @@ def _read_proc_translated_cached() -> Optional[str]:
     lost the first probe, which is the very failure the previous paragraph
     rejects. The schedule runs past the hour and then settles.
     """
-    global _cached_raw, _probed, _probe_attempts, _last_transient_at
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at, _cached_determined
 
     with _lock:
         if _probed:
@@ -145,6 +175,13 @@ def _read_proc_translated_cached() -> Optional[str]:
             _cached_raw = result.raw
             _probed = True
             _last_transient_at = None
+            # Record whether anyone ever answered. Exhausting the budget memoises
+            # `raw=None` exactly like a genuine "no such key" does, and from here
+            # on the two are indistinguishable by return value alone — which is
+            # how a congested Mac ends up confidently reporting itself as Intel.
+            # `.determined`, never `.conclusive`: this branch is also reached by
+            # the permanent-but-unanswered cases (no sysctl, sandbox denial).
+            _cached_determined = result.determined
         else:
             _last_transient_at = _monotonic()
             wait = _RETRY_BACKOFF_SECONDS[min(_probe_attempts, len(_RETRY_BACKOFF_SECONDS)) - 1]
@@ -160,12 +197,83 @@ def _read_proc_translated_cached() -> Optional[str]:
 
 def reset_cache_for_tests() -> None:
     """Drop the memo. Tests only — the architecture never changes at runtime."""
-    global _cached_raw, _probed, _probe_attempts, _last_transient_at
+    global _cached_raw, _probed, _probe_attempts, _last_transient_at, _cached_determined
     with _lock:
         _cached_raw = None
         _probed = False
         _probe_attempts = 0
         _last_transient_at = None
+        _cached_determined = True
+
+
+def probe_settled_unresolved() -> bool:
+    """True once we have STOPPED asking and the kernel never answered.
+
+    Deliberately not "the probe has failed so far". A machine that lost one
+    sysctl to a boot storm is mid-backoff, not undetermined — the retry schedule
+    exists precisely to cover that, and reporting it as unknown would withhold
+    updates from a Mac that is merely busy. Only the settled state qualifies,
+    and it is permanent for the life of the process.
+
+    Two ways to reach it, and the second is easy to miss: the retry budget ran
+    out on a machine that stayed congested, OR the probe hit a permanent
+    obstacle that is not an answer (no sysctl on PATH, a sandbox/EDR denial).
+    Both stop the asking; neither learned anything. Hence ``_cached_determined``
+    rather than the retry flag.
+
+    Split out rather than folded into ``true_machine_arch`` so it can be
+    asserted directly, and because the settled-unresolved state is a fact about
+    the probe rather than about any one caller's architecture question. Note the
+    tray does NOT call this — it reads the ``""`` that ``true_machine_arch``
+    returns, which is the better shape: one translation of this state into a
+    caller-facing answer, not two that can drift.
+    """
+    with _lock:
+        # `_probed and` is belt-and-braces: `_cached_determined` is only set
+        # False in the branch that also sets `_probed = True`, so a mutant
+        # dropping it survives the suite. Kept because the pair is the actual
+        # invariant, and the default `True` protects the un-probed state only by
+        # coincidence of its initial value.
+        return _probed and not _cached_determined
+
+
+def arch_answer_is_provisional(system: Optional[str] = None) -> bool:
+    """True while the architecture answer could still change (macOS only).
+
+    The companion to ``probe_settled_unresolved``, and the two are NOT
+    opposites: this one is about the mid-backoff window, where we are reporting
+    the process architecture as a working assumption and a later probe may
+    overturn it.
+
+    That assumption is fine to NOTIFY on and fine to show in the tray — the cost
+    of being wrong is a row that corrects itself. It is not fine to SELF-INSTALL
+    on. The launch update check runs with ``apply_now=True`` and
+    ``auto_install_updates`` defaults to True, so an Apple Silicon Mac that lost
+    its probe to a login boot storm would download and apply the Intel DMG
+    within the first ~36 minutes — re-pinning itself to the build this whole
+    module exists to get it off. Notifying is reversible; applying is what the
+    user has to undo by hand.
+
+    Darwin-gated INSIDE the predicate, deliberately. Off macOS the probe never
+    runs at all, so ``_probed`` stays False forever — a caller that asked
+    "unsettled?" without the gate would defer every self-install on Windows and
+    Linux permanently.
+
+    It ASKS before answering, rather than reading the memo and hoping somebody
+    else filled it. Reading passively conflates "still retrying" with "nobody
+    has looked yet", and both come back True: a Mac that reached this without a
+    prior probe would defer its self-install forever. Today `_find_platform_asset`
+    happens to warm the memo first, but depending on that ordering is the same
+    kind of unwritten coupling this module has already been bitten by. The probe
+    is memoised, so on a healthy Mac this costs one fork per process and settles
+    on the spot.
+    """
+    system = system or platform.system()
+    if system != "Darwin":
+        return False
+    _read_proc_translated_cached()
+    with _lock:
+        return not _probed
 
 
 def _read_proc_translated() -> ProbeResult:
@@ -176,12 +284,17 @@ def _read_proc_translated() -> ProbeResult:
     blocks the call. Callers must treat None as *not translated*; see
     ``is_rosetta_translated``.
 
-    ``conclusive`` separates "asked and answered no" from "never got an answer",
-    and only a TIMEOUT is the latter. A missing binary or a denied call is an
-    answer: sysctl will not appear mid-session and a sandbox will not lift, so
-    treating those as retryable buys nothing and costs a fork on every menu
-    rebuild — on Windows, where sysctl does not exist at all, it also breaks the
-    memo outright.
+    ``determined`` says whether the KERNEL answered, and only the two
+    ``returncode`` paths below qualify: a value, or the non-zero exit that is
+    the genuine "no such key" of an Intel Mac. Every exception path leaves us
+    knowing nothing about the hardware, whatever we decide about retrying.
+
+    ``conclusive`` is the separate retry decision, and is deliberately True for
+    two UNDETERMINED outcomes: a missing binary and a denied call will not
+    resolve mid-session, so treating them as retryable buys nothing and costs a
+    fork on every menu rebuild — on Windows, where sysctl does not exist at all,
+    it also breaks the memo outright. "Stop asking" and "we found out" are not
+    the same claim, and `probe_settled_unresolved` reads the second one.
     """
     try:
         result = subprocess.run(
@@ -193,37 +306,40 @@ def _read_proc_translated() -> ProbeResult:
     except subprocess.TimeoutExpired as exc:
         # The machine was too busy to answer in two seconds.
         logger.debug(f"Timed out reading {_PROC_TRANSLATED_KEY}: {exc}")
-        return ProbeResult(None, conclusive=False)
+        return ProbeResult(None, determined=False, conclusive=False)
+    except _PERMANENT_OSERRORS as exc:
+        # No sysctl at all (every Windows host) or a sandbox/EDR denial. Neither
+        # resolves mid-session, so stop asking — but neither is an answer about
+        # the hardware, so this is emphatically not `determined`.
+        logger.debug(f"Cannot read {_PROC_TRANSLATED_KEY} on this host: {exc}")
+        return ProbeResult(None, determined=False, conclusive=True)
     except OSError as exc:
-        # Same congestion, different spelling: an overloaded machine refuses the
-        # fork itself with EAGAIN once the per-user process table is full, and
-        # returns ENOMEM under memory pressure. Reproduced under RLIMIT_NPROC as
-        # BlockingIOError, which is an OSError and was being memoised as though
-        # the hardware had answered.
-        #
-        # Everything else here IS permanent for this process — FileNotFoundError
-        # (no sysctl at all, i.e. every Windows host) and PermissionError (a
-        # sandbox denial) will not resolve mid-session, and treating them as
-        # retryable stops the memo engaging and forks on every menu rebuild.
-        transient = exc.errno in _TRANSIENT_ERRNOS
+        # Congestion in one of its many spellings: an overloaded machine refuses
+        # the fork with EAGAIN once the per-user process table is full, ENOMEM
+        # under memory pressure, EMFILE/ENFILE when the fd table is at its cap.
+        # Reproduced under RLIMIT_NPROC as BlockingIOError. Anything that is not
+        # one of the two permanent cases above is treated this way, because the
+        # ways a busy machine can refuse are not enumerable and the cost of
+        # guessing wrong is a confident answer nobody obtained.
         logger.debug(f"Could not read {_PROC_TRANSLATED_KEY} (errno={exc.errno}): {exc}")
-        return ProbeResult(None, conclusive=not transient)
+        return ProbeResult(None, determined=False, conclusive=False)
     except subprocess.SubprocessError as exc:
         logger.debug(f"Could not read {_PROC_TRANSLATED_KEY}: {exc}")
-        return ProbeResult(None, conclusive=True)
+        return ProbeResult(None, determined=False, conclusive=True)
 
     if result.returncode < 0:
         # Killed by a signal — jetsam/OOM under the same memory pressure that
         # produces the timeout. The hardware never got a word in.
         logger.debug(f"{_PROC_TRANSLATED_KEY} probe killed by signal {-result.returncode}")
-        return ProbeResult(None, conclusive=False)
+        return ProbeResult(None, determined=False, conclusive=False)
 
     if result.returncode != 0:
         # Expected on Intel Macs: "second level name 'proc_translated' in
-        # 'sysctl.proc_translated' is invalid". Not an error worth logging loudly.
-        return ProbeResult(None, conclusive=True)
+        # 'sysctl.proc_translated' is invalid". Not an error worth logging loudly
+        # — and it IS the answer, which is why this is determined.
+        return ProbeResult(None, determined=True, conclusive=True)
 
-    return ProbeResult(result.stdout.strip(), conclusive=True)
+    return ProbeResult(result.stdout.strip(), determined=True, conclusive=True)
 
 
 def is_rosetta_translated(
@@ -262,9 +378,24 @@ def true_machine_arch(
 ) -> str:
     """The architecture of the HARDWARE, not of the running process.
 
-    Returns ``platform.machine()`` unchanged everywhere except the one case it
-    gets wrong: an x86_64 process translated by Rosetta 2, which is really
-    running on arm64 silicon.
+    Returns ``platform.machine()`` unchanged everywhere except two cases: an
+    x86_64 process translated by Rosetta 2, which is really running on arm64
+    silicon; and a Mac whose Rosetta probe never resolved, which returns ``""``.
+
+    **The empty string means "we could not determine it", and callers must not
+    read it as an architecture.** ``platform.machine()`` is documented to return
+    ``""`` for the same reason, so this reuses that vocabulary rather than
+    inventing a third one, and ``update_checker._is_wrong_arch`` already refuses
+    every arch-suffixed asset when handed it. Before this, that safety branch was
+    reachable only through a ``platform.machine()`` value that does not occur on
+    macOS: the probe's own doubt was discarded one function earlier, so a
+    congested Mac reported a confident ``"x86_64"`` and was offered the Intel
+    build — the exact outcome the Rosetta work exists to prevent.
+
+    Only the SETTLED-unresolved state qualifies (see ``probe_settled_unresolved``);
+    a machine still inside its retry backoff keeps reporting its process
+    architecture, because withholding updates from a Mac that is briefly busy
+    would be a worse trade than the one this guards against.
 
     Args:
         system: Override ``platform.system()`` for testing.
@@ -280,4 +411,37 @@ def true_machine_arch(
 
     if translated:
         return ARM64
+
+    # Not translated — but on a Mac that can mean "asked and answered no" or
+    # "never got an answer". Only the second is undetermined.
+    #
+    # The two overrides are NOT symmetric here, which is worth stating because
+    # it looks like an oversight:
+    #
+    #   sysctl_reader= replaces the probe itself, so the module memo describes a
+    #     DIFFERENT probe than the one that produced `translated`. Mixing them
+    #     would report this process's doubt about a reader the caller never ran.
+    #     Skipped.
+    #   translated= overrides only the derived boolean. No reader ran, so the
+    #     module memo is still the only — and the correct — record of whether
+    #     THIS process ever got an answer. Consulted.
+    #
+    # That is what lets the tray pass `translated=` to control its Rosetta
+    # wording while still reflecting the real probe's doubt in the arch row.
+    #
+    # `machine == X86_64` matters and is not belt-and-braces: Rosetta translates
+    # x86 ONTO arm and never the reverse, so an arm64 PROCESS proves arm64
+    # hardware outright and the probe was never needed to establish it. Without
+    # this clause a native Apple Silicon Mac whose sysctl is denied by an EDR
+    # policy is told "could not determine (process: arm64)" and offered no build
+    # at all — a regression against the behaviour this branch inherited, on a
+    # machine whose architecture was never actually in doubt.
+    if (
+        system == "Darwin"
+        and machine == X86_64
+        and sysctl_reader is None
+        and probe_settled_unresolved()
+    ):
+        return ""
+
     return machine

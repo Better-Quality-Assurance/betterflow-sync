@@ -53,7 +53,7 @@ def _fake_host(monkeypatch, *, machine, proc_translated):
     """
     monkeypatch.setattr(platform, "machine", lambda: machine)
     monkeypatch.setattr(
-        ma, "_read_proc_translated", lambda: ma.ProbeResult(proc_translated, conclusive=True)
+        ma, "_read_proc_translated", lambda: ma.ProbeResult(proc_translated, determined=True, conclusive=True)
     )
 
 
