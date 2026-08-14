@@ -99,14 +99,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Sync is optional automation: the download page also derives its
-          # version/links from the backend's agent.version config fallback.
-          # If the sync secrets are not configured, skip cleanly with a loud
-          # warning rather than failing the release (avoids perpetual red runs
-          # on a feature that needs org-level secrets to be provisioned).
+          # FAIL, do not skip. This step used to emit a ::warning:: and exit 0
+          # when the secrets were absent, on the reasoning that the sync is
+          # "optional automation". The result was a green run that synced
+          # nothing, on every release, for 18 releases: the download page sat
+          # on v1.5.104 while v1.5.122 was live (#183). A green check is a
+          # claim that the page was updated, and nobody re-checks a claim.
+          #
+          # That silence had a second cost. New machines install whatever the
+          # page advertises, so they got v1.5.104 — which predates the Rosetta
+          # preflight added in v1.5.118. An Apple Silicon Mac therefore
+          # recorded zero time with no warning at all, instead of being told to
+          # run softwareupdate --install-rosetta (#188, ~90 minutes lost on
+          # 2026-08-13). The stale page was not cosmetic; it withheld the fix.
+          #
+          # A red run here cannot block a release: this workflow is triggered
+          # by `release: published` and nothing depends on it. Red is exactly
+          # the signal that was missing.
           if [ -z "${BACKEND_URL:-}" ] || [ -z "${RELEASE_SYNC_TOKEN:-}" ]; then
-            echo "::warning::Downloads sync skipped — set the DOWNLOADS_SYNC_BACKEND_URL and DOWNLOADS_SYNC_TOKEN repository secrets (and the backend AGENT_RELEASE_SYNC_TOKEN env) to enable automatic download-page updates."
-            exit 0
+            echo "::error::Downloads sync NOT performed — the download page still advertises the previous version. Set the DOWNLOADS_SYNC_BACKEND_URL and DOWNLOADS_SYNC_TOKEN repository secrets (and the backend AGENT_RELEASE_SYNC_TOKEN env)." >&2
+            exit 1
           fi
 
           curl --fail --show-error --silent \
