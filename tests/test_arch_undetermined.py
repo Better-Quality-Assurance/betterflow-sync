@@ -406,6 +406,7 @@ def test_a_mac_left_with_no_asset_by_an_undetermined_arch_is_reported_once():
     # platform rather than stubbing `true_machine_arch`, so the memo built by
     # `_exhaust_the_budget` is still the thing under test.
     with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(uh, "send_notification"), \
          patch.object(h, "_report_arch_undetermined") as report:
         h._on_update_available("1.5.124", "http://rel", asset_url=None)
         h._on_update_available("1.5.124", "http://rel", asset_url=None)  # 30-min re-check
@@ -430,6 +431,7 @@ def test_no_asset_for_an_ordinary_reason_is_not_reported_as_undetermined():
     # on the CI runner whatever the code does, which is the shape of a test that
     # proves nothing.
     with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(uh, "send_notification"), \
          patch.object(h, "_report_arch_undetermined") as report:
         h._on_update_available("1.5.124", "http://rel", asset_url=None)
 
