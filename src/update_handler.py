@@ -14,10 +14,10 @@ import time
 from typing import Optional
 
 try:
-    from .machine_arch import true_machine_arch
+    from .machine_arch import arch_answer_is_provisional, true_machine_arch
     from .update_checker import _version_tuple
 except ImportError:  # PyInstaller bundle (src/ is import root)
-    from machine_arch import true_machine_arch
+    from machine_arch import arch_answer_is_provisional, true_machine_arch
     from update_checker import _version_tuple
 
 try:
@@ -257,6 +257,26 @@ class UpdateHandler:
             send_notification("BetterFlow Update", msg)
 
         if not asset_url or not self.config.auto_install_updates:
+            return
+
+        # Everything above this line has already run: the user has been told a
+        # version is available and the tray carries the release link. What is
+        # gated here is only the SELF-INSTALL.
+        #
+        # While the Rosetta probe is still inside its retry schedule we are
+        # reporting the process architecture as a working assumption, which a
+        # later probe may overturn. Notifying on an assumption is free; applying
+        # one is not. The launch check arrives here with apply_now=True, so on a
+        # congested Apple Silicon Mac this is exactly where the Intel DMG would
+        # get downloaded and applied — re-pinning the machine to the wrong build
+        # inside the first ~36 minutes. Skip this cycle; the 30-minute re-check
+        # picks it up for free once the probe has settled.
+        if arch_answer_is_provisional():
+            logger.info(
+                f"Deferring self-install of v{version}: this Mac's architecture is not "
+                "established yet (Rosetta probe still retrying). The next check will "
+                "pick it up."
+            )
             return
 
         # Already downloaded this version — it applies on idle/restart; don't

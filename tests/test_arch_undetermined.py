@@ -17,11 +17,13 @@ These pin the distinction that makes it real: mid-backoff is NOT undetermined
 """
 
 import errno
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import src.update_handler as uh
 from src import machine_arch as ma
 from src.machine_arch import ARM64, X86_64, ProbeResult, true_machine_arch
 from src.ui.tray import arch_menu_label
@@ -122,6 +124,65 @@ def test_a_fork_refused_with_emfile_is_undetermined_not_intel():
     assert true_machine_arch(system="Darwin", machine=X86_64) == ""
     with patch("platform.machine", lambda: X86_64):
         assert _find_platform_asset(RELEASE, system="Darwin") is None
+
+
+def test_a_timed_out_probe_is_undetermined_not_intel():
+    """The motivating case, and it was witnessed by NOTHING.
+
+    Every other test reaching this state goes through `_exhaust_the_budget`,
+    which stubs `_read_proc_translated` wholesale — so the timeout branch's own
+    `determined=False` was supplied by the fixture rather than tested. Flipping
+    it to True in the source left the entire suite green while restoring the
+    #196 defect verbatim: a Mac that loses all four probes to a boot storm
+    reports a confident "x86_64" and is handed the Intel DMG.
+    """
+    _settle_by_raising(subprocess.TimeoutExpired(cmd="sysctl", timeout=2))
+
+    assert ma.probe_settled_unresolved() is True
+    assert true_machine_arch(system="Darwin", machine=X86_64) == ""
+
+
+def test_a_probe_killed_by_a_signal_is_undetermined_not_intel():
+    """jetsam/OOM under the same memory pressure. The hardware never spoke.
+
+    Reaches the classifier by RETURNING a negative returncode rather than
+    raising, so it exercises the branch the exception tests cannot.
+    """
+    clock = [0.0]
+    with patch.object(
+        ma.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=-9, stdout="", stderr="")
+    ), patch.object(ma, "_monotonic", lambda: clock[0]):
+        for _ in range(len(ma._RETRY_BACKOFF_SECONDS) + 2):
+            ma._read_proc_translated_cached()
+            clock[0] += 100000.0
+
+    assert ma.probe_settled_unresolved() is True
+    assert true_machine_arch(system="Darwin", machine=X86_64) == ""
+
+
+def test_a_native_arm64_mac_is_never_undetermined():
+    """An arm64 PROCESS proves arm64 HARDWARE — no probe required.
+
+    Rosetta translates x86 onto arm and never the reverse, so the ambiguity this
+    module exists to resolve simply does not arise for an arm64 process. Without
+    the `machine == X86_64` clause, a native Apple Silicon Mac whose sysctl is
+    denied by an EDR policy is told "could not determine (process: arm64)" and
+    offered no build at all — worse than the behaviour this branch inherited, on
+    a machine whose architecture was never in doubt.
+    """
+    _settle_by_raising(PermissionError(errno.EACCES, "Operation not permitted"))
+    assert ma.probe_settled_unresolved() is True
+
+    assert true_machine_arch(system="Darwin", machine=ARM64) == ARM64
+    assert arch_menu_label(system="Darwin", machine=ARM64, translated=False) == (
+        "Architecture: Apple Silicon (native)"
+    )
+    with patch("platform.machine", lambda: ARM64):
+        assert _find_platform_asset(RELEASE, system="Darwin") == "https://x/arm64.dmg"
+
+    # ...while the genuinely ambiguous x86_64 process on the same denied probe
+    # still withholds. Same memo, opposite answer — that is the whole point.
+    assert true_machine_arch(system="Darwin", machine=X86_64) == ""
 
 
 def test_a_sandbox_denial_is_undetermined_while_staying_memoised():
@@ -338,7 +399,14 @@ def test_a_mac_left_with_no_asset_by_an_undetermined_arch_is_reported_once():
     _exhaust_the_budget()
     h = _update_handler()
 
-    with patch.object(h, "_report_arch_undetermined") as report:
+    # `_on_update_available` asks `true_machine_arch()` with no override, so it
+    # reads the REAL platform. Without these patches this test passes only on a
+    # Mac: on the ubuntu runner that gates every PR here, the arch comes back
+    # truthy, the report never fires, and this assertion fails. Patch the
+    # platform rather than stubbing `true_machine_arch`, so the memo built by
+    # `_exhaust_the_budget` is still the thing under test.
+    with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(h, "_report_arch_undetermined") as report:
         h._on_update_available("1.5.124", "http://rel", asset_url=None)
         h._on_update_available("1.5.124", "http://rel", asset_url=None)  # 30-min re-check
 
@@ -358,10 +426,129 @@ def test_no_asset_for_an_ordinary_reason_is_not_reported_as_undetermined():
         ma._read_proc_translated_cached()
     h = _update_handler()
 
-    with patch.object(h, "_report_arch_undetermined") as report:
+    # Darwin pinned for the same reason as above — otherwise this control passes
+    # on the CI runner whatever the code does, which is the shape of a test that
+    # proves nothing.
+    with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(h, "_report_arch_undetermined") as report:
         h._on_update_available("1.5.124", "http://rel", asset_url=None)
 
     report.assert_not_called()
+
+
+def test_the_ops_report_carries_its_own_fingerprint():
+    """The body itself, unpatched — everything else mocks this method out.
+
+    The error ingest aggregates by fingerprint ALONE (context and message are
+    overwritten newest-wins and the digest reads neither), so the fingerprint
+    is the entire signal. Reusing the managed-install one would silently merge
+    two unrelated ops conditions into a single count, and every other test here
+    would stay green.
+    """
+    h = _update_handler()
+    reporter = MagicMock()
+    h.coordinator.error_reporter = reporter
+
+    h._report_arch_undetermined("1.5.124")
+
+    reporter.capture.assert_called_once()
+    kwargs = reporter.capture.call_args.kwargs
+    assert kwargs["fingerprint"] == "update-arch-undetermined"
+    assert kwargs["level"] == "warning"
+
+
+def test_the_ops_report_never_raises_into_the_update_path():
+    """A broken reporter must not take the updater down with it."""
+    h = _update_handler()
+    h.coordinator.error_reporter = MagicMock()
+    h.coordinator.error_reporter.capture.side_effect = RuntimeError("ingest down")
+
+    h._report_arch_undetermined("1.5.124")  # must not raise
+
+
+# --- notifying on an assumption is free; INSTALLING on one is not ----------
+
+
+def test_no_self_install_while_the_probe_is_still_retrying():
+    """The mid-backoff window, which is ~36 minutes long and auto-applies.
+
+    `true_machine_arch` deliberately still reports the process architecture
+    here — the retry schedule exists to cover a briefly-busy Mac, and issue #196
+    asks for exactly that. But the launch check arrives with `apply_now=True`
+    and `auto_install_updates` defaults True, so an Apple Silicon Mac that lost
+    its probe to a login boot storm would download and APPLY the Intel DMG,
+    re-pinning itself to the build this module exists to get it off.
+
+    The user is still notified — only the self-install is deferred.
+    """
+    # One transient failure: budget intact, so the answer is provisional.
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=False, conclusive=False)):
+        ma._read_proc_translated_cached()
+    assert ma.probe_settled_unresolved() is False, "precondition: mid-backoff, not settled"
+
+    h = _update_handler()
+    with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(h, "_stage_and_maybe_apply") as stage, \
+         patch.object(uh, "send_notification") as notify:
+        h._on_update_available("1.5.124", "http://rel", asset_url="http://x/x86_64.dmg", apply_now=True)
+
+    stage.assert_not_called()
+    notify.assert_called_once()  # told, just not installed for them
+
+
+def test_the_self_install_resumes_once_the_probe_settles():
+    """The permissive direction — deferring forever would also pass the above."""
+    with patch.object(ma, "_read_proc_translated", lambda: ProbeResult(None, determined=True, conclusive=True)):
+        ma._read_proc_translated_cached()
+
+    h = _update_handler()
+    with patch("platform.system", lambda: "Darwin"), patch("platform.machine", lambda: X86_64), \
+         patch.object(h, "_stage_and_maybe_apply") as stage, \
+         patch.object(uh, "send_notification"):
+        h._on_update_available("1.5.124", "http://rel", asset_url="http://x/x86_64.dmg", apply_now=True)
+
+    stage.assert_called_once()
+
+
+def test_an_unprobed_mac_asks_rather_than_deferring_forever():
+    """"Nobody has looked yet" must not read as "still retrying".
+
+    The first cut of this predicate read the memo passively, so a Mac arriving
+    here before anything had probed saw `_probed is False`, called the answer
+    provisional, and deferred — with nothing scheduled to ever change that. It
+    also broke `test_replaceable_install_proceeds_to_stage`, an existing test of
+    the ordinary healthy-Mac staging path, which is how it was caught.
+    """
+    ma.reset_cache_for_tests()
+    calls = []
+
+    def _answered(*a, **k):
+        calls.append(1)
+        return SimpleNamespace(returncode=1, stdout="", stderr="invalid")  # real Intel Mac
+
+    with patch("platform.system", lambda: "Darwin"), patch.object(ma.subprocess, "run", _answered):
+        assert ma.arch_answer_is_provisional() is False
+
+    assert calls, "the predicate must PROBE, not just read a memo somebody else filled"
+
+
+def test_windows_and_linux_self_installs_are_never_deferred():
+    """The predicate MUST be Darwin-gated inside itself.
+
+    Off macOS the probe never runs, so `_probed` stays False for the life of the
+    process — an ungated "is it unsettled?" would defer every self-install on
+    Windows and Linux permanently.
+    """
+    for sysname, mach in (("Windows", "AMD64"), ("Linux", X86_64)):
+        ma.reset_cache_for_tests()
+        h = _update_handler()
+        with patch("platform.system", lambda s=sysname: s), patch("platform.machine", lambda m=mach: m), \
+             patch.object(h, "_stage_and_maybe_apply") as stage, \
+             patch.object(uh, "send_notification"):
+            h._on_update_available("1.5.124", "http://rel", asset_url="http://x/app.zip", apply_now=True)
+
+        assert ma.arch_answer_is_provisional(system=sysname) is False, sysname
+        stage.assert_called_once()
 
 
 def test_the_tray_row_is_unchanged_when_the_probe_resolved():

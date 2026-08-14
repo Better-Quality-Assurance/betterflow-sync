@@ -237,6 +237,45 @@ def probe_settled_unresolved() -> bool:
         return _probed and not _cached_determined
 
 
+def arch_answer_is_provisional(system: Optional[str] = None) -> bool:
+    """True while the architecture answer could still change (macOS only).
+
+    The companion to ``probe_settled_unresolved``, and the two are NOT
+    opposites: this one is about the mid-backoff window, where we are reporting
+    the process architecture as a working assumption and a later probe may
+    overturn it.
+
+    That assumption is fine to NOTIFY on and fine to show in the tray — the cost
+    of being wrong is a row that corrects itself. It is not fine to SELF-INSTALL
+    on. The launch update check runs with ``apply_now=True`` and
+    ``auto_install_updates`` defaults to True, so an Apple Silicon Mac that lost
+    its probe to a login boot storm would download and apply the Intel DMG
+    within the first ~36 minutes — re-pinning itself to the build this whole
+    module exists to get it off. Notifying is reversible; applying is what the
+    user has to undo by hand.
+
+    Darwin-gated INSIDE the predicate, deliberately. Off macOS the probe never
+    runs at all, so ``_probed`` stays False forever — a caller that asked
+    "unsettled?" without the gate would defer every self-install on Windows and
+    Linux permanently.
+
+    It ASKS before answering, rather than reading the memo and hoping somebody
+    else filled it. Reading passively conflates "still retrying" with "nobody
+    has looked yet", and both come back True: a Mac that reached this without a
+    prior probe would defer its self-install forever. Today `_find_platform_asset`
+    happens to warm the memo first, but depending on that ordering is the same
+    kind of unwritten coupling this module has already been bitten by. The probe
+    is memoised, so on a healthy Mac this costs one fork per process and settles
+    on the spot.
+    """
+    system = system or platform.system()
+    if system != "Darwin":
+        return False
+    _read_proc_translated_cached()
+    with _lock:
+        return not _probed
+
+
 def _read_proc_translated() -> ProbeResult:
     """Return the raw ``sysctl.proc_translated`` value and whether it settles it.
 
@@ -389,7 +428,20 @@ def true_machine_arch(
     #
     # That is what lets the tray pass `translated=` to control its Rosetta
     # wording while still reflecting the real probe's doubt in the arch row.
-    if system == "Darwin" and sysctl_reader is None and probe_settled_unresolved():
+    #
+    # `machine == X86_64` matters and is not belt-and-braces: Rosetta translates
+    # x86 ONTO arm and never the reverse, so an arm64 PROCESS proves arm64
+    # hardware outright and the probe was never needed to establish it. Without
+    # this clause a native Apple Silicon Mac whose sysctl is denied by an EDR
+    # policy is told "could not determine (process: arm64)" and offered no build
+    # at all — a regression against the behaviour this branch inherited, on a
+    # machine whose architecture was never actually in doubt.
+    if (
+        system == "Darwin"
+        and machine == X86_64
+        and sysctl_reader is None
+        and probe_settled_unresolved()
+    ):
         return ""
 
     return machine
