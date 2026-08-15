@@ -3568,13 +3568,28 @@ class BetterFlowApp:
         elif key == "update_channel":
             self.config.update_channel = value
             try:
+                # The handler owns this callback, not the app. `self.` here was
+                # an AttributeError raised while EVALUATING the argument, so the
+                # call below never happened and the except logged a
+                # network-sounding warning about a request that was never made
+                # (#199).
+                #
+                # No apply_now wrapper, unlike ensure_update_checks_started's
+                # catch-on-launch: the user is standing in the preferences menu,
+                # and relaunching the app because they switched channel would be
+                # its own bug report. Stage it, exactly as a periodic check does.
                 check_for_update(
                     _VERSION,
                     channel=value,
-                    callback=self._on_update_available,
+                    callback=self.update_handler._on_update_available,
                 )
             except Exception:
-                logger.warning("Failed to check for updates after channel change")
+                # exc_info because a bare message here cost this bug its
+                # visibility: the traceback would have named the AttributeError
+                # instead of implying the network was down.
+                logger.warning(
+                    "Failed to check for updates after channel change", exc_info=True
+                )
         else:
             logger.warning(f"Unknown preference key: {key}")
             return
