@@ -150,6 +150,17 @@ not the person using it:
   at people who were simply not at their desk and stayed quiet on machines
   losing billable time (#195). Omitted entirely when the probe cannot answer —
   never coerced to `0`, which would read as "at the keyboard this second".
+- `machine_arch` (`src/machine_arch.py`) — the CPU architecture of the hardware,
+  seeing through Rosetta 2: an x86_64 build translated on Apple Silicon reports
+  `arm64` here, which is the point. A property of the machine, in the same
+  family as `hardware_serial` and `agent_version`; it names a model of processor
+  and can never distinguish one person's activity from another's. **Why it is
+  sent:** an Intel build on Apple Silicon without Rosetta records zero time, and
+  the fleet had no way to enumerate which machines were in that state (#184) —
+  the answer lived only in the tray of the affected laptop. `null` means
+  `true_machine_arch()` returned `""`, i.e. the probe never resolved; do not
+  coerce that to a string, or "we could not tell" becomes indistinguishable from
+  an architecture.
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.

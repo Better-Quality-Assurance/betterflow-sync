@@ -460,6 +460,13 @@ class BetterFlowClient(BaseApiClient):
         # probe cannot read a value — see the producer in main.py for why null
         # must not become 0.
         "os_idle_seconds",
+        # The HARDWARE architecture, seeing through Rosetta 2 — an x86_64 build
+        # translated on Apple Silicon reports arm64 here, which is the whole
+        # point. Without it the fleet cannot enumerate who is on the wrong build
+        # (#184), and the answer was previously only visible in the tray of the
+        # affected machine. null means true_machine_arch() returned "" (its probe
+        # never resolved); do not coerce that to a string.
+        "machine_arch",
         # The device's live timezone disagrees with the one its working-hours
         # schedule is anchored to. Carried here because a drifted anchor is
         # otherwise a SILENT failure — it zeroes a whole day ("Outside working

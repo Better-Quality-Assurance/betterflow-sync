@@ -564,6 +564,20 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # probe cannot answer — never coerced to 0, which would read as "at the
     # keyboard this second".
     "os_idle_seconds",
+    # The CPU architecture of the hardware this agent is running on, seeing
+    # through Rosetta 2 ("arm64" / "x86_64", or null when the probe could not
+    # resolve). A property of the MACHINE, in the same family as
+    # `hardware_serial` and `agent_version` — it identifies a computer's model
+    # of processor, never a person, and it cannot distinguish one employee's
+    # activity from another's.
+    #
+    # Why it is worth reporting: an Intel build translated on Apple Silicon
+    # records zero time without Rosetta, and the fleet had no way to enumerate
+    # which machines were in that state (#184) — the answer existed only in the
+    # tray of the affected laptop, where nobody is looking. It is the arch
+    # counterpart of the capture-dead flags already declared below: it says
+    # whether this machine can record at all, never what it recorded.
+    "machine_arch",
     # Boolean: this device's live timezone disagrees with the one its
     # working-hours schedule is anchored to. Reports a MISCONFIGURATION of the
     # schedule, not a new fact about the person — no location beyond the

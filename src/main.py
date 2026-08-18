@@ -29,7 +29,7 @@ try:
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .hardware_serial import get_hardware_serial
-    from .machine_arch import is_rosetta_translated
+    from .machine_arch import is_rosetta_translated, true_machine_arch
     from .privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -63,7 +63,7 @@ except ImportError:
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from hardware_serial import get_hardware_serial
-    from machine_arch import is_rosetta_translated
+    from machine_arch import is_rosetta_translated, true_machine_arch
     from privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -2028,6 +2028,15 @@ class SyncCoordinator:
                 telemetry["os_idle_seconds"] = int(idle_seconds)
         except Exception as e:  # noqa: BLE001
             logger.debug("os-idle telemetry unavailable: %s", e)
+        # Report the hardware architecture so the fleet can answer "who is on
+        # the Intel build?". true_machine_arch() returns "" when its Rosetta
+        # probe never resolved; send that as null so the server can tell
+        # "undetermined" from a real value without string-matching emptiness.
+        try:
+            arch = true_machine_arch()
+            telemetry["machine_arch"] = arch or None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("machine-arch telemetry unavailable: %s", e)
         # Surface a working-hours anchor that has drifted from this device's real
         # timezone: allows() self-heals by evaluating in machine-local time, but the
         # fleet still needs to see (and re-anchor) the stale schedule. Included only
