@@ -4089,8 +4089,9 @@ class SyncEngine:
                 other = count - real
                 extra = f"; {other} other unstorable" if other > 0 else ""
                 self.error_reporter.capture(
-                    f"Dropped {real} queued event(s) after max retries — likely "
-                    f"real lost activity (buckets={buckets}, {window}{extra})",
+                    f"Dropped {real} queued event(s) after max retries — the "
+                    f"server rejected them; held in dead-letter for replay, not "
+                    f"discarded (buckets={buckets}, {window}{extra})",
                     level="warning",
                     tags={"component": "offline-queue"},
                     fingerprint="offline-queue-events-dropped",
