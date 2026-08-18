@@ -7,3 +7,10 @@ pytest-cov>=4.0
 responses>=0.23
 pyinstaller>=6.0
 ruff>=0.1.0
+
+# Clock travel for tests. Moves time.time(), time.gmtime(), time.localtime()
+# and datetime together at the C level — a hand-rolled patch that freezes only
+# datetime leaves time.time() on the real clock, and the resulting hours-wide
+# skew reads as a day-boundary bug (#190). Used by tests/freeze_clock_plugin.py,
+# which is opt-in via -p and does not affect a normal run.
+time-machine>=2.13
