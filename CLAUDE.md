@@ -139,6 +139,17 @@ not the person using it:
   tracker binaries could not be installed and that this process has no managed
   watchers of its own). All of it describes whether the machine is capable of
   recording and delivering, never what was recorded.
+- `os_idle_seconds` (`src/sync/os_idle.py`) — seconds since the last keyboard or
+  mouse input, read from the OS clock (HIDIdleTime on macOS,
+  `GetLastInputInfo` on Windows). Presence, never content: no key, no character,
+  no application, no title. It is a scalar reading of the same OS idle clock
+  `sync.in_process_afk` already derives the uploaded AFK stream from, so it adds
+  no category and is strictly less detailed than the stream beside it. **Why it
+  is sent:** with no events arriving, "the user is away" and "the trackers are
+  dead" are indistinguishable on the wire, so the fleet's no-capture alert fired
+  at people who were simply not at their desk and stayed quiet on machines
+  losing billable time (#195). Omitted entirely when the probe cannot answer —
+  never coerced to `0`, which would read as "at the keyboard this second".
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.
@@ -155,10 +166,21 @@ weight — a first-run wizard bullet is read once and forgotten. It renders as
   and shape are the server's contract (`AgentHeartbeatController` →
   `agent_disclosure_acknowledgements`), so neither end may be renamed alone.
 
-`src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
-of what the heartbeat forwards — a field missing from it never leaves the
-machine. Treat that tuple as the source of truth when auditing egress, and
-update this section whenever it changes.
+`src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the enforced allowlist for
+the **`health` dict only** — a field missing from it never leaves the machine.
+It is not the whole payload: `agent_version`, `timezone`, `hardware_serial` and
+`disclosure_acknowledgement` are separate top-level fields on the heartbeat
+body, so reading that tuple as "everything the heartbeat sends" undercounts the
+egress surface. Treat it as the source of truth for the health keys, and update
+this section whenever it changes.
+
+A **second copy of the tuple lives in `src/disclosure_baseline.py`** and
+`tests/test_disclosure_baseline.py` fails on any divergence between the two.
+That is deliberate: the copy in `bf_client.py` is the mechanism, the copy in
+`disclosure_baseline.py` is the declaration, and each new key must carry a
+written reason there saying what it reports about the machine. Adding a key to
+one and not the other reddens the suite; adding it to both without a reason is
+the thing the guard exists to make visible.
 
 #### The one-time privacy notice
 

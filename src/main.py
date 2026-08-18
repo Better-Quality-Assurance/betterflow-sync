@@ -38,6 +38,7 @@ try:
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from .sync.os_idle import get_system_idle_seconds
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -71,6 +72,7 @@ except ImportError:
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from sync.os_idle import get_system_idle_seconds
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -2014,6 +2016,18 @@ class SyncCoordinator:
         last_ok = self._last_successful_sync
         if last_ok is not None:
             telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
+        # The OS idle clock, so the server can tell "user away" from "tracker
+        # dead". Both look identical from event ages alone, which is why the
+        # no_capture alert has fired on people who were simply not at their
+        # desk (#195). Best-effort and OMITTED when unreadable: a null coerced
+        # to 0 would read as "at the keyboard this second", turning an unknown
+        # into the strongest possible claim of presence.
+        try:
+            idle_seconds = get_system_idle_seconds()
+            if idle_seconds is not None:
+                telemetry["os_idle_seconds"] = int(idle_seconds)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("os-idle telemetry unavailable: %s", e)
         # Surface a working-hours anchor that has drifted from this device's real
         # timezone: allows() self-heals by evaluating in machine-local time, but the
         # fleet still needs to see (and re-anchor) the stale schedule. Included only
