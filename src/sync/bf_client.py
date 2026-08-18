@@ -450,6 +450,23 @@ class BetterFlowClient(BaseApiClient):
         "consecutive_sync_failures",
         "idle_while_active_detections",
         "sync_stale_seconds",
+        # Seconds since the user last touched the keyboard or mouse, read from
+        # the OS (HIDIdleTime / GetLastInputInfo), NOT from the AFK tracker.
+        # This is the discriminator the no_capture alert never had: with no
+        # events and a LARGE idle time the user is away and nothing is wrong;
+        # with no events and a SMALL idle time the trackers are dead and
+        # billable time is being lost. Those two produced identical evidence on
+        # the wire until this field existed (#195). Omitted entirely when the
+        # probe cannot read a value — see the producer in main.py for why null
+        # must not become 0.
+        "os_idle_seconds",
+        # The HARDWARE architecture, seeing through Rosetta 2 — an x86_64 build
+        # translated on Apple Silicon reports arm64 here, which is the whole
+        # point. Without it the fleet cannot enumerate who is on the wrong build
+        # (#184), and the answer was previously only visible in the tray of the
+        # affected machine. null means true_machine_arch() returned "" (its probe
+        # never resolved); do not coerce that to a string.
+        "machine_arch",
         # The device's live timezone disagrees with the one its working-hours
         # schedule is anchored to. Carried here because a drifted anchor is
         # otherwise a SILENT failure — it zeroes a whole day ("Outside working

@@ -139,6 +139,28 @@ not the person using it:
   tracker binaries could not be installed and that this process has no managed
   watchers of its own). All of it describes whether the machine is capable of
   recording and delivering, never what was recorded.
+- `os_idle_seconds` (`src/sync/os_idle.py`) — seconds since the last keyboard or
+  mouse input, read from the OS clock (HIDIdleTime on macOS,
+  `GetLastInputInfo` on Windows). Presence, never content: no key, no character,
+  no application, no title. It is a scalar reading of the same OS idle clock
+  `sync.in_process_afk` already derives the uploaded AFK stream from, so it adds
+  no category and is strictly less detailed than the stream beside it. **Why it
+  is sent:** with no events arriving, "the user is away" and "the trackers are
+  dead" are indistinguishable on the wire, so the fleet's no-capture alert fired
+  at people who were simply not at their desk and stayed quiet on machines
+  losing billable time (#195). Omitted entirely when the probe cannot answer —
+  never coerced to `0`, which would read as "at the keyboard this second".
+- `machine_arch` (`src/machine_arch.py`) — the CPU architecture of the hardware,
+  seeing through Rosetta 2: an x86_64 build translated on Apple Silicon reports
+  `arm64` here, which is the point. A property of the machine, in the same
+  family as `hardware_serial` and `agent_version`; it names a model of processor
+  and can never distinguish one person's activity from another's. **Why it is
+  sent:** an Intel build on Apple Silicon without Rosetta records zero time, and
+  the fleet had no way to enumerate which machines were in that state (#184) —
+  the answer lived only in the tray of the affected laptop. `null` means
+  `true_machine_arch()` returned `""`, i.e. the probe never resolved; do not
+  coerce that to a string, or "we could not tell" becomes indistinguishable from
+  an architecture.
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.
@@ -155,10 +177,24 @@ weight — a first-run wizard bullet is read once and forgotten. It renders as
   and shape are the server's contract (`AgentHeartbeatController` →
   `agent_disclosure_acknowledgements`), so neither end may be renamed alone.
 
-`src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the complete, enforced list
-of what the heartbeat forwards — a field missing from it never leaves the
-machine. Treat that tuple as the source of truth when auditing egress, and
-update this section whenever it changes.
+`src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the enforced allowlist for
+the **`health` dict only** — a field missing from it never leaves the machine.
+`hardware_serial` and `disclosure_acknowledgement` are health keys and reach the
+wire only through this tuple's loop, exactly like every other health field; only
+`agent_version` and `timezone` are unconditional top-level fields on the
+heartbeat body, outside the allowlist. So reading the tuple as "everything the
+heartbeat sends" undercounts by two fields, not four. Treat it as the source of
+truth for the health keys, and update this section whenever it changes.
+
+A **second copy of the tuple lives in `src/disclosure_baseline.py`** and
+`tests/test_disclosure_baseline.py` fails on any divergence between the two.
+That is deliberate: the copy in `bf_client.py` is the mechanism, the copy in
+`disclosure_baseline.py` is the declaration, and each new key must carry a
+written reason there saying what it reports about the machine. Adding a key to
+one and not the other reddens the suite — that part is mechanically enforced.
+Adding it to both without a reason is not: the test is a pure set-difference
+between the two tuples and cannot see a missing comment. Writing a reason for
+each new key is a convention, not something the guard checks.
 
 #### The one-time privacy notice
 

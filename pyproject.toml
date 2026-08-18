@@ -43,6 +43,9 @@ dev = [
     "responses>=0.23",
     "pyinstaller>=6.0",
     "ruff>=0.1.0",
+    # Kept in step with requirements-dev.txt, which is what CI installs.
+    # See that file for why a hand-rolled datetime freeze is not a substitute.
+    "time-machine>=2.13",
 ]
 
 [project.scripts]

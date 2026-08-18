@@ -543,6 +543,41 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     "consecutive_sync_failures",
     "idle_while_active_detections",
     "sync_stale_seconds",
+    # Seconds since the last keyboard or mouse input, read from the OS clock
+    # (HIDIdleTime / GetLastInputInfo). A single integer describing PRESENCE at
+    # the machine, never content: no key, no character, no application, no
+    # window title.
+    #
+    # It adds no new CATEGORY. `sync.in_process_afk` — DISCLOSED above, default
+    # True — already derives the away-from-keyboard stream from this same OS
+    # idle clock, and that stream is uploaded as events and is what decides
+    # whether a period counts as worked. This forwards a scalar reading of a
+    # signal already collected and already sent; it is strictly less detailed
+    # than the AFK stream beside it.
+    #
+    # Why it is worth reporting: with no events arriving, "the user is away"
+    # and "the trackers are dead" produce IDENTICAL evidence on the wire. The
+    # fleet alert therefore fires at people who were simply not at their desk,
+    # and stays silent on machines that are losing billable time (#195). A
+    # large idle reading is the agent saying nothing is wrong; a small one with
+    # no events is the agent saying it is broken. Omitted entirely when the
+    # probe cannot answer — never coerced to 0, which would read as "at the
+    # keyboard this second".
+    "os_idle_seconds",
+    # The CPU architecture of the hardware this agent is running on, seeing
+    # through Rosetta 2 ("arm64" / "x86_64", or null when the probe could not
+    # resolve). A property of the MACHINE, in the same family as
+    # `hardware_serial` and `agent_version` — it identifies a computer's model
+    # of processor, never a person, and it cannot distinguish one employee's
+    # activity from another's.
+    #
+    # Why it is worth reporting: an Intel build translated on Apple Silicon
+    # records zero time without Rosetta, and the fleet had no way to enumerate
+    # which machines were in that state (#184) — the answer existed only in the
+    # tray of the affected laptop, where nobody is looking. It is the arch
+    # counterpart of the capture-dead flags already declared below: it says
+    # whether this machine can record at all, never what it recorded.
+    "machine_arch",
     # Boolean: this device's live timezone disagrees with the one its
     # working-hours schedule is anchored to. Reports a MISCONFIGURATION of the
     # schedule, not a new fact about the person — no location beyond the

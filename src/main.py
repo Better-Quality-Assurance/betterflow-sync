@@ -29,7 +29,7 @@ try:
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .hardware_serial import get_hardware_serial
-    from .machine_arch import is_rosetta_translated
+    from .machine_arch import is_rosetta_translated, true_machine_arch
     from .privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -38,6 +38,7 @@ try:
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from .sync.os_idle import get_system_idle_seconds
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -62,7 +63,7 @@ except ImportError:
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from hardware_serial import get_hardware_serial
-    from machine_arch import is_rosetta_translated
+    from machine_arch import is_rosetta_translated, true_machine_arch
     from privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -71,6 +72,7 @@ except ImportError:
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from sync.os_idle import get_system_idle_seconds
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -2014,6 +2016,27 @@ class SyncCoordinator:
         last_ok = self._last_successful_sync
         if last_ok is not None:
             telemetry["sync_stale_seconds"] = int(time.monotonic() - last_ok)
+        # The OS idle clock, so the server can tell "user away" from "tracker
+        # dead". Both look identical from event ages alone, which is why the
+        # no_capture alert has fired on people who were simply not at their
+        # desk (#195). Best-effort and OMITTED when unreadable: a null coerced
+        # to 0 would read as "at the keyboard this second", turning an unknown
+        # into the strongest possible claim of presence.
+        try:
+            idle_seconds = get_system_idle_seconds()
+            if idle_seconds is not None:
+                telemetry["os_idle_seconds"] = int(idle_seconds)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("os-idle telemetry unavailable: %s", e)
+        # Report the hardware architecture so the fleet can answer "who is on
+        # the Intel build?". true_machine_arch() returns "" when its Rosetta
+        # probe never resolved; send that as null so the server can tell
+        # "undetermined" from a real value without string-matching emptiness.
+        try:
+            arch = true_machine_arch()
+            telemetry["machine_arch"] = arch or None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("machine-arch telemetry unavailable: %s", e)
         # Surface a working-hours anchor that has drifted from this device's real
         # timezone: allows() self-heals by evaluating in machine-local time, but the
         # fleet still needs to see (and re-anchor) the stale schedule. Included only
