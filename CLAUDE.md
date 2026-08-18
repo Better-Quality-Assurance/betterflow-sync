@@ -179,19 +179,22 @@ weight — a first-run wizard bullet is read once and forgotten. It renders as
 
 `src/sync/bf_client.py`'s `HEARTBEAT_HEALTH_KEYS` is the enforced allowlist for
 the **`health` dict only** — a field missing from it never leaves the machine.
-It is not the whole payload: `agent_version`, `timezone`, `hardware_serial` and
-`disclosure_acknowledgement` are separate top-level fields on the heartbeat
-body, so reading that tuple as "everything the heartbeat sends" undercounts the
-egress surface. Treat it as the source of truth for the health keys, and update
-this section whenever it changes.
+`hardware_serial` and `disclosure_acknowledgement` are health keys and reach the
+wire only through this tuple's loop, exactly like every other health field; only
+`agent_version` and `timezone` are unconditional top-level fields on the
+heartbeat body, outside the allowlist. So reading the tuple as "everything the
+heartbeat sends" undercounts by two fields, not four. Treat it as the source of
+truth for the health keys, and update this section whenever it changes.
 
 A **second copy of the tuple lives in `src/disclosure_baseline.py`** and
 `tests/test_disclosure_baseline.py` fails on any divergence between the two.
 That is deliberate: the copy in `bf_client.py` is the mechanism, the copy in
 `disclosure_baseline.py` is the declaration, and each new key must carry a
 written reason there saying what it reports about the machine. Adding a key to
-one and not the other reddens the suite; adding it to both without a reason is
-the thing the guard exists to make visible.
+one and not the other reddens the suite — that part is mechanically enforced.
+Adding it to both without a reason is not: the test is a pure set-difference
+between the two tuples and cannot see a missing comment. Writing a reason for
+each new key is a convention, not something the guard checks.
 
 #### The one-time privacy notice
 
