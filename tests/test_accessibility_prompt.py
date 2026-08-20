@@ -15,11 +15,11 @@ runs on every runner. The one test that needs the AX symbol injects a fake
 module rather than requiring the real one.
 """
 
-import re
 import sys
 import types
 from unittest.mock import MagicMock, patch
 
+from tests.remedy_wording import conveys_the_off_then_on_remedy
 from src.sync.macos_window_watcher import MacOSWindowWatcher
 
 NOTIFY = "src.notifications.send_notification"
@@ -218,21 +218,13 @@ V1_5_124_BODY = (
 
 
 def _conveys_the_remedy(body: str) -> bool:
-    """Does this text tell the user the toggle may lie, and what to do about it?
+    """Delegates to the one definition (tests/remedy_wording.py).
 
-    Whole words over a small alternation, not substrings. A bare ``"off" in
-    body`` passes on "you may already be offline" — a body with no remedy at all
-    — and fails on "disable it and re-enable it", which is Apple's own phrasing
-    and arguably clearer than what we ship. Measured, both directions.
+    This used to be defined here and hand-copied into the tray tests in a naive
+    substring form that was vacuous. Two copies, one of them broken, is the
+    defect these very tests exist to catch, so there is now one.
     """
-    low = body.lower()
-    warns = re.search(r"\balready\b", low) is not None
-    turn_off = re.search(r"\b(off|disable|untick|uncheck)\b", low) is not None
-    # BOTH steps. "switch it off." satisfies the first two and leaves the user
-    # worse off than before: on a partly-blind machine they turn off the one
-    # grant that still worked. A half remedy is not a remedy.
-    turn_on = re.search(r"\b(back on|re-?enable|on again|turn it on)\b", low) is not None
-    return warns and turn_off and turn_on
+    return conveys_the_off_then_on_remedy(body)
 
 
 def test_the_remedy_check_rejects_the_body_that_left_four_devices_blind():

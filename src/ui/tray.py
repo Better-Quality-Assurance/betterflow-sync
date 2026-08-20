@@ -61,16 +61,11 @@ except ImportError:
 
 try:
     from ..clipboard import clipboard_available, copy_to_clipboard
-    from .permissions import check_accessibility, check_input_monitoring
     from ..hardware_serial import get_hardware_serial
     from ..machine_arch import ARM64, is_rosetta_translated, true_machine_arch
     from ..notifications import send_notification
 except ImportError:
     from clipboard import clipboard_available, copy_to_clipboard  # type: ignore[no-redef]
-    from ui.permissions import (  # type: ignore[no-redef]
-        check_accessibility,
-        check_input_monitoring,
-    )
     from hardware_serial import get_hardware_serial  # type: ignore[no-redef]
     from machine_arch import (  # type: ignore[no-redef]
         ARM64,
@@ -203,6 +198,12 @@ class TrayModel:
         # macOS Input Monitoring (keystroke/click capture). True until a check
         # proves otherwise so non-macOS platforms never show the warning.
         self.input_monitoring_ok: bool = True
+        # macOS Accessibility (window TITLES). Recorded for the Diagnostics row
+        # only — a missing Accessibility grant must NOT raise NEEDS_PERMISSIONS,
+        # because titles are an attribution detail and tracked time is
+        # unaffected. True until a check proves otherwise, so non-macOS never
+        # shows a warning.
+        self.accessibility_ok: bool = True
 
 
 # On Linux, pystray binds its backend at import time. Choose it explicitly:
@@ -334,63 +335,63 @@ def arch_menu_label(
 
 def capture_permissions_row(
     system: Optional[str] = None,
-    accessibility: Optional[bool] = None,
-    input_monitoring: Optional[bool] = None,
-) -> Optional[str]:
-    """Whether this machine can actually record titles and input, as a readable row.
+    accessibility: bool = True,
+    input_monitoring: bool = True,
+) -> str:
+    """Format the capture-permission state. Pure — it probes nothing.
 
-    Exists because the notification that asks for these grants cannot be shown
-    to have arrived (#204): ``deliverNotification_`` is fire-and-forget and
-    macOS silently discards notifications from an app that was never authorised
-    to post them. A tray row has no such failure mode -- it is there whenever
-    the user looks, and it survives the notification being missed, dismissed or
-    never rendered.
+    Deliberately takes the two booleans rather than reading them. Both siblings
+    say why in their own docstrings: ``_arch_menu_item`` — "the row must never
+    fork sysctl under _menu_lock on the sync cycle" — and the serial row is
+    memoised for the life of the process. ``_create_menu`` runs inside
+    ``_menu_lock``, and ``check_accessibility`` falls through to a real
+    ``AXUIElementCopyAttributeValue`` against the frontmost app whenever
+    ``AXIsProcessTrusted`` returns False, which is exactly the state this row
+    exists to report. Probing here would send IPC to a possibly-wedged app while
+    holding the menu lock, once per rebuild.
 
-    The wording carries the one fact that is not guessable: after a
-    code-signature change macOS shows the toggle ON while the grant is dead (see
-    the header of ``src/ui/permissions.py``), so "enable it" is a no-op
-    instruction. The remedy is to toggle it OFF and back ON. Four devices sat
-    blind for 15-21 days being told to enable something that already looked
-    enabled.
+    Reading the model instead also fixes two things a live probe cannot. The row
+    refreshes when ``_check_permissions`` changes the value (it already forces a
+    menu update), so after the user performs the remedy the row actually
+    changes — for a surface whose whole job is "did my fix work?", saying "still
+    blocked" afterwards is the dead end this exists to close. And it uses the
+    same values as the ``Input tracking off`` banner two rows up, so Diagnostics
+    and the banner cannot contradict each other in one popup.
 
-    Returns None off macOS: Accessibility and Input Monitoring are a macOS
-    concept, and a row about them on Windows is noise rather than diagnosis.
+    Every state carries the ``Capture permissions:`` prefix, like its siblings,
+    so a caller can find the row by one stable key rather than grepping four
+    different sentences.
 
     Args:
         system: Override ``platform.system()`` for testing.
-        accessibility: Override the Accessibility probe for testing.
-        input_monitoring: Override the Input Monitoring probe for testing.
+        accessibility: Whether the Accessibility grant is held.
+        input_monitoring: Whether the Input Monitoring grant is held.
     """
     system = system or platform.system()
     if system != "Darwin":
-        return None
-
-    if accessibility is None:
-        accessibility = check_accessibility()
-    if input_monitoring is None:
-        input_monitoring = check_input_monitoring()
+        # These two grants are a macOS concept. Say so rather than vanishing:
+        # an absent row is indistinguishable from an agent too old to have one.
+        return f"Capture permissions: not applicable on {system}"
 
     if accessibility and input_monitoring:
         return "Capture permissions: OK"
 
-    # Name the grant that failed and the consequence the user can observe. The
-    # two are not interchangeable: Accessibility gates window TITLES, Input
-    # Monitoring gates keystroke and click COUNTS, and they live in different
-    # System Settings panes.
+    # Name the grant that failed and its observable consequence. They are not
+    # interchangeable — Accessibility gates window TITLES, Input Monitoring
+    # gates keystroke and click COUNTS — and naming the wrong one is the
+    # mistake that cost four devices 15-21 blind days.
+    #
+    # Every failure state carries the off-then-on remedy, because after a
+    # code-signature change macOS shows the toggle ON while the grant is dead,
+    # so "enable it" is an instruction the user reads as already done.
     if not accessibility and not input_monitoring:
-        return (
-            "Accessibility + Input Monitoring blocked - re-grant both in "
-            "Privacy & Security (toggle each off, then on)"
-        )
+        return ("Capture permissions: Accessibility + Input Monitoring blocked "
+                "— toggle each off, then on")
     if not accessibility:
-        return (
-            "Accessibility blocked - window titles are empty. Re-grant it in "
-            "Privacy & Security (toggle it off, then on)"
-        )
-    return (
-        "Input Monitoring blocked - keystroke counts are zero. Re-grant it in "
-        "Privacy & Security (toggle it off, then on)"
-    )
+        return ("Capture permissions: Accessibility blocked, no window titles "
+                "— toggle it off, then on")
+    return ("Capture permissions: Input Monitoring blocked, no keystroke counts "
+            "— toggle it off, then on")
 
 
 def serial_menu_row() -> tuple:
@@ -788,6 +789,7 @@ class TrayIcon:
                 "track_display_info": self.model.track_display_info,
                 "needs_permissions": self.model.needs_permissions,
                 "input_monitoring_ok": self.model.input_monitoring_ok,
+                "accessibility_ok": self.model.accessibility_ok,
             }
 
     def _create_menu(self) -> pystray.Menu:
@@ -929,12 +931,9 @@ class TrayIcon:
             Item("─" * 20, None, enabled=False),
             self._serial_menu_item(),
             self._arch_menu_item(),
-            self._capture_permissions_menu_item(),
+            self._capture_permissions_menu_item(s),
             Item("Privacy Policy", self._handle_open_privacy),
         ]
-        # capture_permissions_row() returns None off macOS, so that row simply
-        # is not there rather than saying something meaningless about Windows.
-        diag_items = [i for i in diag_items if i is not None]
         items.append(Item("Diagnostics", pystray.Menu(*diag_items), enabled=logged_in))
         items.append(Item("Sync Now", self._handle_sync_now, enabled=logged_in))
 
@@ -992,18 +991,22 @@ class TrayIcon:
 
         return pystray.Menu(*items)
 
-    def _capture_permissions_menu_item(self) -> Optional["Item"]:
-        """The capture-permission row, or None off macOS.
+    def _capture_permissions_menu_item(self, s: dict) -> "Item":
+        """The capture-permission row, rendered from the snapshot.
 
-        Inert like the other Diagnostics rows: it reports, it does not act. The
-        label lives in the module-level capture_permissions_row() so it can be
-        asserted without a live pystray backend; do not re-derive it here, or
-        the test and the menu drift apart.
+        Inert like its siblings: it reports, it does not act. The label lives in
+        the module-level capture_permissions_row() so it is assertable without a
+        live pystray backend; do not re-derive it here, or the test and the menu
+        drift apart.
         """
-        label = capture_permissions_row()
-        if label is None:
-            return None
-        return Item(label, None, enabled=False)
+        return Item(
+            capture_permissions_row(
+                accessibility=s["accessibility_ok"],
+                input_monitoring=s["input_monitoring_ok"],
+            ),
+            None,
+            enabled=False,
+        )
 
     def _arch_menu_item(self) -> "Item":
         """The architecture row: which build of BetterFlow is actually running.
