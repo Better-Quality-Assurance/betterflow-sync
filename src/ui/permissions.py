@@ -318,6 +318,18 @@ def _tcc_grant_marker() -> Path:
     return Config.get_data_dir() / ".tcc_grant_done"
 
 
+def has_capture_permissions() -> bool:
+    """The single definition of "we hold the grants capture needs".
+
+    Written three times before this existed — ``not A or not B`` at the
+    ``main.py`` callsite, ``A and B`` in the marker branch below, and the pair
+    again while building ``services``. De Morgan-equivalent, so nothing was
+    broken; adding a third grant to one spelling and not the others is a
+    one-line edit away, and it fails silently in both directions (#205).
+    """
+    return check_accessibility() and check_input_monitoring()
+
+
 def grant_tcc_permissions() -> bool:
     """Grant Accessibility and Input Monitoring via TCC database with admin auth.
 
@@ -325,15 +337,27 @@ def grant_tcc_permissions() -> bool:
     launches skip the prompt — if permissions are still missing, the user
     must grant them manually via System Settings.
 
-    Returns True if the grant succeeded or was already attempted.
+    Returns True only when the permissions are actually held. The marker below
+    records that we ASKED, never that we succeeded: it is written in a finally,
+    so a cancelled prompt and a failed sqlite write both set it. Reporting
+    "attempted" as True made every later launch claim a permission the process
+    did not have, and four devices sat window_titles_blind for 15-21 days with
+    this answering True on each start (#205).
     """
     if not _IS_MACOS:
         return True
 
     marker = _tcc_grant_marker()
     if marker.exists():
-        logger.debug("TCC grant already attempted, skipping admin prompt")
-        return True
+        # Still no re-prompt — the marker exists so the admin password is asked
+        # for once, not on every launch. Only the ANSWER changes: report what is
+        # true right now instead of reporting that we once tried.
+        granted = has_capture_permissions()
+        logger.debug(
+            "TCC grant already attempted, skipping admin prompt (granted=%s)",
+            granted,
+        )
+        return granted
 
     services = []
     if not check_accessibility():
@@ -390,8 +414,12 @@ def grant_tcc_permissions() -> bool:
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0:
+            # returncode 0 means the sqlite write succeeded, NOT that this
+            # process now holds the grant — macOS generally does not re-read TCC
+            # for a running client. Ask, do not assume: this is the same claim
+            # the marker branch above was fixed for, one branch down.
             logger.info("TCC permissions granted via admin auth")
-            return True
+            return has_capture_permissions()
         else:
             stderr = result.stderr.strip()
             if "User canceled" in stderr or "-128" in stderr:

@@ -15,6 +15,7 @@ runs on every runner. The one test that needs the AX symbol injects a fake
 module rather than requiring the real one.
 """
 
+import re
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -181,3 +182,79 @@ def test_a_broken_notifier_never_stops_the_watcher():
     # And the latch still moved, so a failing notifier cannot become a retry
     # loop that spawns an osascript every 60s forever.
     assert w._accessibility_notified is True
+
+
+def test_the_prompt_warns_the_toggle_may_already_look_enabled():
+    """"Grant Accessibility" is a no-op instruction for the commonest cause.
+
+    src/ui/permissions.py's own header records why: "After a fresh build the
+    app's code signature changes. macOS may show the toggle as ON in System
+    Settings while AXIsProcessTrusted() returns False... Toggling the permission
+    off and on again in System Settings re-registers it."
+
+    The agent auto-updates, so that is the path most of the fleet takes into this
+    state. A user told to "grant Accessibility" opens the pane, sees BetterFlow
+    already switched on, concludes the message is stale and closes it. Four
+    devices sat blind for 15-21 days, two of them for five days on v1.5.124 —
+    the release that added this very prompt.
+
+    Asserting the information is PRESENT rather than banning phrasings: the ways
+    to word this are unbounded, so a blocklist would be unfinishable.
+    """
+    w = _watcher()
+    with patch(NOTIFY) as notify:
+        w._notify_accessibility_required_once()
+
+    assert _conveys_the_remedy(notify.call_args[0][1])
+
+
+# The v1.5.124 body, verbatim. This is the negative control: without it nobody
+# has ever seen the assertion above distinguish a good body from the one that
+# left four devices blind for 15-21 days.
+V1_5_124_BODY = (
+    "Grant Accessibility to BetterFlow in System Settings > Privacy & "
+    "Security > Accessibility. App names and time are still being tracked."
+)
+
+
+def _conveys_the_remedy(body: str) -> bool:
+    """Does this text tell the user the toggle may lie, and what to do about it?
+
+    Whole words over a small alternation, not substrings. A bare ``"off" in
+    body`` passes on "you may already be offline" — a body with no remedy at all
+    — and fails on "disable it and re-enable it", which is Apple's own phrasing
+    and arguably clearer than what we ship. Measured, both directions.
+    """
+    low = body.lower()
+    warns = re.search(r"\balready\b", low) is not None
+    turn_off = re.search(r"\b(off|disable|untick|uncheck)\b", low) is not None
+    # BOTH steps. "switch it off." satisfies the first two and leaves the user
+    # worse off than before: on a partly-blind machine they turn off the one
+    # grant that still worked. A half remedy is not a remedy.
+    turn_on = re.search(r"\b(back on|re-?enable|on again|turn it on)\b", low) is not None
+    return warns and turn_off and turn_on
+
+
+def test_the_remedy_check_rejects_the_body_that_left_four_devices_blind():
+    """Control on the guard above — an unwitnessed predicate proves nothing."""
+    assert _conveys_the_remedy(V1_5_124_BODY) is False
+
+
+def test_the_remedy_check_accepts_reasonable_rewordings():
+    """It must not false-fail a better message, or it gets weakened not fixed."""
+    assert _conveys_the_remedy(
+        "BetterFlow may already be listed - disable it and re-enable it."
+    ) is True
+
+
+def test_the_remedy_check_rejects_a_half_remedy():
+    """"Switch it off" with no second step is actively harmful, not merely vague."""
+    assert _conveys_the_remedy(
+        "BetterFlow may already look enabled there - if so, switch it off."
+    ) is False
+
+
+def test_the_remedy_check_is_not_satisfied_by_the_word_offline():
+    assert _conveys_the_remedy(
+        "You may already be offline. App names and time are still being tracked."
+    ) is False
