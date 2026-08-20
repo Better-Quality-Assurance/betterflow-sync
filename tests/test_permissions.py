@@ -166,3 +166,40 @@ def test_an_existing_marker_still_suppresses_the_admin_password_prompt(monkeypat
 
     permissions.grant_tcc_permissions()
     assert called == [], "marker present must not spawn osascript"
+
+
+def test_a_successful_sqlite_write_is_not_a_granted_permission(monkeypatch, tmp_path):
+    """The OTHER return-True site — the class had two addresses.
+
+    returncode 0 means the sqlite write into TCC.db succeeded. It does not mean
+    this process now holds the grant: macOS generally does not re-read TCC for a
+    running client. Reporting the write's exit status as the permission state is
+    the same claim the marker branch was fixed for, one branch down in the same
+    function, and it had no test until a surviving mutant said so.
+    """
+    _marker_path(monkeypatch, tmp_path, exists=False)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+    monkeypatch.setattr(
+        permissions.subprocess, "run",
+        lambda *a, **k: MagicMock(returncode=0, stderr=""),
+    )
+
+    assert permissions.grant_tcc_permissions() is False
+
+
+def test_a_write_that_really_did_land_reports_success(monkeypatch, tmp_path):
+    """Allowance half: when the grant IS live afterwards, say so."""
+    marker = _marker_path(monkeypatch, tmp_path, exists=False)
+    state = {"granted": False}
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: state["granted"])
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: state["granted"])
+
+    def _write(*a, **k):
+        state["granted"] = True          # the grant takes effect
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(permissions.subprocess, "run", _write)
+
+    assert permissions.grant_tcc_permissions() is True
+    assert marker.exists(), "the attempt must still be recorded"
