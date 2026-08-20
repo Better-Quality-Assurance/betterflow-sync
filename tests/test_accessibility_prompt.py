@@ -227,8 +227,12 @@ def _conveys_the_remedy(body: str) -> bool:
     """
     low = body.lower()
     warns = re.search(r"\balready\b", low) is not None
-    remedies = re.search(r"\b(off|disable|untick|uncheck)\b", low) is not None
-    return warns and remedies
+    turn_off = re.search(r"\b(off|disable|untick|uncheck)\b", low) is not None
+    # BOTH steps. "switch it off." satisfies the first two and leaves the user
+    # worse off than before: on a partly-blind machine they turn off the one
+    # grant that still worked. A half remedy is not a remedy.
+    turn_on = re.search(r"\b(back on|re-?enable|on again|turn it on)\b", low) is not None
+    return warns and turn_off and turn_on
 
 
 def test_the_remedy_check_rejects_the_body_that_left_four_devices_blind():
@@ -241,6 +245,13 @@ def test_the_remedy_check_accepts_reasonable_rewordings():
     assert _conveys_the_remedy(
         "BetterFlow may already be listed - disable it and re-enable it."
     ) is True
+
+
+def test_the_remedy_check_rejects_a_half_remedy():
+    """"Switch it off" with no second step is actively harmful, not merely vague."""
+    assert _conveys_the_remedy(
+        "BetterFlow may already look enabled there - if so, switch it off."
+    ) is False
 
 
 def test_the_remedy_check_is_not_satisfied_by_the_word_offline():

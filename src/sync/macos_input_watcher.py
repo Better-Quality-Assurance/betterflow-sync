@@ -14,9 +14,17 @@ from datetime import datetime, timezone
 from typing import Optional
 
 try:
-    from ..ui.permissions import check_accessibility, check_input_monitoring
+    from ..ui.permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        has_capture_permissions,
+    )
 except ImportError:
-    from ui.permissions import check_accessibility, check_input_monitoring
+    from ui.permissions import (
+        check_accessibility,
+        check_input_monitoring,
+        has_capture_permissions,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -207,9 +215,11 @@ class MacOSInputWatcher:
             if self.is_running:
                 # Another start() call already brought us online.
                 return
-            # prompt=False so we don't keep showing dialogs on every retry;
+            # has_capture_permissions() is the one definition of this pair
+            # (src/ui/permissions.py). check_input_monitoring defaults to
+            # prompt=False, so this does not re-show dialogs on every retry —
             # the first start() already registered the app in System Settings.
-            if check_accessibility() and check_input_monitoring(prompt=False):
+            if has_capture_permissions():
                 logger.info(
                     "Input watcher permissions now granted — starting capture"
                 )

@@ -2487,7 +2487,11 @@ class BetterFlowApp:
             if not has_capture_permissions():
                 logger.info("Missing macOS permissions, attempting TCC grant")
                 grant_tcc_permissions()
-                self._maybe_warn_capture_permissions()
+            # Unconditional, and that is the point: nested under the guard above,
+            # this could only ever run with a grant already missing, so the
+            # empty-`missing` re-arm was dead code and the stale timestamp
+            # swallowed the NEXT revocation. Its own comment claimed otherwise.
+            self._maybe_warn_capture_permissions()
         if self.window_watcher:
             self.window_watcher.start()
         if self.input_watcher:

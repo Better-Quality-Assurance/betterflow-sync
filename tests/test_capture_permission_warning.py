@@ -20,6 +20,8 @@ monkeypatched here, so nothing touches the real AX API.
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import src.main as main
 
@@ -99,3 +101,132 @@ def test_nothing_is_logged_while_both_grants_are_held(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         app._maybe_warn_capture_permissions()
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_the_rewarn_interval_is_long_enough_to_not_be_a_per_tick_log():
+    """State the REQUIREMENT, not the code's current choice.
+
+    test_it_warns_again_once_the_interval_has_passed computes its offset FROM
+    _PERM_REWARN_INTERVAL, so both sides move together and no value of the
+    constant can redden it — a mutant setting it to 1 second survived the whole
+    1756-test suite. At 1s, with _start_watchers running every 60s, that is
+    exactly the once-a-minute log this method exists to prevent.
+
+    An hour is not the shipped value (4h); it is the loosest setting that is
+    still defensible, so a deliberate retune stays green and a slip does not.
+    """
+    assert main.BetterFlowApp._PERM_REWARN_INTERVAL >= timedelta(hours=1)
+
+
+def test_it_names_BOTH_grants_when_both_are_missing(monkeypatch, caplog):
+    """The commonest state, and it was unpinned.
+
+    The existing tests exercise one-missing-at-a-time, and the two both-missing
+    tests assert only the COUNT of warning records, never the text. So `if` ->
+    `elif`, or "; ".join(missing) -> missing[0], both survived: the user fixes
+    Accessibility, titles return, and keystroke capture stays dead with nothing
+    ever naming it again.
+    """
+    app = _bare_app()
+    _perms(monkeypatch, accessibility=False, input_monitoring=False)
+    with caplog.at_level(logging.WARNING):
+        app._maybe_warn_capture_permissions()
+    assert "Accessibility" in caplog.text
+    assert "Input Monitoring" in caplog.text
+
+
+def _app_for_start_watchers(monkeypatch):
+    """A BetterFlowApp real enough to run _start_watchers end to end."""
+    app = _bare_app()
+    app.window_watcher = app.input_watcher = app.input_source = None
+    app.browser_tracker = app.display_tracker = object()   # skip the start_* branches
+    app.sync_engine = Mock()
+    cfg = SimpleNamespace(
+        sync=SimpleNamespace(in_process_input=False),
+        privacy=SimpleNamespace(track_browser_urls=False, track_display_info=False),
+    )
+    app.config = cfg
+    monkeypatch.setattr(main.sys, "platform", "darwin")
+    return app
+
+
+def test_start_watchers_actually_calls_the_warning(monkeypatch):
+    """The callsite itself was unwitnessed — deleting it left 1756 tests green.
+
+    Patches main.has_capture_permissions, NOT main.check_accessibility: the
+    latter does not reach has_capture_permissions, which closes over
+    permissions.check_accessibility. Patching the wrong one leaves this probing
+    the real AX API and proving nothing.
+    """
+    app = _app_for_start_watchers(monkeypatch)
+    monkeypatch.setattr(main, "has_capture_permissions", lambda: False)
+    monkeypatch.setattr(main, "grant_tcc_permissions", lambda: False)
+    called = []
+    monkeypatch.setattr(
+        type(app), "_maybe_warn_capture_permissions",
+        lambda self: called.append(True), raising=True,
+    )
+    app._start_watchers()
+    assert called == [True], "_start_watchers must consult the warning path"
+
+
+def test_start_watchers_still_reports_when_the_grants_are_held(monkeypatch):
+    """It must run even on the healthy path — that is what re-arms the throttle.
+
+    Nested under `if not has_capture_permissions()` it could only ever run with
+    a grant already missing, so the re-arm was dead and the next revocation was
+    swallowed by a stale timestamp.
+    """
+    app = _app_for_start_watchers(monkeypatch)
+    monkeypatch.setattr(main, "has_capture_permissions", lambda: True)
+    granted = []
+    monkeypatch.setattr(main, "grant_tcc_permissions", lambda: granted.append(True))
+    called = []
+    monkeypatch.setattr(
+        type(app), "_maybe_warn_capture_permissions",
+        lambda self: called.append(True), raising=True,
+    )
+    app._start_watchers()
+    assert granted == [], "must not attempt a TCC grant when permissions are held"
+    assert called == [True], "must still run, so the throttle re-arms"
+
+
+def test_start_watchers_gates_on_BOTH_grants_not_just_accessibility(monkeypatch):
+    """The discriminating input: Accessibility held, Input Monitoring missing.
+
+    Swapping the unified gate for a bare check_accessibility() survived the
+    whole suite, because every other test here makes the two agree. Only a case
+    where they DISAGREE can tell them apart — and this is the real state of a
+    machine that fixed Accessibility after the off-then-on prompt and still has
+    no keystroke capture.
+    """
+    app = _app_for_start_watchers(monkeypatch)
+    monkeypatch.setattr(main, "has_capture_permissions", lambda: False)
+    monkeypatch.setattr(main, "check_accessibility", lambda: True)
+    monkeypatch.setattr(main, "check_input_monitoring", lambda: False)
+    attempted = []
+    monkeypatch.setattr(main, "grant_tcc_permissions", lambda: attempted.append(True))
+    monkeypatch.setattr(
+        type(app), "_maybe_warn_capture_permissions", lambda self: None, raising=True,
+    )
+    app._start_watchers()
+    assert attempted == [True], (
+        "the gate must consider Input Monitoring too — a bare check_accessibility() "
+        "would skip the grant attempt on this machine"
+    )
+
+
+def test_the_input_watcher_can_actually_resolve_the_shared_predicate():
+    """A NameError in macOS-only code that 1762 green tests cannot see.
+
+    macos_input_watcher._permission_retry_loop runs only on macOS with a grant
+    missing, so no test drives it. Unifying it onto has_capture_permissions()
+    without landing the import left a call to an undefined name — the module
+    still imports, the suite still passes, and it raises on exactly the machines
+    this change is about. This asserts the symbol is bound in the module, which
+    is the cheapest thing that would have caught it.
+    """
+    import src.sync.macos_input_watcher as w
+    assert callable(getattr(w, "has_capture_permissions", None)), (
+        "has_capture_permissions is used in _permission_retry_loop but not imported"
+    )
