@@ -181,3 +181,29 @@ def test_a_broken_notifier_never_stops_the_watcher():
     # And the latch still moved, so a failing notifier cannot become a retry
     # loop that spawns an osascript every 60s forever.
     assert w._accessibility_notified is True
+
+
+def test_the_prompt_warns_the_toggle_may_already_look_enabled():
+    """"Grant Accessibility" is a no-op instruction for the commonest cause.
+
+    src/ui/permissions.py's own header records why: "After a fresh build the
+    app's code signature changes. macOS may show the toggle as ON in System
+    Settings while AXIsProcessTrusted() returns False... Toggling the permission
+    off and on again in System Settings re-registers it."
+
+    The agent auto-updates, so that is the path most of the fleet takes into this
+    state. A user told to "grant Accessibility" opens the pane, sees BetterFlow
+    already switched on, concludes the message is stale and closes it. Four
+    devices sat blind for 15-21 days, two of them for five days on v1.5.124 —
+    the release that added this very prompt.
+
+    Asserting the information is PRESENT rather than banning phrasings: the ways
+    to word this are unbounded, so a blocklist would be unfinishable.
+    """
+    w = _watcher()
+    with patch(NOTIFY) as notify:
+        w._notify_accessibility_required_once()
+
+    body = notify.call_args[0][1].lower()
+    assert "already" in body, "must warn the toggle may already read as enabled"
+    assert "off" in body, "must give the off-then-on remedy, not just 'grant'"

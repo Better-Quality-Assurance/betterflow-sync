@@ -2429,7 +2429,17 @@ class BetterFlowApp:
         if sys.platform == "darwin":
             if not check_accessibility() or not check_input_monitoring():
                 logger.info("Missing macOS permissions, attempting TCC grant")
-                grant_tcc_permissions()
+                if not grant_tcc_permissions():
+                    # Discarding this is how the state stayed invisible: the
+                    # watcher starts either way and emits empty titles, so the
+                    # only record was a debug line nobody reads. The user-facing
+                    # ask lives in the watcher (#197); this is the ops-side
+                    # breadcrumb for a log request.
+                    logger.warning(
+                        "macOS permissions still missing after TCC grant attempt "
+                        "— window titles will be empty until the user re-grants "
+                        "Accessibility (System Settings > Privacy & Security)"
+                    )
         if self.window_watcher:
             self.window_watcher.start()
         if self.input_watcher:

@@ -412,6 +412,15 @@ class MacOSWindowWatcher:
         Best-effort. A machine with notifications disabled loses the prompt and
         nothing else — capture is unaffected either way, since app names and
         durations do not need this grant.
+
+        The wording is load-bearing and was wrong in v1.5.124. "Grant
+        Accessibility" is a no-op instruction for the commonest cause: this
+        agent auto-updates, an update changes the code signature, and macOS then
+        shows the toggle as ON while the grant is dead (see the header of
+        ``src/ui/permissions.py``). A user sent to that pane sees BetterFlow
+        already switched on and reasonably concludes there is nothing to do.
+        The remedy is to switch it off and back on, so the notice has to say
+        that (#205).
         """
         if self._accessibility_notified:
             return
@@ -424,9 +433,9 @@ class MacOSWindowWatcher:
 
             send_notification(
                 "BetterFlow can't read window titles",
-                "Grant Accessibility to BetterFlow in System Settings > "
-                "Privacy & Security > Accessibility. App names and time are "
-                "still being tracked.",
+                "Open System Settings > Privacy & Security > Accessibility. "
+                "BetterFlow may already look enabled there — if so, switch it "
+                "off and back on. App names and time are still being tracked.",
             )
         except Exception as e:
             # Never let a failed notification stop the watcher starting.

@@ -325,15 +325,27 @@ def grant_tcc_permissions() -> bool:
     launches skip the prompt — if permissions are still missing, the user
     must grant them manually via System Settings.
 
-    Returns True if the grant succeeded or was already attempted.
+    Returns True only when the permissions are actually held. The marker below
+    records that we ASKED, never that we succeeded: it is written in a finally,
+    so a cancelled prompt and a failed sqlite write both set it. Reporting
+    "attempted" as True made every later launch claim a permission the process
+    did not have, and four devices sat window_titles_blind for 15-21 days with
+    this answering True on each start (#205).
     """
     if not _IS_MACOS:
         return True
 
     marker = _tcc_grant_marker()
     if marker.exists():
-        logger.debug("TCC grant already attempted, skipping admin prompt")
-        return True
+        # Still no re-prompt — the marker exists so the admin password is asked
+        # for once, not on every launch. Only the ANSWER changes: report what is
+        # true right now instead of reporting that we once tried.
+        granted = check_accessibility() and check_input_monitoring()
+        logger.debug(
+            "TCC grant already attempted, skipping admin prompt (granted=%s)",
+            granted,
+        )
+        return granted
 
     services = []
     if not check_accessibility():
