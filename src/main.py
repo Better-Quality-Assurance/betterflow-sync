@@ -799,6 +799,7 @@ class SyncCoordinator:
             with self.tray.model.lock:
                 previous_needs_permissions = self.tray.model.needs_permissions
                 previous_input_ok = self.tray.model.input_monitoring_ok
+                previous_accessibility_ok = self.tray.model.accessibility_ok
                 self.tray.model.needs_permissions = not granted
                 self.tray.model.input_monitoring_ok = has_input
                 self.tray.model.accessibility_ok = has_accessibility
@@ -816,9 +817,16 @@ class SyncCoordinator:
                         should_update_icon = True
                     else:
                         should_update_icon = False
+                # accessibility_ok belongs here even though it never changes the
+                # ICON: it is the one grant whose loss produces no warning state,
+                # so if it does not trigger a menu rebuild the Diagnostics row
+                # refreshes only when some UNRELATED field happens to move. That
+                # is the stale-after-the-remedy dead end the row exists to close
+                # — the user fixes the grant and the row keeps saying blocked.
                 should_update_menu = (
                     previous_needs_permissions != self.tray.model.needs_permissions
                     or previous_input_ok != self.tray.model.input_monitoring_ok
+                    or previous_accessibility_ok != self.tray.model.accessibility_ok
                 )
             if should_update_icon:
                 self.tray._update_icon()
