@@ -23,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 import src.main as main
 
 
@@ -230,3 +232,76 @@ def test_the_input_watcher_can_actually_resolve_the_shared_predicate():
     assert callable(getattr(w, "has_capture_permissions", None)), (
         "has_capture_permissions is used in _permission_retry_loop but not imported"
     )
+
+
+# ── The PRODUCER: nothing wrote accessibility_ok, and a mutant proved it ──
+#
+# The Diagnostics row is a pure formatter over model state, which is right --
+# it must not probe the OS under _menu_lock. But that makes _check_permissions
+# the sole writer, and deleting that write left the whole suite green: the row
+# would render "Capture permissions: OK" forever on a blind machine. The
+# surface built to be the honest one becomes the lying one, which is worse than
+# not having it (Phantom 7 -- every test asserted the consumer).
+
+def _coordinator_with_real_model():
+    """A SyncCoordinator with a REAL TrayModel, enough to run _check_permissions."""
+    from src.ui.tray import TrayModel
+
+    c = object.__new__(main.SyncCoordinator)
+    c.tray = Mock()
+    c.tray.model = TrayModel()
+    c._perm_lock = threading.Lock()
+    c._last_perm_warn_at = None
+    c._input_tracking_ok = True
+    c._maybe_warn_input_tracking = Mock()
+    return c
+
+
+@pytest.mark.parametrize("granted", [True, False])
+def test_check_permissions_records_the_accessibility_grant(monkeypatch, granted):
+    c = _coordinator_with_real_model()
+    monkeypatch.setattr(main, "input_monitoring_active", lambda: True)
+    monkeypatch.setattr(main, "check_accessibility", lambda: granted)
+
+    c._check_permissions()
+
+    assert c.tray.model.accessibility_ok is granted, (
+        "nothing else writes this; the Diagnostics row renders whatever it says"
+    )
+
+
+def test_losing_only_accessibility_still_rebuilds_the_menu(monkeypatch):
+    """The row's whole job is "did my fix work?", so the change must trigger a redraw.
+
+    accessibility_ok never moves the tray ICON -- a missing Accessibility grant
+    deliberately does not raise NEEDS_PERMISSIONS -- so if it is also left out of
+    should_update_menu, nothing rebuilds and the row refreshes only when some
+    UNRELATED field happens to move. That is the stale-after-the-remedy dead end.
+    """
+    c = _coordinator_with_real_model()
+    monkeypatch.setattr(main, "input_monitoring_active", lambda: True)
+    monkeypatch.setattr(main, "check_accessibility", lambda: True)
+    c._check_permissions()
+    c.tray._update_menu.reset_mock()
+
+    # Only Accessibility changes. Input Monitoring stays fine throughout.
+    monkeypatch.setattr(main, "check_accessibility", lambda: False)
+    c._check_permissions()
+
+    c.tray._update_menu.assert_called_once()
+
+
+def test_a_missing_accessibility_grant_does_not_raise_the_permissions_warning(monkeypatch):
+    """Scope guard: titles are attribution detail, tracked time is unaffected.
+
+    A red NEEDS_PERMISSIONS tray on a machine recording every billable second
+    correctly would be a worse bug than the one being fixed.
+    """
+    c = _coordinator_with_real_model()
+    monkeypatch.setattr(main, "input_monitoring_active", lambda: True)
+    monkeypatch.setattr(main, "check_accessibility", lambda: False)
+
+    c._check_permissions()
+
+    assert c.tray.model.needs_permissions is False
+    assert c.tray.model.state is not main.TrayState.NEEDS_PERMISSIONS

@@ -773,10 +773,21 @@ class SyncCoordinator:
         server reads as a jiggler and flags the day as suspicious. App names and
         durations come from NSWorkspace and don't need Accessibility.
 
-        No-op on non-macOS, where the check returns True.
+        Also RECORDS the Accessibility grant, for the Diagnostics row only.
+        Deliberately not part of `granted`: Accessibility gates window TITLES,
+        and losing them costs attribution detail, not tracked time. Raising
+        NEEDS_PERMISSIONS for it would put a red tray icon on a machine that is
+        recording every billable second correctly.
+
+        No-op on non-macOS, where both checks return True.
         """
         try:
             has_input = input_monitoring_active()
+            # input_monitoring_active() (IOKit) is the authoritative probe and is
+            # what the "Input tracking off" banner already renders, so the
+            # Diagnostics row must read the same value or the two can disagree
+            # inside one popup.
+            has_accessibility = check_accessibility()
             granted = has_input
             status = None if has_input else "Input tracking OFF — Fix Permissions"
 
@@ -788,8 +799,10 @@ class SyncCoordinator:
             with self.tray.model.lock:
                 previous_needs_permissions = self.tray.model.needs_permissions
                 previous_input_ok = self.tray.model.input_monitoring_ok
+                previous_accessibility_ok = self.tray.model.accessibility_ok
                 self.tray.model.needs_permissions = not granted
                 self.tray.model.input_monitoring_ok = has_input
+                self.tray.model.accessibility_ok = has_accessibility
                 current_state = self.tray.model.state
                 if not granted:
                     if current_state not in high_priority:
@@ -804,9 +817,16 @@ class SyncCoordinator:
                         should_update_icon = True
                     else:
                         should_update_icon = False
+                # accessibility_ok belongs here even though it never changes the
+                # ICON: it is the one grant whose loss produces no warning state,
+                # so if it does not trigger a menu rebuild the Diagnostics row
+                # refreshes only when some UNRELATED field happens to move. That
+                # is the stale-after-the-remedy dead end the row exists to close
+                # — the user fixes the grant and the row keeps saying blocked.
                 should_update_menu = (
                     previous_needs_permissions != self.tray.model.needs_permissions
                     or previous_input_ok != self.tray.model.input_monitoring_ok
+                    or previous_accessibility_ok != self.tray.model.accessibility_ok
                 )
             if should_update_icon:
                 self.tray._update_icon()
