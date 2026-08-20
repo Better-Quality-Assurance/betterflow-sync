@@ -42,6 +42,7 @@ try:
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
+        has_capture_permissions,
         check_input_monitoring,
         grant_tcc_permissions,
         input_monitoring_active,
@@ -76,6 +77,7 @@ except ImportError:
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
+        has_capture_permissions,
         check_input_monitoring,
         grant_tcc_permissions,
         input_monitoring_active,
@@ -2157,6 +2159,10 @@ class BetterFlowApp:
     and routes tray-menu and system events to the appropriate handler.
     """
 
+    # Mirrors SyncCoordinator._PERM_REWARN_INTERVAL: a permission the user has
+    # not fixed is still worth resurfacing, but not 1,440 times a day.
+    _PERM_REWARN_INTERVAL = timedelta(hours=4)
+
     def __init__(self):
         """Initialize the application."""
         # Logging FIRST, at the default level, because Config.load() itself
@@ -2401,6 +2407,11 @@ class BetterFlowApp:
         # the 60s tick, the post-config-fetch callback and the wake-from-sleep
         # handler all drive it from different threads.
         self._capture_lock = threading.RLock()
+        # Throttle for the still-missing-permission warning. _start_watchers
+        # runs on every 60s tick, so this must not be per-call: see
+        # _maybe_warn_capture_permissions.
+        self._tcc_warn_lock = threading.Lock()
+        self._last_tcc_warn_at: Optional[datetime] = None
         self._capture_allowed: Optional[bool] = None
 
         # Sub-handlers
@@ -2424,22 +2435,59 @@ class BetterFlowApp:
         """Keep the tray visible while background startup progresses."""
         self.tray.set_state(TrayState.STARTING, message)
 
+    def _maybe_warn_capture_permissions(self) -> None:
+        """Report a still-missing capture grant, throttled, naming the right one.
+
+        Two things this must not do, both learned the hard way.
+
+        It must not fire per call. ``_start_watchers`` runs from
+        ``_apply_capture_policy`` on EVERY 60s tick, so an unthrottled line here
+        is ~1,440 a day — which is precisely the once-a-minute log that ran for
+        9-21 days on four devices and changed nothing (#194). A breadcrumb
+        repeated 1,440 times is what makes the log an ops fetch returns
+        unreadable. Same _PERM_REWARN_INTERVAL the input-tracking warning uses.
+
+        It must not blame the wrong grant. The two permissions have different
+        consequences and different System Settings panes: Accessibility gates
+        window TITLES, Input Monitoring gates keystroke/click COUNTS. Saying
+        "titles will be empty" on an Input-Monitoring failure is right about
+        what and wrong about where, which is the mistake that cost the 15-21
+        days in the first place.
+        """
+        missing = []
+        if not check_accessibility():
+            missing.append("Accessibility (window titles will be empty)")
+        if not check_input_monitoring():
+            missing.append("Input Monitoring (keystroke/click capture disabled)")
+
+        now = datetime.now(timezone.utc)
+        with self._tcc_warn_lock:
+            if not missing:
+                # Re-arm, so a later revocation warns again instead of being
+                # swallowed by a stale timestamp.
+                self._last_tcc_warn_at = None
+                return
+            recently_warned = (
+                self._last_tcc_warn_at is not None
+                and (now - self._last_tcc_warn_at) < self._PERM_REWARN_INTERVAL
+            )
+            if recently_warned:
+                return
+            self._last_tcc_warn_at = now
+
+        logger.warning(
+            "macOS permissions still missing after TCC grant attempt: %s "
+            "(System Settings > Privacy & Security)",
+            "; ".join(missing),
+        )
+
     def _start_watchers(self) -> None:
         """Start in-process watchers after the tracker server is available."""
         if sys.platform == "darwin":
-            if not check_accessibility() or not check_input_monitoring():
+            if not has_capture_permissions():
                 logger.info("Missing macOS permissions, attempting TCC grant")
-                if not grant_tcc_permissions():
-                    # Discarding this is how the state stayed invisible: the
-                    # watcher starts either way and emits empty titles, so the
-                    # only record was a debug line nobody reads. The user-facing
-                    # ask lives in the watcher (#197); this is the ops-side
-                    # breadcrumb for a log request.
-                    logger.warning(
-                        "macOS permissions still missing after TCC grant attempt "
-                        "— window titles will be empty until the user re-grants "
-                        "Accessibility (System Settings > Privacy & Security)"
-                    )
+                grant_tcc_permissions()
+                self._maybe_warn_capture_permissions()
         if self.window_watcher:
             self.window_watcher.start()
         if self.input_watcher:

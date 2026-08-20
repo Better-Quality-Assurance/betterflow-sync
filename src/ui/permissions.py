@@ -318,6 +318,18 @@ def _tcc_grant_marker() -> Path:
     return Config.get_data_dir() / ".tcc_grant_done"
 
 
+def has_capture_permissions() -> bool:
+    """The single definition of "we hold the grants capture needs".
+
+    Written three times before this existed — ``not A or not B`` at the
+    ``main.py`` callsite, ``A and B`` in the marker branch below, and the pair
+    again while building ``services``. De Morgan-equivalent, so nothing was
+    broken; adding a third grant to one spelling and not the others is a
+    one-line edit away, and it fails silently in both directions (#205).
+    """
+    return check_accessibility() and check_input_monitoring()
+
+
 def grant_tcc_permissions() -> bool:
     """Grant Accessibility and Input Monitoring via TCC database with admin auth.
 
@@ -340,7 +352,7 @@ def grant_tcc_permissions() -> bool:
         # Still no re-prompt — the marker exists so the admin password is asked
         # for once, not on every launch. Only the ANSWER changes: report what is
         # true right now instead of reporting that we once tried.
-        granted = check_accessibility() and check_input_monitoring()
+        granted = has_capture_permissions()
         logger.debug(
             "TCC grant already attempted, skipping admin prompt (granted=%s)",
             granted,
@@ -402,8 +414,12 @@ def grant_tcc_permissions() -> bool:
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0:
+            # returncode 0 means the sqlite write succeeded, NOT that this
+            # process now holds the grant — macOS generally does not re-read TCC
+            # for a running client. Ask, do not assume: this is the same claim
+            # the marker branch above was fixed for, one branch down.
             logger.info("TCC permissions granted via admin auth")
-            return True
+            return has_capture_permissions()
         else:
             stderr = result.stderr.strip()
             if "User canceled" in stderr or "-128" in stderr:

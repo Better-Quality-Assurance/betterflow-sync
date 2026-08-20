@@ -15,6 +15,7 @@ runs on every runner. The one test that needs the AX symbol injects a fake
 module rather than requiring the real one.
 """
 
+import re
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -204,6 +205,45 @@ def test_the_prompt_warns_the_toggle_may_already_look_enabled():
     with patch(NOTIFY) as notify:
         w._notify_accessibility_required_once()
 
-    body = notify.call_args[0][1].lower()
-    assert "already" in body, "must warn the toggle may already read as enabled"
-    assert "off" in body, "must give the off-then-on remedy, not just 'grant'"
+    assert _conveys_the_remedy(notify.call_args[0][1])
+
+
+# The v1.5.124 body, verbatim. This is the negative control: without it nobody
+# has ever seen the assertion above distinguish a good body from the one that
+# left four devices blind for 15-21 days.
+V1_5_124_BODY = (
+    "Grant Accessibility to BetterFlow in System Settings > Privacy & "
+    "Security > Accessibility. App names and time are still being tracked."
+)
+
+
+def _conveys_the_remedy(body: str) -> bool:
+    """Does this text tell the user the toggle may lie, and what to do about it?
+
+    Whole words over a small alternation, not substrings. A bare ``"off" in
+    body`` passes on "you may already be offline" — a body with no remedy at all
+    — and fails on "disable it and re-enable it", which is Apple's own phrasing
+    and arguably clearer than what we ship. Measured, both directions.
+    """
+    low = body.lower()
+    warns = re.search(r"\balready\b", low) is not None
+    remedies = re.search(r"\b(off|disable|untick|uncheck)\b", low) is not None
+    return warns and remedies
+
+
+def test_the_remedy_check_rejects_the_body_that_left_four_devices_blind():
+    """Control on the guard above — an unwitnessed predicate proves nothing."""
+    assert _conveys_the_remedy(V1_5_124_BODY) is False
+
+
+def test_the_remedy_check_accepts_reasonable_rewordings():
+    """It must not false-fail a better message, or it gets weakened not fixed."""
+    assert _conveys_the_remedy(
+        "BetterFlow may already be listed - disable it and re-enable it."
+    ) is True
+
+
+def test_the_remedy_check_is_not_satisfied_by_the_word_offline():
+    assert _conveys_the_remedy(
+        "You may already be offline. App names and time are still being tracked."
+    ) is False
