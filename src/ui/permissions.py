@@ -308,6 +308,11 @@ def open_input_monitoring_settings() -> None:
 
 _BUNDLE_ID = "co.betterqa.betterflow"
 
+# Stamped into the TCC marker when the running version cannot be read at all.
+# A constant, so it compares equal to itself: an agent that can never resolve
+# its version still asks exactly once, not on every launch.
+_UNKNOWN_AGENT_VERSION = "unknown"
+
 
 def _tcc_grant_marker() -> Path:
     """Path to the marker file that records the TCC grant was already attempted."""
@@ -316,6 +321,99 @@ def _tcc_grant_marker() -> Path:
     except ImportError:
         from config import Config
     return Config.get_data_dir() / ".tcc_grant_done"
+
+
+def _agent_version() -> str:
+    """The running agent version, used to stamp the TCC grant marker.
+
+    Total by construction: every lookup is wrapped and the fallback is a
+    constant, because a version we cannot read must never be able to raise out
+    of a permission check. ``_UNKNOWN_AGENT_VERSION`` still behaves correctly as
+    a stamp — it simply means the fuse re-arms only when the *reading* starts
+    working, never spuriously.
+
+    Mirrors the bundle-first order ``ui/tray.py`` uses: PyInstaller flattens
+    ``src/`` to the root, so the relative import that works from a checkout is
+    the one that fails in a shipped build.
+    """
+    try:
+        import _build_info as _bi  # PyInstaller bundle (src/ is root)
+
+        version = getattr(_bi, "APP_VERSION", None)
+        if version:
+            return str(version)
+    except Exception:  # noqa: BLE001 - never raise out of a permission check
+        pass
+    try:
+        from .. import __version__
+
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src import __version__  # type: ignore[no-redef]
+
+        return str(__version__)
+    except Exception:  # noqa: BLE001
+        pass
+    return _UNKNOWN_AGENT_VERSION
+
+
+def _grant_attempt_is_armed(marker: Path, version: str) -> bool:
+    """May this launch spend the user's one admin-password prompt?
+
+    The marker records that we ASKED, and the fuse is per-VERSION rather than
+    per-install. That is the whole of #205: written in a ``finally``, a
+    cancelled prompt and a failed sqlite write both blew a fuse that nothing
+    re-armed, so four devices sat ``window_titles_blind`` for 15-21 days having
+    been asked exactly once, months earlier, on a build whose code signature no
+    longer existed.
+
+    Three states, and each direction was chosen for how it fails:
+
+    * **No marker** -> armed. A fresh install must be able to ask.
+    * **Marker stamped with a DIFFERENT version (or with nothing at all)** ->
+      armed, once. This is the re-arm. The file's own header documents why an
+      update is the right moment: a new build changes the code signature, macOS
+      may keep showing the toggle ON while ``AXIsProcessTrusted()`` returns
+      False, and the grant genuinely needs re-establishing. A legacy marker
+      written by the old ``touch()`` carries no version and reads as "" here,
+      so the already-blind fleet re-arms on upgrade rather than staying blind
+      forever - which is the outcome this issue exists to produce.
+    * **Marker stamped with THIS version** -> spent. This is the half that must
+      not regress: the fuse exists so the admin password is asked for once, not
+      on every launch. Trading a silent failure for a prompt loop is worse than
+      the bug.
+
+    An existing-but-unreadable marker reads as SPENT, not armed. We know an
+    attempt happened (the file is there) and cannot tell which version made it;
+    re-arming on an ``OSError`` we would hit again on the next write is how a
+    single prompt becomes an infinite one. The honest state still reaches the
+    user - the caller reports ``has_capture_permissions()`` and
+    ``_maybe_warn_capture_permissions()`` names the missing grant.
+    """
+    if not marker.exists():
+        return True
+    try:
+        stamped = marker.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.debug("Could not read TCC marker (%s); treating as spent", e)
+        return False
+    return stamped != version
+
+
+def _record_grant_attempt(marker: Path, version: str) -> None:
+    """Stamp the marker with the version that spent the attempt.
+
+    Replaces a bare ``touch()``. The content is the entire re-arm mechanism: an
+    empty marker cannot say WHICH build asked, so it can only ever mean "never
+    ask again".
+    """
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{version}\n", encoding="utf-8")
+    except OSError as e:
+        logger.debug("Could not write TCC marker: %s", e)
 
 
 def has_capture_permissions() -> bool:
@@ -333,28 +431,40 @@ def has_capture_permissions() -> bool:
 def grant_tcc_permissions() -> bool:
     """Grant Accessibility and Input Monitoring via TCC database with admin auth.
 
-    Shows the native macOS password dialog once on first install. Subsequent
-    launches skip the prompt — if permissions are still missing, the user
-    must grant them manually via System Settings.
+    Shows the native macOS password dialog **once per agent version**, not once
+    per install. Later launches on the same version skip the prompt; the next
+    update re-arms it exactly once. If permissions are still missing after
+    that, the user grants them manually via System Settings.
 
-    Returns True only when the permissions are actually held. The marker below
+    Returns True only when the permissions are actually held. The marker
     records that we ASKED, never that we succeeded: it is written in a finally,
-    so a cancelled prompt and a failed sqlite write both set it. Reporting
-    "attempted" as True made every later launch claim a permission the process
-    did not have, and four devices sat window_titles_blind for 15-21 days with
-    this answering True on each start (#205).
+    so a cancelled prompt and a failed sqlite write both set it. Two separate
+    defects came out of that, and only the first is fixed by honesty alone.
+
+    * Reporting "attempted" as True made every later launch claim a permission
+      the process did not have. Four devices sat ``window_titles_blind`` for
+      15-21 days with this answering True on each start (#205).
+    * The record itself was permanent, so the single recovery attempt was spent
+      at first install even when it FAILED. Version-stamping the marker is what
+      re-arms it — see ``_grant_attempt_is_armed`` for why an update is the
+      right moment and why "never write on failure" is not the fix (it turns
+      one prompt into a prompt on every launch, which is worse).
     """
     if not _IS_MACOS:
         return True
 
     marker = _tcc_grant_marker()
-    if marker.exists():
-        # Still no re-prompt — the marker exists so the admin password is asked
-        # for once, not on every launch. Only the ANSWER changes: report what is
-        # true right now instead of reporting that we once tried.
+    version = _agent_version()
+    if not _grant_attempt_is_armed(marker, version):
+        # Still no re-prompt — the fuse is spent for THIS version, so the admin
+        # password is asked for once per build, not on every launch. Only the
+        # ANSWER changes: report what is true right now instead of reporting
+        # that we once tried.
         granted = has_capture_permissions()
         logger.debug(
-            "TCC grant already attempted, skipping admin prompt (granted=%s)",
+            "TCC grant already attempted for %s, skipping admin prompt "
+            "(granted=%s)",
+            version,
             granted,
         )
         return granted
@@ -366,12 +476,9 @@ def grant_tcc_permissions() -> bool:
         services.append("kTCCServiceListenEvent")
 
     if not services:
-        # Permissions already granted — write marker so we don't re-check.
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-        except OSError as e:
-            logger.debug("Could not write TCC marker: %s", e)
+        # Permissions already granted — stamp the marker so we don't re-check
+        # until the next version, when the signature may have changed.
+        _record_grant_attempt(marker, version)
         return True
 
     # Defensive: refuse to interpolate anything we didn't hardcode ourselves.
@@ -434,10 +541,8 @@ def grant_tcc_permissions() -> bool:
         logger.warning(f"TCC grant error: {e}")
         return False
     finally:
-        # Mark the grant as attempted regardless of outcome so the user
-        # is never prompted again on subsequent launches.
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-        except OSError as exc:
-            logger.debug("Could not write TCC marker: %s", exc)
+        # Record the attempt regardless of outcome, so a cancelled prompt does
+        # not re-ask on the very next launch — but stamp it with the VERSION,
+        # which is what stops the record meaning "never ask again". The bare
+        # touch() this replaces made a cancel permanent (#205).
+        _record_grant_attempt(marker, version)

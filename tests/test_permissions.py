@@ -16,6 +16,8 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import pytest
+
 import src.ui.permissions as permissions
 
 # AXError codes (from <HIServices/AXError.h>)
@@ -120,12 +122,69 @@ def test_ax_api_works_false_when_binding_unavailable(monkeypatch):
 # launch) so these tests pin BOTH halves: it must still not re-prompt, and it
 # must stop claiming success.
 
-def _marker_path(monkeypatch, tmp_path, *, exists):
+# The version every test pretends to be running, so a stamped marker means
+# "this build already spent its prompt" without depending on src.__version__.
+THIS_VERSION = "9.9.9"
+OLDER_VERSION = "9.9.8"
+
+
+class _RealOsascriptInvoked(BaseException):
+    """Deliberately NOT an Exception subclass.
+
+    ``grant_tcc_permissions`` wraps its ``subprocess.run`` in
+    ``except Exception``, so an ordinary error raised here would be swallowed
+    and reported as a plain ``False`` — the guard would fire and look exactly
+    like a normal denial. Deriving from BaseException makes it escape the
+    handler and fail the test out loud.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _never_spawn_real_osascript(monkeypatch):
+    """No test in this module may reach the real admin-password dialog.
+
+    Not hypothetical. ``test_grant_does_not_claim_success_when_permission_is_
+    still_missing`` sets up a marker and does NOT patch ``subprocess.run``,
+    which was harmless only while an existing marker took the early return.
+    The moment a legacy marker began re-arming (#205) that test fell through to
+    a real ``osascript ... with administrator privileges``, popped a genuine
+    password prompt on the developer's machine, blocked the full 120s
+    subprocess timeout — and then PASSED, because a timeout also returns False.
+
+    A green that arrives via the timeout path is the Phantom 4 shape: the right
+    answer for the wrong reason. Tests that mean to exercise the write patch
+    ``subprocess.run`` themselves and override this fixture; anything else
+    reaching it is a bug in the test, and now says so in under a second.
+    """
+    def _boom(*args, **kwargs):
+        raise _RealOsascriptInvoked(
+            f"test tried to run a real subprocess: {args!r}"
+        )
+
+    monkeypatch.setattr(permissions.subprocess, "run", _boom)
+
+
+def _marker_path(monkeypatch, tmp_path, *, exists, version=THIS_VERSION):
+    """Point permissions at a scratch marker, optionally already stamped.
+
+    ``version`` is what the marker CLAIMS spent the attempt. The default is the
+    running version, i.e. the fuse is spent — which is what every caller of this
+    helper predating #205 meant by ``exists=True``. Pass ``OLDER_VERSION`` for
+    the post-update case, or ``""`` for a legacy marker written by the old bare
+    ``touch()``.
+    """
     marker = tmp_path / ".tcc_grant_done"
     if exists:
-        marker.touch()
+        marker.write_text(version, encoding="utf-8")
     monkeypatch.setattr(permissions, "_IS_MACOS", True)
     monkeypatch.setattr(permissions, "_tcc_grant_marker", lambda: marker)
+    # raising=False so this helper still works against the PRE-FIX module,
+    # where _agent_version does not exist. Without it every test below dies
+    # on an AttributeError during the proof-of-failure run and the handshake
+    # proves only that the symbol is new — not that the defect was real.
+    monkeypatch.setattr(
+        permissions, "_agent_version", lambda: THIS_VERSION, raising=False
+    )
     return marker
 
 
@@ -203,3 +262,173 @@ def test_a_write_that_really_did_land_reports_success(monkeypatch, tmp_path):
 
     assert permissions.grant_tcc_permissions() is True
     assert marker.exists(), "the attempt must still be recorded"
+
+
+# --- The one attempt must not be spent forever by a failure (#205) -----------
+#
+# The three points of #205 were: (1) the fuse is single-use and blows on
+# failure, (2) the early return claimed a grant it did not hold, (3) the caller
+# discarded the result. (2) and (3) shipped earlier. This block is (1), the
+# issue's title: a cancelled prompt burned the agent's only automated recovery
+# path permanently, so four devices sat window_titles_blind for 15-21 days
+# having been asked exactly once, months earlier.
+#
+# Both directions are pinned deliberately. A fix that merely stops recording a
+# failed attempt turns one prompt into a prompt on EVERY launch, which is worse
+# than the bug it replaces — so every "must re-arm" test below has a "must stay
+# spent" partner, and the mutation matrix requires both.
+
+
+def _prompt_recorder(monkeypatch, *, returncode=1, stderr="User canceled."):
+    """Capture osascript invocations instead of running them."""
+    calls = []
+
+    def _run(*args, **kwargs):
+        calls.append(args)
+        return MagicMock(returncode=returncode, stderr=stderr)
+
+    monkeypatch.setattr(permissions.subprocess, "run", _run)
+    return calls
+
+
+def test_a_cancelled_prompt_is_retried_after_an_update(monkeypatch, tmp_path):
+    """THE defect. A marker from an older build must not silence the new one.
+
+    Pre-fix this returns without prompting: the marker merely had to EXIST.
+    That is the whole 15-21 day outage — the agent had one chance, spent it on
+    a cancel, and every later launch (including every auto-update, which is
+    exactly when the code signature changes and the grant needs re-establishing)
+    took the early return.
+    """
+    _marker_path(monkeypatch, tmp_path, exists=True, version=OLDER_VERSION)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+    calls = _prompt_recorder(monkeypatch)
+
+    permissions.grant_tcc_permissions()
+
+    assert calls, "a new version must get its own attempt at the grant"
+
+
+def test_a_legacy_unstamped_marker_re_arms_once(monkeypatch, tmp_path):
+    """The already-blind fleet's second chance.
+
+    Devices 17, 22, 23 and 53 carry a marker written by the old bare touch():
+    zero bytes, no version, indistinguishable from "asked on some build we can
+    no longer name". Reading that as spent would leave them blind forever, so
+    it re-arms — which is the entire point of shipping this.
+    """
+    _marker_path(monkeypatch, tmp_path, exists=True, version="")
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+    calls = _prompt_recorder(monkeypatch)
+
+    permissions.grant_tcc_permissions()
+
+    assert calls, "an unstamped legacy marker must re-arm exactly once"
+
+
+def test_the_same_version_never_prompts_twice(monkeypatch, tmp_path):
+    """The other direction, and the one that must never regress.
+
+    Re-arming per LAUNCH instead of per VERSION would trade a silent failure
+    for an admin-password prompt on every start. If this goes red the fix has
+    become worse than the defect.
+    """
+    _marker_path(monkeypatch, tmp_path, exists=True, version=THIS_VERSION)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+    calls = _prompt_recorder(monkeypatch)
+
+    permissions.grant_tcc_permissions()
+
+    assert calls == [], "the fuse is spent for this version — do not re-ask"
+
+
+def test_a_cancelled_attempt_still_records_itself(monkeypatch, tmp_path):
+    """Cancelling must not re-prompt on the very next launch of the SAME build.
+
+    The pair of this and the test above is what makes "one prompt per version"
+    a real contract rather than a hope: the attempt is recorded even when it
+    fails, and it is the STAMP, not the absence of a file, that re-arms later.
+    """
+    marker = _marker_path(monkeypatch, tmp_path, exists=False)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+    _prompt_recorder(monkeypatch)
+
+    assert permissions.grant_tcc_permissions() is False
+    assert marker.read_text(encoding="utf-8").strip() == THIS_VERSION
+
+    # Second launch, same build: the recorded attempt must silence the prompt.
+    calls = _prompt_recorder(monkeypatch)
+    permissions.grant_tcc_permissions()
+    assert calls == [], "a recorded cancel must not re-prompt on the same build"
+
+
+def test_a_successful_grant_does_not_re_prompt_on_the_same_version(monkeypatch, tmp_path):
+    """Success direction: a grant that landed must not keep asking either."""
+    marker = _marker_path(monkeypatch, tmp_path, exists=False)
+    state = {"granted": False}
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: state["granted"])
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: state["granted"])
+
+    def _run(*args, **kwargs):
+        state["granted"] = True
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(permissions.subprocess, "run", _run)
+    assert permissions.grant_tcc_permissions() is True
+    assert marker.read_text(encoding="utf-8").strip() == THIS_VERSION
+
+    calls = _prompt_recorder(monkeypatch)
+    assert permissions.grant_tcc_permissions() is True
+    assert calls == [], "a granted permission must never re-prompt"
+
+
+def test_an_already_granted_machine_restamps_on_upgrade(monkeypatch, tmp_path):
+    """An upgrade re-arms, but must not PROMPT a machine that is already fine.
+
+    Re-arming is permission to ask, not an obligation. With both grants held
+    the services list is empty, so the new version simply re-stamps and returns
+    — no dialog. Without this the re-arm would show a password prompt to the
+    whole healthy fleet on every single update.
+    """
+    marker = _marker_path(monkeypatch, tmp_path, exists=True, version=OLDER_VERSION)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: True)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: True)
+    calls = _prompt_recorder(monkeypatch)
+
+    assert permissions.grant_tcc_permissions() is True
+    assert calls == [], "a healthy machine must not be prompted by an upgrade"
+    assert marker.read_text(encoding="utf-8").strip() == THIS_VERSION
+
+
+def test_an_unreadable_marker_reads_as_spent(monkeypatch, tmp_path):
+    """Fail toward not-nagging when the marker exists but cannot be read.
+
+    We know an attempt happened — the file is there — and cannot tell which
+    build made it. Re-arming on an OSError we would hit again on the next write
+    is how a single prompt becomes an infinite one.
+    """
+    marker = _marker_path(monkeypatch, tmp_path, exists=True, version=OLDER_VERSION)
+    monkeypatch.setattr(permissions, "check_accessibility", lambda: False)
+    monkeypatch.setattr(permissions, "check_input_monitoring", lambda: False)
+
+    def _explode(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(permissions.Path, "read_text", _explode)
+    calls = _prompt_recorder(monkeypatch)
+
+    permissions.grant_tcc_permissions()
+
+    assert calls == [], "an unreadable marker must not start a prompt loop"
+    assert marker.exists()
+
+
+def test_agent_version_is_total(monkeypatch):
+    """_agent_version must never raise out of a permission check."""
+    monkeypatch.setitem(sys.modules, "_build_info", None)
+    assert isinstance(permissions._agent_version(), str)
+    assert permissions._agent_version() != ""
