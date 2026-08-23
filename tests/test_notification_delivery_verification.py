@@ -21,6 +21,7 @@ from it is inferring it from nothing.
 # Renaming them to snake_case would make the fakes stop standing in for the
 # real API, which is the one thing they exist to do.
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -133,9 +134,19 @@ def no_icon():
 
 @pytest.fixture
 def instant_poll(monkeypatch):
-    """Zero the confirmation backoff so the suite does not sleep."""
+    """Zero the confirmation backoff so the suite does not sleep.
+
+    Replaces the whole ``time`` attribute with ``raising=False`` rather
+    than patching ``notifications.time.sleep``. The pre-fix module does
+    not import ``time`` at all, so the obvious form dies in fixture setup
+    and every test built on it ERRORS instead of failing — which reaches
+    the subject exactly never, and would make a proof-of-failure run prove
+    nothing (test_fixture_discipline Phantom 4).
+    """
     sleeper = MagicMock()
-    monkeypatch.setattr(notifications.time, "sleep", sleeper)
+    monkeypatch.setattr(
+        notifications, "time", SimpleNamespace(sleep=sleeper), raising=False
+    )
     return sleeper
 
 
@@ -281,16 +292,31 @@ class TestUnknownIsNotSuccess:
         assert not outcome
 
     def test_nil_center_is_a_failure_not_an_unknown(
-        self, monkeypatch, no_icon, instant_poll
+        self, monkeypatch, no_icon, instant_poll, caplog
     ):
         """``defaultUserNotificationCenter()`` is nil for a process the
         notification system will not talk to. Nothing was posted at all, so
-        this is not merely unverifiable."""
+        this is not merely unverifiable.
+
+        The log line is asserted too, and that is the half that witnesses
+        the guard. Deleting the nil check leaves the outcome at ``FAILED``
+        anyway — posting to nil raises and the handler catches it — so the
+        outcome alone cannot tell the guard from its absence. What changes
+        is whether the operator reads "the notification system will not
+        talk to this process" or a bare ``NoneType has no attribute``.
+        """
+        import logging
+
         install_foundation(monkeypatch, None)
 
-        outcome = notifications._send_macos_pyobjc("Title", "Body", False)
+        with caplog.at_level(logging.DEBUG):
+            outcome = notifications._send_macos_pyobjc("Title", "Body", False)
 
         assert outcome is notifications.NotificationOutcome.FAILED
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("NSUserNotificationCenter" in m for m in messages), (
+            "a nil centre has to say so, not surface as a generic pyobjc error"
+        )
 
     def test_osascript_success_is_unknown_never_delivered(self, monkeypatch):
         """osascript exiting 0 means the AppleScript ran. It says nothing
