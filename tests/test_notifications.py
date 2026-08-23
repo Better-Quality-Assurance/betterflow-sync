@@ -2,7 +2,11 @@
 
 from unittest.mock import MagicMock, patch
 
-from src.notifications import clear_notifications, send_notification
+from src.notifications import (
+    NotificationOutcome,
+    clear_notifications,
+    send_notification,
+)
 import src.notifications as notifications_module
 
 
@@ -43,26 +47,60 @@ class TestSendNotification:
 
     @patch("src.notifications.platform.system", return_value="Darwin")
     @patch("src.notifications._try_load_macos_pyobjc", return_value=True)
-    @patch("src.notifications._send_macos_pyobjc", return_value=True)
+    @patch(
+        "src.notifications._send_macos_pyobjc",
+        return_value=NotificationOutcome.DELIVERED,
+    )
     @patch("src.notifications._send_macos_osascript")
     def test_macos_pyobjc_preferred(
         self, mock_osascript, mock_pyobjc_send, _mock_try, _mock_sys
     ):
-        """When pyobjc is available, osascript path is skipped entirely."""
+        """A VERIFIED delivery skips osascript entirely.
+
+        The stub returns ``DELIVERED`` rather than ``True`` on purpose: a
+        bare truthy is what used to stand in for a delivery nobody had
+        observed (#204), and it must no longer be enough to short-circuit
+        the fallback.
+        """
         send_notification("Title", "Body")
         mock_pyobjc_send.assert_called_once()
         mock_osascript.assert_not_called()
 
     @patch("src.notifications.platform.system", return_value="Darwin")
     @patch("src.notifications._try_load_macos_pyobjc", return_value=True)
-    @patch("src.notifications._send_macos_pyobjc", return_value=False)
+    @patch(
+        "src.notifications._send_macos_pyobjc",
+        return_value=NotificationOutcome.FAILED,
+    )
     @patch("src.notifications._send_macos_osascript")
     def test_macos_pyobjc_failure_falls_back(
         self, mock_osascript, _mock_pyobjc_send, _mock_try, _mock_sys
     ):
         """If the pyobjc call fails, we still try osascript."""
+        mock_osascript.return_value = NotificationOutcome.UNKNOWN
         send_notification("Title", "Body")
         mock_osascript.assert_called_once()
+
+    @patch("src.notifications.platform.system", return_value="Darwin")
+    @patch("src.notifications._try_load_macos_pyobjc", return_value=True)
+    @patch(
+        "src.notifications._send_macos_pyobjc",
+        return_value=NotificationOutcome.SUPPRESSED,
+    )
+    @patch("src.notifications._send_macos_osascript")
+    def test_macos_suppression_also_falls_back(
+        self, mock_osascript, _mock_pyobjc_send, _mock_try, _mock_sys
+    ):
+        """The case the fallback existed for and could never reach.
+
+        Pre-fix the pyobjc path returned ``True`` whether or not macOS kept
+        the notification, so a suppressed notice short-circuited every
+        alternative and the user was told nothing.
+        """
+        mock_osascript.return_value = NotificationOutcome.UNKNOWN
+        outcome = send_notification("Title", "Body")
+        mock_osascript.assert_called_once()
+        assert outcome is NotificationOutcome.UNKNOWN
 
     @patch("src.notifications.platform.system", return_value="Windows")
     @patch("src.notifications.subprocess.run")
@@ -84,8 +122,8 @@ class TestSendNotification:
     @patch("src.notifications._try_load_macos_pyobjc", return_value=False)
     @patch("src.notifications.subprocess.run", side_effect=Exception("fail"))
     def test_exception_is_swallowed(self, _mock_run, _mock_pyobjc, _mock_sys):
-        # Should not raise
-        send_notification("Title", "Body")
+        # Should not raise — but it must not read as success either.
+        assert send_notification("Title", "Body") is NotificationOutcome.FAILED
 
 
 class TestClearNotifications:
