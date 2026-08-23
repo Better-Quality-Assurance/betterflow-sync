@@ -427,16 +427,35 @@ class MacOSWindowWatcher:
         self._accessibility_notified = True
         try:
             try:
-                from ..notifications import send_notification
+                from ..notifications import NotificationOutcome, send_notification
             except ImportError:
-                from notifications import send_notification  # type: ignore[no-redef]
+                from notifications import (  # type: ignore[no-redef]
+                    NotificationOutcome,
+                    send_notification,
+                )
 
-            send_notification(
+            outcome = send_notification(
                 "BetterFlow can't read window titles",
                 "Open System Settings > Privacy & Security > Accessibility. "
                 "BetterFlow may already look enabled there — if so, switch it "
                 "off and back on. App names and time are still being tracked.",
             )
+            # #194 was the same failure one layer down: the log was the only
+            # record and nobody reads it, so five people sat degraded for 12-17
+            # days. Replacing the log with a toast only helps if the toast
+            # arrives, so record whether it did rather than assuming.
+            if outcome is NotificationOutcome.DELIVERED:
+                logger.info(
+                    "Accessibility notice accepted by Notification Center "
+                    "(not proof the user read it)"
+                )
+            else:
+                logger.error(
+                    "Accessibility notice was NOT delivered (%s) — window "
+                    "titles stay empty and the user has not been asked to "
+                    "re-grant the permission",
+                    outcome.value,
+                )
         except Exception as e:
             # Never let a failed notification stop the watcher starting.
             logger.debug("Accessibility notification failed: %s", e)

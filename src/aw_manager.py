@@ -828,16 +828,55 @@ class AWManager:
         self._rosetta_notified = True
         try:
             try:
-                from .notifications import send_notification
+                from .notifications import NotificationOutcome, send_notification
             except ImportError:
-                from notifications import send_notification
-            send_notification(
+                from notifications import NotificationOutcome, send_notification
+            outcome = send_notification(
                 "BetterFlow can't track on this Mac",
                 "Rosetta 2 is required. Open Terminal and run: "
                 "softwareupdate --install-rosetta",
             )
         except Exception:
             logger.debug("Rosetta notification failed", exc_info=True)
+            return
+
+        # This device records ZERO time until someone installs Rosetta, and
+        # the notification is the only thing that asks them to. Whether it
+        # arrived was previously unknowable — the notice shipped in v1.5.118
+        # and a user still lost ~90 minutes on v1.5.122 (#204), with nothing
+        # anywhere to say whether they were ever told. Say so now, either way.
+        if outcome is NotificationOutcome.DELIVERED:
+            logger.info(
+                "Rosetta notice accepted by Notification Center. That is not "
+                "proof the user read it — a Focus mode files it silently."
+            )
+            return
+
+        logger.error(
+            "Rosetta notice was NOT delivered (%s). This Mac is recording no "
+            "time and the person at the keyboard has not been asked to fix it; "
+            "the tray state and the tracker_install_failed signal are the only "
+            "remaining routes to them.",
+            outcome.value,
+        )
+        reporter = self.error_reporter
+        if reporter is not None:
+            try:
+                reporter.capture(
+                    "Rosetta required notice not delivered to the user",
+                    level="error",
+                    tags={
+                        "component": "aw_manager",
+                        "platform": _get_platform_key(),
+                        "notification_outcome": outcome.value,
+                    },
+                    context={"aw_version": AW_VERSION},
+                    fingerprint="rosetta-notice-undelivered",
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to report undelivered Rosetta notice", exc_info=True
+                )
 
     def _start_locked(self) -> bool:
         # Every route back to a running tracker funnels through here, so this one
