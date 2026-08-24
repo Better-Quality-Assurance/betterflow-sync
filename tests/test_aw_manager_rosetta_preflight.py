@@ -653,8 +653,15 @@ def test_the_re_probe_does_not_reach_the_sixty_second_start_path():
     mgr = _mgr()
     completed = subprocess.CompletedProcess(args=[], returncode=1)
 
+    # The binary half is pinned so the gate REACHES the host probe this test
+    # counts. Left to the real resolver it answers from whatever trackers happen
+    # to be installed on the machine running the suite: x86_64 on a developer
+    # Mac that has BetterFlow (probe runs, count 1), ELF on the Linux runner
+    # (could-not-tell, count 0). The assertion below was measuring the host
+    # rather than the memo, and was green here for that reason alone.
     with patch("src.aw_manager.sys.platform", "darwin"), \
          patch("src.aw_manager.platform.machine", return_value="arm64"), \
+         patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch("src.aw_manager.subprocess.run", return_value=completed) as run, \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch.object(AWManager, "_port_in_use", return_value=False), \

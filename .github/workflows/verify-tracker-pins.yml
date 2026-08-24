@@ -20,6 +20,10 @@ on:
       - "src/aw_release.py"
       - "src/aw_manager.py"
       - "scripts/download_aw.py"
+      # aw_release.py imports ARM64/X86_64 from here, and the asset keys are
+      # built from them — so a change to those spellings changes the keys this
+      # job verifies. Same trigger-path hole as the one above, one import along.
+      - "src/machine_arch.py"
       - "tests/test_aw_manager_asset_integrity.py"
       - "scripts/verify_tracker_pins.py"
       - ".github/workflows/verify-tracker-pins.yml"
