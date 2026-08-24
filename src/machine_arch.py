@@ -445,3 +445,65 @@ def true_machine_arch(
         return ""
 
     return machine
+
+
+def process_arch(
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+    translated: Optional[bool] = None,
+) -> str:
+    """The architecture of the RUNNING PROCESS — i.e. which BUILD is installed.
+
+    The deliberate counterpart to ``true_machine_arch()`` above, and the reason
+    both exist is that they answer different questions:
+
+        true_machine_arch()  "what silicon is this Mac?"
+        process_arch()       "which build of BetterFlow is running on it?"
+
+    ``true_machine_arch()`` resolves *through* Rosetta on purpose, so a
+    translated x86_64 process reports ``arm64``. That is correct for its
+    question and it is exactly why it cannot answer this one: a native Apple
+    Silicon install and an Intel build under Rosetta return the SAME value from
+    it, and are therefore byte-identical on the heartbeat. Measured on real
+    Apple Silicon (Darwin 25.5.0), running this module under both personalities:
+
+        native                  process=arm64   true_machine_arch=arm64
+        arch -x86_64 (Rosetta)  process=x86_64  true_machine_arch=arm64
+
+    Only the left column moves. So "who is sitting on the Intel build?" (#184)
+    is answerable only from the PAIR, never from either field alone:
+
+        machine_arch=arm64  process_arch=arm64   native build          fine
+        machine_arch=arm64  process_arch=x86_64  Intel build/Rosetta   THIS
+        machine_arch=x86_64 process_arch=x86_64  a genuine Intel Mac   fine
+
+    Three properties worth stating, because each is a way this could have been
+    written wrongly:
+
+    - **It forks nothing.** A process always knows its own ISA;
+      ``platform.machine()`` is the answer and needs no probe. The sibling above
+      forks ``sysctl`` and is memoised for it — this must not acquire that cost,
+      or the tray pays for it under ``_menu_lock`` on the sync cycle.
+    - **Its "undetermined" state is far rarer, not absent.** ``true_machine_arch()``
+      returns ``""`` whenever its probe never resolved, which is an ordinary
+      outcome. A running process has an architecture by construction, so the
+      honest answer here is essentially always available — but the *source* is
+      ``platform.machine()``, which the stdlib documents as returning ``""`` when
+      it cannot determine one, so this can return ``""`` too. Callers must map it
+      the same way they map its sibling's: to null, never to a string. Reading a
+      blank as an architecture is the failure either helper can cause, and the
+      rarity of the case here makes it likelier to be shipped unhandled, not
+      less costly when it is.
+    - **``translated`` is accepted and ignored.** It is taken only so callers
+      and tests can pass the same keyword set to both helpers; honouring it
+      would re-introduce precisely the Rosetta resolution that makes this field
+      unable to answer its question.
+
+    Args:
+        system: Override ``platform.system()`` for testing. Unused — the answer
+            is platform-independent — and accepted for signature symmetry.
+        machine: Override ``platform.machine()`` for testing.
+        translated: Accepted for signature symmetry with the helpers above and
+            deliberately not consulted. See the note above.
+    """
+    return machine or platform.machine()

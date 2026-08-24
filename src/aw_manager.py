@@ -135,6 +135,21 @@ WINDOW_TITLE_EVENT_LIMIT = 500
 # error reports. start() is retried from the health-check tick, so without this
 # a fail-closed download would toast the user every cycle.
 DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
+# The one thing that fixes a zero-recording Apple Silicon Mac, spelled once.
+# Three surfaces quote it — the log line, the toast, and (since #188) the tray
+# state that persists for as long as the fault does. It is the whole remedy, so
+# a typo in any single copy is a user typing a command that does nothing on the
+# day they are already recording nothing; one constant is what stops the three
+# from drifting. The agent cannot run it itself: it needs an admin password.
+ROSETTA_INSTALL_COMMAND = "softwareupdate --install-rosetta"
+# How long a Rosetta answer stands before force_restart() is allowed to re-ask.
+# Installing Rosetta needs no reboot, so the answer CAN change under a running
+# agent and a memo held for the life of the process left the user stuck at "still
+# blocked" with nothing telling them to relaunch. Five minutes because the two
+# costs pull opposite ways: the escalation path that clears this runs every 60s
+# for the whole of a total-capture outage, and re-probing on each one puts a
+# subprocess fork per minute back on precisely the machine the memo protects.
+ROSETTA_REPROBE_INTERVAL = 300.0
 # (ops summary, ops fingerprint, user toast) per cause of "this device captures
 # NOTHING". Keyed rather than branched so a new cause is a table row. Both are
 # the same outage to the person using the machine, so both must reach them —
@@ -531,9 +546,18 @@ class AWManager:
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
-        # not probed yet. Rosetta cannot appear or vanish without a reboot, so
-        # this is probed once rather than on every 60s start attempt.
+        # not probed yet. Installing Rosetta needs no reboot, so force_restart()
+        # clears this to let a device that was fixed recover on its own — but
+        # only once per ROSETTA_REPROBE_INTERVAL, because a sustained outage
+        # calls force_restart on every 60s cycle and this memo exists to keep
+        # `/usr/bin/arch` off that path.
         self._rosetta_missing_cached: Optional[bool] = None
+        # monotonic timestamp of the last completed probe, for that interval.
+        self._rosetta_probed_at: float = float("-inf")
+        # The last answer we LOGGED. Re-probing must not reprint the same error
+        # every few minutes for the life of an outage — that is the 60-second
+        # log spam the preflight was written to end, arriving by another door.
+        self._rosetta_logged: Optional[bool] = None
         self._rosetta_notified: bool = False
         # Components whose binary is on disk but cannot EXECUTE (EBADARCH /
         # ENOEXEC). Keeps the capture-dead latch honest when only SOME binaries
@@ -810,14 +834,117 @@ class AWManager:
             missing = False
 
         self._rosetta_missing_cached = missing
-        if missing:
-            logger.error(
-                "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
-                "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
-                "until it is installed: run `softwareupdate --install-rosetta` "
-                "(needs an admin password, so the agent cannot do it for you)."
-            )
+        self._rosetta_probed_at = time.monotonic()
+        # Log the ANSWER changing, not the probe running. force_restart clears
+        # the memo so an installed Rosetta is noticed without an agent restart,
+        # which means this function now runs repeatedly during an outage instead
+        # of once per process; reprinting the same error each time would rebuild
+        # the identical-line spam the preflight exists to have ended.
+        if missing is not self._rosetta_logged:
+            if missing:
+                logger.error(
+                    "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
+                    "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
+                    "until it is installed: run `%s` "
+                    "(needs an admin password, so the agent cannot do it for you).",
+                    ROSETTA_INSTALL_COMMAND,
+                )
+            elif self._rosetta_logged is True:
+                # The recovery. Worth a line of its own: it is the only record
+                # that the user's install landed and capture can resume, and
+                # support reads these logs to answer exactly that question.
+                logger.info(
+                    "Rosetta 2 is now available — the x86_64 trackers can start. "
+                    "Capture should resume on this cycle."
+                )
+            self._rosetta_logged = missing
         return missing
+
+    def capture_blocked_remedy(self) -> Optional[str]:
+        """One sentence for a surface that PERSISTS, or None.
+
+        Returns the user-facing remedy when this device is recording nothing
+        for a cause the person at the keyboard can actually fix, and ``None``
+        whenever we have not established such a cause. Today that is exactly
+        one cause: Apple Silicon without Rosetta 2.
+
+        **Why this exists.** The Rosetta fault already reached the user twice —
+        a one-shot toast, and a red tray. The toast fires once per process,
+        during the noisiest minute of a new laptop's first launch, and
+        ``clear_notifications()`` wipes it on quit; the tray persisted for the
+        whole outage and said *"ActivityWatch not responding"*, naming a
+        component the user has never heard of. So the fault was reported on a
+        surface nobody could act on and mis-labelled on the surface that lasted.
+        Carmen Lapusan lost ~90 minutes to that on 2026-08-13, after Laszlo
+        Fabian Raul's device recorded zero seconds across 2026-07-22/23. This
+        method is what lets the persistent surface carry the actionable text.
+
+        **Reads the MEMO, never the probe.** ``_rosetta_missing()`` forks
+        ``/usr/bin/arch``; this is called while building a tray message, on the
+        sync cycle, so it consults the cached answer only. The same rule the
+        tray's own ``_arch_menu_item`` and ``serial_menu_row`` carry.
+
+        **Two conditions, not one, and the second is the one that was missing.**
+        A Rosetta memo of ``True`` says these binaries cannot execute here. It
+        does NOT say this device is recording nothing — a user who installed a
+        native arm64 ActivityWatch themselves has a live server on the port and
+        a memo that will read ``True`` forever. Gating on the memo alone put
+        *"Not recording — Rosetta 2 required"* in front of someone who IS
+        recording, about a component irrelevant to whatever actually failed,
+        the moment any unrelated bucket failure escalated.
+
+        So the remedy also requires ``tracker_download_failed`` — the manager's
+        own latch for "this device captures nothing", set on the same branch of
+        ``_start_locked`` and deliberately NOT set when an external server is
+        attached. ``_managed_components_unavailable`` is the wrong flag for this
+        question: it is true on the recording-via-external device too, by
+        design, because our watchers really are unavailable there.
+
+        **"Attached" means answering ``/api/0/info``, not holding the socket.**
+        The first cut of the condition above rode on ``_port_in_use()``, a bare
+        TCP connect, so ANY process on port 5600 withheld the remedy — and a
+        Rosetta-blocked Mac holding a dead ``bf-data-service`` is precisely a
+        device with a listener and no capture, un-reapable because our binaries
+        have never run there. That returned ``None``, the tray fell back to
+        *"ActivityWatch not responding"*, and the fleet saw
+        ``tracker_download_failed=False``: the exact outage this method exists
+        to name, restored on the exact device it was written for.
+
+        **Deliberately NOT under ``_lifecycle_lock``**, unlike its sibling
+        ``health_snapshot()`` which reads the same latch under it. The caller is
+        the tray-message path, and ``force_restart()`` holds that lock across
+        process spawns — taking it here would block a UI update behind tracker
+        teardown. Both reads are single attribute loads of a bool/tri-state, so
+        there is no torn read; the worst case is a value that was true an
+        instant ago, which is all a tray message can ever claim anyway.
+
+        (Until this commit the argument was "the memo is write-once and
+        monotonic". That stopped being true when ``force_restart()`` began
+        clearing it so an installed Rosetta can be noticed without an agent
+        restart. The conclusion survives; the reason for it did not, and a stale
+        reason is worse than none.)
+
+        **Three states, not two.** The memo is ``None`` until something probed:
+
+            True  -> established: no Rosetta, these binaries cannot run
+            False -> established: Rosetta is present, this is some OTHER fault
+            None  -> nobody has asked yet
+
+        Only ``True`` earns a remedy. Treating ``None`` as ``True`` would put a
+        confident Rosetta instruction on every unrelated outage on every
+        platform, including machines that already have it — a guess, on the one
+        surface that exists to stop the user guessing. Fail toward saying
+        nothing, exactly as ``_rosetta_missing()`` itself fails toward
+        attempting the start.
+        """
+        if self._rosetta_missing_cached is not True:
+            return None
+        if not self.tracker_download_failed:
+            return None
+        return (
+            "Not recording — Rosetta 2 required. Open Terminal and run: "
+            f"{ROSETTA_INSTALL_COMMAND}"
+        )
 
     def _notify_rosetta_required_once(self) -> None:
         """Tell the user once per process. The tray state is set by the caller's
@@ -834,7 +961,7 @@ class AWManager:
             outcome = send_notification(
                 "BetterFlow can't track on this Mac",
                 "Rosetta 2 is required. Open Terminal and run: "
-                "softwareupdate --install-rosetta",
+                f"{ROSETTA_INSTALL_COMMAND}",
             )
         except Exception:
             logger.debug("Rosetta notification failed", exc_info=True)
@@ -886,17 +1013,91 @@ class AWManager:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
 
+        # Probed BEFORE the Rosetta branch below, not after it. Our managed
+        # binaries being unrunnable says nothing about whether SOMETHING is
+        # capturing on this port: a user who hit the "nothing is being tracked"
+        # wall and installed a native arm64 ActivityWatch themselves is
+        # recording perfectly well. With the probe below the branch, that device
+        # latched the capture-dead flags and never reached the external-attach
+        # path at all, so it reported itself as recording nothing while
+        # recording — and, once capture_blocked_remedy() started reading those
+        # flags, would have been told to install Rosetta over an unrelated
+        # bucket failure. The download-failure path a few lines down has always
+        # asked this question in this order; the Rosetta path did not.
+        server_already_running = self._port_in_use()
+
         # Apple Silicon without Rosetta 2 can never run these binaries. Checked
         # BEFORE spawning rather than after 21 identical EBADARCH failures, and
         # reported rather than retried, because no amount of retrying installs
         # Rosetta. See _rosetta_missing().
         if self._rosetta_missing():
-            self.tracker_download_failed = True
+            # Managed watchers are unavailable either way — these binaries do
+            # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
+            # `server_already_running` is a TCP connect, and a held socket is
+            # NOT a running tracker. Here — and ONLY here — that distinction
+            # decides whether the user is told anything at all, so this branch
+            # pays for one HTTP ask before granting the carve-out.
+            #
+            # Why this branch and not the download-failure one below: the other
+            # paths use the port answer to decide whether to START something,
+            # and a hung-but-listening server there is recoverable — the
+            # unreachable watchdog escalates to force_restart(), which reaps the
+            # orphan and rebuilds (that is what its docstring describes). On a
+            # Rosetta-missing Mac there is no such recovery: _reap_orphan_
+            # processes is path-scoped to binaries_dir, and OUR binaries have
+            # never executed on this machine, so the listener is un-reapable by
+            # construction. The only decision left on this branch is what to
+            # TELL the person, and getting that wrong cost ~90 minutes once.
+            #
+            # Failing this way is also the safe direction: a false "responding"
+            # withholds the remedy (the regression below), while a false "not
+            # responding" merely offers a Rosetta instruction to a device that
+            # is, in fact, running an ARM ActivityWatch which just failed to
+            # answer /info within 2s — visible, wrong for one cycle, and it
+            # self-corrects on the next probe.
+            if server_already_running and self._server_responding():
+                # ...but an external server IS capturing on this port, so this
+                # is not a "capturing nothing" device. Verbatim the rule the
+                # download-failure branch below already applies: attach, log,
+                # and do NOT latch the capture-dead flag or alarm the user.
+                # Telling this person to install Rosetta would name a component
+                # irrelevant to whatever actually went wrong.
+                logger.warning(
+                    "Managed trackers cannot run (no Rosetta 2), but an external "
+                    "server is running on port %s — attaching to it",
+                    self.aw_port,
+                )
+                self._using_external = True
+                # CLEAR the latch, do not merely decline to set it. This branch
+                # returns before the "binaries resolved" clear forty lines down,
+                # so on a Rosetta-missing Mac nothing else ever unsets it — and
+                # a single /info timeout on a healthy external server would
+                # otherwise latch "captures nothing" for the life of the
+                # process, putting a permanent "install Rosetta" in front of
+                # someone who IS recording and reporting a false capture-dead
+                # device to the fleet. Found by walking three cycles with one
+                # transient blip in them, not by reading.
+                #
+                # Safe because of what this branch has just established: a
+                # server ANSWERED /api/0/info on our port. That is the same
+                # evidence the flag's own name asks for, so clearing it here is
+                # the flag being accurate rather than an optimistic reset.
+                self.tracker_download_failed = False
+                return True
+            if server_already_running:
+                # Held, but dead. Worth its own line: this device looks
+                # "started" to every port-level check in the file while
+                # capturing nothing, and nothing here can reap the listener.
+                logger.warning(
+                    "Managed trackers cannot run (no Rosetta 2) and the process "
+                    "holding port %s does not answer /api/0/info — treating this "
+                    "device as capturing nothing",
+                    self.aw_port,
+                )
+            self.tracker_download_failed = True
             self._notify_rosetta_required_once()
             return False
-
-        server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
 
@@ -1105,6 +1306,43 @@ class AWManager:
             # Drop external attachment so _start_locked starts our own server
             # if the port is now free after the reap.
             self._using_external = False
+            # Re-probe Rosetta on the way back up. The memo is otherwise written
+            # once per process and cleared nowhere, so a user who read the tray,
+            # ran `softwareupdate --install-rosetta` and watched it finish still
+            # saw "Not recording — Rosetta 2 required" until they thought to
+            # quit and relaunch the agent — and nothing on any surface asked
+            # them to. That is the dead end tray.py's capture_permissions_row()
+            # already names in its own docstring: for a surface whose whole job
+            # is "did my fix work?", still saying "blocked" afterwards is the
+            # failure, not a cosmetic lag.
+            #
+            # Here rather than on a timer because this is the one path that
+            # already exists to rebuild a stack believed dead, and it is exactly
+            # where a device in this state arrives: capture is gone, so the
+            # unreachable watchdog escalates and calls force_restart on every
+            # cycle. Clearing the memo makes the very next start attempt real,
+            # the trackers spawn, and the tray goes green on its own.
+            #
+            # Rate-limited, and that is not tidiness. _note_aw_unreachable
+            # returns True on EVERY cycle once the 180s grace period is up (only
+            # a reachable ActivityWatch resets it), so a device that is capturing
+            # nothing force-restarts every 60 seconds for as long as the outage
+            # lasts — which on a Rosetta-missing Mac is indefinitely. Clearing
+            # unconditionally would therefore fork `/usr/bin/arch` once a minute
+            # on exactly the machine this memo was introduced to protect, which
+            # is the "21 identical failures at 60-second intervals" pattern the
+            # preflight replaced, wearing a different hat.
+            #
+            # ROSETTA_REPROBE_INTERVAL bounds it to one fork per five minutes,
+            # so the user who runs the command waits at most that long for the
+            # tray to go green — a loop that closes slowly still closes, and an
+            # unbounded fork rate on a broken device does not.
+            #
+            # A probe that fails still fails toward "available" (see
+            # _rosetta_missing), so the worst case is one spawn attempt the
+            # EBADARCH handler already covers.
+            if time.monotonic() - self._rosetta_probed_at >= ROSETTA_REPROBE_INTERVAL:
+                self._rosetta_missing_cached = None
             return self._start_locked()
 
     def restart_idle_tracker(self, reason: str = "") -> None:
@@ -1636,9 +1874,31 @@ class AWManager:
             logger.error(f"Failed to start {name}: {e}")
             return False
 
+    def _server_responding(self) -> bool:
+        """True only if a tracker server ANSWERS ``/api/0/info`` on our port.
+
+        The single HTTP ask that ``_wait_for_server`` polls, lifted out so the
+        two callers cannot drift. This is the difference between *something
+        holds the socket* and *a tracker server is up*, and those are not the
+        same question — ``_port_in_use()`` answers the first and is routinely
+        read as the second. ``force_restart()``'s own docstring names the gap:
+        a ``bf-data-service`` that still holds port 5600 and no longer answers
+        HTTP is exactly what it exists to reclaim.
+
+        One request, one 2s timeout, no retry loop: callers that need to WAIT
+        for a boot own the deadline (``_wait_for_server``); callers deciding
+        what is true right now do not.
+        """
+        url = f"http://localhost:{self.aw_port}/api/0/info"
+        try:
+            req = urllib.request.urlopen(url, timeout=2)
+            req.close()
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
     def _wait_for_server(self) -> bool:
         """Wait for tracker server to accept connections."""
-        url = f"http://localhost:{self.aw_port}/api/0/info"
         deadline = time.monotonic() + STARTUP_TIMEOUT
 
         while time.monotonic() < deadline:
@@ -1651,19 +1911,21 @@ class AWManager:
                 )
                 return False
 
-            try:
-                req = urllib.request.urlopen(url, timeout=2)
-                req.close()
+            if self._server_responding():
                 logger.info("Tracker server is ready")
                 return True
-            except (urllib.error.URLError, OSError):
-                time.sleep(0.5)
+            time.sleep(0.5)
 
         logger.error(f"Tracker server not ready after {STARTUP_TIMEOUT}s")
         return False
 
     def _port_in_use(self) -> bool:
-        """Check if something is listening on the tracker port."""
+        """Check if something is listening on the tracker port.
+
+        A bare TCP connect. It proves the socket is held; it does NOT prove a
+        tracker is capturing there — see ``_server_responding()`` for that
+        question, and do not use this one to answer it.
+        """
         import socket
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
