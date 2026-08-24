@@ -144,6 +144,11 @@ class SystemEventHandler:
             return
         if self.coordinator.is_on_break:
             logger.info("System wake - staying on break")
+            # Second reason to stay paused, same stale sentence as the branch
+            # above. PAUSED is re-asserted rather than ON_BREAK because the
+            # state is not this handler's to change — it only has to stop the
+            # tray claiming a cause that has ended.
+            self.tray.set_state(TrayState.PAUSED)
             return
         # Private Time is intentionally NOT auto-restored: it was ended at the
         # sleep boundary (on_system_sleep), so a sleep cleanly ends a private
@@ -203,6 +208,11 @@ class SystemEventHandler:
             return
         if self.coordinator.is_on_break:
             logger.info("Screen unlocked - staying on break")
+            # Second reason to stay paused, same stale sentence as the branch
+            # above. PAUSED is re-asserted rather than ON_BREAK because the
+            # state is not this handler's to change — it only has to stop the
+            # tray claiming a cause that has ended.
+            self.tray.set_state(TrayState.PAUSED)
             return
         if pre_lock_private:
             logger.info("Screen unlocked - restoring private time")

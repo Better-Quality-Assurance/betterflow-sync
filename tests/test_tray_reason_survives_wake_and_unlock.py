@@ -57,13 +57,13 @@ def _make_handler(tray: TrayIcon) -> SystemEventHandler:
     )
 
 
-@pytest.mark.parametrize(
-    "down,up,sentence",
-    [
-        ("on_system_sleep", "on_system_wake", "Sleeping"),
-        ("on_screen_lock", "on_screen_unlock", "Screen locked"),
-    ],
-)
+_RESUME_PATHS = [
+    ("on_system_sleep", "on_system_wake", "Sleeping"),
+    ("on_screen_lock", "on_screen_unlock", "Screen locked"),
+]
+
+
+@pytest.mark.parametrize("down,up,sentence", _RESUME_PATHS)
 def test_the_resume_path_stops_reporting_the_cause_that_ended(down, up, sentence):
     """The user had paused manually, so both handlers take the early return that
     keeps the agent paused. The state is right; the SENTENCE is stale."""
@@ -80,4 +80,34 @@ def test_the_resume_path_stops_reporting_the_cause_that_ended(down, up, sentence
     assert tray.model.state is TrayState.PAUSED, "still paused — only the reason ended"
     assert tray._get_status_text() == "Paused", (
         f"the tray still says {sentence!r} after {up}"
+    )
+
+
+@pytest.mark.parametrize("down,up,sentence", _RESUME_PATHS)
+def test_the_same_holds_when_a_BREAK_is_what_keeps_it_paused(down, up, sentence):
+    """The second early return on each resume path, found by walking the class
+    rather than the reported instance.
+
+    Both handlers have TWO reasons to stay paused: a manual pause and an active
+    break. The first was fixed because it was the one under the microscope; this
+    branch sits two lines below it, reached whenever someone's laptop sleeps or
+    locks during a break, and it had exactly the same stale sentence.
+
+    Note ``tray.model.on_break`` stays False here on purpose. ``_get_status_text``
+    checks that FLAG before the state, so a tray that already knows it is on a
+    break renders "On Break (Nm left)" and hides the defect. The failing case is
+    the coordinator knowing about the break while the tray's flag does not —
+    which is precisely the state these handlers are called in.
+    """
+    tray = _make_tray()
+    handler = _make_handler(tray)
+    handler.coordinator.is_on_break = True
+
+    getattr(handler, down)()
+    assert tray._get_status_text() == sentence, "precondition: the cause is on screen"
+
+    getattr(handler, up)()
+
+    assert tray._get_status_text() == "Paused", (
+        f"the tray still says {sentence!r} after {up} during a break"
     )
