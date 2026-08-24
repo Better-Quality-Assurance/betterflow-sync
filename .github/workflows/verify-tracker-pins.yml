@@ -1,6 +1,6 @@
 name: Verify Tracker Asset Pins
 
-# The RELEASE_SHA256 pins in src/aw_manager.py are hand-computed literals, and
+# The RELEASE_SHA256 pins in src/aw_release.py are hand-computed literals, and
 # tests/test_aw_manager_asset_integrity.py only cross-checks them against a
 # second copy of the same literals — so a wrong value passes the unit suite and
 # fails closed on the fleet instead (no trackers installed, zero capture).
@@ -14,7 +14,12 @@ on:
   workflow_dispatch:
   push:
     paths:
+      # src/aw_release.py is where the pins live. aw_manager.py is kept because
+      # it re-exports them and is where a stray second copy would most likely
+      # reappear — the drift this layout exists to prevent.
+      - "src/aw_release.py"
       - "src/aw_manager.py"
+      - "scripts/download_aw.py"
       - "tests/test_aw_manager_asset_integrity.py"
       - "scripts/verify_tracker_pins.py"
       - ".github/workflows/verify-tracker-pins.yml"
@@ -38,10 +43,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # platformdirs is the only third-party import src/aw_manager.py pulls in at
-      # module level; the verifier needs nothing else from requirements.txt.
-      - name: Install the one import the constants need
-        run: pip install platformdirs
+      # src/aw_release.py is deliberately dependency-free, so the verifier now
+      # needs nothing installed at all. It used to import the constants through
+      # src/aw_manager.py, which drags in platformdirs at module level.
 
       - name: Fetch upstream archives and compare against the pins
         run: python scripts/verify_tracker_pins.py

@@ -44,42 +44,35 @@ ALL_COMPONENTS = [BF_SERVER] + BF_WATCHERS
 # tracker runs but stays blind. See _should_reinstall_trackers.
 BETTERQA_TEAM_ID = "87NVC57J44"
 
-AW_VERSION = "v0.13.2"
-RELEASE_BASE = (
-    f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
-)
-RELEASE_ASSETS = {
-    "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
-    "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
-    "linux": f"activitywatch-{AW_VERSION}-linux-x86_64.zip",
-}
+# The pinned upstream release lives in ONE place (src/aw_release.py) and is
+# re-exported here. These names stay module-level attributes of aw_manager on
+# purpose: callers and tests reach them as `aw_manager.RELEASE_SHA256` and patch
+# them with `patch.object`, which only works on a real module global.
+try:
+    from .machine_arch import macho_arches
+except ImportError:  # pragma: no cover - frozen/script import path
+    from machine_arch import macho_arches
 
-# SHA-256 of the vetted RELEASE_ASSETS archives above. GitHub release assets on
-# a pinned tag are mutable by the upstream account, so the version pin alone is
-# not an integrity guarantee — a compromised ActivityWatch account could swap
-# the binaries under the same tag. The download is verified against these
-# hashes before extraction (fail closed on mismatch). MUST be recomputed on
-# every AW_VERSION bump (shasum -a 256 on the freshly-vetted zips).
-#
-# Provenance: computed 2026-07-08 from the upstream v0.13.2 release assets when
-# the pins were introduced. These literals are NOT self-verifying — the unit
-# test only compares them to a second hand-copied record, so a wrong value
-# passes tests and instead fails closed on the fleet (no trackers installed).
-# scripts/verify_tracker_pins.py fetches the real archives and checks the
-# digests; it runs nightly via .github/workflows/verify-tracker-pins.yml and on
-# any change to this file. Run it locally after every AW_VERSION bump.
-RELEASE_SHA256 = {
-    "darwin": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",
-    "windows": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
-    "linux": "8f62b10babf8a8f108cbdf7267c02fbc1ce2a970fa9535f230b3416b803e3360",
-}
-
-# Mapping from original AW names to our branded names (used during download/extract)
-AW_TO_BF_NAMES = {
-    "aw-server-rust": "bf-data-service",
-    "aw-watcher-window": "bf-window-tracker",
-    "aw-watcher-afk": "bf-idle-tracker",
-}
+try:
+    from .aw_release import (  # noqa: F401
+        AW_TO_BF_NAMES,
+        AW_VERSION,
+        RELEASE_ASSETS,
+        RELEASE_BASE,
+        RELEASE_SHA256,
+        asset_key,
+        platform_key,
+    )
+except ImportError:  # pragma: no cover - frozen/script import path
+    from aw_release import (  # noqa: F401
+        AW_TO_BF_NAMES,
+        AW_VERSION,
+        RELEASE_ASSETS,
+        RELEASE_BASE,
+        RELEASE_SHA256,
+        asset_key,
+        platform_key,
+    )
 
 STARTUP_TIMEOUT = 10  # seconds to wait for server to be ready
 SHUTDOWN_TIMEOUT = 5  # seconds before force-killing
@@ -179,12 +172,13 @@ DOWNLOAD_RETRY_MAX_INTERVAL = 3600  # 1 hour
 
 
 def _get_platform_key() -> str:
-    system = platform.system()
-    if system == "Darwin":
-        return "darwin"
-    if system == "Windows":
-        return "windows"
-    return "linux"
+    """The on-disk tracker directory name. Delegates to the one definition.
+
+    Note this is the DIRECTORY key, not the download key: a build ships exactly
+    one architecture, so the layout under `resources/trackers/` stays per-OS.
+    Use `asset_key()` to choose which archive to fetch.
+    """
+    return platform_key()
 
 
 def _app_support_base() -> str:
@@ -290,7 +284,11 @@ def _terminate_pid(pid: int, grace: float = SHUTDOWN_TIMEOUT) -> None:
 
 def _download_aw_binaries(install_dir: str) -> bool:
     """Download and extract tracker binaries to install_dir. Returns True on success."""
-    plat = _get_platform_key()
+    # The DOWNLOAD key carries an architecture on macOS; the install directory
+    # below does not. Keeping them separate is what lets a native arm64 install
+    # and an Intel one share the same on-disk layout while fetching different
+    # archives.
+    plat = asset_key()
     asset = RELEASE_ASSETS.get(plat)
     if not asset:
         logger.error(f"No release available for platform: {plat}")
@@ -789,8 +787,83 @@ class AWManager:
         except Exception:
             logger.warning("Failed to notify about tracker download failure", exc_info=True)
 
+    def _bundled_trackers_need_rosetta(self) -> bool:
+        """True when the trackers ON THIS MACHINE cannot run natively here.
+
+        Reads the Mach-O header of the tracker we are actually going to spawn.
+        That is the artifact whose requirement decides the question — not the
+        pinned asset name, which describes what a *fresh* install would fetch
+        and says nothing about the copy already sitting at the persistent path.
+
+        Fails toward **False** (do not block) whenever the answer is not
+        established: no binaries resolved yet on a first run, an unreadable
+        header, a path that does not exist. That direction is deliberate and
+        matches `_rosetta_missing`'s own broken-probe behaviour — a start
+        attempt that turns out to be wrong still hits the EBADARCH handler in
+        `_start_component`, whereas a false block records nothing at all and is
+        the exact harm this whole area exists to prevent.
+        """
+        binaries_dir = self._get_binaries_dir()
+        if not binaries_dir:
+            # First run, nothing downloaded yet. The download picks the archive
+            # matching this host (see aw_release.asset_key), so there is no
+            # reason to assume the wrong architecture is coming.
+            return False
+
+        host = platform.machine()
+        for name in ALL_COMPONENTS:
+            arches = macho_arches(os.path.join(binaries_dir, name, name))
+            if not arches:
+                continue  # could not tell — not evidence of a mismatch
+            # The first READABLE tracker settles it: all three come out of one
+            # archive, so they share an architecture. If it runs natively these
+            # are not the x86-only set, and anything still failing is a
+            # different fault that must not be reported as a Rosetta problem.
+            return host not in arches
+            return True
+        # Nothing readable. Not established, so do not block.
+        return False
+
+    def _rosetta_required(self) -> bool:
+        """True when capture is blocked for want of Rosetta 2 — the real gate.
+
+        Two independent questions, and conflating them is the defect this
+        method exists to fix (#216):
+
+            does the BINARY need Rosetta?   _bundled_trackers_need_rosetta()
+            does the HOST lack Rosetta?     _rosetta_missing()
+
+        Only both together block capture. The predicate used to ask the second
+        alone, which was correct exactly while every bundled macOS tracker was
+        x86_64 — true from day one until the ActivityWatch pin moved to
+        v0.14.0b4. From that moment the host question is the wrong one: a clean
+        Apple Silicon Mac with no Rosetta still answers "missing", and native
+        arm64 trackers that would run perfectly well would never be spawned.
+        Shipping native binaries and keeping this gate would have left Rosetta
+        just as mandatory as before, with nothing in any test to say so.
+
+        Order matters for cost as well as correctness. The binary check reads a
+        few bytes of a local file; `_rosetta_missing()` forks `/usr/bin/arch`.
+        Asking the cheap, decisive question first means a native install never
+        pays for the fork at all, on a path that runs every 60 seconds — and it
+        leaves `_rosetta_missing_cached` as `None` there, so
+        `capture_blocked_remedy()` correctly offers no Rosetta instruction on a
+        machine that does not need one.
+        """
+        if sys.platform != "darwin":
+            return False
+        if not self._bundled_trackers_need_rosetta():
+            return False
+        return self._rosetta_missing()
+
     def _rosetta_missing(self) -> bool:
         """True only when this Mac is Apple Silicon AND cannot run x86_64.
+
+        **This is the HOST question only.** It answers "can this machine
+        execute x86_64 code", which stopped being sufficient on its own once
+        the bundled trackers became native arm64. `_rosetta_required()` is the
+        gate; this is one of its two inputs. Calling it directly to decide
+        whether capture is blocked is the bug described in #216.
 
         RELEASE_ASSETS is x86_64 on every platform because upstream
         ActivityWatch publishes nothing else for macOS: v0.13.2 has only
@@ -1026,11 +1099,12 @@ class AWManager:
         # asked this question in this order; the Rosetta path did not.
         server_already_running = self._port_in_use()
 
-        # Apple Silicon without Rosetta 2 can never run these binaries. Checked
-        # BEFORE spawning rather than after 21 identical EBADARCH failures, and
-        # reported rather than retried, because no amount of retrying installs
-        # Rosetta. See _rosetta_missing().
-        if self._rosetta_missing():
+        # Trackers this machine cannot execute. Checked BEFORE spawning rather
+        # than after 21 identical EBADARCH failures, and reported rather than
+        # retried, because no amount of retrying installs Rosetta.
+        # See _rosetta_required() — and note it asks what the BUNDLED BINARIES
+        # need, not merely what this host supports.
+        if self._rosetta_required():
             # Managed watchers are unavailable either way — these binaries do
             # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
@@ -2157,19 +2231,15 @@ class AWManager:
             # then survives every future update instead of breaking on each one.
             if getattr(sys, "frozen", False):
                 base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
-                if (
-                    os.path.isdir(base)
-                    and _binaries_present(base)
-                    and self._should_reinstall_trackers(install_dir, base)
-                ):
-                    logger.warning(
-                        "Persistent bf-idle-tracker is ad-hoc/mis-signed while the "
-                        "bundled copy is Developer-ID signed (Team %s) — reinstalling "
-                        "so its Input Monitoring grant is stable. Re-grant Input "
-                        "Monitoring for bf-idle-tracker once after this update.",
-                        BETTERQA_TEAM_ID,
-                    )
-                    self._install_to_persistent(base, install_dir)
+                if os.path.isdir(base) and _binaries_present(base):
+                    # Log the reason the check actually found, not a fixed
+                    # sentence: an architecture reinstall and a signing
+                    # reinstall are different faults with different follow-up
+                    # for the user, and only one of them costs them a re-grant.
+                    reason = self._tracker_reinstall_reason(install_dir, base)
+                    if reason:
+                        logger.warning("Reinstalling bundled trackers: %s.", reason)
+                        self._install_to_persistent(base, install_dir)
             return install_dir
 
         # Development: relative to project root (already has permissions)
@@ -2218,7 +2288,74 @@ class AWManager:
         return None
 
     @classmethod
+    def _tracker_reinstall_reason(cls, install_dir: str, bundle_dir: str) -> Optional[str]:
+        """Why the persistent trackers must be replaced, or None to keep them.
+
+        Returns a short sentence for the log rather than a bool, because the
+        two reasons need different words and #213 was written after a surface
+        confidently named the wrong cause for 90 minutes. A caller that logs one
+        fixed message for every reinstall repeats that mistake one layer down.
+
+        **Architecture is checked first and is the more severe of the two.** A
+        mis-signed tracker runs but goes blind; a wrong-architecture tracker
+        does not start at all, so capture is dead rather than degraded.
+
+        This is the upgrade path for #216 and without it the ActivityWatch bump
+        would help nobody who already has BetterFlow. `_install_to_persistent`
+        copies the bundle's trackers to a stable path once, deliberately, so the
+        Accessibility grant survives updates — which also means an existing
+        Apple Silicon install keeps the x86_64 trackers it first installed, even
+        after updating to a build whose bundle is native arm64. Both copies are
+        signed with our team, so the signing check below sees nothing wrong and
+        the machine would need Rosetta forever.
+        """
+        idle = IDLE_TRACKER
+        installed_bin = os.path.join(install_dir, idle, idle)
+        bundled_bin = os.path.join(bundle_dir, idle, idle)
+
+        installed_arches = macho_arches(installed_bin)
+        bundled_arches = macho_arches(bundled_bin)
+        host = platform.machine()
+        # Every clause is required, and each one fails toward KEEPING the
+        # installed copy — the conservative direction, since a needless
+        # reinstall costs the user a fresh Input Monitoring grant.
+        #   - both sets non-empty: an unreadable header means "could not tell",
+        #     never "wrong arch" (see macho_arches).
+        #   - host not in installed: the copy on disk genuinely cannot run here.
+        #   - host in bundled: and the replacement genuinely can. Without this a
+        #     build whose bundle is equally unrunnable would churn the binary
+        #     and change nothing, the same trap the signing check avoids by
+        #     refusing to swap ad-hoc for ad-hoc.
+        if (
+            installed_arches
+            and bundled_arches
+            and host not in installed_arches
+            and host in bundled_arches
+        ):
+            return (
+                f"installed {idle} is {'/'.join(sorted(installed_arches))} and cannot run "
+                f"natively on this {host} Mac, while the bundled copy is "
+                f"{'/'.join(sorted(bundled_arches))} — reinstalling so capture no longer "
+                "depends on Rosetta 2"
+            )
+
+        if cls._should_reinstall_for_signing(install_dir, bundle_dir):
+            return (
+                f"persistent {idle} is ad-hoc/mis-signed while the bundled copy is "
+                f"Developer-ID signed (Team {BETTERQA_TEAM_ID}) — reinstalling so its "
+                "Input Monitoring grant is stable. Re-grant Input Monitoring for "
+                f"{idle} once after this update"
+            )
+
+        return None
+
+    @classmethod
     def _should_reinstall_trackers(cls, install_dir: str, bundle_dir: str) -> bool:
+        """Bool form of `_tracker_reinstall_reason`, kept for callers/tests."""
+        return cls._tracker_reinstall_reason(install_dir, bundle_dir) is not None
+
+    @classmethod
+    def _should_reinstall_for_signing(cls, install_dir: str, bundle_dir: str) -> bool:
         """True when the installed bf-idle-tracker is NOT signed with our
         Developer ID team but the bundled one IS.
 

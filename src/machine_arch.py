@@ -21,6 +21,7 @@ same spirit as ``release_version.py``.
 
 import logging
 import platform
+import struct
 import subprocess
 import threading
 import time
@@ -507,3 +508,103 @@ def process_arch(
             deliberately not consulted. See the note above.
     """
     return machine or platform.machine()
+
+
+# ---------------------------------------------------------------------------
+# What a BINARY needs, as opposed to what the host provides.
+# ---------------------------------------------------------------------------
+#
+# Everything above answers "what is this machine?". The Rosetta question needs
+# the other half: "what does the thing I am about to spawn require?" Asking only
+# the host is what made the preflight wrong the moment the bundled trackers
+# became native — see aw_manager._rosetta_required().
+
+# Mach-O header magics. A thin object stores its magic in the host's byte order;
+# a universal ("fat") archive is big-endian by definition.
+_MH_MAGIC_64 = 0xFEEDFACF
+_MH_CIGAM_64 = 0xCFFAEDFE
+_MH_MAGIC_32 = 0xFEEDFACE
+_MH_CIGAM_32 = 0xCEFAEDFE
+_FAT_MAGIC = 0xCAFEBABE
+_FAT_MAGIC_64 = 0xCAFEBABF
+
+# cputype values, from <mach/machine.h>. The 0x01000000 bit is CPU_ARCH_ABI64.
+_CPU_TYPE_X86_64 = 0x01000007
+_CPU_TYPE_ARM64 = 0x0100000C
+
+_CPU_TYPE_NAMES = {
+    _CPU_TYPE_X86_64: X86_64,
+    _CPU_TYPE_ARM64: ARM64,
+}
+
+# A universal binary's header is 8 bytes plus 20 per slice. Real ones carry two
+# or three; the cap is only so a corrupt or hostile nfat_arch cannot make us
+# read megabytes looking for slices that are not there.
+_MAX_FAT_SLICES = 32
+
+
+def macho_arches(path: str) -> set:
+    """The architectures a Mach-O file can execute as.
+
+    Returns ``{"arm64"}``, ``{"x86_64"}``, both for a universal binary, or an
+    **empty set when the file could not be read as Mach-O at all** — missing,
+    unreadable, truncated, or not a Mach-O in the first place.
+
+    The empty set means "could not tell", never "no architectures", and callers
+    must not read it as evidence either way. `aw_manager._rosetta_required()`
+    treats it as "do not block", which keeps a broken read from refusing to
+    start trackers on a machine that is fine — the same direction the Rosetta
+    probe itself fails, and the EBADARCH handler in `_start_component` still
+    catches a genuine mismatch at spawn time.
+
+    Reads at most a few hundred bytes of header. This sits on the tracker start
+    path, which runs every 60 seconds.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+            if len(head) < 8:
+                return set()
+
+            (magic_be,) = struct.unpack(">I", head[:4])
+
+            if magic_be in (_FAT_MAGIC, _FAT_MAGIC_64):
+                # Universal archive: big-endian count, then one 20-byte
+                # fat_arch per slice whose first field is the cputype. The
+                # 64-bit variant widens later fields, not the leading cputype,
+                # so reading only that field is correct for both.
+                (nfat,) = struct.unpack(">I", head[4:8])
+                if nfat > _MAX_FAT_SLICES:
+                    logger.debug(f"{path}: implausible fat slice count {nfat}, ignoring")
+                    return set()
+                stride = 32 if magic_be == _FAT_MAGIC_64 else 20
+                table = fh.read(stride * nfat)
+                arches = set()
+                for i in range(nfat):
+                    chunk = table[i * stride : i * stride + 4]
+                    if len(chunk) < 4:
+                        break
+                    (cputype,) = struct.unpack(">I", chunk)
+                    name = _CPU_TYPE_NAMES.get(cputype)
+                    if name:
+                        arches.add(name)
+                return arches
+
+            # Thin object. The magic tells us the byte order the cputype that
+            # follows is written in; MH_CIGAM_* is the byte-swapped spelling.
+            (magic_le,) = struct.unpack("<I", head[:4])
+            if magic_le in (_MH_MAGIC_64, _MH_MAGIC_32):
+                (cputype,) = struct.unpack("<I", head[4:8])
+            elif magic_le in (_MH_CIGAM_64, _MH_CIGAM_32):
+                (cputype,) = struct.unpack(">I", head[4:8])
+            else:
+                return set()
+
+            name = _CPU_TYPE_NAMES.get(cputype)
+            return {name} if name else set()
+    except OSError as exc:
+        logger.debug(f"Could not read Mach-O header of {path}: {exc}")
+        return set()
+    except struct.error as exc:
+        logger.debug(f"Malformed Mach-O header in {path}: {exc}")
+        return set()

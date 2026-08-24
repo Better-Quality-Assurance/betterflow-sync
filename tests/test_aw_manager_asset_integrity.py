@@ -34,6 +34,16 @@ VETTED_HASHES = {
         "windows": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
         "linux": "8f62b10babf8a8f108cbdf7267c02fbc1ce2a970fa9535f230b3416b803e3360",
     },
+    # v0.14.0b4 is the first pin with a per-architecture macOS key, because it
+    # is the first release that publishes both. That is the whole point of the
+    # bump (#216): the arm64 archive is what lets Apple Silicon run the
+    # trackers natively instead of through Rosetta 2.
+    "v0.14.0b4": {
+        "darwin-arm64": "98a142c47aadc3873cf3e6f4e71c28c4897a4b48868e4586ed08680c23f06584",
+        "darwin-x86_64": "090b91b269b2d18049c44b4d10f9142bcd7c72269b199a570665927d5521f665",
+        "windows": "c7acb66d5824aeeef17e0c941efd1f0dbaf216e112260972efa21cff40c25832",
+        "linux": "5f608c7c1a717e98b9e46738a0d6aca2906b73d70271fc9882bbabb9aebbbf76",
+    },
 }
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

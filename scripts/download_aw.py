@@ -5,6 +5,7 @@ import platform
 import shutil
 import ssl
 import stat
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -12,45 +13,52 @@ import urllib.error
 import urllib.request
 import zipfile
 
-AW_VERSION = "v0.13.2"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Original AW binary names (what's in the zip) -> branded names
-AW_TO_BF_NAMES = {
-    "aw-server-rust": "bf-data-service",
-    "aw-watcher-window": "bf-window-tracker",
-    "aw-watcher-afk": "bf-idle-tracker",
-}
+# The pin lives in src/aw_release.py and NOWHERE else. This script used to
+# carry its own AW_VERSION and RELEASE_ASSETS, which nothing compared against
+# the runtime copy — and this script is what build.yml uses to fetch the
+# binaries we ship, so a drift meant the build downloading one version while
+# the agent verified the digests of another, with the nightly pin guard green.
+sys.path.insert(0, PROJECT_ROOT)
+from src.machine_arch import ARM64, X86_64, macho_arches  # noqa: E402
+from src.aw_release import (  # noqa: E402
+    AW_TO_BF_NAMES,
+    AW_VERSION,
+    RELEASE_ASSETS,
+    RELEASE_BASE,
+    RELEASE_SHA256,
+    asset_key,
+    platform_key,
+)
 
 # Branded names (what we check for on disk)
 BF_BINARIES = list(AW_TO_BF_NAMES.values())
 
-# GitHub release URLs
-RELEASE_BASE = (
-    f"https://github.com/ActivityWatch/activitywatch/releases/download/{AW_VERSION}"
-)
-RELEASE_ASSETS = {
-    "darwin": f"activitywatch-{AW_VERSION}-macos-x86_64.zip",
-    "windows": f"activitywatch-{AW_VERSION}-windows-x86_64.zip",
-    "linux": f"activitywatch-{AW_VERSION}-linux-x86_64.zip",
-}
-
 # Output directory relative to project root
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_BASE = os.path.join(PROJECT_ROOT, "resources", "trackers")
 
 
 def get_platform() -> str:
-    """Get current platform key."""
-    system = platform.system()
-    if system == "Darwin":
-        return "darwin"
-    elif system == "Windows":
-        return "windows"
-    elif system == "Linux":
-        return "linux"
-    else:
-        print(f"Unsupported platform: {system}")
-        sys.exit(1)
+    """The on-disk tracker directory key. Delegates to the one definition."""
+    return platform_key()
+
+
+def get_asset_key() -> str:
+    """Which archive THIS BUILD needs.
+
+    Honours `TARGET_ARCH`, which `.github/workflows/build.yml` already sets per
+    matrix leg, because a cross-architecture build must fetch the trackers of
+    the architecture it is BUILDING FOR, not of the runner executing it. The
+    macOS x86_64 leg runs on `macos-14-large`; without this it would bundle
+    whatever the runner happens to be and ship a DMG whose trackers do not match
+    its own binaries.
+
+    Falls back to this host's architecture for local builds, where the two are
+    the same thing.
+    """
+    target = os.environ.get("TARGET_ARCH", "").strip()
+    return asset_key(machine=target or None)
 
 
 def get_output_dir(plat: str) -> str:
@@ -83,6 +91,32 @@ def resolve_binary_path(output_dir: str, name: str, plat: str) -> str | None:
         return bundled
 
     return None
+
+
+def arch_mismatch(output_dir: str, plat: str, key: str) -> bool:
+    """True when the trackers on disk are not the architecture we are building.
+
+    macOS only: it is the sole platform where we publish two architectures into
+    one per-OS directory, so it is the only one where a leftover tree can be
+    complete, correctly named, and still wrong. Returns False whenever the
+    header cannot be read, which re-downloads nothing on the strength of a
+    failed probe.
+    """
+    if plat != "darwin":
+        return False
+    wanted = ARM64 if key.endswith(ARM64) else X86_64
+    for name in BF_BINARIES:
+        path = resolve_binary_path(output_dir, name, plat)
+        if not path:
+            continue
+        arches = macho_arches(path)
+        if arches and wanted not in arches:
+            print(
+                f"  {name} on disk is {'/'.join(sorted(arches))}, need {wanted} "
+                "— re-downloading"
+            )
+            return True
+    return False
 
 
 def build_ssl_context() -> ssl.SSLContext:
@@ -120,9 +154,34 @@ def build_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def download_release(plat: str) -> str:
+def verify_digest(zip_path: str, key: str) -> None:
+    """Fail CLOSED if the archive does not match its pinned SHA-256.
+
+    The runtime download path in src/aw_manager.py has always done this; this
+    script — which fetches the binaries we actually SHIP — did not, so the
+    build was the unverified half of a pair whose whole point is that upstream
+    release assets are mutable under a pinned tag.
+    """
+    expected = RELEASE_SHA256.get(key)
+    if not expected:
+        print(f"ERROR: no pinned SHA-256 for {key}; refusing to bundle unverified binaries")
+        sys.exit(1)
+    hasher = hashlib.sha256()
+    with open(zip_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    actual = hasher.hexdigest()
+    if actual != expected:
+        print(f"ERROR: SHA-256 mismatch for {RELEASE_ASSETS[key]}")
+        print(f"  expected: {expected}")
+        print(f"  actual:   {actual}")
+        sys.exit(1)
+    print(f"  digest OK ({actual[:12]}...)")
+
+
+def download_release(key: str) -> str:
     """Download release zip to a temp file. Returns path to zip."""
-    asset = RELEASE_ASSETS[plat]
+    asset = RELEASE_ASSETS[key]
     url = f"{RELEASE_BASE}/{asset}"
     print(f"Downloading {url} ...")
 
@@ -223,21 +282,29 @@ def fix_permissions(output_dir: str, plat: str) -> None:
 
 
 def main() -> None:
-    """Download tracker binaries for the current platform."""
+    """Download tracker binaries for the platform/architecture being built."""
     plat = get_platform()
+    key = get_asset_key()
     output_dir = get_output_dir(plat)
 
-    print(f"BetterFlow Tracker Components {AW_VERSION} — platform: {plat}")
+    print(f"BetterFlow Tracker Components {AW_VERSION} — platform: {plat} ({key})")
     print(f"Output: {output_dir}")
     print()
 
-    if binaries_exist(output_dir, plat):
+    # "Already present" must also mean "present for the RIGHT architecture".
+    # The output directory is per-OS, so a tree left by a previous build of the
+    # other macOS architecture satisfies a name-only check and would be bundled
+    # unchanged — shipping x86_64 trackers inside an arm64 DMG, which is the
+    # #216 bug reintroduced at build time.
+    if binaries_exist(output_dir, plat) and not arch_mismatch(output_dir, plat, key):
         print("All binaries already present, skipping download.")
         return
 
-    zip_path = download_release(plat)
+    zip_path = download_release(key)
 
     try:
+        print("Verifying archive digest...")
+        verify_digest(zip_path, key)
         print("Extracting binaries...")
         extract_binaries(zip_path, output_dir, plat)
         fix_permissions(output_dir, plat)

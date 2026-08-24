@@ -15,11 +15,50 @@ healthy. No amount of retrying installs Rosetta, so the loop was pure noise.
 import contextlib
 import errno
 import logging
+import os
+import struct
 import subprocess
+import tempfile
 import urllib.error
 from unittest.mock import patch
 
-from src.aw_manager import ROSETTA_REPROBE_INTERVAL, AWManager
+from src.aw_manager import ALL_COMPONENTS, ROSETTA_REPROBE_INTERVAL, AWManager
+
+# Mach-O header bytes, written for real rather than mocked. `_rosetta_required`
+# reads the header of the tracker it is about to spawn, so a test that patched
+# that read would be asserting against its own answer (the whole reason the old
+# preflight was wrong: it asked the host, not the binary).
+_MH_MAGIC_64 = 0xFEEDFACF
+_CPU_TYPE_X86_64 = 0x01000007
+_CPU_TYPE_ARM64 = 0x0100000C
+
+
+def _macho_header(cputype: int) -> bytes:
+    return struct.pack("<II", _MH_MAGIC_64, cputype)
+
+
+def _tracker_tree(cputype: int) -> str:
+    """A tracker directory whose binaries really carry the given architecture.
+
+    Returns the directory; the caller points `_get_binaries_dir` at it. The
+    files are 8-byte headers, which is all `macho_arches` reads and all that is
+    needed to answer "can this machine execute this".
+    """
+    root = tempfile.mkdtemp(prefix="bf-trackers-")
+    for name in ALL_COMPONENTS:
+        comp = os.path.join(root, name)
+        os.makedirs(comp, exist_ok=True)
+        with open(os.path.join(comp, name), "wb") as fh:
+            fh.write(_macho_header(cputype))
+    return root
+
+
+# The stale-install world the Rosetta path now describes: x86_64 trackers
+# already sitting at the persistent path on an arm64 Mac. A FRESH Apple Silicon
+# install no longer reaches this path at all — it downloads the arm64 archive
+# and runs natively — which is exactly the behaviour change #216 asked for.
+_X86_TRACKERS = _tracker_tree(_CPU_TYPE_X86_64)
+_ARM64_TRACKERS = _tracker_tree(_CPU_TYPE_ARM64)
 
 
 class _Clock:
@@ -392,9 +431,45 @@ def _no_tracker_stack(rosetta_ok):
         patch("src.aw_manager._download_aw_binaries", return_value=False),
         patch.object(AWManager, "_notify_rosetta_required_once"),
         patch.object(AWManager, "_dispatch_download_failure_report"),
-        patch.object(AWManager, "_get_binaries_dir", return_value=None),
+        # x86_64 trackers ON DISK. Before #216 this fixture returned None and
+        # the Rosetta branch was still reached, because the gate asked only
+        # whether the HOST had Rosetta. It now asks what the BINARY needs, so a
+        # fixture with no binaries cannot reach the branch these tests are
+        # about — see the precondition assertion in _assert_rosetta_path_live.
+        patch.object(AWManager, "_get_binaries_dir", return_value=_X86_TRACKERS),
         patch.object(AWManager, "_port_in_use", return_value=False),
         patch.object(AWManager, "_stop_locked"),
+    )
+
+
+def _arch_probe_calls(run_mock) -> int:
+    """How many times the ROSETTA PROBE forked — not every subprocess.
+
+    `subprocess.run` is also used by `_reap_orphan_processes` (one `pgrep` per
+    component), and that path became reachable in these fixtures once
+    `_get_binaries_dir` returned a real directory. Counting the mock wholesale
+    therefore measured "arch probes + 3 pgreps per escalation" while claiming to
+    measure re-probes. Filtering on the probe's own argv keeps the assertion
+    pointed at the thing the rate limit governs.
+    """
+    return sum(
+        1
+        for call in run_mock.call_args_list
+        if call.args and call.args[0] and call.args[0][0] == "/usr/bin/arch"
+    )
+
+
+def _assert_rosetta_path_live(mgr):
+    """Precondition: this fixture can actually reach the Rosetta branch.
+
+    Without this, every negative assertion below ("no second log line", "the
+    remedy persists") is satisfied just as well by a fixture that never enters
+    the branch at all — the phantom that made these tests need updating in the
+    first place.
+    """
+    assert mgr._bundled_trackers_need_rosetta() is True, (
+        "fixture precondition: the trackers on disk must be x86-only, or the "
+        "Rosetta branch is unreachable and these assertions prove nothing"
     )
 
 
@@ -463,7 +538,8 @@ def test_the_re_probe_is_rate_limited_off_the_sixty_second_escalation():
         stack.enter_context(patch("src.aw_manager.time.monotonic", clock))
 
         assert mgr._start_locked() is False
-        assert run.call_count == 1
+        _assert_rosetta_path_live(mgr)
+        assert _arch_probe_calls(run) == 1
 
         # Escalations at the real 60s cadence, stopping one short of the
         # interval. Both ends of the boundary are asserted deliberately: the
@@ -474,7 +550,7 @@ def test_the_re_probe_is_rate_limited_off_the_sixty_second_escalation():
             mgr.force_restart(reason="server unreachable")
 
         assert clock.t - 10_000.0 < ROSETTA_REPROBE_INTERVAL, "fixture is past the boundary"
-        assert run.call_count == 1, (
+        assert _arch_probe_calls(run) == 1, (
             "the probe re-forked inside the interval — this is the 60s spam again"
         )
 
@@ -483,7 +559,7 @@ def test_the_re_probe_is_rate_limited_off_the_sixty_second_escalation():
         # dead end the clear exists to remove.
         clock.advance(60)
         mgr.force_restart(reason="server unreachable")
-        assert run.call_count == 2
+        assert _arch_probe_calls(run) == 2
 
 
 def test_a_persisting_outage_logs_the_cause_once_not_once_per_re_probe(caplog):
