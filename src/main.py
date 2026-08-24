@@ -29,7 +29,7 @@ try:
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .hardware_serial import get_hardware_serial
-    from .machine_arch import is_rosetta_translated, true_machine_arch
+    from .machine_arch import is_rosetta_translated, process_arch, true_machine_arch
     from .privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -64,7 +64,7 @@ except ImportError:
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from hardware_serial import get_hardware_serial
-    from machine_arch import is_rosetta_translated, true_machine_arch
+    from machine_arch import is_rosetta_translated, process_arch, true_machine_arch
     from privacy_notice import (
         acknowledgement_telemetry,
         needs_acknowledgement,
@@ -1323,6 +1323,40 @@ class SyncCoordinator:
         self._aw_unreachable_since = None
         self._aw_unreachable_streak = 0
 
+    # What the tray says when the tracker stack is down for a reason we cannot
+    # name. True, and all the user can do with it is call support.
+    _GENERIC_TRACKER_FAULT = "ActivityWatch not responding"
+
+    def _tracker_fault_message(self) -> str:
+        """The sentence the tray carries while capture is dead.
+
+        Both escalation paths below (server unreachable, and a half-hung
+        bf-data-service) set the SAME tray state, and both used to hard-code
+        ``_GENERIC_TRACKER_FAULT``. On an Apple Silicon Mac with no Rosetta 2
+        that string is the only thing standing between a user and hours of
+        silent data loss, and it names a component they have never heard of
+        instead of the one command that fixes it (#188).
+
+        Routed through one helper rather than fixed at each call site: the two
+        are the same outage to the person reading the tray, and a remedy that
+        appears on only one of them is a device that keeps its old, wrong
+        sentence depending on which watchdog happened to fire first.
+
+        Falls back to the generic text on anything unexpected — an absent
+        remedy, a manager that raises, or a non-string. That last case is not
+        hypothetical padding: the message is rendered verbatim into the tray, so
+        a truthy non-string would put a repr in front of the user, and a plain
+        ``remedy or fallback`` would do exactly that against any test double.
+        """
+        try:
+            remedy = self.aw_manager.capture_blocked_remedy()
+        except Exception:  # noqa: BLE001
+            logger.debug("capture_blocked_remedy failed", exc_info=True)
+            return self._GENERIC_TRACKER_FAULT
+        if isinstance(remedy, str) and remedy.strip():
+            return remedy
+        return self._GENERIC_TRACKER_FAULT
+
     def _escalate_aw_unreachable(self, now: Optional[float] = None) -> None:
         """Rebuild the tracker stack and surface the fault.
 
@@ -1348,7 +1382,7 @@ class SyncCoordinator:
             # A rebuild that fails must not swallow the escalation below — that
             # would hide the very fault it was trying to report.
             logger.warning("force_restart failed during escalation", exc_info=True)
-        self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+        self.tray.set_state(TrayState.ERROR, self._tracker_fault_message())
 
     def _handle_aw_bucket_failure(self) -> None:
         """AW answers is_running() (/info) but the bucket fetch (/buckets/) keeps
@@ -1376,7 +1410,7 @@ class SyncCoordinator:
             except Exception:
                 # A failing rebuild must not swallow the tray escalation below.
                 logger.warning("force_restart failed on bucket-fetch escalation", exc_info=True)
-            self.tray.set_state(TrayState.ERROR, "ActivityWatch not responding")
+            self.tray.set_state(TrayState.ERROR, self._tracker_fault_message())
         else:
             logger.info(
                 "ActivityWatch bucket fetch failing (%d/%d) — retrying next cycle "
@@ -2059,6 +2093,21 @@ class SyncCoordinator:
             telemetry["machine_arch"] = arch or None
         except Exception as e:  # noqa: BLE001
             logger.debug("machine-arch telemetry unavailable: %s", e)
+        # ...and the architecture of THIS PROCESS, which is the build that is
+        # installed. Sent alongside the field above rather than instead of it:
+        # true_machine_arch() resolves through Rosetta by design, so a native
+        # arm64 install and an Intel build under Rosetta are indistinguishable
+        # from it, and "who is on the Intel BUILD?" (#184) is answerable only
+        # from the pair. Never null — a running process always has an
+        # architecture — so unlike machine_arch there is no "" to map.
+        #
+        # Its OWN try/except, deliberately: folded into the block above, a
+        # failure here would silently delete the machine_arch that already
+        # ships, trading a working field for a new one.
+        try:
+            telemetry["process_arch"] = process_arch()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("process-arch telemetry unavailable: %s", e)
         # Surface a working-hours anchor that has drifted from this device's real
         # timezone: allows() self-heals by evaluating in machine-local time, but the
         # fleet still needs to see (and re-anchor) the stale schedule. Included only

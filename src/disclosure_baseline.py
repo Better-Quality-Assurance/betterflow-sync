@@ -578,6 +578,18 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # counterpart of the capture-dead flags already declared below: it says
     # whether this machine can record at all, never what it recorded.
     "machine_arch",
+    # The architecture of the RUNNING PROCESS — which BUILD of the agent is
+    # installed, as opposed to `machine_arch` above, which is the silicon.
+    # Identical category to it: a model of processor, never a person, and it
+    # cannot distinguish one employee's activity from another's.
+    #
+    # Why it is worth reporting SEPARATELY, given machine_arch is already here:
+    # machine_arch resolves through Rosetta by design, so a native Apple Silicon
+    # install and an Intel build under Rosetta report the same value and are
+    # byte-identical on the wire. machine_arch therefore answers "who is on
+    # Intel SILICON?" while #184 asks "who is on the Intel BUILD?" — and only
+    # this field can tell those apart. Reported as a pair, never alone.
+    "process_arch",
     # Boolean: this device's live timezone disagrees with the one its
     # working-hours schedule is anchored to. Reports a MISCONFIGURATION of the
     # schedule, not a new fact about the person — no location beyond the

@@ -135,6 +135,13 @@ WINDOW_TITLE_EVENT_LIMIT = 500
 # error reports. start() is retried from the health-check tick, so without this
 # a fail-closed download would toast the user every cycle.
 DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
+# The one thing that fixes a zero-recording Apple Silicon Mac, spelled once.
+# Three surfaces quote it — the log line, the toast, and (since #188) the tray
+# state that persists for as long as the fault does. It is the whole remedy, so
+# a typo in any single copy is a user typing a command that does nothing on the
+# day they are already recording nothing; one constant is what stops the three
+# from drifting. The agent cannot run it itself: it needs an admin password.
+ROSETTA_INSTALL_COMMAND = "softwareupdate --install-rosetta"
 # (ops summary, ops fingerprint, user toast) per cause of "this device captures
 # NOTHING". Keyed rather than branched so a new cause is a table row. Both are
 # the same outage to the person using the machine, so both must reach them —
@@ -814,10 +821,55 @@ class AWManager:
             logger.error(
                 "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
                 "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
-                "until it is installed: run `softwareupdate --install-rosetta` "
-                "(needs an admin password, so the agent cannot do it for you)."
+                "until it is installed: run `%s` "
+                "(needs an admin password, so the agent cannot do it for you).",
+                ROSETTA_INSTALL_COMMAND,
             )
         return missing
+
+    def capture_blocked_remedy(self) -> Optional[str]:
+        """One sentence for a surface that PERSISTS, or None.
+
+        Returns the user-facing remedy when this device is recording nothing
+        for a cause the person at the keyboard can actually fix, and ``None``
+        whenever we have not established such a cause. Today that is exactly
+        one cause: Apple Silicon without Rosetta 2.
+
+        **Why this exists.** The Rosetta fault already reached the user twice —
+        a one-shot toast, and a red tray. The toast fires once per process,
+        during the noisiest minute of a new laptop's first launch, and
+        ``clear_notifications()`` wipes it on quit; the tray persisted for the
+        whole outage and said *"ActivityWatch not responding"*, naming a
+        component the user has never heard of. So the fault was reported on a
+        surface nobody could act on and mis-labelled on the surface that lasted.
+        Carmen Lapusan lost ~90 minutes to that on 2026-08-13, after Laszlo
+        Fabian Raul's device recorded zero seconds across 2026-07-22/23. This
+        method is what lets the persistent surface carry the actionable text.
+
+        **Reads the MEMO, never the probe.** ``_rosetta_missing()`` forks
+        ``/usr/bin/arch``; this is called while building a tray message, on the
+        sync cycle, so it consults the cached answer only. The same rule the
+        tray's own ``_arch_menu_item`` and ``serial_menu_row`` carry.
+
+        **Three states, not two.** The memo is ``None`` until something probed:
+
+            True  -> established: no Rosetta, nothing is being recorded
+            False -> established: Rosetta is present, this is some OTHER fault
+            None  -> nobody has asked yet
+
+        Only ``True`` earns a remedy. Treating ``None`` as ``True`` would put a
+        confident Rosetta instruction on every unrelated outage on every
+        platform, including machines that already have it — a guess, on the one
+        surface that exists to stop the user guessing. Fail toward saying
+        nothing, exactly as ``_rosetta_missing()`` itself fails toward
+        attempting the start.
+        """
+        if self._rosetta_missing_cached is not True:
+            return None
+        return (
+            "Not recording — Rosetta 2 required. Open Terminal and run: "
+            f"{ROSETTA_INSTALL_COMMAND}"
+        )
 
     def _notify_rosetta_required_once(self) -> None:
         """Tell the user once per process. The tray state is set by the caller's
@@ -834,7 +886,7 @@ class AWManager:
             outcome = send_notification(
                 "BetterFlow can't track on this Mac",
                 "Rosetta 2 is required. Open Terminal and run: "
-                "softwareupdate --install-rosetta",
+                f"{ROSETTA_INSTALL_COMMAND}",
             )
         except Exception:
             logger.debug("Rosetta notification failed", exc_info=True)
