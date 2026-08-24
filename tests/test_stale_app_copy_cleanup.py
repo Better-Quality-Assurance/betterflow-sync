@@ -385,6 +385,41 @@ def test_the_return_value_lists_only_what_actually_went(tmp_path, monkeypatch):
     assert purge_stale_bundle_copies(running) == []
 
 
+def test_a_non_canonical_copy_says_so_out_loud(tmp_path, caplog):
+    """The whole deliverable of the #211 headline fix, and it had no witness.
+
+    Removing the `stem != _CANONICAL_STEM` bail-out changed no test, because the
+    patterns are built from the running stem and match nothing from a backup
+    copy either way — so the RETURN value is identical with and without it. What
+    the bail-out exists for is the log line: the affected device produced no
+    output at all, and #211 was found by grepping one machine's log, so a
+    greppable warning is the entire mechanism by which the fleet's remaining
+    cases get discovered.
+
+    Asserting on the emitted record, not on the return, because the return
+    cannot distinguish the two states.
+    """
+    import logging
+
+    canonical = _make_app(tmp_path, "BetterFlow.app", version="1.5.125")
+    backup = _make_app(tmp_path, "BetterFlow-1.5.119-backup.app", version="1.5.119")
+
+    with caplog.at_level(logging.WARNING, logger="src.self_updater"):
+        assert find_stale_bundle_copies(backup) == []
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("BetterFlow-1.5.119-backup.app" in m for m in warnings), warnings
+    assert any("#211" in m for m in warnings), (
+        "the line has to be greppable back to the issue that needs it"
+    )
+
+    # Control: the canonical copy must NOT emit it, or the signal is noise.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="src.self_updater"):
+        find_stale_bundle_copies(canonical)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_purge_is_a_no_op_from_a_non_canonical_copy(tmp_path):
     """#211's actual device. It had booted BetterFlow-1.5.119-backup.app, where
     the patterns — built from the RUNNING stem — cannot see the canonical
