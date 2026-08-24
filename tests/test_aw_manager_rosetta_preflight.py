@@ -11,15 +11,26 @@ Laszlo Fabian Raul's device did that 21 times on 2026-07-23 alone, at 60-second
 intervals, recording zero seconds on both 07-22 and 07-23 while reporting itself
 healthy. No amount of retrying installs Rosetta, so the loop was pure noise.
 
-**Both halves of the gate must be supplied, not just the host half.** Since #216
-the start path gates on `_rosetta_required()`, the conjunction of "the bundled
-binary needs Rosetta" and "the host lacks Rosetta". A test that patches only
-`_rosetta_missing` no longer blocks anything: the binary half reads the Mach-O
-header of the tracker on disk, and on the Linux CI runner those are ELF, so it
-answers "could not tell" and correctly declines to block. That is not a
-hypothetical — it reddened seven tests here that were green on macOS, where the
-worktree simply had no trackers on disk at all, and it sent the start path on to
-a real 187 MB download inside a unit test.
+**A test that asserts the Rosetta block must pin THREE things, not one.** Since
+#216 the start path gates on `_rosetta_required()`, which is macOS-only and is
+the conjunction of "the bundled binary needs Rosetta" and "the host lacks
+Rosetta":
+
+    patch("src.aw_manager.sys.platform", "darwin")            <- or it returns
+    patch.object(AWManager, "_bundled_trackers_need_rosetta")     False before
+    patch.object(AWManager, "_rosetta_missing")                   asking either
+
+Patching only `_rosetta_missing` — which used to BE the gate — blocks nothing.
+Seven tests here did that and were green on macOS and red on the Linux runner,
+where the platform guard returns False before either patched half is consulted,
+so `_start_locked` sailed past the branch and spawned.
+
+Both of the other two matter independently and it is worth saying why, because
+the first repair attempt supplied only the binary half and stayed red. The
+platform guard is what CI actually tripped on; the binary half is what would
+have tripped next, since the trackers on a Linux runner are ELF and
+`macho_arches` correctly answers "could not tell" for them. Fixing either alone
+leaves the test dependent on which machine runs it.
 """
 
 import contextlib
@@ -179,7 +190,8 @@ def test_start_refuses_and_reports_instead_of_spawning():
     # depending on whether the developer happens to have ActivityWatch running.
     # It found this the honest way: on a laptop with a live server on 5600 the
     # unpinned version returned True and reddened here.
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch.object(AWManager, "_port_in_use", return_value=False), \
@@ -230,7 +242,8 @@ def test_an_external_server_is_attached_to_rather_than_declared_dead():
     # What `_rosetta_missing()` writes on the real path; the patch below
     # replaces the method, so the fixture owes the memo.
     mgr._rosetta_missing_cached = True
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once") as notify, \
          patch.object(AWManager, "_port_in_use", return_value=True), \
@@ -276,7 +289,8 @@ def test_a_held_port_that_answers_nothing_is_not_a_recording_device():
     """
     mgr = _mgr()
     mgr._rosetta_missing_cached = True
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once") as notify, \
          patch.object(AWManager, "_port_in_use", return_value=True), \
@@ -316,7 +330,8 @@ def test_a_transient_info_failure_does_not_latch_for_the_life_of_the_process():
     mgr._rosetta_missing_cached = True
     answers = iter([False, True, True])
 
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch.object(AWManager, "_port_in_use", return_value=True), \
@@ -349,7 +364,8 @@ def test_the_carve_out_asks_over_http_not_over_tcp():
     pay for an HTTP request, and this branch runs on the 60s start path.
     """
     mgr = _mgr()
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch.object(AWManager, "_port_in_use", return_value=True), \
@@ -359,7 +375,8 @@ def test_the_carve_out_asks_over_http_not_over_tcp():
     assert info.call_count == 1, "the carve-out did not consult /api/0/info"
 
     mgr = _mgr()
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
          patch.object(AWManager, "_port_in_use", return_value=False), \
@@ -403,7 +420,8 @@ def test_server_responding_is_the_http_ask_wait_for_server_polls():
 
 def test_the_user_is_told_once_not_every_cycle():
     mgr = _mgr()
-    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_bundled_trackers_need_rosetta", return_value=True), \
          patch.object(AWManager, "_port_in_use", return_value=False), \
          patch("src.notifications.send_notification") as notify:
