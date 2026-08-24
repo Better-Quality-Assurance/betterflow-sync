@@ -474,8 +474,13 @@ class BetterFlowClient(BaseApiClient):
         # and cannot be told apart on the wire. Only the pair answers #184's
         # actual question — machine_arch=arm64 with process_arch=x86_64 is a
         # device sitting on the Intel build, which is the population that issue
-        # exists to enumerate. Unlike machine_arch this is never null: a running
-        # process always has an architecture, so there is no "undetermined".
+        # exists to enumerate. null carries the same meaning as it does for
+        # machine_arch: the architecture could not be determined. A running
+        # process essentially always has one, so null here should be very rare —
+        # but platform.machine() is documented to return "" when it cannot
+        # answer, and this loop filters by KEY MEMBERSHIP, not truthiness, so an
+        # unmapped "" would reach the wire as a blank architecture. Mapped at the
+        # producer (main.py).
         "process_arch",
         # The device's live timezone disagrees with the one its working-hours
         # schedule is anchored to. Carried here because a drifted anchor is

@@ -187,3 +187,62 @@ def test_a_failing_process_arch_probe_does_not_take_machine_arch_with_it():
         telemetry = _telemetry_from_real_app()
 
     assert telemetry["machine_arch"] == "arm64"
+
+
+# ── The fallback branch: platform.machine() answering "" ────────────────
+#
+# Everything above this point either passes `machine=` explicitly or patches
+# `process_arch` wholesale, so `return machine or platform.machine()` -- the
+# only line in the function -- had its right-hand side witnessed by nothing.
+# That is unwitnessed BY CONSTRUCTION, not by oversight: an injected value is
+# what makes the tests above meaningful on an ubuntu runner, and it is exactly
+# what hides this.
+
+
+def test_process_arch_falls_through_to_the_real_probe():
+    """The positive control, and the reason the two below are not vacuous.
+
+    Without this, a mutant deleting the fallback entirely (`return machine`)
+    would leave every assertion in this section passing on None.
+    """
+    with patch("src.machine_arch.platform.machine", return_value="arm64"):
+        assert process_arch() == "arm64"
+
+
+def test_an_undeterminable_architecture_is_empty_not_a_lie():
+    """platform.machine() is documented to return "" when it cannot determine
+    the architecture (reachable on Windows with a scrubbed service
+    environment). The helper must pass that through rather than inventing a
+    value -- the mapping to null is the caller's job, and doing it here would
+    give this helper a different contract from its sibling."""
+    with patch("src.machine_arch.platform.machine", return_value=""):
+        assert process_arch() == ""
+
+
+def test_a_blank_architecture_reaches_the_wire_as_null_not_as_a_string():
+    """THE assertion. HEARTBEAT_HEALTH_KEYS filters by key MEMBERSHIP, not by
+    truthiness, so an unmapped "" ships -- and a consumer written against "this
+    field is never null" reads a blank string as an architecture whose name
+    happens to be empty. `or None` at the producer, matching machine_arch five
+    lines above it, is what keeps "we could not tell" distinguishable.
+
+    Driven through the REAL process_arch rather than a patched return value:
+    patching the function is precisely what made this branch invisible.
+    """
+    with patch("src.machine_arch.platform.machine", return_value=""):
+        telemetry = _telemetry_from_real_app()
+
+    assert "process_arch" in telemetry, "absence is a different claim from null"
+    assert telemetry["process_arch"] is None
+
+
+def test_the_pair_maps_an_undeterminable_arch_the_same_way_on_both_halves():
+    """The sibling has always mapped "" to None. A pair whose two halves
+    disagree about how to say "unknown" is worse than either convention: the
+    reader cannot tell a genuinely blank build from a genuinely unknown one."""
+    with patch("src.machine_arch.platform.machine", return_value=""), \
+            patch("src.main.true_machine_arch", return_value=""):
+        telemetry = _telemetry_from_real_app()
+
+    assert telemetry["process_arch"] is None
+    assert telemetry["machine_arch"] is None

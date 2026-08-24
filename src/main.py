@@ -2098,14 +2098,20 @@ class SyncCoordinator:
         # true_machine_arch() resolves through Rosetta by design, so a native
         # arm64 install and an Intel build under Rosetta are indistinguishable
         # from it, and "who is on the Intel BUILD?" (#184) is answerable only
-        # from the pair. Never null — a running process always has an
-        # architecture — so unlike machine_arch there is no "" to map.
+        # from the pair. Mapped "" -> None exactly like machine_arch five lines
+        # up: platform.machine() is documented to return "" when it cannot
+        # answer, and while that is vanishingly rare for a running process it is
+        # not impossible (a scrubbed service environment on Windows). An empty
+        # string on the wire is the one outcome the reader must not get —
+        # HEARTBEAT_HEALTH_KEYS filters by membership, not truthiness, so ""
+        # ships, and "we could not tell" would arrive as an architecture whose
+        # name happens to be blank.
         #
         # Its OWN try/except, deliberately: folded into the block above, a
         # failure here would silently delete the machine_arch that already
         # ships, trading a working field for a new one.
         try:
-            telemetry["process_arch"] = process_arch()
+            telemetry["process_arch"] = process_arch() or None
         except Exception as e:  # noqa: BLE001
             logger.debug("process-arch telemetry unavailable: %s", e)
         # Surface a working-hours anchor that has drifted from this device's real

@@ -169,9 +169,14 @@ not the person using it:
   value and are byte-identical on the wire. `machine_arch` therefore answers
   "who is on Intel *silicon*?" while #184 asks "who is on the Intel *build*?" —
   and only the PAIR separates them (`machine_arch=arm64` with
-  `process_arch=x86_64` is a device sitting on the wrong build). Unlike
-  `machine_arch` it is never `null`: a running process always has an
-  architecture, so there is no "undetermined" state to model.
+  `process_arch=x86_64` is a device sitting on the wrong build). `null` means
+  the same thing it does for `machine_arch` — the architecture could not be
+  determined — and must be handled the same way. A running process essentially
+  always has an architecture, so `null` here should be far rarer than for its
+  sibling, but `platform.machine()` is documented to return `""` when it cannot
+  answer; that is mapped to `null` at the producer rather than shipped as a
+  blank string, because `HEARTBEAT_HEALTH_KEYS` filters by key membership and
+  would otherwise put `""` on the wire.
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.

@@ -484,11 +484,16 @@ def process_arch(
       ``platform.machine()`` is the answer and needs no probe. The sibling above
       forks ``sysctl`` and is memoised for it — this must not acquire that cost,
       or the tray pays for it under ``_menu_lock`` on the sync cycle.
-    - **It has no "undetermined" state.** ``true_machine_arch()`` returns ``""``
-      when its probe never resolved, and callers must not read that as an
-      architecture. There is no equivalent doubt here: a running process has an
-      architecture by construction, so this never returns ``""`` and consumers
-      need no such branch.
+    - **Its "undetermined" state is far rarer, not absent.** ``true_machine_arch()``
+      returns ``""`` whenever its probe never resolved, which is an ordinary
+      outcome. A running process has an architecture by construction, so the
+      honest answer here is essentially always available — but the *source* is
+      ``platform.machine()``, which the stdlib documents as returning ``""`` when
+      it cannot determine one, so this can return ``""`` too. Callers must map it
+      the same way they map its sibling's: to null, never to a string. Reading a
+      blank as an architecture is the failure either helper can cause, and the
+      rarity of the case here makes it likelier to be shipped unhandled, not
+      less costly when it is.
     - **``translated`` is accepted and ignored.** It is taken only so callers
       and tests can pass the same keyword set to both helpers; honouring it
       would re-introduce precisely the Rosetta resolution that makes this field
