@@ -39,7 +39,6 @@ from src.machine_arch import process_arch, true_machine_arch
 from src.main import SyncCoordinator
 from src.sync.bf_client import BetterFlowClient
 
-
 # ── The resolver ────────────────────────────────────────────────────────
 
 

@@ -39,7 +39,6 @@ import pytest
 from src.aw_manager import AWManager
 from src.main import SyncCoordinator
 
-
 # The command is the entire point of the change. A message that says "Rosetta"
 # without it leaves the user exactly where Carmen was: knowing a word, not a fix.
 _INSTALL_COMMAND = "softwareupdate --install-rosetta"
