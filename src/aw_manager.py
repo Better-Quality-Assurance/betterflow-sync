@@ -851,6 +851,18 @@ class AWManager:
         sync cycle, so it consults the cached answer only. The same rule the
         tray's own ``_arch_menu_item`` and ``serial_menu_row`` carry.
 
+        **Deliberately NOT under ``_lifecycle_lock``**, unlike its sibling
+        ``health_snapshot()`` which reads the capture-dead flags under it. Two
+        reasons, and the second is the one that matters. The memo is write-once
+        and monotonic — whether this Mac can execute x86_64 cannot change
+        without a reboot, so there is no torn read to protect against and a
+        stale read is impossible rather than merely unlikely; the flags
+        ``health_snapshot`` guards are genuinely re-written on every start.
+        And the caller is the tray-message path, which runs while
+        ``force_restart()`` may be holding that lock across process spawns —
+        so taking it here would block a UI update behind tracker teardown to
+        re-read a value that cannot have changed.
+
         **Three states, not two.** The memo is ``None`` until something probed:
 
             True  -> established: no Rosetta, nothing is being recorded

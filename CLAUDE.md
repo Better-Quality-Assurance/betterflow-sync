@@ -161,6 +161,17 @@ not the person using it:
   `true_machine_arch()` returned `""`, i.e. the probe never resolved; do not
   coerce that to a string, or "we could not tell" becomes indistinguishable from
   an architecture.
+- `process_arch` (`src/machine_arch.py`) — the CPU architecture of the running
+  **process**, i.e. which BUILD of the agent is installed. Same category as
+  `machine_arch` above: a model of processor, never a person. **Why it is sent
+  separately:** `machine_arch` resolves *through* Rosetta on purpose, so a
+  native arm64 install and an Intel build under Rosetta report the identical
+  value and are byte-identical on the wire. `machine_arch` therefore answers
+  "who is on Intel *silicon*?" while #184 asks "who is on the Intel *build*?" —
+  and only the PAIR separates them (`machine_arch=arm64` with
+  `process_arch=x86_64` is a device sitting on the wrong build). Unlike
+  `machine_arch` it is never `null`: a running process always has an
+  architecture, so there is no "undetermined" state to model.
 
 The serial is shown back to the user in the tray under **Diagnostics > Device
 serial**, next to the Privacy Policy link, and clicking it copies the value.
