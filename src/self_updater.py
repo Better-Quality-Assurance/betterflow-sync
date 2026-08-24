@@ -43,6 +43,23 @@ except ImportError:  # PyInstaller bundle (src/ is import root)
 
 logger = logging.getLogger(__name__)
 
+# Our bundle id. Already spelled in src/autostart.py (as the launchd label,
+# which happens to be the same string) and src/ui/permissions.py; a guard test
+# pins all three rather than a refactor threading one constant through modules
+# that have no other reason to depend on each other.
+BUNDLE_ID = "co.betterqa.betterflow"
+
+# Names our updater has left in /Applications across versions. Each is a
+# FORMAT over the running bundle's stem, so the sweep can only ever match a
+# sibling of the app that is running.
+#
+# Deliberately closed rather than a glob. A leftover copy costs disk; a wrong
+# deletion costs somebody an application, so anything outside the shapes we can
+# show we produced stays put:
+#   <stem>.app.old   the Linux AppImage form, seen on a Mac in #211
+#   <stem>.old.app   what _apply_macos_update creates today
+#   <stem>-<ver>-backup.app   provenance unknown, seen on the #211 device
+
 # The only Apple Developer ID team we ever ship production releases under.
 # Pinned to make _verify_codesign reject updates signed by any other team,
 # even on a fresh install with no prior team-ID context to compare against.
@@ -987,3 +1004,107 @@ def apply_staged_update(
         # finally never runs. On failure we leak hundreds of MB (the DMG)
         # in /tmp unless we clean up here.
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _bundle_identifier(app: Path) -> Optional[str]:
+    """The bundle id an .app claims, or None if it will not say.
+
+    None means "I do not know whose this is", which is not permission to delete
+    it — every caller must treat it as a refusal, not as a mismatch.
+    """
+    import plistlib
+
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None
+    value = data.get("CFBundleIdentifier")
+    return value if isinstance(value, str) else None
+
+
+def find_stale_bundle_copies(running_app: Path) -> list[Path]:
+    """Sibling copies of THIS app left behind by an earlier update.
+
+    Returns paths only; deleting is the caller's job, so the decision can be
+    tested without a filesystem that can lose something.
+
+    #211: a device carried three copies under one bundle id, booted the oldest
+    (below the server's minimum version floor) and had its Accessibility grant
+    flap, because macOS keeps one row per app and which copy that row means is
+    not ours to decide.
+
+    Four guards, in order of how much they matter:
+
+    1. **Identity.** The candidate's own Info.plist must name OUR bundle id.
+       This is the one doing the real work: a name pattern is a guess about
+       provenance, and an Info.plist is the bundle stating who it is. Anything
+       that will not answer is left alone.
+    2. **Name.** One of the shapes we can show our updater has produced,
+       derived from the running bundle's stem. Closed list, not a glob.
+    3. **Siblings only**, never recursive. A sweep of /Applications by
+       directory walk is not a thing this should ever grow into.
+    4. **No symlinks.** Deleting through one deletes its target, which by
+       definition is not a copy our updater left here.
+    """
+    import re as _re
+
+    parent = running_app.parent
+    stem = running_app.stem  # "BetterFlow" from "BetterFlow.app"
+    patterns = [
+        _re.compile(rf"^{_re.escape(stem)}\.app\.old$"),
+        _re.compile(rf"^{_re.escape(stem)}\.old\.app$"),
+        _re.compile(rf"^{_re.escape(stem)}-[0-9][0-9.]*-backup\.app$"),
+    ]
+
+    stale: list[Path] = []
+    try:
+        entries = sorted(parent.iterdir())
+    except OSError as e:
+        logger.warning("Could not list %s while looking for stale copies: %s", parent, e)
+        return []
+
+    for entry in entries:
+        # `entry == running_app` is DEFENCE IN DEPTH and a mutation run will
+        # flag it as unwitnessed. It is not a gap — it is unreachable while the
+        # name patterns below are correct, because the running bundle's own
+        # name cannot match a pattern built from its own stem. Proven as a pair
+        # rather than left to argument:
+        #
+        #   neuter the name filter alone       -> running bundle NOT returned
+        #   neuter the name filter AND this    -> running bundle IS returned
+        #
+        # So this line is the only thing standing between a broken name pattern
+        # and deleting the app that is currently executing. Keep it.
+        if entry == running_app or entry.is_symlink() or not entry.is_dir():
+            continue
+        if not any(p.match(entry.name) for p in patterns):
+            continue
+        identifier = _bundle_identifier(entry)
+        if identifier != BUNDLE_ID:
+            logger.info(
+                "Leaving %s alone: bundle id is %r, not ours",
+                entry, identifier,
+            )
+            continue
+        stale.append(entry)
+    return stale
+
+
+def purge_stale_bundle_copies(running_app: Path) -> list[Path]:
+    """Delete what find_stale_bundle_copies names. Returns what went.
+
+    Best-effort by design: a copy we cannot remove (permissions, a file in use)
+    is logged and skipped. Failing to tidy up must never stop the agent
+    starting, which is the one job it has.
+    """
+    removed: list[Path] = []
+    for app in find_stale_bundle_copies(running_app):
+        try:
+            shutil.rmtree(app)
+        except Exception as e:
+            logger.warning("Could not remove stale copy %s: %s", app, e)
+            continue
+        logger.info("Removed stale copy of this app: %s", app)
+        removed.append(app)
+    return removed

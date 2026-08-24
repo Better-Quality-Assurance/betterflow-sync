@@ -2980,6 +2980,33 @@ class BetterFlowApp:
             except Exception as e:
                 logger.warning("Auto-start sync failed (non-fatal): %s", e)
 
+        # Sweep sibling copies of ourselves left by earlier updates (#211).
+        #
+        # Runs at startup rather than after an update, because the copies that
+        # matter are ALREADY on disk — a device carried three, booted the oldest
+        # (below the server's minimum version floor) for days, and had its
+        # Accessibility grant flap, since macOS keeps one row per app and which
+        # copy that row means is not ours to decide. Fixing whichever writer
+        # leaves them behind does nothing for a machine that already has them.
+        #
+        # After _maybe_relocate_to_applications() above, deliberately: that call
+        # can move us, and the sweep is scoped to siblings of where we are NOW.
+        #
+        # Non-fatal on every path. Failing to tidy up must not stop the agent
+        # starting, which is the one job it has.
+        if sys.platform == "darwin" and ".app/Contents/MacOS/" in sys.executable:
+            try:
+                try:
+                    from .self_updater import purge_stale_bundle_copies
+                except ImportError:
+                    from self_updater import purge_stale_bundle_copies
+                running_bundle = Path(
+                    sys.executable.split(".app/Contents/MacOS/")[0] + ".app"
+                )
+                purge_stale_bundle_copies(running_bundle)
+            except Exception as e:
+                logger.warning("Stale-copy sweep failed (non-fatal): %s", e)
+
         # First-run setup wizard.
         #
         # Gate on stored CREDENTIALS, not on the setup_complete flag alone. The
