@@ -114,7 +114,29 @@ def _app_launch_args() -> list[str]:
         # Use 'open -a' with the .app bundle path for a clean launch
         parts = exe.split(".app/Contents/MacOS/")
         bundle_path = parts[0] + ".app"
-        return ["open", "-a", bundle_path]
+        # `open <path>`, NOT `open -a <path>`. They look interchangeable and are
+        # not: `-a` names an APPLICATION, which macOS resolves through the
+        # LaunchServices database rather than by opening the path you handed it.
+        # When several copies are registered under one bundle id, which copy
+        # wins is LaunchServices' choice.
+        #
+        # #211: a device's plist said `/Applications/BetterFlow.app` and the
+        # machine came up running `/Applications/BetterFlow-1.5.119-backup.app`
+        # — below the server's minimum floor — for days, while every sync logged
+        # "update required". Three copies shared `co.betterqa.betterflow`.
+        # Without `-a` the argument is a path again and no other bundle can be
+        # substituted.
+        #
+        # The resolution itself is INFERRED, not witnessed (the issue says so;
+        # tccd logs had aged out). This does not depend on that being the cause:
+        # it removes the only freedom the launch command had, which is worth
+        # doing either way.
+        #
+        # Migration is automatic and needs no code. `_macos_plist_is_current()`
+        # compares the installed ProgramArguments against this list, so every
+        # plist still carrying the `-a` form now reads as stale and
+        # `ensure_synced()` rewrites it on the next startup.
+        return ["open", bundle_path]
     # Running as a Python script
     return [sys.executable, "-m", "src.main"]
 
