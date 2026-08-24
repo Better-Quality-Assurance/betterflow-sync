@@ -1166,9 +1166,35 @@ class TrayIcon:
         return state not in (TrayState.ERROR, TrayState.STARTING, TrayState.WAITING_AUTH)
 
     def _check_api_status(self, s: Optional[dict] = None) -> bool:
-        """Check if BetterFlow API is reachable (best-effort, non-blocking)."""
+        """Check if BetterFlow API is reachable (best-effort, non-blocking).
+
+        **ERROR is deliberately NOT in this tuple**, and was until #188.
+
+        The queue states are honest signals about the API: QUEUED and
+        QUEUE_WARNING mean events are piling up locally, which is what an
+        unreachable backend looks like from here. ERROR never was one, and this
+        PR made that visible by giving the row above it something specific to
+        say. Read every producer:
+
+        - ``_escalate_aw_unreachable`` / ``_handle_aw_bucket_failure`` — TRACKER
+          faults. The API is demonstrably reachable; the heartbeat carrying
+          ``tracker_download_failed`` is how the fleet learns about the fault at
+          all.
+        - ``_report_sync_failure`` — asks ``bf.is_reachable()`` FIRST and routes
+          an unreachable API to QUEUED("Offline"). It reaches ERROR only on the
+          branch where the API answered.
+        - the login handlers — "Login busy", "Login cancelled". A server that
+          answers.
+
+        So no caller of ``set_state(ERROR, …)`` implies an unreachable API, and
+        the row asserted one on all of them. Harmless while the line above read
+        a vague "Error"; a contradiction the moment it reads "Not recording —
+        Rosetta 2 required", because the first submenu a worried user opens then
+        names a second, false cause for a fault that has just been correctly
+        diagnosed.
+        """
         state = s["state"] if s else self.model.state
-        return state not in (TrayState.QUEUED, TrayState.QUEUE_WARNING, TrayState.ERROR)
+        return state not in (TrayState.QUEUED, TrayState.QUEUE_WARNING)
 
     # -- Menu action handlers ------------------------------------------------
 
@@ -1469,7 +1495,7 @@ class TrayIcon:
             faulted = (TrayState.ERROR, TrayState.QUEUE_WARNING)
             if status_text is not None:
                 self.model.status_text = status_text
-            elif state in faulted and previous_state not in faulted:
+            elif state in faulted and previous_state != state:
                 # ENTERING a fault with nothing to say. Mirror of the recovery
                 # clear below, and it only started to matter once the ERROR
                 # branch of _get_status_text began rendering this field: the
@@ -1480,6 +1506,21 @@ class TrayIcon:
                 # under a red icon — "App status: Starting..." on a machine that
                 # has been running for hours, which reads as a hung app rather
                 # than a reported fault.
+                #
+                # `previous_state != state`, NOT `previous_state not in faulted`.
+                # `faulted` holds TWO states, so the membership test treats a
+                # QUEUE_WARNING → ERROR move as staying put: the queue's
+                # "Queue 92% full" survived into a red row describing a TRACKER
+                # fault, and a text-less ERROR after a text-less QUEUE_WARNING
+                # resurrected whatever sentence preceded both. Precisely the
+                # harm the paragraph above describes, entered by the door the
+                # first version of this guard did not watch — a guard has two
+                # ends and you guard the one you were reasoning about
+                # (diagnosis-discipline.md Rule 3).
+                #
+                # The inequality is also what preserves the deliberate
+                # ERROR → ERROR retention below: same state is one outage
+                # escalating again, not a new one.
                 #
                 # Every escalation in src/ passes a message today, so this is a
                 # guard on the shape rather than on a live caller. It is cheap

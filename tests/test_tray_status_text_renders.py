@@ -173,6 +173,74 @@ def test_a_previous_states_message_never_reappears_under_a_fault():
     assert _app_status_row(tray) == "App status: Error"
 
 
+def test_a_queue_message_does_not_survive_into_a_tracker_fault():
+    """`faulted` holds TWO states, so the first cut of the entry clear —
+    `previous_state not in faulted` — read QUEUE_WARNING → ERROR as staying
+    put and cleared nothing. The queue's own sentence then rendered as the
+    cause of a tracker fault: a specific, confident, wrong diagnosis on the one
+    surface #188 exists to make trustworthy.
+    """
+    tray = _make_tray()
+
+    tray.set_state(TrayState.ERROR, _REMEDY)
+    tray.set_state(TrayState.QUEUE_WARNING, "Queue 92% full")
+    tray.set_state(TrayState.ERROR)
+
+    assert _app_status_row(tray) == "App status: Error"
+
+
+def test_a_stale_remedy_is_not_resurrected_by_a_hop_through_the_other_fault():
+    """The nastier half of the same hole: two text-less transitions in a row.
+
+    ERROR(remedy) → QUEUE_WARNING(no text) → ERROR(no text) cleared on neither
+    hop, so a remedy from an outage that had already been superseded came back
+    under a later, unrelated fault — the surface asserting a cause nobody
+    established.
+    """
+    tray = _make_tray()
+
+    tray.set_state(TrayState.ERROR, _REMEDY)
+    tray.set_state(TrayState.QUEUE_WARNING)
+    tray.set_state(TrayState.ERROR)
+
+    row = _app_status_row(tray)
+    assert row == "App status: Error"
+    assert "Rosetta" not in row
+
+
+def test_the_guarded_half_still_works():
+    """The control the original guard was written for, kept explicit so a
+    mutant that fixes the new door by breaking the old one is visible."""
+    tray = _make_tray()
+
+    tray.set_state(TrayState.ERROR, _REMEDY)
+    tray.set_state(TrayState.SYNCING)
+    tray.set_state(TrayState.ERROR)
+
+    assert _app_status_row(tray) == "App status: Error"
+
+
+def test_a_repeat_queue_warning_keeps_its_own_sentence():
+    """The ERROR → ERROR retention, in its sibling state. The inequality has to
+    preserve BOTH diagonals of `faulted`, not only the one that already had a
+    test — a `previous_state == TrayState.ERROR` special-case would satisfy
+    every other test in this file and silently blank this one.
+
+    Asserted on the MODEL, deliberately, and it is the one test here that
+    cannot use the menu row: `_get_status_text`'s QUEUE_WARNING branch returns
+    the constant "Offline (queue full)" and reads no field. So this pins what
+    `set_state` stores rather than what is drawn — the honest scope, and it
+    stops being a lie the day that branch starts rendering too.
+    """
+    tray = _make_tray()
+
+    tray.set_state(TrayState.QUEUE_WARNING, "Queue 92% full")
+    tray.set_state(TrayState.QUEUE_WARNING)
+
+    with tray.model.lock:
+        assert tray.model.status_text == "Queue 92% full"
+
+
 def test_a_repeat_escalation_keeps_the_sentence_it_already_carries():
     """The other side of the entry clear: ERROR → ERROR is the SAME outage
     escalating again, not a new one. Clearing there would blank the remedy on
@@ -224,6 +292,55 @@ def test_recovery_stops_rendering_the_stale_sentence():
     row = _app_status_row(tray)
     assert row == "App status: Active"
     assert "Rosetta" not in row
+
+
+# ── The rest of the menu must not contradict the row ────────────────────
+
+
+def _diag_rows(tray: TrayIcon) -> dict[str, str]:
+    rows = {}
+    for line in _menu_labels(tray):
+        for key in ("ActivityWatch: ", "API: "):
+            if line.startswith(key):
+                rows[key.rstrip(": ")] = line
+    return rows
+
+
+def test_a_tracker_fault_does_not_also_claim_the_api_is_unreachable():
+    """The whole menu is read at once, and it used to disagree with itself.
+
+    `_check_api_status` derived `API: Unreachable` from TrayState.ERROR. Not
+    one producer of that state implies an unreachable API — the two tracker
+    escalations reach the backend on the same cycle to report the fault, and
+    `_report_sync_failure` routes an unreachable API to QUEUED before it can
+    get here. Pre-#188 the top row said "Error" and "API: Unreachable" read as
+    elaboration; now the top row makes a specific, correct, actionable claim
+    and the row below it names a different cause.
+    """
+    tray = _make_tray()
+
+    tray.set_state(TrayState.ERROR, _REMEDY)
+
+    rows = _diag_rows(tray)
+    assert rows["ActivityWatch"] == "ActivityWatch: Not running"
+    assert rows["API"] == "API: Connected", (
+        "the menu contradicts the remedy one row above it"
+    )
+
+
+def test_the_queue_states_still_report_the_api_as_unreachable():
+    """The control. ERROR was the wrong signal; the queue states are the right
+    one, and removing them to silence the row above would blind the surface
+    that exists to say "your events are not leaving this machine".
+    """
+    tray = _make_tray()
+
+    for state in (TrayState.QUEUED, TrayState.QUEUE_WARNING):
+        tray.set_state(state, None)
+        assert _diag_rows(tray)["API"] == "API: Unreachable", state
+
+    tray.set_state(TrayState.SYNCING)
+    assert _diag_rows(tray)["API"] == "API: Connected"
 
 
 def test_the_other_states_are_untouched_by_the_error_branch():
