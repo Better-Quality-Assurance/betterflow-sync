@@ -218,7 +218,7 @@ def test_the_bucket_failure_path_says_the_same_thing(coord):
     assert _names_the_remedy(_tray_message(coord)), _tray_message(coord)
 
 
-def test_a_bucket_failure_on_a_RECORDING_device_names_no_remedy(coord):
+def test_a_bucket_failure_on_a_recording_device_names_no_remedy(coord):
     """The case the mocked version of the test above could not express.
 
     Same escalation, same missing Rosetta, but an external native-arm64 server

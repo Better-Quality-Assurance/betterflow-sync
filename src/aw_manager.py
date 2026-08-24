@@ -142,6 +142,14 @@ DOWNLOAD_FAILURE_REPORT_INTERVAL = 3600  # 1 hour
 # day they are already recording nothing; one constant is what stops the three
 # from drifting. The agent cannot run it itself: it needs an admin password.
 ROSETTA_INSTALL_COMMAND = "softwareupdate --install-rosetta"
+# How long a Rosetta answer stands before force_restart() is allowed to re-ask.
+# Installing Rosetta needs no reboot, so the answer CAN change under a running
+# agent and a memo held for the life of the process left the user stuck at "still
+# blocked" with nothing telling them to relaunch. Five minutes because the two
+# costs pull opposite ways: the escalation path that clears this runs every 60s
+# for the whole of a total-capture outage, and re-probing on each one puts a
+# subprocess fork per minute back on precisely the machine the memo protects.
+ROSETTA_REPROBE_INTERVAL = 300.0
 # (ops summary, ops fingerprint, user toast) per cause of "this device captures
 # NOTHING". Keyed rather than branched so a new cause is a table row. Both are
 # the same outage to the person using the machine, so both must reach them —
@@ -538,9 +546,18 @@ class AWManager:
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
-        # not probed yet. Rosetta cannot appear or vanish without a reboot, so
-        # this is probed once rather than on every 60s start attempt.
+        # not probed yet. Installing Rosetta needs no reboot, so force_restart()
+        # clears this to let a device that was fixed recover on its own — but
+        # only once per ROSETTA_REPROBE_INTERVAL, because a sustained outage
+        # calls force_restart on every 60s cycle and this memo exists to keep
+        # `/usr/bin/arch` off that path.
         self._rosetta_missing_cached: Optional[bool] = None
+        # monotonic timestamp of the last completed probe, for that interval.
+        self._rosetta_probed_at: float = float("-inf")
+        # The last answer we LOGGED. Re-probing must not reprint the same error
+        # every few minutes for the life of an outage — that is the 60-second
+        # log spam the preflight was written to end, arriving by another door.
+        self._rosetta_logged: Optional[bool] = None
         self._rosetta_notified: bool = False
         # Components whose binary is on disk but cannot EXECUTE (EBADARCH /
         # ENOEXEC). Keeps the capture-dead latch honest when only SOME binaries
@@ -817,14 +834,30 @@ class AWManager:
             missing = False
 
         self._rosetta_missing_cached = missing
-        if missing:
-            logger.error(
-                "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
-                "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
-                "until it is installed: run `%s` "
-                "(needs an admin password, so the agent cannot do it for you).",
-                ROSETTA_INSTALL_COMMAND,
-            )
+        self._rosetta_probed_at = time.monotonic()
+        # Log the ANSWER changing, not the probe running. force_restart clears
+        # the memo so an installed Rosetta is noticed without an agent restart,
+        # which means this function now runs repeatedly during an outage instead
+        # of once per process; reprinting the same error each time would rebuild
+        # the identical-line spam the preflight exists to have ended.
+        if missing is not self._rosetta_logged:
+            if missing:
+                logger.error(
+                    "This Mac is Apple Silicon and Rosetta 2 is not installed, so the "
+                    "x86_64 ActivityWatch trackers cannot run. Nothing will be tracked "
+                    "until it is installed: run `%s` "
+                    "(needs an admin password, so the agent cannot do it for you).",
+                    ROSETTA_INSTALL_COMMAND,
+                )
+            elif self._rosetta_logged is True:
+                # The recovery. Worth a line of its own: it is the only record
+                # that the user's install landed and capture can resume, and
+                # support reads these logs to answer exactly that question.
+                logger.info(
+                    "Rosetta 2 is now available — the x86_64 trackers can start. "
+                    "Capture should resume on this cycle."
+                )
+            self._rosetta_logged = missing
         return missing
 
     def capture_blocked_remedy(self) -> Optional[str]:
@@ -1233,12 +1266,26 @@ class AWManager:
             # cycle. Clearing the memo makes the very next start attempt real,
             # the trackers spawn, and the tray goes green on its own.
             #
-            # Cost is one `/usr/bin/arch -x86_64 /usr/bin/true` per force
-            # restart, which is a rare escalation path, not the 60s start path
-            # the memo exists to keep clear. A probe that fails still fails
-            # toward "available" (see _rosetta_missing), so the worst case is
-            # one spawn attempt the EBADARCH handler already covers.
-            self._rosetta_missing_cached = None
+            # Rate-limited, and that is not tidiness. _note_aw_unreachable
+            # returns True on EVERY cycle once the 180s grace period is up (only
+            # a reachable ActivityWatch resets it), so a device that is capturing
+            # nothing force-restarts every 60 seconds for as long as the outage
+            # lasts — which on a Rosetta-missing Mac is indefinitely. Clearing
+            # unconditionally would therefore fork `/usr/bin/arch` once a minute
+            # on exactly the machine this memo was introduced to protect, which
+            # is the "21 identical failures at 60-second intervals" pattern the
+            # preflight replaced, wearing a different hat.
+            #
+            # ROSETTA_REPROBE_INTERVAL bounds it to one fork per five minutes,
+            # so the user who runs the command waits at most that long for the
+            # tray to go green — a loop that closes slowly still closes, and an
+            # unbounded fork rate on a broken device does not.
+            #
+            # A probe that fails still fails toward "available" (see
+            # _rosetta_missing), so the worst case is one spawn attempt the
+            # EBADARCH handler already covers.
+            if time.monotonic() - self._rosetta_probed_at >= ROSETTA_REPROBE_INTERVAL:
+                self._rosetta_missing_cached = None
             return self._start_locked()
 
     def restart_idle_tracker(self, reason: str = "") -> None:

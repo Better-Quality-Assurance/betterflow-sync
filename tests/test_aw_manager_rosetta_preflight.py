@@ -14,10 +14,26 @@ healthy. No amount of retrying installs Rosetta, so the loop was pure noise.
 
 import contextlib
 import errno
+import logging
 import subprocess
 from unittest.mock import patch
 
-from src.aw_manager import AWManager
+from src.aw_manager import ROSETTA_REPROBE_INTERVAL, AWManager
+
+
+class _Clock:
+    """A monotonic clock the test drives, so the re-probe interval is exercised
+    rather than waited out. Real time would make these tests either slow or
+    dependent on how fast the runner is."""
+
+    def __init__(self):
+        self.t = 10_000.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
 
 
 def _mgr() -> AWManager:
@@ -229,10 +245,12 @@ def test_installing_rosetta_is_noticed_without_an_agent_restart():
     """
     mgr = _mgr()
     installed = {"yet": False}
+    clock = _Clock()
 
     with contextlib.ExitStack() as stack:
         for ctx in _no_tracker_stack(lambda: installed["yet"]):
             stack.enter_context(ctx)
+        stack.enter_context(patch("src.aw_manager.time.monotonic", clock))
 
         # Blocked. The tray owes a remedy.
         assert mgr._start_locked() is False
@@ -243,11 +261,82 @@ def test_installing_rosetta_is_noticed_without_an_agent_restart():
 
         # The next watchdog escalation force-restarts the stack, as it has been
         # doing every cycle throughout the outage.
+        clock.advance(ROSETTA_REPROBE_INTERVAL)
         mgr.force_restart(reason="server unreachable")
 
         # THE assertion: the surface can go green on its own.
         assert mgr._rosetta_missing_cached is False
         assert mgr.capture_blocked_remedy() is None
+
+
+def test_the_re_probe_is_rate_limited_off_the_sixty_second_escalation():
+    """The cost of the clear above, and the reason it is not unconditional.
+
+    _note_aw_unreachable returns True on EVERY cycle once its 180s grace period
+    is up — only a reachable ActivityWatch resets it — so a device capturing
+    nothing force-restarts every 60 seconds for the whole outage. An
+    unconditional clear therefore forks /usr/bin/arch once a minute on exactly
+    the Mac the memo was introduced to protect: the "21 identical failures at
+    60-second intervals" pattern the preflight replaced, arriving by another
+    door. Found by reading the escalation cadence, not by a failing test.
+    """
+    mgr = _mgr()
+    clock = _Clock()
+
+    with contextlib.ExitStack() as stack:
+        for ctx in _no_tracker_stack(False):
+            stack.enter_context(ctx)
+        run = stack.enter_context(
+            patch("src.aw_manager.subprocess.run",
+                  return_value=subprocess.CompletedProcess(args=[], returncode=1))
+        )
+        stack.enter_context(patch("src.aw_manager.time.monotonic", clock))
+
+        assert mgr._start_locked() is False
+        assert run.call_count == 1
+
+        # Escalations at the real 60s cadence, stopping one short of the
+        # interval. Both ends of the boundary are asserted deliberately: the
+        # first draft advanced 5 x 60 = exactly 300, landed ON the `>=`, and
+        # reddened — a fixture bug that reads exactly like a broken rate limit.
+        for _ in range(4):
+            clock.advance(60)
+            mgr.force_restart(reason="server unreachable")
+
+        assert clock.t - 10_000.0 < ROSETTA_REPROBE_INTERVAL, "fixture is past the boundary"
+        assert run.call_count == 1, (
+            "the probe re-forked inside the interval — this is the 60s spam again"
+        )
+
+        # Crossing it, the probe DOES re-ask. Without this half the assertion
+        # above is satisfied by a memo that never re-probes at all, which is the
+        # dead end the clear exists to remove.
+        clock.advance(60)
+        mgr.force_restart(reason="server unreachable")
+        assert run.call_count == 2
+
+
+def test_a_persisting_outage_logs_the_cause_once_not_once_per_re_probe(caplog):
+    """The other half of the same cost. Re-probing makes _rosetta_missing run
+    repeatedly, so it now logs the ANSWER changing rather than the probe
+    running — otherwise the identical error line reappears every interval for
+    the life of the outage."""
+    mgr = _mgr()
+    clock = _Clock()
+
+    with contextlib.ExitStack() as stack:
+        for ctx in _no_tracker_stack(False):
+            stack.enter_context(ctx)
+        stack.enter_context(patch("src.aw_manager.time.monotonic", clock))
+
+        with caplog.at_level(logging.ERROR, logger="src.aw_manager"):
+            mgr._start_locked()
+            for _ in range(3):
+                clock.advance(ROSETTA_REPROBE_INTERVAL)
+                mgr.force_restart(reason="server unreachable")
+
+    blocked = [r for r in caplog.records if "Rosetta 2 is not installed" in r.getMessage()]
+    assert len(blocked) == 1, f"logged the same cause {len(blocked)} times"
 
 
 def test_a_still_missing_rosetta_survives_the_re_probe():
@@ -256,12 +345,15 @@ def test_a_still_missing_rosetta_survives_the_re_probe():
     for as long as the fault does, which is the whole reason the tray (not the
     one-shot toast) is the surface #188 needed."""
     mgr = _mgr()
+    clock = _Clock()
 
     with contextlib.ExitStack() as stack:
         for ctx in _no_tracker_stack(False):
             stack.enter_context(ctx)
+        stack.enter_context(patch("src.aw_manager.time.monotonic", clock))
 
         assert mgr._start_locked() is False
+        clock.advance(ROSETTA_REPROBE_INTERVAL)
         mgr.force_restart(reason="server unreachable")
 
         assert mgr._rosetta_missing_cached is True
