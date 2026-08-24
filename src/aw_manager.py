@@ -1069,6 +1069,21 @@ class AWManager:
                     self.aw_port,
                 )
                 self._using_external = True
+                # CLEAR the latch, do not merely decline to set it. This branch
+                # returns before the "binaries resolved" clear forty lines down,
+                # so on a Rosetta-missing Mac nothing else ever unsets it — and
+                # a single /info timeout on a healthy external server would
+                # otherwise latch "captures nothing" for the life of the
+                # process, putting a permanent "install Rosetta" in front of
+                # someone who IS recording and reporting a false capture-dead
+                # device to the fleet. Found by walking three cycles with one
+                # transient blip in them, not by reading.
+                #
+                # Safe because of what this branch has just established: a
+                # server ANSWERED /api/0/info on our port. That is the same
+                # evidence the flag's own name asks for, so clearing it here is
+                # the flag being accurate rather than an optimistic reset.
+                self.tracker_download_failed = False
                 return True
             if server_already_running:
                 # Held, but dead. Worth its own line: this device looks

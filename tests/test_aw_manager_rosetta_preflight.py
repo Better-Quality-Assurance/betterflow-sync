@@ -240,6 +240,49 @@ def test_a_held_port_that_answers_nothing_is_not_a_recording_device():
     assert mgr._managed_components_unavailable is True
 
 
+def test_a_transient_info_failure_does_not_latch_for_the_life_of_the_process():
+    """The cost of the gate above, and the reason the attach branch CLEARS
+    rather than merely declining to set.
+
+    /info can time out on a healthy server — a busy laptop, a 2s budget. That
+    single cycle latches `tracker_download_failed`, and the Rosetta branch
+    returns before the "binaries resolved" clear forty lines down, so on a
+    Rosetta-missing Mac nothing else ever unsets it. The device would attach
+    externally and record perfectly while showing a permanent "install
+    Rosetta" and reporting itself capture-dead to the fleet: round 1's
+    Important arriving through a blip instead of a config.
+
+    Walks three real cycles with one blip in them. Found this way rather than
+    by reading, which is why the walk is the test.
+    """
+    mgr = _mgr()
+    mgr._rosetta_missing_cached = True
+    answers = iter([False, True, True])
+
+    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once"), \
+         patch.object(AWManager, "_port_in_use", return_value=True), \
+         patch.object(AWManager, "_server_responding", side_effect=lambda: next(answers)), \
+         patch("src.aw_manager.subprocess.Popen"):
+        # Cycle 1: the blip. Correctly read as capture-dead on the evidence
+        # available at the time — this half must NOT be softened.
+        assert mgr._start_locked() is False
+        assert mgr.tracker_download_failed is True
+        assert mgr.capture_blocked_remedy() is not None
+
+        # Cycle 2: the server answers. The device is recording.
+        assert mgr._start_locked() is True
+        assert mgr._using_external is True
+        # THE assertion: the latch is cleared, so the surface goes green and
+        # the fleet stops seeing a capture-dead device.
+        assert mgr.tracker_download_failed is False
+        assert mgr.capture_blocked_remedy() is None
+
+        # Cycle 3: and it stays that way.
+        assert mgr._start_locked() is True
+        assert mgr.capture_blocked_remedy() is None
+
+
 def test_the_carve_out_asks_over_http_not_over_tcp():
     """Names the mechanism, so a future refactor back to `_port_in_use()` alone
     reddens even if someone rewrites the two tests above.
