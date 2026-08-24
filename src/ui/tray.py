@@ -146,7 +146,8 @@ class TrayModel:
         self.state: TrayState = TrayState.STARTING
         self.paused: bool = False
         self.private_mode: bool = False
-        self.status_text: str = "Starting..."
+        # One copy of this label, in STATUS_TEXT_STATES.
+        self.status_text: str = STATUS_TEXT_STATES[TrayState.STARTING]
         self.hours_today: str = "0h 0m"
         self.hours_this_week: str = "---"
         self.hours_this_month: str = "---"
@@ -484,6 +485,28 @@ STATUS_TEXT_STATES: dict["TrayState", str] = {
     # field would hand an unknown state a stale sentence.
     TrayState.STARTING: "Starting...",
 }
+
+# Which of those states keep their sentence when re-entered with nothing new to
+# say. This is the THIRD fact about an owning state, and it was a blanket rule
+# until #214 widened the set — correct while the only re-entrant owners were the
+# two fault states, where re-entry genuinely means "the same thing again".
+#
+# PAUSED broke it. PAUSED has FIVE writers with five different causes (sleep,
+# screen lock, idle, a user pause, a break), so PAUSED → PAUSED is usually a
+# CHANGE of cause, not a repeat of one. Retaining there put "Screen locked" on
+# an unlocked laptop, "Sleeping" on an awake one, and "Idle" on a machine whose
+# user had just clicked Pause — while the pause notification fired beside it
+# saying otherwise. All three render "Paused" on origin/main, so all three were
+# regressions introduced by the widening rather than pre-existing.
+#
+# ERROR and QUEUE_WARNING are SINGLE-cause: re-entry is the same outage or the
+# same full queue reported again, and blanking on the second watchdog tick would
+# darken the surface exactly when the user looks at it. Both diagonals are
+# pinned (test_tray_status_text_renders.py:223, :244). A state earns retention
+# by having one cause, not by owning the field.
+STATUS_TEXT_RETAIN_ON_REENTRY: frozenset = frozenset(
+    {TrayState.ERROR, TrayState.QUEUE_WARNING}
+)
 
 # Colors for each state — BetterFlow brand palette
 STATE_COLORS = {
@@ -1140,7 +1163,9 @@ class TrayIcon:
             # but the state alone must not read as "Starting...".
             return "Private Time"
         else:
-            return "Starting..."
+            # A state nothing handles. Deliberately NOT reading
+            # status_text — see STARTING's note in STATUS_TEXT_STATES.
+            return STATUS_TEXT_STATES[TrayState.STARTING]
 
     def _owned_status_text(self, s: Optional[dict], generic: str) -> str:
         """The stored sentence for a state that owns one, else its own label.
@@ -1522,12 +1547,12 @@ class TrayIcon:
         with self.model.lock:
             previous_state = self.model.state
             self.model.state = state
-            # THE shared rule — see STATUS_TEXT_STATES. Re-deriving it here
-            # is what let the clears and the render disagree (#214).
-            owns_status_text = STATUS_TEXT_STATES
             if status_text is not None:
                 self.model.status_text = status_text
-            elif state in owns_status_text and previous_state != state:
+            elif state in STATUS_TEXT_STATES and (
+                previous_state != state
+                or state not in STATUS_TEXT_RETAIN_ON_REENTRY
+            ):
                 # ENTERING a fault with nothing to say. Mirror of the recovery
                 # clear below, and it only started to matter once the ERROR
                 # branch of _get_status_text began rendering this field: the
@@ -1540,11 +1565,11 @@ class TrayIcon:
                 # than a reported fault.
                 #
                 # `previous_state != state`, NOT
-                # `previous_state not in owns_status_text`. The set holds EIGHT
-                # states (it held two when this was written), so the membership
-                # test treats a QUEUE_WARNING → ERROR move as staying put — and
-                # widening the set widened that hole from one pair to
-                # fifty-six ordered pairs. The queue's
+                # `previous_state not in STATUS_TEXT_STATES`. The set holds
+                # EIGHT states (it held two when this was written), so a
+                # membership test would treat a QUEUE_WARNING → ERROR move as
+                # staying put — and widening the set widened that hole from one
+                # ordered pair to fifty-six. The queue's
                 # "Queue 92% full" survived into a red row describing a TRACKER
                 # fault, and a text-less ERROR after a text-less QUEUE_WARNING
                 # resurrected whatever sentence preceded both. Precisely the
@@ -1553,16 +1578,19 @@ class TrayIcon:
                 # ends and you guard the one you were reasoning about
                 # (diagnosis-discipline.md Rule 3).
                 #
-                # The inequality is also what preserves the deliberate
-                # ERROR → ERROR retention below: same state is one outage
-                # escalating again, not a new one.
+                # The inequality preserves the deliberate ERROR → ERROR
+                # retention — same state is one outage escalating again — but
+                # ONLY for the states STATUS_TEXT_RETAIN_ON_REENTRY names.
+                # Re-entering any other owner clears, because for a multi-cause
+                # state like PAUSED a repeat is a different cause, not the
+                # same one.
                 #
                 # Every escalation in src/ passes a message today, so this is a
                 # guard on the shape rather than on a live caller. It is cheap
                 # and the alternative is a surface that lies whenever someone
                 # adds one that does not.
                 self.model.status_text = None
-            elif previous_state in owns_status_text and state not in owns_status_text:
+            elif previous_state in STATUS_TEXT_STATES and state not in STATUS_TEXT_STATES:
                 # Recovery transition: ERROR/QUEUE_WARNING → anything-healthy.
                 # Old status_text (e.g. "ActivityWatch is not running") would
                 # leak into the next display path until something else writes

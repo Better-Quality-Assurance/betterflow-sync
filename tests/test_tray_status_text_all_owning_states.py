@@ -128,7 +128,15 @@ def test_each_state_renders_the_sentence_its_writer_composed(state, written, gen
 
     # The other direction, so ``generic`` is load-bearing rather than decoration:
     # the same state with nothing to say falls back to its own label.
+    #
+    # Entered from SYNCING rather than from a fresh tray. A fresh tray is seeded
+    # ``state=STARTING, status_text="Starting..."``, so ``set_state(STARTING)``
+    # on one is a same-state re-entry and the value read back is the SEED, not
+    # the fallback — the two strings coincide, so the assertion passed while
+    # testing nothing. A reviewer's in-memory mutant of that dict entry survived
+    # the whole module because of it.
     bare = _make_tray()
+    bare.set_state(TrayState.SYNCING)
     bare.set_state(state)
     assert bare._get_status_text() == generic
 
@@ -168,21 +176,60 @@ def test_every_state_either_owns_the_field_or_provably_ignores_it():
             )
 
 
-def test_the_clear_and_the_render_read_the_same_rule():
-    """``set_state``'s clears and ``_get_status_text``'s reads were two answers to
-    one question, and QUEUE_WARNING was where they disagreed.
+def test_every_ordered_pair_of_states_leaves_the_right_sentence():
+    """The whole 11x11 transition matrix, replacing a source-shape guard.
 
-    Asserting on the object identity of the tuple, not on its contents: a copy
-    with the same members today is the same defect waiting to drift apart again.
+    The first version of this asserted that ``inspect.getsource(set_state)``
+    contains "STATUS_TEXT_STATES" and lacks "faulted = (". Both reviewers broke
+    it, in both directions, and they were right:
+
+    - restoring the exact defect (a local ``(ERROR, QUEUE_WARNING)`` tuple) left
+      it GREEN, because the literal it greps for also appears in the comment
+      above the line and in the docstring — a detector satisfied by prose
+      describing the thing it looks for;
+    - a behaviour-preserving extraction of the clear turned it RED.
+
+    A guard that false-fails on a legitimate refactor gets loosened rather than
+    fixed, so it was a liability rather than coverage. This asserts the RULE
+    instead of the text, and no rename or extraction can defeat it.
     """
-    import inspect
+    for a in TrayState:
+        for b in TrayState:
+            tray = _make_tray()
+            tray.set_state(a, SENTINEL)
+            tray.set_state(b)  # no text: b has nothing of its own to say
 
-    source = inspect.getsource(tray_module.TrayIcon.set_state)
-    assert "STATUS_TEXT_STATES" in source, (
-        "set_state re-derives which states own status_text instead of reading "
-        "the shared tuple"
+            rendered = tray._get_status_text()
+            retains = a is b and b in tray_module.STATUS_TEXT_RETAIN_ON_REENTRY
+
+            if retains:
+                assert rendered == SENTINEL, f"{a.value} -> {b.value} should retain"
+            else:
+                assert rendered != SENTINEL, (
+                    f"{a.value} -> {b.value} leaked the previous sentence"
+                )
+
+
+def test_only_single_cause_states_retain_their_sentence_on_re_entry():
+    """Retention is earned by having ONE cause, not by owning the field.
+
+    PAUSED is the counter-example that forced this to become data: five writers
+    (sleep, screen lock, idle, a user pause, a break) with five different
+    sentences, so PAUSED -> PAUSED is normally a CHANGE of cause. Retaining
+    there put "Screen locked" on an unlocked laptop and "Idle" on a machine
+    whose user had just clicked Pause — while the pause notification fired
+    beside it saying otherwise. All three read "Paused" on origin/main, so the
+    widening introduced them.
+    """
+    assert tray_module.STATUS_TEXT_RETAIN_ON_REENTRY <= set(STATUS_TEXT_STATES), (
+        "a state cannot retain a field it does not own"
     )
-    assert "faulted = (" not in source, "the second, disagreeing copy is still here"
+    assert TrayState.PAUSED not in tray_module.STATUS_TEXT_RETAIN_ON_REENTRY
+
+    tray = _make_tray()
+    tray.set_state(TrayState.PAUSED, "Idle")
+    tray.set_paused(True)  # the real path: main.py:3467 -> tray.py set_state(PAUSED)
+    assert tray._get_status_text() == "Paused"
 
 
 # ── Controls: the floors, and no leaking across transitions ──────────────
@@ -248,6 +295,21 @@ def test_a_partial_snapshot_still_answers():
         }
         rendered = tray._get_status_text(partial)
         assert isinstance(rendered, str) and rendered.strip(), state
+
+    # The other half, which the #213 version of this could not ask: a NON-owner
+    # handed a snapshot that DOES carry the key must ignore it. Omitting the key
+    # cannot distinguish "does not read it" from "reads a key I did not supply"
+    # (Phantom 16, an agreement region) — and that is exactly why the guard
+    # written to catch this widening did not catch it.
+    for state in (TrayState.SYNCING, TrayState.PRIVATE, TrayState.ON_BREAK):
+        supplied = {
+            "on_break": False,
+            "private_mode": False,
+            "state": state,
+            "break_minutes_left": 0,
+            "status_text": SENTINEL,
+        }
+        assert tray._get_status_text(supplied) != SENTINEL, state
 
 
 def test_the_break_and_private_flags_still_win_over_the_state():

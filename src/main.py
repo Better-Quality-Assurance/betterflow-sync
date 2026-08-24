@@ -814,6 +814,16 @@ class SyncCoordinator:
                 else:
                     if current_state == TrayState.NEEDS_PERMISSIONS:
                         self.tray.model.state = TrayState.SYNCING
+                        # Clear the hint we wrote above. This block is the only
+                        # place that moves state WITHOUT going through
+                        # set_state, so neither of its clears runs here. The
+                        # stale text is currently unreachable — SYNCING does not
+                        # render the field, and every later entry into a state
+                        # that does trips the entry-clear — but that is an
+                        # argument about the whole state machine holding, made
+                        # afresh by anyone who adds an owner. One line removes
+                        # the dependency on it.
+                        self.tray.model.status_text = None
                         should_update_icon = True
                     else:
                         should_update_icon = False
@@ -1808,7 +1818,8 @@ class SyncCoordinator:
             is_idle = self.idle_paused
 
             if self.paused_by_network:
-                self.tray.set_state(TrayState.QUEUED, "Offline")
+                # No text: the label is STATUS_TEXT_STATES[QUEUED].
+                self.tray.set_state(TrayState.QUEUED)
                 self.tray.update_stats(queue_size=self.queue.size())
                 # A network outage suspends UPLOAD, not capture: suspend_upload()
                 # keeps the trackers recording and queueing locally, often for
@@ -2022,7 +2033,8 @@ class SyncCoordinator:
         except Exception:
             reachable = False
         if not reachable:
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+            # No text: the label is STATUS_TEXT_STATES[QUEUED].
+            self.tray.set_state(TrayState.QUEUED)
         else:
             self.tray.set_state(TrayState.ERROR, error_message)
 
