@@ -49,6 +49,17 @@ logger = logging.getLogger(__name__)
 # that have no other reason to depend on each other.
 BUNDLE_ID = "co.betterqa.betterflow"
 
+# What _apply_macos_update leaves aside mid-replace. Spelled once because the
+# sweep below has to recognise exactly what that function creates: change the
+# writer and an independent copy in the sweep silently stops matching it, in the
+# reassuring direction ("nothing to clean up") with no test failing.
+_MACOS_BACKUP_SUFFIX = ".old.app"
+
+# The bundle stem every shipped build installs under (build.spec's CFBundleName).
+# The sweep derives its patterns from the RUNNING bundle's stem, so running from
+# anything else means it cannot see the canonical copy's siblings.
+_CANONICAL_STEM = "BetterFlow"
+
 # Names our updater has left in /Applications across versions. Each is a
 # FORMAT over the running bundle's stem, so the sweep can only ever match a
 # sibling of the app that is running.
@@ -405,7 +416,7 @@ def _apply_local_artifact(
                 return False
 
             # 3. Replace: move old aside, move new in place
-            backup_path = app_path.parent / f"{app_path.stem}.old.app"
+            backup_path = app_path.parent / f"{app_path.stem}{_MACOS_BACKUP_SUFFIX}"
             if backup_path.exists():
                 shutil.rmtree(backup_path)
 
@@ -1023,6 +1034,13 @@ def _bundle_identifier(app: Path) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
+# Public name for the module-private resolver above. Renaming the original
+# would touch 10 call sites across three test files this change has no other
+# business in; an alias gives callers outside the module a public symbol
+# without that blast radius.
+get_app_bundle_path = _get_app_bundle_path
+
+
 def find_stale_bundle_copies(running_app: Path) -> list[Path]:
     """Sibling copies of THIS app left behind by an earlier update.
 
@@ -1047,15 +1065,36 @@ def find_stale_bundle_copies(running_app: Path) -> list[Path]:
     4. **No symlinks.** Deleting through one deletes its target, which by
        definition is not a copy our updater left here.
     """
-    import re as _re
-
     parent = running_app.parent
     stem = running_app.stem  # "BetterFlow" from "BetterFlow.app"
     patterns = [
-        _re.compile(rf"^{_re.escape(stem)}\.app\.old$"),
-        _re.compile(rf"^{_re.escape(stem)}\.old\.app$"),
-        _re.compile(rf"^{_re.escape(stem)}-[0-9][0-9.]*-backup\.app$"),
+        re.compile(rf"^{re.escape(stem)}\.app\.old$"),
+        re.compile(rf"^{re.escape(stem + _MACOS_BACKUP_SUFFIX)}$"),
+        re.compile(rf"^{re.escape(stem)}-[0-9][0-9.]*-backup\.app$"),
     ]
+
+    if stem != _CANONICAL_STEM:
+        # Every pattern is built from the RUNNING bundle's stem, so from a
+        # non-canonical copy the sweep cannot see the canonical install's
+        # siblings and returns [] — which is exactly the state #211 reported:
+        # that device had booted BetterFlow-1.5.119-backup.app, where this
+        # function finds nothing and both duplicates survive.
+        #
+        # Returning [] is still the RIGHT action. The alternative — resolving
+        # the canonical stem from our own Info.plist and sweeping from here —
+        # would have a backup copy delete the newer BetterFlow.app beside it,
+        # which is worse than the sediment. The real repair is to get back into
+        # the canonical bundle; the sweep then works on the next launch.
+        #
+        # What was missing is any trace of it. A device in this state produced
+        # no output at all, and #211 was found by grepping one machine's log.
+        logger.warning(
+            "Running from %r, not the canonical %s.app — the stale-copy sweep "
+            "cannot see the canonical install's siblings and is doing nothing "
+            "(#211). This device is running a non-canonical copy of the agent.",
+            running_app.name, _CANONICAL_STEM,
+        )
+        return []
 
     stale: list[Path] = []
     try:
@@ -1078,7 +1117,7 @@ def find_stale_bundle_copies(running_app: Path) -> list[Path]:
         # and deleting the app that is currently executing. Keep it.
         if entry == running_app or entry.is_symlink() or not entry.is_dir():
             continue
-        if not any(p.match(entry.name) for p in patterns):
+        if not any(p.fullmatch(entry.name) for p in patterns):
             continue
         identifier = _bundle_identifier(entry)
         if identifier != BUNDLE_ID:
