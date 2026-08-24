@@ -2289,7 +2289,18 @@ class AWManager:
                     reason = self._tracker_reinstall_reason(install_dir, base)
                     if reason:
                         logger.warning("Reinstalling bundled trackers: %s.", reason)
-                        self._install_to_persistent(base, install_dir)
+                        # Read the result. The reason is recomputed every cycle,
+                        # so a silent failure here is not a one-off — it is the
+                        # same warning every 60 seconds for the life of the
+                        # install, with capture dead throughout and nothing in
+                        # the log saying the repair never landed.
+                        if not self._install_to_persistent(base, install_dir):
+                            logger.error(
+                                "Tracker reinstall FAILED — capture stays blocked and "
+                                "this will be retried every cycle. Reason it was "
+                                "attempted: %s.",
+                                reason,
+                            )
             return install_dir
 
         # Development: relative to project root (already has permissions)
@@ -2442,6 +2453,24 @@ class AWManager:
                 if os.path.isdir(src_subdir):
                     if os.path.isdir(dst_subdir):
                         shutil.rmtree(dst_subdir)
+                    elif os.path.exists(dst_subdir):
+                        # A LEGACY FLAT install puts a FILE at this path
+                        # (`trackers/darwin/bf-idle-tracker`) rather than a
+                        # directory, so the isdir branch above misses it and
+                        # copytree then raises FileExistsError. Every reinstall
+                        # fails, and because the reason is recomputed each cycle
+                        # the device logs the same warning every 60 seconds and
+                        # never repairs — permanently, on exactly the machines
+                        # #216 exists to rescue.
+                        #
+                        # Removing the launcher is also what fixes RESOLUTION:
+                        # _resolve_binary_path checks the flat path FIRST, so a
+                        # surviving file here would keep winning over the
+                        # bundled tree we are about to write. The flat layout's
+                        # other siblings (`Python`, `libssl…`) are inert once
+                        # the launcher is gone, since nothing resolves to them
+                        # on their own.
+                        os.remove(dst_subdir)
                     shutil.copytree(src_subdir, dst_subdir)
                     # Ensure binaries are executable
                     for root, _, files in os.walk(dst_subdir):

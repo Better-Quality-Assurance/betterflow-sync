@@ -54,12 +54,16 @@ def _fat(*cputypes: int) -> bytes:
 _EXE = ".exe" if platform.system() == "Windows" else ""
 
 
-def _tracker_tree(tmp_path, cputype: int, name: str) -> str:
+def _tracker_tree(tmp_path, cputype: int, name: str, ext: str = _EXE) -> str:
+    """A bundled tree. `ext` defaults to the running host's, and is overridden
+    to "" by the tests that patch `platform.system` to Darwin — under that patch
+    `_resolve_binary_path` looks for extension-less launchers on every host, so
+    host-shaped names would resolve to nothing on the Windows CI leg."""
     root = tmp_path / name
     for component in ALL_COMPONENTS:
         comp_dir = root / component
         comp_dir.mkdir(parents=True, exist_ok=True)
-        (comp_dir / (component + _EXE)).write_bytes(_thin(cputype))
+        (comp_dir / (component + ext)).write_bytes(_thin(cputype))
     return str(root)
 
 
@@ -445,3 +449,84 @@ def test_the_build_does_not_redownload_on_a_failed_probe(tmp_path):
     # there is nothing to compare and the key carries no arch to compare with.
     intel = _macos_tree(tmp_path, dl.BF_BINARIES, _CPU_TYPE_X86_64, "windows")
     assert dl.arch_mismatch(intel, "windows", "windows") is False
+
+
+# --------------------------------------------------------------------------
+# The CONSUMER. Everything above asserts what _tracker_reinstall_reason
+# RETURNS; none of it proves the reinstall it asks for can actually happen.
+# That is Phantom 7, and it hid a defect that made the whole upgrade path inert
+# for legacy installs — the exact population #216 exists to rescue.
+# --------------------------------------------------------------------------
+
+
+# What architecture is this tree? `AWManager._tracker_tree_arches` is the
+# production answer — it resolves each component through `_resolve_binary_path`
+# (which owns the flat/bundled layouts AND the ".exe" suffix) and reduces with
+# `common_arches`. Re-spelling either half here would judge the tree by paths
+# the running host never resolves, so both assertions below would read an empty
+# tree and pass — or fail — for reasons that have nothing to do with the fix.
+_tree_arches = AWManager._tracker_tree_arches
+
+
+def _flat_install(tmp_path, cputype: int, name: str) -> str:
+    """A LEGACY FLAT install: launchers are FILES at the root, beside a shared
+    runtime. This is what machines installed before the bundled layout have on
+    disk, and it is the shape `_install_to_persistent` used to choke on.
+
+    Extension-less on purpose: the tests using it patch `platform.system` to
+    Darwin, so this is what `_resolve_binary_path` looks for on every host."""
+    root = tmp_path / name
+    root.mkdir(parents=True, exist_ok=True)
+    for component in ALL_COMPONENTS:
+        (root / component).write_bytes(_thin(cputype))
+    (root / "Python").write_bytes(_thin(cputype))
+    return str(root)
+
+
+def test_a_flat_x86_install_is_actually_repaired_not_just_diagnosed(tmp_path):
+    """The consumer test. Asserts the tree's architecture CHANGED.
+
+    `_install_to_persistent` removed `dst_subdir` only when it was a directory.
+    A flat install puts a FILE there, so `copytree` raised FileExistsError, the
+    install returned False, and the reason — recomputed every cycle — stayed
+    identical forever: a warning every 60 seconds, capture dead, no repair.
+
+    Every other reinstall test asserts the REASON. None of them would have
+    failed on that, because the producer was working perfectly.
+    """
+    installed = _flat_install(tmp_path, _CPU_TYPE_X86_64, "flat-installed")
+    bundled = _tracker_tree(tmp_path, _CPU_TYPE_ARM64, "native-bundle", ext="")
+
+    with patch("src.aw_manager.platform.machine", return_value=ARM64), \
+         patch("src.aw_manager.platform.system", return_value="Darwin"), \
+         patch("src.aw_manager.subprocess.run"):
+        # Precondition: the gate does ask for a repair on this tree.
+        assert AWManager._tracker_reinstall_reason(installed, bundled) is not None
+        assert _tree_arches(installed) == {X86_64}
+
+        ok = AWManager._install_to_persistent(bundled, installed)
+
+        assert ok is True, "the reinstall the gate asked for did not succeed"
+        # The property that matters, and the one no producer test can express.
+        assert _tree_arches(installed) == {ARM64}, (
+            "trackers on disk are still the wrong architecture after a reinstall "
+            "the gate reported as needed"
+        )
+        # And it must now be SETTLED: asking again returns nothing to do, or the
+        # device warns and re-copies on every 60s cycle forever.
+        with patch.object(AWManager, "_should_reinstall_for_signing", return_value=False):
+            assert AWManager._tracker_reinstall_reason(installed, bundled) is None
+
+
+def test_a_bundled_x86_install_is_also_actually_repaired(tmp_path):
+    """The same consumer assertion for the modern layout, so the flat fix is
+    not the only path with evidence behind it."""
+    installed = _tracker_tree(tmp_path, _CPU_TYPE_X86_64, "bundled-installed", ext="")
+    bundled = _tracker_tree(tmp_path, _CPU_TYPE_ARM64, "bundled-native", ext="")
+
+    with patch("src.aw_manager.platform.machine", return_value=ARM64), \
+         patch("src.aw_manager.platform.system", return_value="Darwin"), \
+         patch("src.aw_manager.subprocess.run"):
+        assert _tree_arches(installed) == {X86_64}
+        assert AWManager._install_to_persistent(bundled, installed) is True
+        assert _tree_arches(installed) == {ARM64}
