@@ -146,7 +146,8 @@ class TrayModel:
         self.state: TrayState = TrayState.STARTING
         self.paused: bool = False
         self.private_mode: bool = False
-        self.status_text: str = "Starting..."
+        # One copy of this label, in STATUS_TEXT_STATES.
+        self.status_text: str = STATUS_TEXT_STATES[TrayState.STARTING]
         self.hours_today: str = "0h 0m"
         self.hours_this_week: str = "---"
         self.hours_this_month: str = "---"
@@ -448,6 +449,64 @@ class TrayState(Enum):
     STARTING = "starting"  # Blue - starting up
     WAITING_AUTH = "waiting_auth"  # Amber - waiting for browser login
 
+
+# The one answer to "which states own ``status_text``?", and the label each one
+# falls back to when its writer had nothing specific to say.
+#
+# It was previously two answers. ``set_state`` cleared the field for
+# ``(ERROR, QUEUE_WARNING)`` and ``_get_status_text`` rendered it for ERROR
+# alone, so QUEUE_WARNING was cleared by a rule that no longer matched the rule
+# that read it. That disagreement is not cosmetic: the clears are the only thing
+# stopping one state's sentence rendering under the next state's label, so
+# "renders it" and "is cleared on entry to it" must name the same set or a
+# widened branch is worse than the generic label it replaced.
+#
+# Membership and the floor live together deliberately. A state added to the
+# render path without a floor would show ``App status:`` with nothing after it
+# the first time its writer passed a blank; keying the label off the same dict
+# makes that unrepresentable.
+STATUS_TEXT_STATES: dict["TrayState", str] = {
+    TrayState.ERROR: "Error",
+    TrayState.QUEUE_WARNING: "Offline (queue full)",
+    TrayState.QUEUED: "Offline",
+    TrayState.WAITING_AUTH: "Waiting for login...",
+    TrayState.PAUSED: "Paused",
+    # Without a floor here a user outside their enforced working-hours window
+    # read "App status: Starting...", which looks like a hung app rather than a
+    # deliberate not-recording state.
+    TrayState.PRIVATE_HOURS: "Outside working hours",
+    # Writes its text directly under the model lock (src/main.py:810) rather
+    # than through set_state, so it is invisible to a grep for
+    # ``set_state(TrayState.X, "…")`` and was missing from #214's own table.
+    TrayState.NEEDS_PERMISSIONS: "Permissions needed",
+    # _set_startup_status feeds real progress here. STARTING is an EXPLICIT
+    # member rather than being folded into the ``else`` fallback below: the
+    # fallback catches states nothing handles, and a fallback that rendered the
+    # field would hand an unknown state a stale sentence.
+    TrayState.STARTING: "Starting...",
+}
+
+# Which of those states keep their sentence when re-entered with nothing new to
+# say. This is the THIRD fact about an owning state, and it was a blanket rule
+# until #214 widened the set — correct while the only re-entrant owners were the
+# two fault states, where re-entry genuinely means "the same thing again".
+#
+# PAUSED broke it. PAUSED has FIVE writers with five different causes (sleep,
+# screen lock, idle, a user pause, a break), so PAUSED → PAUSED is usually a
+# CHANGE of cause, not a repeat of one. Retaining there put "Screen locked" on
+# an unlocked laptop, "Sleeping" on an awake one, and "Idle" on a machine whose
+# user had just clicked Pause — while the pause notification fired beside it
+# saying otherwise. All three render "Paused" on origin/main, so all three were
+# regressions introduced by the widening rather than pre-existing.
+#
+# ERROR and QUEUE_WARNING are SINGLE-cause: re-entry is the same outage or the
+# same full queue reported again, and blanking on the second watchdog tick would
+# darken the surface exactly when the user looks at it. Both diagonals are
+# pinned (test_tray_status_text_renders.py:223, :244). A state earns retention
+# by having one cause, not by owning the field.
+STATUS_TEXT_RETAIN_ON_REENTRY: frozenset = frozenset(
+    {TrayState.ERROR, TrayState.QUEUE_WARNING}
+)
 
 # Colors for each state — BetterFlow brand palette
 STATE_COLORS = {
@@ -1080,49 +1139,20 @@ class TrayIcon:
             return f"On Break ({break_minutes_left}m left)"
         elif private_mode:
             return "Private Time"
-        elif state == TrayState.SYNCING:
-            return "Active"
-        elif state == TrayState.QUEUED:
-            return "Offline"
-        elif state == TrayState.QUEUE_WARNING:
-            return "Offline (queue full)"
-        elif state == TrayState.ERROR:
-            # Render the sentence the escalation handed us, not the constant.
+        elif state in STATUS_TEXT_STATES:
+            # Render the sentence the writer handed us, not the constant.
             #
             # ``status_text`` was write-only from the day it shipped: every
-            # producer set it, ``_snapshot_model`` carried it, and no render
-            # path read it. So the tray's persistent line said "Error" through
-            # every outage, whatever the cause, and #188's 90 minutes of a red
-            # tray naming the wrong component could not have been fixed by
-            # improving the message — the message reached nobody. This is the
-            # read that makes the field a field.
-            #
-            # Read INSIDE the branch, not at the top with its siblings: the only
-            # states that write it are the ones this branch covers, and a
-            # top-level read would make every unrelated caller of
-            # ``_get_status_text`` supply a key it has no business knowing about.
-            #
-            # ``or "Error"`` keeps the old constant as the floor. A blank or
-            # whitespace-only text must not render as ``App status:`` with
-            # nothing after it, and a non-string (a test double, a repr) must not
-            # be interpolated in front of the user — the same rule
-            # ``_tracker_fault_message`` applies one layer up, for the same
-            # reason.
-            status_text = s["status_text"] if s else self.model.status_text
-            if isinstance(status_text, str) and status_text.strip():
-                return status_text.strip()
-            return "Error"
-        elif state == TrayState.PAUSED:
-            return "Paused"
-        elif state == TrayState.WAITING_AUTH:
-            return "Waiting for login..."
-        elif state == TrayState.NEEDS_PERMISSIONS:
-            return "Permissions needed"
-        elif state == TrayState.PRIVATE_HOURS:
-            # Without this branch a user outside their enforced working-hours
-            # window read "App status: Starting...", which looks like a hung app
-            # rather than a deliberate not-recording state.
-            return "Outside working hours"
+            # producer set it, ``_snapshot_model`` carried it, and no render path
+            # read it. #213 made ERROR read it — #188's 90 minutes of a red tray
+            # naming the wrong component could not have been fixed by improving
+            # the message, because the message reached nobody. Seven states were
+            # still discarding theirs: a person whose session expired, a person
+            # whose queue is 87% full and a person whose laptop is asleep were
+            # shown one generic word each.
+            return self._owned_status_text(s, STATUS_TEXT_STATES[state])
+        elif state == TrayState.SYNCING:
+            return "Active"
         elif state == TrayState.ON_BREAK:
             # Normally covered by the on_break flag above; this catches the state
             # being set without the model flag, which also fell through to
@@ -1133,7 +1163,29 @@ class TrayIcon:
             # but the state alone must not read as "Starting...".
             return "Private Time"
         else:
-            return "Starting..."
+            # A state nothing handles. Deliberately NOT reading
+            # status_text — see STARTING's note in STATUS_TEXT_STATES.
+            return STATUS_TEXT_STATES[TrayState.STARTING]
+
+    def _owned_status_text(self, s: Optional[dict], generic: str) -> str:
+        """The stored sentence for a state that owns one, else its own label.
+
+        ``.get()`` rather than ``s["status_text"]``: the key is read for eight
+        states now, and a caller passing a partial snapshot must get the label
+        rather than a ``KeyError``. ``_snapshot_model`` always supplies it, so
+        the difference is only visible to callers that build a dict by hand —
+        which the existing suite does.
+
+        The floor is per-state and non-negotiable. A blank or whitespace-only
+        text must not render as ``App status:`` with nothing after it, and a
+        non-string (a test double, a repr) must never be interpolated in front
+        of the user — the same rule ``_tracker_fault_message`` applies one layer
+        up, for the same reason.
+        """
+        status_text = s.get("status_text") if s else self.model.status_text
+        if isinstance(status_text, str) and status_text.strip():
+            return status_text.strip()
+        return generic
 
     # -- Lock-protected checkers for `checked` lambdas ----------------------
 
@@ -1485,17 +1537,22 @@ class TrayIcon:
 
         Args:
             state: New state
-            status_text: Optional status message for error state. Passing None
+            status_text: Optional status message for any state in
+                ``STATUS_TEXT_STATES`` (eight of them, not just ERROR —
+                the docstring said "error state" while eight call sites
+                already passed one for something else). Passing None
                 explicitly when transitioning OUT of an error/queue state
                 clears the previous text so it doesn't leak across transitions.
         """
         with self.model.lock:
             previous_state = self.model.state
             self.model.state = state
-            faulted = (TrayState.ERROR, TrayState.QUEUE_WARNING)
             if status_text is not None:
                 self.model.status_text = status_text
-            elif state in faulted and previous_state != state:
+            elif state in STATUS_TEXT_STATES and (
+                previous_state != state
+                or state not in STATUS_TEXT_RETAIN_ON_REENTRY
+            ):
                 # ENTERING a fault with nothing to say. Mirror of the recovery
                 # clear below, and it only started to matter once the ERROR
                 # branch of _get_status_text began rendering this field: the
@@ -1507,9 +1564,12 @@ class TrayIcon:
                 # has been running for hours, which reads as a hung app rather
                 # than a reported fault.
                 #
-                # `previous_state != state`, NOT `previous_state not in faulted`.
-                # `faulted` holds TWO states, so the membership test treats a
-                # QUEUE_WARNING → ERROR move as staying put: the queue's
+                # `previous_state != state`, NOT
+                # `previous_state not in STATUS_TEXT_STATES`. The set holds
+                # EIGHT states (it held two when this was written), so a
+                # membership test would treat a QUEUE_WARNING → ERROR move as
+                # staying put — and widening the set widened that hole from one
+                # ordered pair to fifty-six. The queue's
                 # "Queue 92% full" survived into a red row describing a TRACKER
                 # fault, and a text-less ERROR after a text-less QUEUE_WARNING
                 # resurrected whatever sentence preceded both. Precisely the
@@ -1518,16 +1578,19 @@ class TrayIcon:
                 # ends and you guard the one you were reasoning about
                 # (diagnosis-discipline.md Rule 3).
                 #
-                # The inequality is also what preserves the deliberate
-                # ERROR → ERROR retention below: same state is one outage
-                # escalating again, not a new one.
+                # The inequality preserves the deliberate ERROR → ERROR
+                # retention — same state is one outage escalating again — but
+                # ONLY for the states STATUS_TEXT_RETAIN_ON_REENTRY names.
+                # Re-entering any other owner clears, because for a multi-cause
+                # state like PAUSED a repeat is a different cause, not the
+                # same one.
                 #
                 # Every escalation in src/ passes a message today, so this is a
                 # guard on the shape rather than on a live caller. It is cheap
                 # and the alternative is a surface that lies whenever someone
                 # adds one that does not.
                 self.model.status_text = None
-            elif previous_state in faulted and state not in faulted:
+            elif previous_state in STATUS_TEXT_STATES and state not in STATUS_TEXT_STATES:
                 # Recovery transition: ERROR/QUEUE_WARNING → anything-healthy.
                 # Old status_text (e.g. "ActivityWatch is not running") would
                 # leak into the next display path until something else writes

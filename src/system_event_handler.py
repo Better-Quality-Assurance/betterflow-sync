@@ -134,9 +134,21 @@ class SystemEventHandler:
                 logger.warning("send_sleep_event failed: %s", e)
         if user_paused:
             logger.info("System wake - staying paused (user-initiated pause active)")
+            # Re-assert PAUSED with no text. The state is unchanged, so this is
+            # a no-op for the icon — but the tray now RENDERS status_text, and
+            # the sentence still sitting there is "Sleeping", written on the way
+            # down. Returning without this leaves an awake laptop reporting that
+            # it is asleep. The cause is now the user's pause, which has no
+            # sentence of its own: the generic "Paused" is the true answer.
+            self.tray.set_state(TrayState.PAUSED)
             return
         if self.coordinator.is_on_break:
             logger.info("System wake - staying on break")
+            # Second reason to stay paused, same stale sentence as the branch
+            # above. PAUSED is re-asserted rather than ON_BREAK because the
+            # state is not this handler's to change — it only has to stop the
+            # tray claiming a cause that has ended.
+            self.tray.set_state(TrayState.PAUSED)
             return
         # Private Time is intentionally NOT auto-restored: it was ended at the
         # sleep boundary (on_system_sleep), so a sleep cleanly ends a private
@@ -189,9 +201,18 @@ class SystemEventHandler:
             pre_lock_private = self._pre_lock_private
         if user_paused:
             logger.info("Screen unlocked - staying paused (user-initiated pause active)")
+            # Same as the wake path above: "Screen locked" is still stored and
+            # now renders, so an unlocked screen would keep reporting itself
+            # locked.
+            self.tray.set_state(TrayState.PAUSED)
             return
         if self.coordinator.is_on_break:
             logger.info("Screen unlocked - staying on break")
+            # Second reason to stay paused, same stale sentence as the branch
+            # above. PAUSED is re-asserted rather than ON_BREAK because the
+            # state is not this handler's to change — it only has to stop the
+            # tray claiming a cause that has ended.
+            self.tray.set_state(TrayState.PAUSED)
             return
         if pre_lock_private:
             logger.info("Screen unlocked - restoring private time")
@@ -237,4 +258,6 @@ class SystemEventHandler:
             logger.info("Network offline - suspending upload (capture continues)")
             self.sync_engine.suspend_upload("network offline")
             self.coordinator.paused_by_network = True
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+            # No text: "Offline" is STATUS_TEXT_STATES[QUEUED] and passing it
+            # here would be a second copy of the label to keep in step.
+            self.tray.set_state(TrayState.QUEUED)
