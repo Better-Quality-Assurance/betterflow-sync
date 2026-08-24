@@ -25,7 +25,7 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, Iterable, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -608,3 +608,34 @@ def macho_arches(path: str) -> set:
     except struct.error as exc:
         logger.debug(f"Malformed Mach-O header in {path}: {exc}")
         return set()
+
+
+def common_arches(paths: Iterable[str]) -> Optional[set]:
+    """The architectures EVERY readable binary in a group can execute as.
+
+    An INTERSECTION, and deliberately not "whichever one we managed to read
+    first". A group of binaries is installed component by component (see
+    `aw_manager._install_to_persistent`), so a copy that raises partway leaves
+    one component at the new architecture and another at the old one. A
+    first-readable rule answers about whichever file it happened to open, so a
+    mixed tree reads as fine while the component it did not look at cannot
+    start at all — and the caller spawns it every cycle with nothing recorded
+    about why it dies.
+
+    Returns **None** when nothing in the group could be read: "could not tell",
+    which callers must fail toward the safe direction on. That is a different
+    answer from an **empty set**, which means the group WAS read and shares no
+    architecture at all — there is no way to run all of it on one machine.
+
+    One rule, three callers: the Rosetta start gate, the tracker reinstall
+    decision, and the build's re-download check all have to agree about what
+    "this tree is the wrong architecture" means, or a tree one of them accepts
+    is a tree another silently spawns.
+    """
+    common: Optional[set] = None
+    for path in paths:
+        arches = macho_arches(path)
+        if not arches:
+            continue  # could not tell — never evidence of a mismatch
+        common = set(arches) if common is None else (common & arches)
+    return common

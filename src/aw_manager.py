@@ -1,7 +1,6 @@
 """Manage bundled tracker processes (ActivityWatch components, white-labeled)."""
 
 import errno
-import hashlib
 import json
 import logging
 import os
@@ -41,7 +40,7 @@ ALL_COMPONENTS = [BF_SERVER] + BF_WATCHERS
 # (Developer ID, hardened runtime, stable identifier). A persistent tracker that
 # is NOT signed with this team is a stale ad-hoc copy from a pre-signing build:
 # its TCC (Input Monitoring) grant is fragile and gets silently denied, so the
-# tracker runs but stays blind. See _should_reinstall_trackers.
+# tracker runs but stays blind. See _tracker_reinstall_reason.
 BETTERQA_TEAM_ID = "87NVC57J44"
 
 # The pinned upstream release lives in ONE place (src/aw_release.py) and is
@@ -49,9 +48,9 @@ BETTERQA_TEAM_ID = "87NVC57J44"
 # purpose: callers and tests reach them as `aw_manager.RELEASE_SHA256` and patch
 # them with `patch.object`, which only works on a real module global.
 try:
-    from .machine_arch import macho_arches
+    from .machine_arch import common_arches
 except ImportError:  # pragma: no cover - frozen/script import path
-    from machine_arch import macho_arches
+    from machine_arch import common_arches
 
 try:
     from .aw_release import (  # noqa: F401
@@ -61,6 +60,7 @@ try:
         RELEASE_BASE,
         RELEASE_SHA256,
         asset_key,
+        digest_mismatch,
         platform_key,
     )
 except ImportError:  # pragma: no cover - frozen/script import path
@@ -71,6 +71,7 @@ except ImportError:  # pragma: no cover - frozen/script import path
         RELEASE_BASE,
         RELEASE_SHA256,
         asset_key,
+        digest_mismatch,
         platform_key,
     )
 
@@ -284,14 +285,18 @@ def _terminate_pid(pid: int, grace: float = SHUTDOWN_TIMEOUT) -> None:
 
 def _download_aw_binaries(install_dir: str) -> bool:
     """Download and extract tracker binaries to install_dir. Returns True on success."""
-    # The DOWNLOAD key carries an architecture on macOS; the install directory
-    # below does not. Keeping them separate is what lets a native arm64 install
-    # and an Intel one share the same on-disk layout while fetching different
-    # archives.
-    plat = asset_key()
-    asset = RELEASE_ASSETS.get(plat)
+    # TWO keys, and they are not interchangeable. The DOWNLOAD key carries an
+    # architecture on macOS ("darwin-arm64"); the PLATFORM key never does, and
+    # everything below that asks "which OS is this" — the ".exe" suffix, the
+    # chmod, the quarantine strip — must keep using the platform key. Feeding it
+    # the asset key instead silently skips the POSIX branch on every Mac,
+    # leaving freshly extracted launchers at zipfile's 0644 with the quarantine
+    # xattr intact while this function still logs success.
+    key = asset_key()
+    plat = platform_key()
+    asset = RELEASE_ASSETS.get(key)
     if not asset:
-        logger.error(f"No release available for platform: {plat}")
+        logger.error(f"No release available for platform: {key}")
         return False
 
     url = f"{RELEASE_BASE}/{asset}"
@@ -340,20 +345,12 @@ def _download_aw_binaries(install_dir: str) -> bool:
         # Integrity check: the tag is pinned but GitHub release assets are
         # mutable by the upstream account, so verify the archive against the
         # vetted hash before extracting (and before any chmod/quarantine-strip).
-        expected_sha = RELEASE_SHA256.get(plat)
-        if not expected_sha:
-            logger.error(f"No pinned SHA-256 for platform {plat}; refusing to install trackers")
-            return False
-        hasher = hashlib.sha256()
-        with open(tmp_zip, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        actual_sha = hasher.hexdigest()
-        if actual_sha != expected_sha:
-            logger.error(
-                f"Tracker archive SHA-256 mismatch for {asset}: "
-                f"expected {expected_sha}, got {actual_sha} — refusing to install"
-            )
+        # The rule itself lives beside the pins (aw_release.digest_mismatch) so
+        # the build script enforces the identical one; RELEASE_SHA256 is passed
+        # explicitly because it is this module's global that tests patch.
+        problem = digest_mismatch(tmp_zip, key, RELEASE_SHA256)
+        if problem:
+            logger.error(f"Refusing to install tracker archive: {problem}")
             return False
 
         logger.info(f"Downloaded {size_mb:.1f} MB (SHA-256 verified), extracting binaries...")
@@ -787,44 +784,86 @@ class AWManager:
         except Exception:
             logger.warning("Failed to notify about tracker download failure", exc_info=True)
 
-    def _bundled_trackers_need_rosetta(self) -> bool:
-        """True when the trackers ON THIS MACHINE cannot run natively here.
+    @staticmethod
+    def _tracker_tree_arches(tree_dir: str) -> Optional[set]:
+        """The architectures EVERY readable tracker in `tree_dir` can run as.
 
-        Reads the Mach-O header of the tracker we are actually going to spawn.
-        That is the artifact whose requirement decides the question — not the
-        pinned asset name, which describes what a *fresh* install would fetch
-        and says nothing about the copy already sitting at the persistent path.
+        The single answer to "what architecture is this tracker tree", used by
+        the Rosetta start gate and the reinstall decision alike (and mirrored by
+        `scripts/download_aw.py` at build time). Three sites that disagree about
+        it is three different ideas of which tree is runnable, which is how a
+        tree one of them accepts becomes a tree another one spawns and watches
+        die.
+
+        The layout is `_resolve_binary_path`'s business, not this method's: it
+        is what `_binaries_present` and `_start_component` use to decide which
+        file actually gets SPAWNED, and it accepts the legacy flat layout
+        (`<tree>/<component>` plus an adjacent `Python/`) as well as the bundled
+        one. Re-spelling a single branch of it here would judge a flat install
+        by files that do not exist, answer "could not tell" for every component,
+        and leave exactly the stale x86_64 tree this gate exists to catch both
+        unblocked and un-reinstalled. `common_arches` owns the rule; None means
+        "could not tell" — see its docstring.
+        """
+        paths = [_resolve_binary_path(tree_dir, name) for name in ALL_COMPONENTS]
+        return common_arches([p for p in paths if p])
+
+    @staticmethod
+    def _describe_arches(arches: set) -> str:
+        """Render an arch set for a log line, including the empty case.
+
+        Empty is not "unknown" here — it is a tree whose components share no
+        architecture — so it must not print as a blank.
+        """
+        return "/".join(sorted(arches)) or "a mix with no common architecture"
+
+    @classmethod
+    def _bundled_trackers_need_rosetta(cls, binaries_dir: Optional[str]) -> bool:
+        """True when the trackers in `binaries_dir` cannot run natively here.
+
+        Reads the Mach-O headers of the trackers we are actually going to
+        spawn. Those are the artifacts whose requirement decides the question —
+        not the pinned asset name, which describes what a *fresh* install would
+        fetch and says nothing about the copy already sitting at the persistent
+        path.
+
+        **A pure query, and it takes the directory rather than resolving one.**
+        `_get_binaries_dir()` is a resolver that also INSTALLS: in a frozen
+        macOS build it can rewrite the whole persistent tracker tree before
+        answering. A predicate that called it would report on binaries it had
+        just created rather than on the state it was asked about, and would
+        cost two `codesign` forks on a path that runs every 60 seconds. The
+        caller resolves once and passes the answer in.
+
+        Every component is consulted, via `common_arches` — see its docstring
+        for why the first readable one is not allowed to settle it.
 
         Fails toward **False** (do not block) whenever the answer is not
-        established: no binaries resolved yet on a first run, an unreadable
-        header, a path that does not exist. That direction is deliberate and
+        established: no binaries resolved yet on a first run, unreadable
+        headers, a path that does not exist. That direction is deliberate and
         matches `_rosetta_missing`'s own broken-probe behaviour — a start
         attempt that turns out to be wrong still hits the EBADARCH handler in
         `_start_component`, whereas a false block records nothing at all and is
         the exact harm this whole area exists to prevent.
         """
-        binaries_dir = self._get_binaries_dir()
         if not binaries_dir:
             # First run, nothing downloaded yet. The download picks the archive
             # matching this host (see aw_release.asset_key), so there is no
             # reason to assume the wrong architecture is coming.
             return False
 
-        host = platform.machine()
-        for name in ALL_COMPONENTS:
-            arches = macho_arches(os.path.join(binaries_dir, name, name))
-            if not arches:
-                continue  # could not tell — not evidence of a mismatch
-            # The first READABLE tracker settles it: all three come out of one
-            # archive, so they share an architecture. If it runs natively these
-            # are not the x86-only set, and anything still failing is a
-            # different fault that must not be reported as a Rosetta problem.
-            return host not in arches
-            return True
-        # Nothing readable. Not established, so do not block.
-        return False
+        arches = cls._tracker_tree_arches(binaries_dir)
+        if arches is None:
+            # Nothing readable. Not established, so do not block.
+            return False
+        # An EMPTY set is established, and the worst case: the tree is mixed
+        # (a reinstall that failed partway), so no single architecture runs all
+        # of it. Blocking is right — half the trackers would EBADARCH on every
+        # cycle otherwise, with AFK capture silently dead and nothing recorded
+        # about why.
+        return platform.machine() not in arches
 
-    def _rosetta_required(self) -> bool:
+    def _rosetta_required(self, binaries_dir: Optional[str]) -> bool:
         """True when capture is blocked for want of Rosetta 2 — the real gate.
 
         Two independent questions, and conflating them is the defect this
@@ -843,16 +882,21 @@ class AWManager:
         just as mandatory as before, with nothing in any test to say so.
 
         Order matters for cost as well as correctness. The binary check reads a
-        few bytes of a local file; `_rosetta_missing()` forks `/usr/bin/arch`.
-        Asking the cheap, decisive question first means a native install never
-        pays for the fork at all, on a path that runs every 60 seconds — and it
-        leaves `_rosetta_missing_cached` as `None` there, so
+        few bytes of already-resolved local files; `_rosetta_missing()` forks
+        `/usr/bin/arch`. Asking the cheap, decisive question first means a
+        native install never pays for the fork at all, on a path that runs every
+        60 seconds — and it leaves `_rosetta_missing_cached` as `None` there, so
         `capture_blocked_remedy()` correctly offers no Rosetta instruction on a
         machine that does not need one.
+
+        Args:
+            binaries_dir: The already-resolved tracker directory (None if there
+                is none yet). Taken as an argument rather than resolved here so
+                this stays a query: see `_bundled_trackers_need_rosetta`.
         """
         if sys.platform != "darwin":
             return False
-        if not self._bundled_trackers_need_rosetta():
+        if not self._bundled_trackers_need_rosetta(binaries_dir):
             return False
         return self._rosetta_missing()
 
@@ -1099,12 +1143,20 @@ class AWManager:
         # asked this question in this order; the Rosetta path did not.
         server_already_running = self._port_in_use()
 
+        # Resolved BEFORE the Rosetta gate, and exactly once. _get_binaries_dir
+        # is also the installer: on a frozen macOS build it replaces a stale
+        # x86_64 tracker tree with the bundled arm64 one. Asking the gate first
+        # and resolving afterwards would block that very machine on the trackers
+        # it is about to stop having — capture dead forever on a device whose
+        # whole fix is one directory copy away.
+        binaries_dir = self._get_binaries_dir()
+
         # Trackers this machine cannot execute. Checked BEFORE spawning rather
         # than after 21 identical EBADARCH failures, and reported rather than
         # retried, because no amount of retrying installs Rosetta.
-        # See _rosetta_required() — and note it asks what the BUNDLED BINARIES
+        # See _rosetta_required() — and note it asks what the INSTALLED BINARIES
         # need, not merely what this host supports.
-        if self._rosetta_required():
+        if self._rosetta_required(binaries_dir):
             # Managed watchers are unavailable either way — these binaries do
             # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
@@ -1172,8 +1224,6 @@ class AWManager:
             self.tracker_download_failed = True
             self._notify_rosetta_required_once()
             return False
-
-        binaries_dir = self._get_binaries_dir()
 
         if binaries_dir and not (self._exec_failed_components - self._disabled_components):
             # Clear the latch on EVERY route that resolves usable binaries, not
@@ -2310,33 +2360,37 @@ class AWManager:
         the machine would need Rosetta forever.
         """
         idle = IDLE_TRACKER
-        installed_bin = os.path.join(install_dir, idle, idle)
-        bundled_bin = os.path.join(bundle_dir, idle, idle)
-
-        installed_arches = macho_arches(installed_bin)
-        bundled_arches = macho_arches(bundled_bin)
+        # The WHOLE tree, not just the idle tracker: `_install_to_persistent`
+        # copies component by component, so a copy that raises partway leaves a
+        # mixed tree. Judging it by one component would call such a tree healthy
+        # and leave the other component unable to start — the same first-readable
+        # trap `common_arches` exists to close, and the same rule the start gate
+        # and the build's re-download check now apply.
+        installed_arches = cls._tracker_tree_arches(install_dir)
+        bundled_arches = cls._tracker_tree_arches(bundle_dir)
         host = platform.machine()
         # Every clause is required, and each one fails toward KEEPING the
         # installed copy — the conservative direction, since a needless
         # reinstall costs the user a fresh Input Monitoring grant.
-        #   - both sets non-empty: an unreadable header means "could not tell",
-        #     never "wrong arch" (see macho_arches).
-        #   - host not in installed: the copy on disk genuinely cannot run here.
+        #   - neither is None: unreadable headers mean "could not tell", never
+        #     "wrong arch" (see common_arches).
+        #   - host not in installed: the copy on disk genuinely cannot run here
+        #     (an empty set says no single architecture runs all of it).
         #   - host in bundled: and the replacement genuinely can. Without this a
         #     build whose bundle is equally unrunnable would churn the binary
         #     and change nothing, the same trap the signing check avoids by
         #     refusing to swap ad-hoc for ad-hoc.
         if (
-            installed_arches
-            and bundled_arches
+            installed_arches is not None
+            and bundled_arches is not None
             and host not in installed_arches
             and host in bundled_arches
         ):
             return (
-                f"installed {idle} is {'/'.join(sorted(installed_arches))} and cannot run "
-                f"natively on this {host} Mac, while the bundled copy is "
-                f"{'/'.join(sorted(bundled_arches))} — reinstalling so capture no longer "
-                "depends on Rosetta 2"
+                f"installed trackers are {cls._describe_arches(installed_arches)} and "
+                f"cannot run natively on this {host} Mac, while the bundled copy is "
+                f"{cls._describe_arches(bundled_arches)} — reinstalling so capture no "
+                "longer depends on Rosetta 2"
             )
 
         if cls._should_reinstall_for_signing(install_dir, bundle_dir):
@@ -2348,11 +2402,6 @@ class AWManager:
             )
 
         return None
-
-    @classmethod
-    def _should_reinstall_trackers(cls, install_dir: str, bundle_dir: str) -> bool:
-        """Bool form of `_tracker_reinstall_reason`, kept for callers/tests."""
-        return cls._tracker_reinstall_reason(install_dir, bundle_dir) is not None
 
     @classmethod
     def _should_reinstall_for_signing(cls, install_dir: str, bundle_dir: str) -> bool:

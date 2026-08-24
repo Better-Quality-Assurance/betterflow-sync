@@ -34,30 +34,42 @@ def _teams(install, bundle):
     return patch.object(AWManager, "_tracker_team_identifier", staticmethod(fake))
 
 
+def _reason(install="/install", bundle="/bundle"):
+    """The shipped decision itself.
+
+    These paths do not exist, so the architecture check that runs first cannot
+    read a header, answers "could not tell", and hands over to the signing rule
+    below — which is the case this file is about.
+    """
+    return AWManager._tracker_reinstall_reason(install, bundle)
+
+
 def test_reinstall_when_installed_adhoc_and_bundle_signed():
     """The real-world bug: ad-hoc persistent copy, Developer-ID bundle."""
     with _teams(install=None, bundle=BETTERQA_TEAM_ID):
-        assert AWManager._should_reinstall_trackers("/install", "/bundle") is True
+        reason = _reason()
+    assert reason is not None
+    assert "Input Monitoring" in reason
 
 
 def test_no_reinstall_when_both_signed_with_our_team():
     """Already healed (or shipped signed from the start) — leave it alone."""
     with _teams(install=BETTERQA_TEAM_ID, bundle=BETTERQA_TEAM_ID):
-        assert AWManager._should_reinstall_trackers("/install", "/bundle") is False
+        assert _reason() is None
 
 
 def test_no_reinstall_when_bundle_also_adhoc():
     """Old build whose bundle is ad-hoc too — swapping ad-hoc for ad-hoc would
     only churn the binary and force a needless re-grant for no gain."""
     with _teams(install=None, bundle=None):
-        assert AWManager._should_reinstall_trackers("/install", "/bundle") is False
+        assert _reason() is None
 
 
 def test_reinstall_when_installed_is_foreign_team_but_bundle_ours():
     """Defensive: a tracker signed by some other team still gets replaced by our
     properly-signed bundle copy."""
     with _teams(install="OTHERTEAM9", bundle=BETTERQA_TEAM_ID):
-        assert AWManager._should_reinstall_trackers("/install", "/bundle") is True
+        assert _reason() is not None
 
 
 def test_team_identifier_is_none_off_macos():

@@ -77,7 +77,11 @@ def test_the_build_script_and_the_agent_resolve_the_same_pin():
     assert aw_manager.AW_VERSION is aw_release.AW_VERSION
     assert download_aw.AW_VERSION is aw_release.AW_VERSION
     assert download_aw.RELEASE_ASSETS is aw_release.RELEASE_ASSETS
-    assert download_aw.RELEASE_SHA256 is aw_release.RELEASE_SHA256
+    assert aw_manager.RELEASE_SHA256 is aw_release.RELEASE_SHA256
+    # The build no longer names the digest table at all: it calls the shared
+    # fail-closed check, which reads the pins next to it. Same pin, and now the
+    # same rule enforcing it.
+    assert download_aw.digest_mismatch is aw_release.digest_mismatch
 
 
 @pytest.mark.parametrize(
@@ -110,6 +114,24 @@ def test_windows_and_linux_have_no_architecture_dimension():
     assert asset_key(system="Windows", machine="AMD64") == "windows"
     assert asset_key(system="Linux", machine="aarch64") == "linux"
     assert asset_key(system="Linux", machine="x86_64") == "linux"
+
+
+def test_asset_arch_is_the_inverse_of_asset_key():
+    """`arch_mismatch` decides what "the right architecture" is entirely from
+    this function, and it is the only thing stopping a second `make dmg` in one
+    worktree from bundling the other leg's trackers. Answering the platform
+    instead of the arch — or None for a `darwin-*` key — makes that check say
+    False, the download is skipped, and the arm64 DMG ships Intel trackers.
+    `asset_key` has coverage in both directions; without this its inverse had
+    none."""
+    from src.aw_release import asset_arch, asset_key
+
+    for machine in ("arm64", "x86_64"):
+        assert asset_arch(asset_key(system="Darwin", machine=machine)) == machine
+    # Windows and Linux keys carry no architecture (see the module docstring).
+    # Guessing one for them would re-download on every build of those legs.
+    assert asset_arch("windows") is None
+    assert asset_arch("linux") is None
 
 
 def test_macos_picks_the_archive_matching_the_running_build():

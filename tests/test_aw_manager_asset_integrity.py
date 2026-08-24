@@ -3,7 +3,7 @@
 `_download_aw_binaries` verifies the downloaded ActivityWatch archive against
 `RELEASE_SHA256` and fails CLOSED on a mismatch or a missing pin. That makes a
 routine `AW_VERSION` bump dangerous: forget to recompute the hashes and every
-machine that needs a bootstrap (or a `_should_reinstall_trackers` reinstall)
+machine that needs a bootstrap (or a `_tracker_reinstall_reason` reinstall)
 silently installs nothing — no trackers, zero activity captured, one log line.
 
 These tests make that mistake fail in CI instead of on the fleet.
@@ -20,7 +20,7 @@ from src import aw_manager
 from src.aw_manager import AW_VERSION, RELEASE_ASSETS, RELEASE_SHA256
 
 # The AW_VERSION whose archives were hand-vetted (shasum -a 256 on the release
-# assets) to produce the RELEASE_SHA256 values in src/aw_manager.py. Bumping
+# assets) to produce the RELEASE_SHA256 values in src/aw_release.py. Bumping
 # AW_VERSION without re-vetting and updating BOTH this constant and the hashes
 # is exactly the silent-outage scenario above, so it must break the build.
 #

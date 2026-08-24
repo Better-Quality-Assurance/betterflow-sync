@@ -18,6 +18,7 @@ bug being fixed, one layer up.
 """
 
 import os
+import platform
 import struct
 import subprocess
 from unittest.mock import patch
@@ -46,12 +47,19 @@ def _fat(*cputypes: int) -> bytes:
     return out
 
 
+# The gate resolves each component through `_resolve_binary_path`, which
+# appends ".exe" on Windows. Fixtures must name their launchers the way the
+# running host really would, or the whole tree resolves to nothing on the
+# Windows CI leg and every assertion below passes for the wrong reason.
+_EXE = ".exe" if platform.system() == "Windows" else ""
+
+
 def _tracker_tree(tmp_path, cputype: int, name: str) -> str:
     root = tmp_path / name
     for component in ALL_COMPONENTS:
         comp_dir = root / component
         comp_dir.mkdir(parents=True, exist_ok=True)
-        (comp_dir / component).write_bytes(_thin(cputype))
+        (comp_dir / (component + _EXE)).write_bytes(_thin(cputype))
     return str(root)
 
 
@@ -146,8 +154,16 @@ def _mgr() -> AWManager:
     return mgr
 
 
-def _apple_silicon_without_rosetta(binaries_dir):
-    """An arm64 Mac whose `/usr/bin/arch -x86_64` probe FAILS — no Rosetta."""
+def _apple_silicon_without_rosetta():
+    """An arm64 Mac whose `/usr/bin/arch -x86_64` probe FAILS — no Rosetta.
+
+    The tracker directory is NOT patched in: the gate takes it as an argument.
+    `_get_binaries_dir` is the installer as well as the resolver — in a frozen
+    macOS build it can rewrite the whole persistent tracker tree before
+    returning — so it is patched to RAISE here, and a regression that reaches
+    for it from inside the query fails loudly instead of quietly reporting on
+    binaries it just created.
+    """
     return (
         patch("src.aw_manager.sys.platform", "darwin"),
         patch("src.aw_manager.platform.machine", return_value=ARM64),
@@ -155,7 +171,11 @@ def _apple_silicon_without_rosetta(binaries_dir):
             "src.aw_manager.subprocess.run",
             return_value=subprocess.CompletedProcess(args=[], returncode=1),
         ),
-        patch.object(AWManager, "_get_binaries_dir", return_value=binaries_dir),
+        patch.object(
+            AWManager,
+            "_get_binaries_dir",
+            side_effect=AssertionError("the Rosetta gate must not resolve or install binaries"),
+        ),
     )
 
 
@@ -167,11 +187,13 @@ def test_native_trackers_start_on_a_mac_with_no_rosetta(tmp_path):
     """
     native = _tracker_tree(tmp_path, _CPU_TYPE_ARM64, "native")
     mgr = _mgr()
-    p1, p2, p3, p4 = _apple_silicon_without_rosetta(native)
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
     with p1, p2, p3, p4:
         # Precondition: the fixture really is the case under test.
-        assert macho_arches(os.path.join(native, IDLE_TRACKER, IDLE_TRACKER)) == {ARM64}
-        assert mgr._rosetta_required() is False
+        assert macho_arches(
+            os.path.join(native, IDLE_TRACKER, IDLE_TRACKER + _EXE)
+        ) == {ARM64}
+        assert mgr._rosetta_required(native) is False
 
 
 def test_x86_trackers_on_a_mac_with_no_rosetta_are_still_blocked(tmp_path):
@@ -180,9 +202,50 @@ def test_x86_trackers_on_a_mac_with_no_rosetta_are_still_blocked(tmp_path):
     failures-per-hour behaviour the preflight was built to end."""
     intel = _tracker_tree(tmp_path, _CPU_TYPE_X86_64, "intel")
     mgr = _mgr()
-    p1, p2, p3, p4 = _apple_silicon_without_rosetta(intel)
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
     with p1, p2, p3, p4:
-        assert mgr._rosetta_required() is True
+        assert mgr._rosetta_required(intel) is True
+
+
+def test_a_half_reinstalled_tree_is_blocked_rather_than_spawned(tmp_path):
+    """A reinstall that fails partway leaves one component at the new
+    architecture and another at the old one. Judging the tree by the first
+    component we can read calls that healthy, so the start proceeds, the other
+    component EBADARCHes every cycle, AFK capture is dead, and nothing is
+    recorded about why. Every component has to agree."""
+    mixed = tmp_path / "mixed"
+    for i, component in enumerate(ALL_COMPONENTS):
+        d = mixed / component
+        d.mkdir(parents=True)
+        # First component native, the rest left at the old architecture.
+        d.joinpath(component + _EXE).write_bytes(
+            _thin(_CPU_TYPE_ARM64 if i == 0 else _CPU_TYPE_X86_64)
+        )
+    mgr = _mgr()
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
+    with p1, p2, p3, p4:
+        assert mgr._bundled_trackers_need_rosetta(str(mixed)) is True
+
+
+def test_a_flat_layout_install_is_judged_too(tmp_path):
+    """The persistent tree can still be in the LEGACY FLAT layout.
+
+    `_resolve_binary_path` accepts `<dir>/bf-idle-tracker` beside a `Python/`
+    runtime dir, `_binaries_present` is built on it, and `_start_component`
+    spawns whatever it returns. A gate that knew only the bundled layout would
+    find no file for any component, answer "could not tell", and let exactly
+    the stale x86_64 tree it exists to catch start unblocked — neither refused
+    nor reinstalled, EBADARCH every cycle.
+    """
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    (flat / "Python").mkdir()  # the adjacent runtime the flat layout needs
+    for component in ALL_COMPONENTS:
+        (flat / (component + _EXE)).write_bytes(_thin(_CPU_TYPE_X86_64))
+    mgr = _mgr()
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
+    with p1, p2, p3, p4:
+        assert mgr._bundled_trackers_need_rosetta(str(flat)) is True
 
 
 def test_x86_trackers_are_fine_once_rosetta_is_present(tmp_path):
@@ -191,9 +254,8 @@ def test_x86_trackers_are_fine_once_rosetta_is_present(tmp_path):
     with patch("src.aw_manager.sys.platform", "darwin"), \
          patch("src.aw_manager.platform.machine", return_value=ARM64), \
          patch("src.aw_manager.subprocess.run",
-               return_value=subprocess.CompletedProcess(args=[], returncode=0)), \
-         patch.object(AWManager, "_get_binaries_dir", return_value=intel):
-        assert mgr._rosetta_required() is False
+               return_value=subprocess.CompletedProcess(args=[], returncode=0)):
+        assert mgr._rosetta_required(intel) is False
 
 
 def test_a_native_install_never_forks_the_rosetta_probe(tmp_path):
@@ -209,9 +271,8 @@ def test_a_native_install_never_forks_the_rosetta_probe(tmp_path):
     mgr = _mgr()
     with patch("src.aw_manager.sys.platform", "darwin"), \
          patch("src.aw_manager.platform.machine", return_value=ARM64), \
-         patch("src.aw_manager.subprocess.run") as run, \
-         patch.object(AWManager, "_get_binaries_dir", return_value=native):
-        assert mgr._rosetta_required() is False
+         patch("src.aw_manager.subprocess.run") as run:
+        assert mgr._rosetta_required(native) is False
         arch_calls = [
             c for c in run.call_args_list
             if c.args and c.args[0] and c.args[0][0] == "/usr/bin/arch"
@@ -225,10 +286,10 @@ def test_no_binaries_yet_does_not_block(tmp_path):
     """First run: nothing downloaded. The gate must not block, or a clean Mac
     never gets as far as downloading the arm64 archive that would fix it."""
     mgr = _mgr()
-    p1, p2, p3, p4 = _apple_silicon_without_rosetta(None)
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
     with p1, p2, p3, p4:
-        assert mgr._bundled_trackers_need_rosetta() is False
-        assert mgr._rosetta_required() is False
+        assert mgr._bundled_trackers_need_rosetta(None) is False
+        assert mgr._rosetta_required(None) is False
 
 
 def test_an_unreadable_binary_does_not_block(tmp_path):
@@ -240,19 +301,18 @@ def test_an_unreadable_binary_does_not_block(tmp_path):
     for component in ALL_COMPONENTS:
         d = junk / component
         d.mkdir(parents=True)
-        (d / component).write_bytes(b"not a mach-o")
+        (d / (component + _EXE)).write_bytes(b"not a mach-o")
     mgr = _mgr()
-    p1, p2, p3, p4 = _apple_silicon_without_rosetta(str(junk))
+    p1, p2, p3, p4 = _apple_silicon_without_rosetta()
     with p1, p2, p3, p4:
-        assert mgr._bundled_trackers_need_rosetta() is False
+        assert mgr._bundled_trackers_need_rosetta(str(junk)) is False
 
 
 def test_non_macos_is_never_gated(tmp_path):
     intel = _tracker_tree(tmp_path, _CPU_TYPE_X86_64, "linuxish")
     mgr = _mgr()
-    with patch("src.aw_manager.sys.platform", "linux"), \
-         patch.object(AWManager, "_get_binaries_dir", return_value=intel):
-        assert mgr._rosetta_required() is False
+    with patch("src.aw_manager.sys.platform", "linux"):
+        assert mgr._rosetta_required(intel) is False
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +332,6 @@ def test_an_existing_x86_install_is_replaced_by_the_native_bundle(tmp_path):
         reason = AWManager._tracker_reinstall_reason(installed, bundled)
     assert reason is not None
     assert "cannot run natively" in reason
-    assert AWManager._should_reinstall_trackers(installed, bundled) is True
 
 
 def test_a_matching_arch_is_not_reinstalled_for_arch_reasons(tmp_path):
@@ -303,7 +362,7 @@ def test_an_unreadable_bundle_does_not_trigger_a_reinstall(tmp_path):
     for component in ALL_COMPONENTS:
         d = bundled / component
         d.mkdir(parents=True)
-        (d / component).write_bytes(b"nope")
+        (d / (component + _EXE)).write_bytes(b"nope")
     with patch("src.aw_manager.platform.machine", return_value=ARM64), \
          patch.object(AWManager, "_should_reinstall_for_signing", return_value=False):
         assert AWManager._tracker_reinstall_reason(installed, str(bundled)) is None
@@ -322,3 +381,67 @@ def test_the_signing_reason_still_fires_and_says_so(tmp_path):
     assert reason is not None
     assert "Input Monitoring" in reason
     assert "cannot run natively" not in reason
+
+
+# --------------------------------------------------------------------------
+# The build side. The same rule, applied one step earlier — and the only thing
+# standing between the arm64 DMG and a leftover Intel tracker tree.
+# --------------------------------------------------------------------------
+
+
+def _download_aw():
+    """`scripts/download_aw.py`, loaded by path (it is not an importable pkg)."""
+    import importlib.util
+
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "download_aw.py",
+    )
+    spec = importlib.util.spec_from_file_location("download_aw_arch_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _macos_tree(tmp_path, binaries, cputype: int, name: str) -> str:
+    """A `resources/trackers/darwin` tree as the build script writes one."""
+    root = tmp_path / name
+    for binary in binaries:
+        d = root / binary
+        d.mkdir(parents=True)
+        (d / binary).write_bytes(_thin(cputype))
+    return str(root)
+
+
+def test_the_build_redownloads_a_leftover_tree_from_the_other_macos_leg(tmp_path):
+    """Build the x86_64 DMG and then the arm64 one in the same worktree and the
+    first leg's trackers are still on disk — complete, correctly named, and
+    wrong. `binaries_exist` says True, so `arch_mismatch` is the only thing
+    stopping the arm64 DMG from shipping Intel trackers: #216 restored at build
+    time, with every other test green."""
+    dl = _download_aw()
+    intel = _macos_tree(tmp_path, dl.BF_BINARIES, _CPU_TYPE_X86_64, "darwin")
+
+    # Precondition: the stale tree really does look complete to the build.
+    assert dl.binaries_exist(intel, "darwin") is True
+    assert dl.arch_mismatch(intel, "darwin", "darwin-arm64") is True
+    # The control: the leg that matches must not re-download on every build.
+    assert dl.arch_mismatch(intel, "darwin", "darwin-x86_64") is False
+
+
+def test_the_build_does_not_redownload_on_a_failed_probe(tmp_path):
+    """Unreadable headers are 'could not tell'. Re-downloading on the strength
+    of a failed probe would make every Windows/Linux build refetch too."""
+    dl = _download_aw()
+    junk = tmp_path / "junk"
+    for binary in dl.BF_BINARIES:
+        d = junk / binary
+        d.mkdir(parents=True)
+        (d / binary).write_bytes(b"not a mach-o")
+
+    assert dl.arch_mismatch(str(junk), "darwin", "darwin-arm64") is False
+    # Non-macOS platforms publish one architecture into their own directory, so
+    # there is nothing to compare and the key carries no arch to compare with.
+    intel = _macos_tree(tmp_path, dl.BF_BINARIES, _CPU_TYPE_X86_64, "windows")
+    assert dl.arch_mismatch(intel, "windows", "windows") is False

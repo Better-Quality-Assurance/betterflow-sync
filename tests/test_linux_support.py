@@ -79,9 +79,32 @@ class TestDownloadAwScriptLinux:
         assert "linux" in download_aw.RELEASE_ASSETS
 
     def test_get_platform_linux(self, monkeypatch):
+        # `get_platform` now delegates to src.aw_release.platform_key, so the
+        # script no longer imports `platform` itself and there is no
+        # `download_aw.platform` to reach through. Patch the stdlib module the
+        # delegate actually reads.
+        import platform as platform_module
+
         download_aw = _load_download_aw()
-        monkeypatch.setattr(download_aw.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(platform_module, "system", lambda: "Linux")
         assert download_aw.get_platform() == "linux"
+
+    def test_linux_takes_the_x86_64_asset_whatever_the_machine_reports(self, monkeypatch):
+        """Linux has no architecture dimension, deliberately.
+
+        Upstream publishes no linux-arm64 build, so an arm64 Linux host keeps
+        getting the x86_64 archive exactly as it did before the macOS split —
+        unchanged, not improved. Pinned so the asymmetry is not "tidied" into
+        symmetry, which would turn that host into a hard "no release for this
+        platform".
+        """
+        import platform as platform_module
+
+        download_aw = _load_download_aw()
+        monkeypatch.setattr(platform_module, "system", lambda: "Linux")
+        monkeypatch.setattr(platform_module, "machine", lambda: "aarch64")
+        assert download_aw.get_asset_key() == "linux"
+        assert download_aw.RELEASE_ASSETS["linux"].endswith("-linux-x86_64.zip")
 
 
 # ---------------------------------------------------------------------------

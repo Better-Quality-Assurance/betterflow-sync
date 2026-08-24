@@ -16,6 +16,7 @@ import contextlib
 import errno
 import logging
 import os
+import platform
 import struct
 import subprocess
 import tempfile
@@ -45,10 +46,14 @@ def _tracker_tree(cputype: int) -> str:
     needed to answer "can this machine execute this".
     """
     root = tempfile.mkdtemp(prefix="bf-trackers-")
+    # ".exe" on Windows because the gate resolves each component through
+    # `_resolve_binary_path`, which appends it there — a fixture named without
+    # it resolves to nothing on the Windows CI leg.
+    ext = ".exe" if platform.system() == "Windows" else ""
     for name in ALL_COMPONENTS:
         comp = os.path.join(root, name)
         os.makedirs(comp, exist_ok=True)
-        with open(os.path.join(comp, name), "wb") as fh:
+        with open(os.path.join(comp, name + ext), "wb") as fh:
             fh.write(_macho_header(cputype))
     return root
 
@@ -467,7 +472,7 @@ def _assert_rosetta_path_live(mgr):
     the branch at all — the phantom that made these tests need updating in the
     first place.
     """
-    assert mgr._bundled_trackers_need_rosetta() is True, (
+    assert mgr._bundled_trackers_need_rosetta(_X86_TRACKERS) is True, (
         "fixture precondition: the trackers on disk must be x86-only, or the "
         "Rosetta branch is unreachable and these assertions prove nothing"
     )

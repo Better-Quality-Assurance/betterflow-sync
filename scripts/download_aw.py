@@ -1,11 +1,9 @@
 """Download ActivityWatch binaries from GitHub releases and rename for white-labeling."""
 
 import os
-import platform
 import shutil
 import ssl
 import stat
-import hashlib
 import subprocess
 import sys
 import tempfile
@@ -21,14 +19,15 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # binaries we ship, so a drift meant the build downloading one version while
 # the agent verified the digests of another, with the nightly pin guard green.
 sys.path.insert(0, PROJECT_ROOT)
-from src.machine_arch import ARM64, X86_64, macho_arches  # noqa: E402
+from src.machine_arch import common_arches  # noqa: E402
 from src.aw_release import (  # noqa: E402
     AW_TO_BF_NAMES,
     AW_VERSION,
     RELEASE_ASSETS,
     RELEASE_BASE,
-    RELEASE_SHA256,
+    asset_arch,
     asset_key,
+    digest_mismatch,
     platform_key,
 )
 
@@ -99,24 +98,26 @@ def arch_mismatch(output_dir: str, plat: str, key: str) -> bool:
     macOS only: it is the sole platform where we publish two architectures into
     one per-OS directory, so it is the only one where a leftover tree can be
     complete, correctly named, and still wrong. Returns False whenever the
-    header cannot be read, which re-downloads nothing on the strength of a
+    headers cannot be read, which re-downloads nothing on the strength of a
     failed probe.
+
+    `asset_arch` decodes the key and `common_arches` decides what the tree is —
+    the same two rules the agent applies at start time. Spelling either one out
+    again here (a `key.endswith(...)`, a first-readable-wins loop) is a second
+    implementation free to drift from the one that ships.
     """
     if plat != "darwin":
         return False
-    wanted = ARM64 if key.endswith(ARM64) else X86_64
-    for name in BF_BINARIES:
-        path = resolve_binary_path(output_dir, name, plat)
-        if not path:
-            continue
-        arches = macho_arches(path)
-        if arches and wanted not in arches:
-            print(
-                f"  {name} on disk is {'/'.join(sorted(arches))}, need {wanted} "
-                "— re-downloading"
-            )
-            return True
-    return False
+    wanted = asset_arch(key)
+    if wanted is None:
+        return False
+    paths = [resolve_binary_path(output_dir, name, plat) for name in BF_BINARIES]
+    arches = common_arches([p for p in paths if p])
+    if arches is None or wanted in arches:
+        return False
+    have = "/".join(sorted(arches)) or "a mix with no common architecture"
+    print(f"  trackers on disk are {have}, need {wanted} — re-downloading")
+    return True
 
 
 def build_ssl_context() -> ssl.SSLContext:
@@ -161,22 +162,18 @@ def verify_digest(zip_path: str, key: str) -> None:
     script — which fetches the binaries we actually SHIP — did not, so the
     build was the unverified half of a pair whose whole point is that upstream
     release assets are mutable under a pinned tag.
+
+    The rule itself lives with the pins (`aw_release.digest_mismatch`) and is
+    called by both halves. Single-sourcing the pin while hand-writing its
+    enforcement twice is the same defect one layer up: a future change to the
+    rule would have to land in both copies or the build and the agent would
+    accept different archives.
     """
-    expected = RELEASE_SHA256.get(key)
-    if not expected:
-        print(f"ERROR: no pinned SHA-256 for {key}; refusing to bundle unverified binaries")
+    problem = digest_mismatch(zip_path, key)
+    if problem:
+        print(f"ERROR: {problem}")
         sys.exit(1)
-    hasher = hashlib.sha256()
-    with open(zip_path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    actual = hasher.hexdigest()
-    if actual != expected:
-        print(f"ERROR: SHA-256 mismatch for {RELEASE_ASSETS[key]}")
-        print(f"  expected: {expected}")
-        print(f"  actual:   {actual}")
-        sys.exit(1)
-    print(f"  digest OK ({actual[:12]}...)")
+    print("  digest OK")
 
 
 def download_release(key: str) -> str:
