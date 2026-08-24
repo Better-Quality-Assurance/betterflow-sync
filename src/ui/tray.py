@@ -1087,6 +1087,30 @@ class TrayIcon:
         elif state == TrayState.QUEUE_WARNING:
             return "Offline (queue full)"
         elif state == TrayState.ERROR:
+            # Render the sentence the escalation handed us, not the constant.
+            #
+            # ``status_text`` was write-only from the day it shipped: every
+            # producer set it, ``_snapshot_model`` carried it, and no render
+            # path read it. So the tray's persistent line said "Error" through
+            # every outage, whatever the cause, and #188's 90 minutes of a red
+            # tray naming the wrong component could not have been fixed by
+            # improving the message — the message reached nobody. This is the
+            # read that makes the field a field.
+            #
+            # Read INSIDE the branch, not at the top with its siblings: the only
+            # states that write it are the ones this branch covers, and a
+            # top-level read would make every unrelated caller of
+            # ``_get_status_text`` supply a key it has no business knowing about.
+            #
+            # ``or "Error"`` keeps the old constant as the floor. A blank or
+            # whitespace-only text must not render as ``App status:`` with
+            # nothing after it, and a non-string (a test double, a repr) must not
+            # be interpolated in front of the user — the same rule
+            # ``_tracker_fault_message`` applies one layer up, for the same
+            # reason.
+            status_text = s["status_text"] if s else self.model.status_text
+            if isinstance(status_text, str) and status_text.strip():
+                return status_text.strip()
             return "Error"
         elif state == TrayState.PAUSED:
             return "Paused"
@@ -1442,11 +1466,27 @@ class TrayIcon:
         with self.model.lock:
             previous_state = self.model.state
             self.model.state = state
+            faulted = (TrayState.ERROR, TrayState.QUEUE_WARNING)
             if status_text is not None:
                 self.model.status_text = status_text
-            elif previous_state in (TrayState.ERROR, TrayState.QUEUE_WARNING) and state not in (
-                TrayState.ERROR, TrayState.QUEUE_WARNING,
-            ):
+            elif state in faulted and previous_state not in faulted:
+                # ENTERING a fault with nothing to say. Mirror of the recovery
+                # clear below, and it only started to matter once the ERROR
+                # branch of _get_status_text began rendering this field: the
+                # model seeds status_text to "Starting...", and every writer
+                # before this point (the NEEDS_PERMISSIONS hint in main.py, an
+                # older escalation) leaves its own sentence behind. Without this
+                # a text-less escalation renders the PREVIOUS state's message
+                # under a red icon — "App status: Starting..." on a machine that
+                # has been running for hours, which reads as a hung app rather
+                # than a reported fault.
+                #
+                # Every escalation in src/ passes a message today, so this is a
+                # guard on the shape rather than on a live caller. It is cheap
+                # and the alternative is a surface that lies whenever someone
+                # adds one that does not.
+                self.model.status_text = None
+            elif previous_state in faulted and state not in faulted:
                 # Recovery transition: ERROR/QUEUE_WARNING → anything-healthy.
                 # Old status_text (e.g. "ActivityWatch is not running") would
                 # leak into the next display path until something else writes
