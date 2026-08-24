@@ -12,6 +12,7 @@ intervals, recording zero seconds on both 07-22 and 07-23 while reporting itself
 healthy. No amount of retrying installs Rosetta, so the loop was pure noise.
 """
 
+import contextlib
 import errno
 import subprocess
 from unittest.mock import patch
@@ -101,8 +102,15 @@ def test_start_refuses_and_reports_instead_of_spawning():
     # notifier's own spawn (notify-send on Linux). Without this the assertion
     # below reads that as "a tracker was started" — green on macOS, red on the
     # Linux CI runner.
+    #
+    # _port_in_use is pinned because _start_locked now consults it BEFORE the
+    # Rosetta branch, so an unpinned probe makes this test answer differently
+    # depending on whether the developer happens to have ActivityWatch running.
+    # It found this the honest way: on a laptop with a live server on 5600 the
+    # unpinned version returned True and reddened here.
     with patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once"), \
+         patch.object(AWManager, "_port_in_use", return_value=False), \
          patch("src.aw_manager.subprocess.Popen") as popen:
         started = mgr._start_locked()
 
@@ -113,9 +121,44 @@ def test_start_refuses_and_reports_instead_of_spawning():
     assert mgr.health_snapshot()["tracker_download_failed"] is True
 
 
+def test_an_external_server_is_attached_to_rather_than_declared_dead():
+    """The other end of the branch above, and the reason it has two.
+
+    Rosetta missing means OUR binaries cannot execute. It does not mean this
+    device records nothing: a user who hit the wall and installed a native arm64
+    ActivityWatch themselves has a live server on the port. Before the port
+    probe moved above the Rosetta branch, that machine latched
+    tracker_download_failed and never reached the external-attach path — so it
+    reported capturing nothing while capturing, and once capture_blocked_remedy
+    began reading that latch it would have been told to install Rosetta over
+    some unrelated outage.
+
+    managed_components_unavailable stays True either way: our watchers really
+    are unavailable, and the backend needs to know the device cannot self-heal.
+    """
+    mgr = _mgr()
+    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once") as notify, \
+         patch.object(AWManager, "_port_in_use", return_value=True), \
+         patch("src.aw_manager.subprocess.Popen") as popen:
+        started = mgr._start_locked()
+
+    assert started is True
+    popen.assert_not_called()
+    assert mgr._using_external is True
+    # THE assertion: not capture-dead, so no remedy is owed.
+    assert mgr.tracker_download_failed is False
+    assert mgr.capture_blocked_remedy() is None
+    # ...and no toast either. This person is recording.
+    notify.assert_not_called()
+    # Still un-self-healing, and the fleet must still see that.
+    assert mgr._managed_components_unavailable is True
+
+
 def test_the_user_is_told_once_not_every_cycle():
     mgr = _mgr()
     with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_port_in_use", return_value=False), \
          patch("src.notifications.send_notification") as notify:
         mgr._start_locked()
         mgr._start_locked()
@@ -136,3 +179,110 @@ def test_ebadarch_still_caught_if_the_preflight_is_bypassed():
         assert mgr._start_component("bf-data-service", "/fake") is False
 
     assert mgr.tracker_download_failed is True
+
+
+def _no_tracker_stack(rosetta_ok):
+    """Apple Silicon, a chosen Rosetta answer, and NOTHING that touches the
+    network, the process table or the port.
+
+    ``_download_aw_binaries`` is the one that matters and is easy to miss: with
+    no binaries on disk ``_start_locked`` falls through to the auto-download,
+    and an unpatched run fetches ~100 MB of upstream release archives from a
+    unit test. Found by running it — the first version of the test below hung
+    until the harness killed it at two minutes.
+
+    ``rosetta_ok`` may be a callable so a test can flip the answer mid-run,
+    which is the whole point of the re-probe.
+    """
+    def probe(*_a, **_k):
+        ok = rosetta_ok() if callable(rosetta_ok) else rosetta_ok
+        return subprocess.CompletedProcess(args=[], returncode=0 if ok else 1)
+
+    return (
+        patch("src.aw_manager.sys.platform", "darwin"),
+        patch("src.aw_manager.platform.machine", return_value="arm64"),
+        patch("src.aw_manager.subprocess.run", side_effect=probe),
+        patch("src.aw_manager.subprocess.Popen"),
+        patch("src.aw_manager._download_aw_binaries", return_value=False),
+        patch.object(AWManager, "_notify_rosetta_required_once"),
+        patch.object(AWManager, "_dispatch_download_failure_report"),
+        patch.object(AWManager, "_get_binaries_dir", return_value=None),
+        patch.object(AWManager, "_port_in_use", return_value=False),
+        patch.object(AWManager, "_stop_locked"),
+    )
+
+
+def test_installing_rosetta_is_noticed_without_an_agent_restart():
+    """The user's "did my fix work?" loop has to be able to close.
+
+    The memo is written once per process. Cleared nowhere, a user who read the
+    tray, ran `softwareupdate --install-rosetta` and watched it finish kept
+    seeing "Not recording — Rosetta 2 required" until they thought to quit and
+    relaunch — and no surface asked them to. tray.py's capture_permissions_row()
+    already states that rule for its own row: for a surface whose whole job is
+    "did my fix work?", still saying blocked afterwards is the dead end.
+
+    force_restart is where a device in this state actually arrives: capture is
+    gone, so the unreachable watchdog escalates and calls it every cycle. This
+    drives that real sequence — blocked, remedy owed; user installs Rosetta;
+    next escalation — and asserts the remedy is withdrawn on its own.
+    """
+    mgr = _mgr()
+    installed = {"yet": False}
+
+    with contextlib.ExitStack() as stack:
+        for ctx in _no_tracker_stack(lambda: installed["yet"]):
+            stack.enter_context(ctx)
+
+        # Blocked. The tray owes a remedy.
+        assert mgr._start_locked() is False
+        assert mgr.capture_blocked_remedy() is not None
+
+        # The user runs the command. Nothing in the agent is restarted.
+        installed["yet"] = True
+
+        # The next watchdog escalation force-restarts the stack, as it has been
+        # doing every cycle throughout the outage.
+        mgr.force_restart(reason="server unreachable")
+
+        # THE assertion: the surface can go green on its own.
+        assert mgr._rosetta_missing_cached is False
+        assert mgr.capture_blocked_remedy() is None
+
+
+def test_a_still_missing_rosetta_survives_the_re_probe():
+    """The control for the clear above. Re-probing must not amnesty a machine
+    that is still blocked — the remedy has to persist across every escalation
+    for as long as the fault does, which is the whole reason the tray (not the
+    one-shot toast) is the surface #188 needed."""
+    mgr = _mgr()
+
+    with contextlib.ExitStack() as stack:
+        for ctx in _no_tracker_stack(False):
+            stack.enter_context(ctx)
+
+        assert mgr._start_locked() is False
+        mgr.force_restart(reason="server unreachable")
+
+        assert mgr._rosetta_missing_cached is True
+        assert mgr.capture_blocked_remedy() is not None
+
+
+def test_the_re_probe_does_not_reach_the_sixty_second_start_path():
+    """force_restart is an escalation, not the sync cycle. The memo exists to
+    keep `/usr/bin/arch` off the 60s path, and clearing it there instead of here
+    would have re-forked a subprocess every minute on every Mac in the fleet."""
+    mgr = _mgr()
+    completed = subprocess.CompletedProcess(args=[], returncode=1)
+
+    with patch("src.aw_manager.sys.platform", "darwin"), \
+         patch("src.aw_manager.platform.machine", return_value="arm64"), \
+         patch("src.aw_manager.subprocess.run", return_value=completed) as run, \
+         patch.object(AWManager, "_notify_rosetta_required_once"), \
+         patch.object(AWManager, "_port_in_use", return_value=False), \
+         patch("src.aw_manager.subprocess.Popen"):
+        mgr._start_locked()
+        mgr._start_locked()
+        mgr._start_locked()
+
+    assert run.call_count == 1

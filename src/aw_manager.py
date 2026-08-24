@@ -851,21 +851,39 @@ class AWManager:
         sync cycle, so it consults the cached answer only. The same rule the
         tray's own ``_arch_menu_item`` and ``serial_menu_row`` carry.
 
+        **Two conditions, not one, and the second is the one that was missing.**
+        A Rosetta memo of ``True`` says these binaries cannot execute here. It
+        does NOT say this device is recording nothing — a user who installed a
+        native arm64 ActivityWatch themselves has a live server on the port and
+        a memo that will read ``True`` forever. Gating on the memo alone put
+        *"Not recording — Rosetta 2 required"* in front of someone who IS
+        recording, about a component irrelevant to whatever actually failed,
+        the moment any unrelated bucket failure escalated.
+
+        So the remedy also requires ``tracker_download_failed`` — the manager's
+        own latch for "this device captures nothing", set on the same branch of
+        ``_start_locked`` and deliberately NOT set when an external server is
+        attached. ``_managed_components_unavailable`` is the wrong flag for this
+        question: it is true on the recording-via-external device too, by
+        design, because our watchers really are unavailable there.
+
         **Deliberately NOT under ``_lifecycle_lock``**, unlike its sibling
-        ``health_snapshot()`` which reads the capture-dead flags under it. Two
-        reasons, and the second is the one that matters. The memo is write-once
-        and monotonic — whether this Mac can execute x86_64 cannot change
-        without a reboot, so there is no torn read to protect against and a
-        stale read is impossible rather than merely unlikely; the flags
-        ``health_snapshot`` guards are genuinely re-written on every start.
-        And the caller is the tray-message path, which runs while
-        ``force_restart()`` may be holding that lock across process spawns —
-        so taking it here would block a UI update behind tracker teardown to
-        re-read a value that cannot have changed.
+        ``health_snapshot()`` which reads the same latch under it. The caller is
+        the tray-message path, and ``force_restart()`` holds that lock across
+        process spawns — taking it here would block a UI update behind tracker
+        teardown. Both reads are single attribute loads of a bool/tri-state, so
+        there is no torn read; the worst case is a value that was true an
+        instant ago, which is all a tray message can ever claim anyway.
+
+        (Until this commit the argument was "the memo is write-once and
+        monotonic". That stopped being true when ``force_restart()`` began
+        clearing it so an installed Rosetta can be noticed without an agent
+        restart. The conclusion survives; the reason for it did not, and a stale
+        reason is worse than none.)
 
         **Three states, not two.** The memo is ``None`` until something probed:
 
-            True  -> established: no Rosetta, nothing is being recorded
+            True  -> established: no Rosetta, these binaries cannot run
             False -> established: Rosetta is present, this is some OTHER fault
             None  -> nobody has asked yet
 
@@ -877,6 +895,8 @@ class AWManager:
         attempting the start.
         """
         if self._rosetta_missing_cached is not True:
+            return None
+        if not self.tracker_download_failed:
             return None
         return (
             "Not recording — Rosetta 2 required. Open Terminal and run: "
@@ -950,17 +970,44 @@ class AWManager:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
 
+        # Probed BEFORE the Rosetta branch below, not after it. Our managed
+        # binaries being unrunnable says nothing about whether SOMETHING is
+        # capturing on this port: a user who hit the "nothing is being tracked"
+        # wall and installed a native arm64 ActivityWatch themselves is
+        # recording perfectly well. With the probe below the branch, that device
+        # latched the capture-dead flags and never reached the external-attach
+        # path at all, so it reported itself as recording nothing while
+        # recording — and, once capture_blocked_remedy() started reading those
+        # flags, would have been told to install Rosetta over an unrelated
+        # bucket failure. The download-failure path a few lines down has always
+        # asked this question in this order; the Rosetta path did not.
+        server_already_running = self._port_in_use()
+
         # Apple Silicon without Rosetta 2 can never run these binaries. Checked
         # BEFORE spawning rather than after 21 identical EBADARCH failures, and
         # reported rather than retried, because no amount of retrying installs
         # Rosetta. See _rosetta_missing().
         if self._rosetta_missing():
-            self.tracker_download_failed = True
+            # Managed watchers are unavailable either way — these binaries do
+            # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
+            if server_already_running:
+                # ...but an external server IS capturing on this port, so this
+                # is not a "capturing nothing" device. Verbatim the rule the
+                # download-failure branch below already applies: attach, log,
+                # and do NOT latch the capture-dead flag or alarm the user.
+                # Telling this person to install Rosetta would name a component
+                # irrelevant to whatever actually went wrong.
+                logger.warning(
+                    "Managed trackers cannot run (no Rosetta 2), but an external "
+                    "server is running on port %s — attaching to it",
+                    self.aw_port,
+                )
+                self._using_external = True
+                return True
+            self.tracker_download_failed = True
             self._notify_rosetta_required_once()
             return False
-
-        server_already_running = self._port_in_use()
 
         binaries_dir = self._get_binaries_dir()
 
@@ -1169,6 +1216,29 @@ class AWManager:
             # Drop external attachment so _start_locked starts our own server
             # if the port is now free after the reap.
             self._using_external = False
+            # Re-probe Rosetta on the way back up. The memo is otherwise written
+            # once per process and cleared nowhere, so a user who read the tray,
+            # ran `softwareupdate --install-rosetta` and watched it finish still
+            # saw "Not recording — Rosetta 2 required" until they thought to
+            # quit and relaunch the agent — and nothing on any surface asked
+            # them to. That is the dead end tray.py's capture_permissions_row()
+            # already names in its own docstring: for a surface whose whole job
+            # is "did my fix work?", still saying "blocked" afterwards is the
+            # failure, not a cosmetic lag.
+            #
+            # Here rather than on a timer because this is the one path that
+            # already exists to rebuild a stack believed dead, and it is exactly
+            # where a device in this state arrives: capture is gone, so the
+            # unreachable watchdog escalates and calls force_restart on every
+            # cycle. Clearing the memo makes the very next start attempt real,
+            # the trackers spawn, and the tray goes green on its own.
+            #
+            # Cost is one `/usr/bin/arch -x86_64 /usr/bin/true` per force
+            # restart, which is a rare escalation path, not the 60s start path
+            # the memo exists to keep clear. A probe that fails still fails
+            # toward "available" (see _rosetta_missing), so the worst case is
+            # one spawn attempt the EBADARCH handler already covers.
+            self._rosetta_missing_cached = None
             return self._start_locked()
 
     def restart_idle_tracker(self, reason: str = "") -> None:

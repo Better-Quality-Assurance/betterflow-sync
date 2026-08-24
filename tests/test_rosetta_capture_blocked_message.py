@@ -99,15 +99,28 @@ def _escalate(coord):
 # ── The producer: aw_manager knows which of the three causes it is ──────
 
 
-def _manager_with_rosetta_memo(missing):
-    """A real AWManager with ONLY the Rosetta memo populated.
+def _manager_with_rosetta_memo(missing, capture_dead=True):
+    """A real AWManager carrying only the two fields the remedy may read.
 
-    ``__new__`` rather than a constructed manager: this method must read the
-    memo and nothing else, so a fixture that cannot supply anything else is the
+    ``__new__`` rather than a constructed manager: this method must read these
+    two and nothing else, so a fixture that cannot supply anything else is the
     strongest available statement of that.
+
+    ``capture_dead`` is ``tracker_download_failed`` — the manager's own latch
+    for "this device is capturing nothing". It defaults True because that is the
+    state every caller of this helper was implicitly assuming before the flag
+    was part of the condition at all.
+
+    ``force_restart`` is the one method stubbed, for the escalation tests that
+    hand this object to a coordinator: it tears down process trees and now
+    re-probes Rosetta, which is a separate mechanism with its own tests. Left
+    real it would raise on the absent lock, be swallowed by the caller's
+    try/except, and quietly make this a test of the error path instead.
     """
     m = AWManager.__new__(AWManager)
     m._rosetta_missing_cached = missing
+    m.tracker_download_failed = capture_dead
+    m.force_restart = MagicMock(return_value=False)
     return m
 
 
@@ -116,6 +129,21 @@ def test_the_manager_reports_the_remedy_when_rosetta_is_the_established_cause():
 
     assert remedy is not None, "the one cause we can name must be named"
     assert _names_the_remedy(remedy), remedy
+
+
+def test_the_manager_withholds_a_remedy_from_a_device_that_is_recording():
+    """A missing Rosetta is not the same fact as a dead capture.
+
+    A user who hit the "nothing is being tracked" wall and installed a native
+    arm64 ActivityWatch themselves keeps the memo at True forever while
+    recording perfectly well. Gating on the memo alone put "Not recording —
+    Rosetta 2 required" in front of that person on any unrelated outage, about a
+    component with nothing to do with it. ``tracker_download_failed`` is the
+    manager's own answer to "is this device capturing nothing", and
+    ``_start_locked`` deliberately leaves it False when an external server holds
+    the port.
+    """
+    assert _manager_with_rosetta_memo(True, capture_dead=False).capture_blocked_remedy() is None
 
 
 def test_the_manager_withholds_a_remedy_when_rosetta_is_fine():
@@ -174,16 +202,38 @@ def test_the_bucket_failure_path_says_the_same_thing(coord):
     so a fix applied to one leaves a device that reaches the other still reading
     "ActivityWatch not responding" — the same outage, the same wrong sentence.
     Mutation: revert either call site alone and exactly one of these two reddens.
+
+    Driven by a REAL manager rather than a mocked return value. With a mock this
+    test asserted only that whatever the manager said reached the tray, which is
+    true of a manager answering wrongly — it pinned "a bucket failure renders the
+    Rosetta remedy" as correct, unconditionally, which is exactly the defect its
+    sibling below now covers. The manager here is in the state the sentence
+    actually describes: Rosetta missing AND nothing being captured.
     """
-    coord.aw_manager.capture_blocked_remedy.return_value = (
-        "Not recording — Rosetta 2 required. Open Terminal and run: "
-        f"{_INSTALL_COMMAND}"
-    )
+    coord.aw_manager = _manager_with_rosetta_memo(True)
 
     for _ in range(coord._AW_UNREACHABLE_ERROR_THRESHOLD):
         coord._handle_aw_bucket_failure()
 
     assert _names_the_remedy(_tray_message(coord)), _tray_message(coord)
+
+
+def test_a_bucket_failure_on_a_RECORDING_device_names_no_remedy(coord):
+    """The case the mocked version of the test above could not express.
+
+    Same escalation, same missing Rosetta, but an external native-arm64 server
+    is capturing — so ``tracker_download_failed`` is False and the outage is
+    something else entirely. The tray must fall back to the generic sentence
+    rather than confidently blaming a component that is not the cause.
+    """
+    coord.aw_manager = _manager_with_rosetta_memo(True, capture_dead=False)
+
+    for _ in range(coord._AW_UNREACHABLE_ERROR_THRESHOLD):
+        coord._handle_aw_bucket_failure()
+
+    message = _tray_message(coord)
+    assert message == "ActivityWatch not responding"
+    assert "rosetta" not in message.lower()
 
 
 def test_an_ordinary_outage_still_reads_as_before(coord):
