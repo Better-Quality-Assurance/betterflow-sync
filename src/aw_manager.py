@@ -900,6 +900,16 @@ class AWManager:
         question: it is true on the recording-via-external device too, by
         design, because our watchers really are unavailable there.
 
+        **"Attached" means answering ``/api/0/info``, not holding the socket.**
+        The first cut of the condition above rode on ``_port_in_use()``, a bare
+        TCP connect, so ANY process on port 5600 withheld the remedy — and a
+        Rosetta-blocked Mac holding a dead ``bf-data-service`` is precisely a
+        device with a listener and no capture, un-reapable because our binaries
+        have never run there. That returned ``None``, the tray fell back to
+        *"ActivityWatch not responding"*, and the fleet saw
+        ``tracker_download_failed=False``: the exact outage this method exists
+        to name, restored on the exact device it was written for.
+
         **Deliberately NOT under ``_lifecycle_lock``**, unlike its sibling
         ``health_snapshot()`` which reads the same latch under it. The caller is
         the tray-message path, and ``force_restart()`` holds that lock across
@@ -1024,7 +1034,29 @@ class AWManager:
             # Managed watchers are unavailable either way — these binaries do
             # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
-            if server_already_running:
+            # `server_already_running` is a TCP connect, and a held socket is
+            # NOT a running tracker. Here — and ONLY here — that distinction
+            # decides whether the user is told anything at all, so this branch
+            # pays for one HTTP ask before granting the carve-out.
+            #
+            # Why this branch and not the download-failure one below: the other
+            # paths use the port answer to decide whether to START something,
+            # and a hung-but-listening server there is recoverable — the
+            # unreachable watchdog escalates to force_restart(), which reaps the
+            # orphan and rebuilds (that is what its docstring describes). On a
+            # Rosetta-missing Mac there is no such recovery: _reap_orphan_
+            # processes is path-scoped to binaries_dir, and OUR binaries have
+            # never executed on this machine, so the listener is un-reapable by
+            # construction. The only decision left on this branch is what to
+            # TELL the person, and getting that wrong cost ~90 minutes once.
+            #
+            # Failing this way is also the safe direction: a false "responding"
+            # withholds the remedy (the regression below), while a false "not
+            # responding" merely offers a Rosetta instruction to a device that
+            # is, in fact, running an ARM ActivityWatch which just failed to
+            # answer /info within 2s — visible, wrong for one cycle, and it
+            # self-corrects on the next probe.
+            if server_already_running and self._server_responding():
                 # ...but an external server IS capturing on this port, so this
                 # is not a "capturing nothing" device. Verbatim the rule the
                 # download-failure branch below already applies: attach, log,
@@ -1038,6 +1070,16 @@ class AWManager:
                 )
                 self._using_external = True
                 return True
+            if server_already_running:
+                # Held, but dead. Worth its own line: this device looks
+                # "started" to every port-level check in the file while
+                # capturing nothing, and nothing here can reap the listener.
+                logger.warning(
+                    "Managed trackers cannot run (no Rosetta 2) and the process "
+                    "holding port %s does not answer /api/0/info — treating this "
+                    "device as capturing nothing",
+                    self.aw_port,
+                )
             self.tracker_download_failed = True
             self._notify_rosetta_required_once()
             return False
@@ -1817,9 +1859,31 @@ class AWManager:
             logger.error(f"Failed to start {name}: {e}")
             return False
 
+    def _server_responding(self) -> bool:
+        """True only if a tracker server ANSWERS ``/api/0/info`` on our port.
+
+        The single HTTP ask that ``_wait_for_server`` polls, lifted out so the
+        two callers cannot drift. This is the difference between *something
+        holds the socket* and *a tracker server is up*, and those are not the
+        same question — ``_port_in_use()`` answers the first and is routinely
+        read as the second. ``force_restart()``'s own docstring names the gap:
+        a ``bf-data-service`` that still holds port 5600 and no longer answers
+        HTTP is exactly what it exists to reclaim.
+
+        One request, one 2s timeout, no retry loop: callers that need to WAIT
+        for a boot own the deadline (``_wait_for_server``); callers deciding
+        what is true right now do not.
+        """
+        url = f"http://localhost:{self.aw_port}/api/0/info"
+        try:
+            req = urllib.request.urlopen(url, timeout=2)
+            req.close()
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
     def _wait_for_server(self) -> bool:
         """Wait for tracker server to accept connections."""
-        url = f"http://localhost:{self.aw_port}/api/0/info"
         deadline = time.monotonic() + STARTUP_TIMEOUT
 
         while time.monotonic() < deadline:
@@ -1832,19 +1896,21 @@ class AWManager:
                 )
                 return False
 
-            try:
-                req = urllib.request.urlopen(url, timeout=2)
-                req.close()
+            if self._server_responding():
                 logger.info("Tracker server is ready")
                 return True
-            except (urllib.error.URLError, OSError):
-                time.sleep(0.5)
+            time.sleep(0.5)
 
         logger.error(f"Tracker server not ready after {STARTUP_TIMEOUT}s")
         return False
 
     def _port_in_use(self) -> bool:
-        """Check if something is listening on the tracker port."""
+        """Check if something is listening on the tracker port.
+
+        A bare TCP connect. It proves the socket is held; it does NOT prove a
+        tracker is capturing there — see ``_server_responding()`` for that
+        question, and do not use this one to answer it.
+        """
         import socket
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

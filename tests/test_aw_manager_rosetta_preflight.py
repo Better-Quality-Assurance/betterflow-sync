@@ -16,6 +16,7 @@ import contextlib
 import errno
 import logging
 import subprocess
+import urllib.error
 from unittest.mock import patch
 
 from src.aw_manager import ROSETTA_REPROBE_INTERVAL, AWManager
@@ -151,11 +152,33 @@ def test_an_external_server_is_attached_to_rather_than_declared_dead():
 
     managed_components_unavailable stays True either way: our watchers really
     are unavailable, and the backend needs to know the device cannot self-heal.
+
+    **The fixture, not the assertion, was the round-2 defect.** This test used
+    to pin `_port_in_use=True` alone and assert "no remedy" under the sentence
+    *this person is recording* — but a TCP connect cannot establish that
+    premise, so the assertion also certified a device whose port is held by
+    something dead. `_server_responding` is now pinned as well, which is what
+    makes the docstring true of the device the fixture actually builds; the
+    case it was wrongly covering has its own test below.
+
+    **Second defect in the same fixture, found by running the new sibling.**
+    Patching the `_rosetta_missing` METHOD skips the memo write the real probe
+    performs, so `_rosetta_missing_cached` stayed None — and
+    `capture_blocked_remedy()` returns None on a None memo by its own first
+    line. The "THE assertion" below was therefore satisfied by an un-probed
+    memo whatever `tracker_download_failed` said, i.e. it passed identically
+    against the bug, the fix, and no implementation at all. The memo is now set
+    to what the real probe would have written, which is what makes the
+    `tracker_download_failed` half of the condition the thing under test.
     """
     mgr = _mgr()
+    # What `_rosetta_missing()` writes on the real path; the patch below
+    # replaces the method, so the fixture owes the memo.
+    mgr._rosetta_missing_cached = True
     with patch.object(AWManager, "_rosetta_missing", return_value=True), \
          patch.object(AWManager, "_notify_rosetta_required_once") as notify, \
          patch.object(AWManager, "_port_in_use", return_value=True), \
+         patch.object(AWManager, "_server_responding", return_value=True), \
          patch("src.aw_manager.subprocess.Popen") as popen:
         started = mgr._start_locked()
 
@@ -169,6 +192,110 @@ def test_an_external_server_is_attached_to_rather_than_declared_dead():
     notify.assert_not_called()
     # Still un-self-healing, and the fleet must still see that.
     assert mgr._managed_components_unavailable is True
+
+
+def test_a_held_port_that_answers_nothing_is_not_a_recording_device():
+    """The fixture no test could express, and the regression it hid.
+
+    Round 2 hoisted the port probe above the Rosetta branch and gave the
+    external-server carve-out to ANY TCP listener. `_port_in_use()` is a bare
+    connect, so on a Rosetta-blocked Mac holding a hung `bf-data-service` —
+    port 5600 held, HTTP dead, which is the state `force_restart()`'s own
+    docstring exists to describe — `_start_locked` returned True, left
+    `tracker_download_failed` False, and `capture_blocked_remedy()` answered
+    None. The tray then fell back to "ActivityWatch not responding": the
+    literal #188 exists to remove, restored on #188's own device.
+
+    Un-reapable, too: `_reap_orphan_processes` is path-scoped to binaries_dir
+    and our binaries have never executed here, so nothing clears it and the
+    contradictory steady state (started=True, /info dead, fleet sees healthy)
+    persists for the life of the process.
+
+    Both booleans are pinned deliberately — production computes them, so an
+    unpinned probe would answer differently on a developer laptop that happens
+    to run ActivityWatch. The memo is supplied for the same reason: patching
+    the `_rosetta_missing` METHOD skips the write the real probe performs, and
+    `capture_blocked_remedy()` short-circuits on a None memo — which is what
+    made the sibling above pass against the regression.
+    """
+    mgr = _mgr()
+    mgr._rosetta_missing_cached = True
+    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once") as notify, \
+         patch.object(AWManager, "_port_in_use", return_value=True), \
+         patch.object(AWManager, "_server_responding", return_value=False), \
+         patch("src.aw_manager.subprocess.Popen") as popen:
+        started = mgr._start_locked()
+
+    assert started is False
+    popen.assert_not_called()
+    # Never claim an attachment to something that does not answer.
+    assert mgr._using_external is False
+    # THE assertion: capture IS dead here, so the remedy is owed and the fleet
+    # can see the device.
+    assert mgr.tracker_download_failed is True
+    remedy = mgr.capture_blocked_remedy()
+    assert remedy is not None and "Rosetta" in remedy, remedy
+    notify.assert_called_once()
+    assert mgr._managed_components_unavailable is True
+
+
+def test_the_carve_out_asks_over_http_not_over_tcp():
+    """Names the mechanism, so a future refactor back to `_port_in_use()` alone
+    reddens even if someone rewrites the two tests above.
+
+    Also pins the short-circuit: with nothing on the port there is no reason to
+    pay for an HTTP request, and this branch runs on the 60s start path.
+    """
+    mgr = _mgr()
+    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once"), \
+         patch.object(AWManager, "_port_in_use", return_value=True), \
+         patch.object(AWManager, "_server_responding", return_value=False) as info, \
+         patch("src.aw_manager.subprocess.Popen"):
+        mgr._start_locked()
+    assert info.call_count == 1, "the carve-out did not consult /api/0/info"
+
+    mgr = _mgr()
+    with patch.object(AWManager, "_rosetta_missing", return_value=True), \
+         patch.object(AWManager, "_notify_rosetta_required_once"), \
+         patch.object(AWManager, "_port_in_use", return_value=False), \
+         patch.object(AWManager, "_server_responding", return_value=True) as info, \
+         patch("src.aw_manager.subprocess.Popen"):
+        mgr._start_locked()
+    assert info.call_count == 0, "asked over HTTP with nothing on the port"
+
+
+def test_server_responding_is_the_http_ask_wait_for_server_polls():
+    """One implementation, two callers. `_wait_for_server` used to inline this
+    request; a second spelling is how the two drift into disagreeing about what
+    "the server is up" means.
+
+    Drives the REAL `_server_responding` against a patched urlopen — the
+    positive AND the negative, because a probe that answers False for every
+    input would satisfy the regression test above while measuring nothing.
+    """
+    mgr = _mgr()
+
+    with patch("src.aw_manager.urllib.request.urlopen") as urlopen:
+        assert mgr._server_responding() is True
+    assert urlopen.call_args[0][0] == "http://localhost:5600/api/0/info"
+    assert urlopen.call_args[1]["timeout"] == 2
+
+    with patch("src.aw_manager.urllib.request.urlopen",
+               side_effect=OSError("connection reset")):
+        assert mgr._server_responding() is False
+
+    # A held-but-dead socket answers the TCP connect and refuses the request;
+    # URLError is what urlopen raises there and it must not escape.
+    with patch("src.aw_manager.urllib.request.urlopen",
+               side_effect=urllib.error.URLError("timed out")):
+        assert mgr._server_responding() is False
+
+    # And _wait_for_server routes through it rather than asking again itself.
+    with patch.object(AWManager, "_server_responding", return_value=True) as ok:
+        assert mgr._wait_for_server() is True
+    assert ok.call_count == 1
 
 
 def test_the_user_is_told_once_not_every_cycle():
