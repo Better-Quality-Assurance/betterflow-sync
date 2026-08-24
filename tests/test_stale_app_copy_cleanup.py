@@ -122,10 +122,23 @@ def test_it_does_not_leave_the_directory_it_was_given(tmp_path):
 
 def test_a_symlink_is_never_a_candidate(tmp_path):
     """Deleting through a symlink deletes the target. Whatever it points at,
-    the link is not a stale copy our updater left."""
+    the link is not a stale copy our updater left.
+
+    Skipped rather than failed where the OS will not make one. This is the first
+    ``symlink_to`` in the suite, and the tag build runs ``pytest tests/`` on the
+    FOUR-platform matrix including windows-latest, with ``release: needs:
+    build`` — so a hard failure here produces no release artifacts at all. That
+    is precisely how ``os.getuid()`` killed v1.5.119's first tag build (#168,
+    fixed in #171). Windows needs SeCreateSymbolicLinkPrivilege, which a runner
+    may or may not hold; catching the refusal keeps the coverage everywhere it
+    does work instead of trading it for a dead release.
+    """
     running = _make_app(tmp_path, "BetterFlow.app")
     real = _make_app(tmp_path / "elsewhere", "BetterFlow.app")
-    (tmp_path / "BetterFlow.app.old").symlink_to(real)
+    try:
+        (tmp_path / "BetterFlow.app.old").symlink_to(real)
+    except OSError as e:  # pragma: no cover — platform-dependent
+        pytest.skip(f"this OS refused to create a symlink: {e}")
 
     assert find_stale_bundle_copies(running) == []
 
@@ -138,18 +151,24 @@ def test_a_plain_file_wearing_the_name_is_not_a_bundle(tmp_path):
 
 
 @pytest.mark.parametrize("name", [
-    "BetterFlow.app",           # the running one, under a different parent check
+    # "BetterFlow.app" was here and created nothing (guarded by an `if`), so it
+    # asserted nothing that test_it_never_returns_the_running_bundle does not.
     "BetterFlowExtra.app",      # prefix match is not a pattern match
     "MyBetterFlow.app.old",     # suffix match is not a pattern match
     "BetterFlow.app.old.txt",   # trailing junk
     "BetterFlow-backup.app",    # no version segment
+    # Without these the version segment is unwitnessed: a reviewer broadened
+    # `[0-9][0-9.]*` to `.*` and to `[0-9.]*` and no test noticed, so the
+    # "closed list, not a glob" claim had no proof for the third pattern.
+    "BetterFlow-nightly-backup.app",
+    "BetterFlow-v1.5.119-backup.app",
+    "BetterFlow--backup.app",
 ])
 def test_names_outside_the_known_patterns_are_ignored(tmp_path, name):
     """The pattern list is deliberately closed. Anything we did not demonstrably
     create stays put — a leftover costs disk, a wrong deletion costs an app."""
     running = _make_app(tmp_path, "BetterFlow.app")
-    if name != "BetterFlow.app":
-        _make_app(tmp_path, name)
+    _make_app(tmp_path, name)
 
     assert find_stale_bundle_copies(running) == []
 
@@ -378,3 +397,42 @@ def test_purge_is_a_no_op_from_a_non_canonical_copy(tmp_path):
 
     assert purge_stale_bundle_copies(backup) == []
     assert canonical.exists() and dot_old.exists() and backup.exists()
+
+
+def test_a_differently_cased_copy_is_still_found(tmp_path):
+    """/Applications is APFS and case-INSENSITIVE, so `betterflow.app.old` and
+    `BetterFlow.app.old` are one file to the filesystem and were two different
+    strings to the pattern list. The copy survived, in the safe direction and
+    therefore silently.
+
+    Note this fixture only reaches the branch on a case-sensitive filesystem;
+    on a case-insensitive one `_make_app` would collide with the running bundle.
+    The assertion is about the PATTERN, which is why it is written against a
+    name the matcher must accept rather than against filesystem behaviour.
+    """
+    running = _make_app(tmp_path, "BetterFlow.app")
+    odd = _make_app(tmp_path, "betterflow.app.old")
+
+    assert find_stale_bundle_copies(running) == [odd]
+
+
+def test_the_legacy_bundle_name_is_a_known_blind_spot(tmp_path):
+    """Documenting a gap rather than implying coverage.
+
+    This repo renamed "BetterFlow Sync.app" to "BetterFlow.app" (see
+    src/autostart.py's plist-staleness note). A machine still carrying the old
+    name under our bundle id is invisible to the sweep forever — same
+    duplicate-registration condition as #211, one name away — because every
+    pattern is built from the RUNNING stem and the canonical stem check refuses
+    to run from anything else.
+
+    Asserted as the CURRENT behaviour so the next person meets it as a decision
+    rather than as a surprise. Widening to the legacy stem would let a
+    "BetterFlow Sync.app" install delete "BetterFlow.app" beside it, which is
+    the wrong trade.
+    """
+    running = _make_app(tmp_path, "BetterFlow.app")
+    legacy = _make_app(tmp_path, "BetterFlow Sync.app")
+
+    assert find_stale_bundle_copies(running) == []
+    assert legacy.exists()

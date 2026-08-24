@@ -1068,9 +1068,16 @@ def find_stale_bundle_copies(running_app: Path) -> list[Path]:
     parent = running_app.parent
     stem = running_app.stem  # "BetterFlow" from "BetterFlow.app"
     patterns = [
-        re.compile(rf"^{re.escape(stem)}\.app\.old$"),
-        re.compile(rf"^{re.escape(stem + _MACOS_BACKUP_SUFFIX)}$"),
-        re.compile(rf"^{re.escape(stem)}-[0-9][0-9.]*-backup\.app$"),
+        # IGNORECASE because /Applications is APFS, which is case-INSENSITIVE:
+        # `betterflow.app.old` and `BetterFlow.app.old` are the same file to the
+        # filesystem and were two different strings to this list, so a copy the
+        # sweep exists to remove survived under a different capitalisation.
+        # Safe to widen — the running bundle still cannot self-match under any
+        # casing, since `{stem}.app` is not equal to any of the three shapes
+        # below however it is cased, and the identity guard is unchanged.
+        re.compile(rf"^{re.escape(stem)}\.app\.old$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(stem + _MACOS_BACKUP_SUFFIX)}$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(stem)}-[0-9][0-9.]*-backup\.app$", re.IGNORECASE),
     ]
 
     if stem != _CANONICAL_STEM:
@@ -1115,6 +1122,10 @@ def find_stale_bundle_copies(running_app: Path) -> list[Path]:
         #
         # So this line is the only thing standing between a broken name pattern
         # and deleting the app that is currently executing. Keep it.
+        # `not entry.is_dir()` is also unwitnessed and also kept: a plain file
+        # wearing the name is already refused by the identity guard, because
+        # _bundle_identifier cannot read Contents/Info.plist out of a file. Same
+        # defence-in-depth reasoning as the line's other two clauses.
         if entry == running_app or entry.is_symlink() or not entry.is_dir():
             continue
         if not any(p.fullmatch(entry.name) for p in patterns):

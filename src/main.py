@@ -3300,11 +3300,23 @@ class BetterFlowApp:
         and had its Accessibility grant flap — macOS keeps one row per app and
         which copy that row means is not ours to decide.
 
-        Called from run() AFTER _maybe_relocate_to_applications(), which can
-        move us: the sweep is scoped to siblings of where we are NOW. It also
-        runs after ensure_autostart_synced(), which is the wrong way round on
-        principle — clear the sediment, then write the plist — but sweeping
-        first does not rescue the case that matters, where we are running from a
+        Called from run() after _maybe_relocate_to_applications(). An earlier
+        version of this docstring said that was "because that call can move us"
+        — which is wrong, and wrong in the direction that misleads: if it moves
+        us it ends in os._exit(0) (main.py:3275), so the sweep never runs in
+        this process at all. What the ordering actually means is that the sweep
+        only ever runs when we were NOT relocated, i.e. on wherever we happen to
+        be — which for a declined prompt can be ~/Downloads, a mounted DMG, or a
+        Gatekeeper AppTranslocation path, not /Applications.
+
+        That is acceptable rather than intended: every candidate must still be a
+        sibling, match a closed name list, and claim our bundle id, so a sweep
+        from an odd location finds nothing to do. Saying so plainly because this
+        is exactly the kind of rationale a later reader reasons from.
+
+        It also runs after ensure_autostart_synced(), which is the wrong way
+        round on principle — clear the sediment, then write the plist — but
+        sweeping first does not rescue the case that matters, where we are on a
         non-canonical copy and the sweep correctly finds nothing either way.
 
         Non-fatal on every path. Failing to tidy up must not stop the agent
