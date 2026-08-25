@@ -416,7 +416,7 @@ def _apply_local_artifact(
                 return False
 
             # 3. Replace: move old aside, move new in place
-            backup_path = app_path.parent / f"{app_path.stem}{_MACOS_BACKUP_SUFFIX}"
+            backup_path = _macos_backup_path(app_path)
             if backup_path.exists():
                 shutil.rmtree(backup_path)
 
@@ -1015,6 +1015,18 @@ def apply_staged_update(
         # finally never runs. On failure we leak hundreds of MB (the DMG)
         # in /tmp unless we clean up here.
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _macos_backup_path(app_path: Path) -> Path:
+    """Where _apply_macos_update moves the old bundle mid-replace.
+
+    A function rather than an inline f-string so the sweep can be tested against
+    the WRITER's own expression instead of against a copy of it. Sharing
+    _MACOS_BACKUP_SUFFIX was not enough on its own: a test that rebuilt the name
+    from the constant had both sides of its assertion tracing back to one
+    artifact, so reverting this line to a literal changed nothing it could see.
+    """
+    return app_path.parent / f"{app_path.stem}{_MACOS_BACKUP_SUFFIX}"
 
 
 def _bundle_identifier(app: Path) -> Optional[str]:

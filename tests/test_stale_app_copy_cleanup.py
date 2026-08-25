@@ -29,8 +29,8 @@ from pathlib import Path
 import pytest
 
 from src.self_updater import (
-    BUNDLE_ID,
     _CANONICAL_STEM,
+    BUNDLE_ID,
     find_stale_bundle_copies,
     purge_stale_bundle_copies,
 )
@@ -519,16 +519,25 @@ def test_the_name_the_updater_leaves_behind_is_the_name_the_sweep_looks_for(tmp_
     suite green, so the constant's own comment — "change the writer and the
     sweep silently stops matching it" — was still true, one step along.
 
-    This builds the backup name the way the updater does and feeds it to the
-    sweep, so a divergence at either end reddens.
+    This asks the updater's own helper for the name and feeds it to the sweep,
+    so a divergence at either end reddens.
+
+    Honest scope: it exercises _macos_backup_path, not _apply_macos_update
+    itself, which needs a downloaded archive and a real bundle to run. If
+    someone stops CALLING the helper from that function, this test cannot see
+    it — the helper existing is what makes the divergence a one-line change
+    rather than a silent drift, not a proof that the call site remains.
     """
     import src.self_updater as su
 
     running = _make_app(tmp_path, "BetterFlow.app")
 
-    # Exactly the expression at _apply_macos_update's backup line.
-    leftover_name = f"{running.stem}{su._MACOS_BACKUP_SUFFIX}"
-    leftover = _make_app(tmp_path, leftover_name)
+    # _macos_backup_path is what _apply_macos_update now calls, so this asks
+    # the WRITER for the name rather than rebuilding it from the shared
+    # constant. The earlier version did the latter and had both sides of the
+    # assertion tracing to one artifact, so reverting the writer's line to a
+    # literal ".bak.app" changed nothing it could see (Rule 6a).
+    leftover = _make_app(tmp_path, su._macos_backup_path(running).name)
 
     assert find_stale_bundle_copies(running) == [leftover], (
         "the sweep does not recognise the name the updater actually creates"
