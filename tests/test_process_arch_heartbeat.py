@@ -246,3 +246,29 @@ def test_the_pair_maps_an_undeterminable_arch_the_same_way_on_both_halves():
 
     assert telemetry["process_arch"] is None
     assert telemetry["machine_arch"] is None
+
+
+def test_the_tray_reads_process_arch_rather_than_re_deriving_it():
+    """Callsite guard, not a helper test.
+
+    `process_arch()` passing in isolation says nothing about whether the surface
+    the user reads uses it. `arch_menu_label` renders the process architecture
+    in its could-not-determine row; re-deriving it there with a second inline
+    `platform.machine()` is how the tray ends up naming one architecture while
+    the heartbeat reports another.
+    """
+    import inspect
+
+    from src.ui import tray
+
+    source = inspect.getsource(tray.arch_menu_label)
+    # Drop the docstring AND comment lines before matching: both DISCUSS
+    # platform.machine() by name, so a raw scan fires on the prose explaining
+    # the fix and reports the code as broken.
+    body = "\n".join(
+        line
+        for line in source.split('"""')[-1].splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "process_arch()" in body, "the tray must read the named helper"
+    assert "platform.machine()" not in body, "no second inline re-derivation"
