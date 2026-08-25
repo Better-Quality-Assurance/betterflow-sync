@@ -4032,7 +4032,7 @@ class SyncEngine:
         except Exception as e:
             logger.debug("logs_requested: could not resolve log dir: %s", e)
             return
-        log_tail = self._read_log_tail(log_dir / "betterflow.log")
+        log_tail = self._read_rotated_log_tail(log_dir / "betterflow.log")
         if not log_tail:
             # WARNING (not debug) so the next successful upload carries a record
             # of why earlier ones were skipped — the admin's flag stays set and
@@ -4172,6 +4172,60 @@ class SyncEngine:
             return None
         # Re-encode so the result is always valid UTF-8 the server can store.
         return raw.decode("utf-8", errors="replace").encode("utf-8")
+
+    @staticmethod
+    def _read_rotated_log_tail(path, max_bytes: int = 512 * 1024) -> bytes:
+        """The last ``max_bytes`` of the LOGICAL log, spanning rotations.
+
+        ``_read_log_tail`` reads one file. ``setup_logging`` configures
+        ``RotatingFileHandler(maxBytes=5 MiB, backupCount=3)``, so up to ~20 MB
+        of history sits beside it in ``betterflow.log.1/.2/.3`` and none of it
+        was ever uploaded — the moment the live file rotated, an incident became
+        unreachable by any means we have.
+
+        #225, and it cost a real answer: a capture from device 14 on 2026-08-25
+        covered only that day, so the line that would have settled #211's
+        diagnosis (2026-08-23) was gone and the fix shipped marked *inferred*.
+
+        This deliberately costs nothing from the trade-offs #225 weighed. The
+        budget is unchanged, so the payload cannot grow. The server still gets
+        one ``log`` file, so the contract is unchanged. Nothing new is written to
+        disk. It only fills the SAME budget from further back when the live file
+        does not fill it alone — which is exactly the post-rotation state that
+        lost the evidence.
+
+        When ``betterflow.log`` already exceeds the budget the result is
+        byte-identical to reading it alone, so the common case on every device in
+        the fleet is untouched.
+
+        Returns oldest-first so a reader can follow it, and ``b""`` when there is
+        nothing — callers use ``if not tail``, which is unchanged.
+        """
+        from pathlib import Path as _Path
+
+        live = _Path(path)
+        # Newest first, taking each file's own tail; reversed at the end.
+        candidates = [live] + [
+            _Path(f"{live}.{i}") for i in range(1, 4)
+        ]
+
+        chunks: list[bytes] = []
+        remaining = max_bytes
+        for candidate in candidates:
+            if remaining <= 0:
+                break
+            # _read_log_tail already normalises each chunk to valid UTF-8, so the
+            # concatenation is valid too. One invalid byte makes the server's
+            # INSERT fail with MySQL 1366 and drops the whole upload silently.
+            part = SyncEngine._read_log_tail(candidate, remaining)
+            if not part:
+                # None (unreadable) and b"" (empty) both just mean "nothing here";
+                # keep going, because one bad rotation must not cost us the rest.
+                continue
+            chunks.append(part)
+            remaining -= len(part)
+
+        return b"".join(reversed(chunks))
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:
