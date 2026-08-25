@@ -38,7 +38,16 @@ def _python_files():
 
 
 def test_only_one_file_defines_the_version():
-    definers = [p for p in _python_files() if _ASSIGNMENT.search(p.read_text())]
+    # encoding="utf-8" explicitly, matching the house convention. `read_text()`
+    # uses the platform default, which is cp1252 on Windows — and this codebase
+    # is full of UTF-8 em-dashes, so the bare form raises UnicodeDecodeError
+    # there while passing on macOS and Linux. It does not show up on the `test`
+    # job either, since that is Linux-only: the Windows leg runs only in the
+    # release-tag build, so a source-scanning guard written without this is
+    # green until the day someone cuts a release.
+    definers = [
+        p for p in _python_files() if _ASSIGNMENT.search(p.read_text(encoding="utf-8"))
+    ]
     assert [p.name for p in definers] == ["aw_release.py"], (
         "AW_VERSION must be assigned in src/aw_release.py and nowhere else; "
         f"found assignments in {[str(p.relative_to(REPO)) for p in definers]}"
