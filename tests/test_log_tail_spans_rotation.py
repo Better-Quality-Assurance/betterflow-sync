@@ -71,14 +71,53 @@ def test_a_full_current_log_is_unchanged(tmp_path):
 
 
 def test_it_never_exceeds_the_budget(tmp_path):
-    """The payload cap is the whole reason this fix is free. Four full files on
-    disk must still produce at most `max_bytes`."""
-    for name in ("betterflow.log.3", "betterflow.log.2", "betterflow.log.1", "betterflow.log"):
+    """The payload cap is the whole reason this fix is free.
+
+    The live file is deliberately SMALLER than the budget. An earlier version
+    made all four files 4096 bytes against a 1000-byte budget, so the live file
+    filled it alone, the loop broke after one iteration and no cross-file
+    accounting ever ran — a mutant giving every file the full cap survived it.
+    Phantom 16: the fixture sat where correct and wrong agree.
+    """
+    for name in ("betterflow.log.3", "betterflow.log.2", "betterflow.log.1"):
         _write(tmp_path / name, "y" * 4096)
+    _write(tmp_path / "betterflow.log", "today\n")
 
     tail = SyncEngine._read_rotated_log_tail(tmp_path / "betterflow.log", max_bytes=1000)
 
     assert len(tail) <= 1000
+
+
+def test_replacement_expansion_cannot_burst_the_budget(tmp_path):
+    """`_read_log_tail` normalises with errors="replace" and U+FFFD is THREE
+    bytes, so an invalid byte expands 1->3 AFTER the budget was decremented.
+
+    Measured at the real 512 KB budget before this was capped: a rotated file of
+    invalid bytes returned 1,572,864 bytes. The server enforces max:1024 KB and
+    hard-422s above it, and `logs_requested_at` clears only on success — so the
+    agent would retry every heartbeat forever and the admin would never get
+    logs. Below that it keeps the LAST 512 KB, trimming the opposite end to the
+    one we fill, discarding the rotated history this function exists to deliver.
+    """
+    (tmp_path / "betterflow.log.1").write_bytes(b"\x97" * 4096)
+    _write(tmp_path / "betterflow.log", "today\n")
+
+    tail = SyncEngine._read_rotated_log_tail(tmp_path / "betterflow.log", max_bytes=1000)
+
+    assert len(tail) <= 1000, f"expansion burst the cap: {len(tail)} bytes"
+    tail.decode("utf-8")  # the trim must not cut a character in half
+
+
+def test_the_trim_keeps_the_newest_end(tmp_path):
+    """When the cap bites, keep the same end the server keeps. Trimming the
+    other one would leave agent and server discarding different halves."""
+    _write(tmp_path / "betterflow.log.1", "OLDEST-" + "o" * 2000)
+    _write(tmp_path / "betterflow.log", "NEWEST-LINE\n")
+
+    tail = SyncEngine._read_rotated_log_tail(tmp_path / "betterflow.log", max_bytes=500)
+
+    assert len(tail) <= 500
+    assert b"NEWEST-LINE" in tail
 
 
 def test_a_missing_rotation_is_not_an_error(tmp_path):

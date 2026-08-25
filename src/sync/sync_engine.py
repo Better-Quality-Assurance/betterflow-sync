@@ -4188,11 +4188,23 @@ class SyncEngine:
         diagnosis (2026-08-23) was gone and the fix shipped marked *inferred*.
 
         This deliberately costs nothing from the trade-offs #225 weighed. The
-        budget is unchanged, so the payload cannot grow. The server still gets
-        one ``log`` file, so the contract is unchanged. Nothing new is written to
-        disk. It only fills the SAME budget from further back when the live file
-        does not fill it alone — which is exactly the post-rotation state that
-        lost the evidence.
+        budget is enforced on the RETURNED bytes, so the payload cannot grow. The
+        server still gets one ``log`` file, so the contract is unchanged. Nothing
+        new is written to disk. It only fills the SAME budget from further back
+        when the live file does not fill it alone — which is exactly the
+        post-rotation state that lost the evidence.
+
+        The final cap is not belt-and-braces. ``_read_log_tail`` normalises each
+        chunk with ``errors="replace"``, and U+FFFD is THREE bytes, so an invalid
+        byte expands 1→3 *after* the budget was decremented. Measured at the real
+        512 KB budget, a rotated file of invalid bytes returned **1,572,864** —
+        three times the cap. That matters twice over, because the server
+        (``AgentLogController``) enforces ``max:1024`` KB and hard-422s above it,
+        and ``logs_requested_at`` clears only on success, so the agent would
+        retry every heartbeat forever and the admin would never get logs. Below
+        that it silently keeps the LAST 512 KB — trimming from the opposite end
+        to the one we fill, which would discard exactly the rotated history this
+        function exists to deliver.
 
         When ``betterflow.log`` already exceeds the budget the result is
         byte-identical to reading it alone, so the common case on every device in
@@ -4201,12 +4213,12 @@ class SyncEngine:
         Returns oldest-first so a reader can follow it, and ``b""`` when there is
         nothing — callers use ``if not tail``, which is unchanged.
         """
-        from pathlib import Path as _Path
+        from pathlib import Path
 
-        live = _Path(path)
+        live = Path(path)
         # Newest first, taking each file's own tail; reversed at the end.
         candidates = [live] + [
-            _Path(f"{live}.{i}") for i in range(1, 4)
+            Path(f"{live}.{i}") for i in range(1, 4)
         ]
 
         chunks: list[bytes] = []
@@ -4225,7 +4237,20 @@ class SyncEngine:
             chunks.append(part)
             remaining -= len(part)
 
-        return b"".join(reversed(chunks))
+        joined = b"".join(reversed(chunks))
+        if len(joined) > max_bytes:
+            # Keep the NEWEST max_bytes — the same end the server keeps, so the
+            # two agree instead of the server silently trimming the other one.
+            joined = joined[-max_bytes:]
+            # A byte slice can land inside a multi-byte character. Drop leading
+            # continuation bytes (0x80-0xBF) so the result stays valid UTF-8 —
+            # one invalid byte makes the server's INSERT fail with MySQL 1366 and
+            # drops the whole upload.
+            i = 0
+            while i < len(joined) and 0x80 <= joined[i] < 0xC0:
+                i += 1
+            joined = joined[i:]
+        return joined
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:
