@@ -30,6 +30,7 @@ import pytest
 
 from src.self_updater import (
     BUNDLE_ID,
+    _CANONICAL_STEM,
     find_stale_bundle_copies,
     purge_stale_bundle_copies,
 )
@@ -206,7 +207,9 @@ def test_run_dispatches_the_sweep():
     assert "self._sweep_stale_bundle_copies()" not in commented
 
 
-def test_the_sweep_method_passes_the_resolved_bundle_and_logs_what_went(monkeypatch):
+def test_the_sweep_method_passes_the_resolved_bundle_and_logs_what_went(
+    monkeypatch, caplog
+):
     """Behavioural, not textual: the method must resolve the running bundle and
     hand THAT to the purge. An earlier revision re-derived the path by string
     split, which diverges from the module's own resolver through a symlinked
@@ -225,9 +228,20 @@ def test_the_sweep_method_passes_the_resolved_bundle_and_logs_what_went(monkeypa
         lambda running: calls.append(running) or [Path("/Applications/BetterFlow.app.old")],
     )
 
-    BetterFlowApp._sweep_stale_bundle_copies(object())
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="src.main"):
+        BetterFlowApp._sweep_stale_bundle_copies(object())
 
     assert calls == [Path("/Applications/BetterFlow.app")]
+
+    # ...and logs what went. The name said so and nothing asserted it (Phantom
+    # 9: a verb in the test name, no assertion behind it) — deleting the whole
+    # logger.info block survived mutation. That line is one record per DEVICE,
+    # which is the fleet question a per-file log inside purge_ cannot answer.
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("BetterFlow.app.old" in m for m in messages), messages
+    assert any("Removed 1 stale" in m for m in messages), messages
 
 
 def test_the_sweep_does_nothing_off_macos(monkeypatch):
@@ -239,11 +253,21 @@ def test_the_sweep_does_nothing_off_macos(monkeypatch):
     monkeypatch.setattr(main_mod.sys, "platform", "win32")
     import src.self_updater as su
 
+    # Patching the resolver is NOT incidental — without it this test passed for
+    # the wrong reason and the darwin gate had no witness at all. The real
+    # resolver takes its own win32 branch, finds sys.frozen false, returns None,
+    # and the `running is None` guard produces the identical `called == []`.
+    # Removing the platform check entirely left the whole suite green.
+    monkeypatch.setattr(su, "get_app_bundle_path", lambda: Path("/Applications/BetterFlow.app"))
     monkeypatch.setattr(su, "purge_stale_bundle_copies", lambda r: called.append(r) or [])
 
     BetterFlowApp._sweep_stale_bundle_copies(object())
 
-    assert called == []
+    assert called == [], (
+        "the sweep ran off macOS; on Linux every AppImage start would then log "
+        "the '#211 non-canonical copy' warning, turning the fleet-discovery "
+        "signal this branch exists to create into pure noise"
+    )
 
 
 def test_a_failing_sweep_never_stops_the_agent_starting(monkeypatch):
@@ -302,6 +326,19 @@ def test_the_identity_macos_knows_us_by_is_written_once_per_reason():
     assert permissions._BUNDLE_ID == BUNDLE_ID, "same concept, must agree"
 
     spec = (Path(__file__).parent.parent / "build.spec").read_text()
+
+    # The bundle NAME is a second authority, and this branch made it
+    # load-bearing: _CANONICAL_STEM is the switch deciding whether the sweep
+    # runs at all. Renaming it in build.spec alone disables the sweep on every
+    # device forever AND makes every device log the alarming non-canonical
+    # warning — and this repo has already done exactly one such rename
+    # ("BetterFlow Sync.app" -> "BetterFlow.app"). The docstring above reasons
+    # about precisely this class for the id; the name needs the same guard.
+    assert f'name="{_CANONICAL_STEM}.app"' in spec, (
+        "build.spec's bundle name is what _CANONICAL_STEM has to match; a "
+        "rename there silently switches the sweep off fleet-wide"
+    )
+
     assert f'bundle_identifier="{BUNDLE_ID}"' in spec, (
         "build.spec is what actually stamps CFBundleIdentifier into the shipped "
         "bundle; the sweep compares against that, not against this constant"
@@ -440,10 +477,11 @@ def test_a_differently_cased_copy_is_still_found(tmp_path):
     strings to the pattern list. The copy survived, in the safe direction and
     therefore silently.
 
-    Note this fixture only reaches the branch on a case-sensitive filesystem;
-    on a case-insensitive one `_make_app` would collide with the running bundle.
-    The assertion is about the PATTERN, which is why it is written against a
-    name the matcher must accept rather than against filesystem behaviour.
+    An earlier version of this note claimed the fixture "only reaches the
+    branch on a case-sensitive filesystem". That is wrong, and a reviewer had to
+    say so: `betterflow.app.old` and `BetterFlow.app` do not collide even
+    case-insensitively, so this runs and genuinely witnesses IGNORECASE on the
+    Mac it will run on — reverting the flag reddens it.
     """
     running = _make_app(tmp_path, "BetterFlow.app")
     odd = _make_app(tmp_path, "betterflow.app.old")
@@ -471,3 +509,41 @@ def test_the_legacy_bundle_name_is_a_known_blind_spot(tmp_path):
 
     assert find_stale_bundle_copies(running) == []
     assert legacy.exists()
+
+
+def test_the_name_the_updater_leaves_behind_is_the_name_the_sweep_looks_for(tmp_path):
+    """The two ends of _MACOS_BACKUP_SUFFIX, driven rather than asserted equal.
+
+    Sharing a constant is not the same as proving both ends use it: reverting
+    the writer at _apply_macos_update to a literal ".bak.app" left the whole
+    suite green, so the constant's own comment — "change the writer and the
+    sweep silently stops matching it" — was still true, one step along.
+
+    This builds the backup name the way the updater does and feeds it to the
+    sweep, so a divergence at either end reddens.
+    """
+    import src.self_updater as su
+
+    running = _make_app(tmp_path, "BetterFlow.app")
+
+    # Exactly the expression at _apply_macos_update's backup line.
+    leftover_name = f"{running.stem}{su._MACOS_BACKUP_SUFFIX}"
+    leftover = _make_app(tmp_path, leftover_name)
+
+    assert find_stale_bundle_copies(running) == [leftover], (
+        "the sweep does not recognise the name the updater actually creates"
+    )
+
+
+def test_running_from_the_legacy_name_bails_out(tmp_path):
+    """The reverse direction its sibling's docstring describes but never runs.
+
+    "BetterFlow Sync.app" was this app's name before a rename. A machine still
+    on it is not merely unswept — it takes the non-canonical bail-out, so it
+    also announces itself in the log, which is how such a device would now be
+    found at all.
+    """
+    legacy = _make_app(tmp_path, "BetterFlow Sync.app")
+    _make_app(tmp_path, "BetterFlow Sync.app.old")
+
+    assert find_stale_bundle_copies(legacy) == []

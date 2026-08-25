@@ -1038,7 +1038,17 @@ def _bundle_identifier(app: Path) -> Optional[str]:
 # would touch 10 call sites across three test files this change has no other
 # business in; an alias gives callers outside the module a public symbol
 # without that blast radius.
-get_app_bundle_path = _get_app_bundle_path
+def get_app_bundle_path() -> Optional[Path]:
+    """Public wrapper, deliberately a function and not `= _get_app_bundle_path`.
+
+    An assignment binds the function OBJECT at import time, so a test that
+    monkeypatches the private name leaves the alias pointing at the original and
+    silently gets the real resolver — measured: after patching
+    `_get_app_bundle_path`, the alias still returned None. Three existing test
+    files patch only the private name, so that trap was one test away from a
+    green assertion about an early return that never happened.
+    """
+    return _get_app_bundle_path()
 
 
 def find_stale_bundle_copies(running_app: Path) -> list[Path]:
@@ -1128,6 +1138,13 @@ def find_stale_bundle_copies(running_app: Path) -> list[Path]:
         # defence-in-depth reasoning as the line's other two clauses.
         if entry == running_app or entry.is_symlink() or not entry.is_dir():
             continue
+        # fullmatch rather than match. Redundant against the ^...$ anchors for
+        # every ordinary name — reverting EITHER alone survives mutation, only
+        # dropping both reds — and kept for the one case it covers: `$` also
+        # matches before a trailing newline, and APFS permits newlines in
+        # filenames, so `BetterFlow.app.old\n` satisfied a list this comment
+        # calls closed. Same defence-in-depth footing as `entry == running_app`
+        # below, recorded here for the same reason.
         if not any(p.fullmatch(entry.name) for p in patterns):
             continue
         identifier = _bundle_identifier(entry)
