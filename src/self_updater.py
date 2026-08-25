@@ -600,6 +600,56 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
+def _detach_dmg(mount_point: Path) -> bool:
+    """Unmount a DMG. Returns whether it worked; NEVER raises.
+
+    #211: this used to raise from `_extract_from_dmg`'s `finally`, which threw
+    away an update that had already succeeded. `shutil.copytree` completes
+    inside the `try`; by the time we get here the .app is sitting in the extract
+    directory and the only thing left is housekeeping. Martin's Mac hit
+    `hdiutil detach failed (rc=1)` on 2026-08-23, the update aborted, and the
+    machine ran 1.5.119 for days — below the server's own minimum version floor,
+    logging "update required" on every sync.
+
+    The trade is not close. A failed unmount costs a stale entry in /Volumes
+    until the next reboot. Aborting costs a device stuck on an old build, and
+    the abort also strands `staged_update/`, so the retry loop then fails on a
+    missing `staged.json` and reports THAT instead.
+
+    Raising from a `finally` has a second cost that the incident log cannot
+    show: it REPLACES any exception still in flight. A genuine failure in the
+    copy above would have been relabelled as a detach problem, and its cause
+    discarded.
+
+    Two attempts. The first is polite; the retry adds `-force`, which is what
+    clears the usual cause — a straggling process still holding the volume.
+    """
+    for attempt, extra in enumerate((["-quiet"], ["-force", "-quiet"]), start=1):
+        try:
+            result = subprocess.run(
+                ["hdiutil", "detach", str(mount_point), *extra],
+                capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "hdiutil detach timed out (attempt %d) — the update is unaffected",
+                attempt,
+            )
+            continue
+        if result.returncode == 0:
+            return True
+        logger.warning(
+            "hdiutil detach failed (attempt %d, rc=%d): %s",
+            attempt, result.returncode, (result.stderr or "").strip(),
+        )
+    logger.error(
+        "Could not unmount %s. The extracted update is unaffected and the "
+        "install continues; this leaves a stale mount until the next reboot.",
+        mount_point,
+    )
+    return False
+
+
 def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
     """Mount a DMG, copy the .app out, and unmount."""
     mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
@@ -627,23 +677,9 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         shutil.copytree(str(app_found), str(dest), symlinks=True)
         logger.info(f"Extracted {app_found.name} from DMG")
     finally:
-        # Always attempt to detach, then clean up the mount point directory
-        try:
-            result = subprocess.run(
-                ["hdiutil", "detach", str(mount_point), "-quiet"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
-                logger.error(
-                    f"hdiutil detach failed (rc={result.returncode}): {result.stderr.strip()}"
-                )
-                raise RuntimeError("Failed to detach DMG mount - aborting update")
-        except subprocess.TimeoutExpired as e:
-            logger.error("hdiutil detach timed out - DMG may still be mounted")
-            raise RuntimeError("Failed to detach DMG mount - aborting update") from e
-        finally:
-            # Remove the mount point directory itself
-            shutil.rmtree(mount_point, ignore_errors=True)
+        # Housekeeping only — see _detach_dmg. It never raises, deliberately.
+        _detach_dmg(mount_point)
+        shutil.rmtree(mount_point, ignore_errors=True)
 
 
 def _fix_permissions(app_path: Path) -> None:
