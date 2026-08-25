@@ -129,3 +129,37 @@ def test_the_result_is_valid_utf8(tmp_path):
 
     tail.decode("utf-8")  # must not raise
     assert b"old" in tail and b"new" in tail
+
+
+# ── The callsite, which the helper tests cannot speak for ────────────────
+
+
+def test_the_upload_path_actually_sends_the_rotated_history(tmp_path, monkeypatch):
+    """Phantom 3, caught by mutation: every test above calls
+    `_read_rotated_log_tail` directly, so reverting the CALLER back to
+    `_read_log_tail` left all nine green. The whole fix could ship inert on the
+    fleet and nothing here would notice.
+
+    This drives `_upload_requested_logs` and asserts on the bytes handed to
+    `bf.upload_logs` — the actual payload, not the helper's return value.
+    """
+    from unittest.mock import MagicMock
+
+    from src.sync.sync_engine import SyncEngine
+
+    (tmp_path / "betterflow.log.1").write_bytes(b"OLD-INCIDENT\n")
+    (tmp_path / "betterflow.log").write_bytes(b"today\n")
+
+    engine = SyncEngine.__new__(SyncEngine)  # no __init__: this method needs two attrs
+    engine.config = MagicMock()
+    engine.config.get_log_dir.return_value = tmp_path
+    engine.bf = MagicMock()
+
+    engine._upload_requested_logs()
+
+    engine.bf.upload_logs.assert_called_once()
+    sent = engine.bf.upload_logs.call_args[0][0]
+    assert b"OLD-INCIDENT" in sent, (
+        "the upload path still reads only the live file — the fix is inert"
+    )
+    assert b"today" in sent
