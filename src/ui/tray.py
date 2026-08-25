@@ -62,7 +62,7 @@ except ImportError:
 try:
     from ..clipboard import clipboard_available, copy_to_clipboard
     from ..hardware_serial import get_hardware_serial
-    from ..machine_arch import ARM64, is_rosetta_translated, true_machine_arch
+    from ..machine_arch import ARM64, is_rosetta_translated, process_arch, true_machine_arch
     from ..notifications import send_notification
 except ImportError:
     from clipboard import clipboard_available, copy_to_clipboard  # type: ignore[no-redef]
@@ -70,6 +70,7 @@ except ImportError:
     from machine_arch import (  # type: ignore[no-redef]
         ARM64,
         is_rosetta_translated,
+        process_arch,
         true_machine_arch,
     )
     from notifications import send_notification  # type: ignore[no-redef]
@@ -308,7 +309,12 @@ def arch_menu_label(
         translated: Override the Rosetta determination for testing.
     """
     system = system or platform.system()
-    machine = machine or platform.machine()
+    # The architecture of THIS PROCESS, via the named helper rather than a
+    # second inline platform.machine(). Same discipline this function's own
+    # docstring already applies to the hardware arch ("never re-derived here"):
+    # a second copy is how the tray ends up naming one architecture while the
+    # heartbeat reports another.
+    machine = machine or process_arch()
     if translated is None:
         translated = is_rosetta_translated(system=system)
 
