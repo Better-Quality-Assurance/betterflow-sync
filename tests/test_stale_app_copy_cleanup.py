@@ -556,3 +556,22 @@ def test_running_from_the_legacy_name_bails_out(tmp_path):
     _make_app(tmp_path, "BetterFlow Sync.app.old")
 
     assert find_stale_bundle_copies(legacy) == []
+
+
+def test_the_public_resolver_follows_a_patch_of_the_private_one(monkeypatch):
+    """Witnesses why `get_app_bundle_path` is a wrapper and not an assignment.
+
+    `get_app_bundle_path = _get_app_bundle_path` binds the function OBJECT at
+    import time, so a test patching the private name leaves the alias pointing
+    at the original and silently gets the real resolver. Three existing test
+    files patch only the private name, so that trap was one test away from a
+    green assertion about an early return that never happened.
+
+    Reverting the wrapper to an assignment survives every OTHER test here — they
+    patch both names — so without this the guard has no witness at all.
+    """
+    import src.self_updater as su
+
+    monkeypatch.setattr(su, "_get_app_bundle_path", lambda: Path("/patched/BetterFlow.app"))
+
+    assert su.get_app_bundle_path() == Path("/patched/BetterFlow.app")
