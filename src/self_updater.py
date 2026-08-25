@@ -600,18 +600,147 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
+# Polite first, then force. See _detach_dmg for what `-force` does and does not
+# buy — it fixes rc=16 (a holder) and does NOT help rc=1 (never mounted), which
+# is the code #211 actually logged. This comment used to assert the rc=16 story
+# as that incident's cause; it was refuted by measurement and the correction
+# landed 45 lines below without touching the text a reader meets FIRST.
+#
+# No `-quiet`: output is captured, not printed, so it bought nothing and it
+# BLANKED the only diagnostic we get. Measured on Darwin 24.6.0 — with `-quiet`
+# both rc=1 and rc=16 return an empty stderr, so the "rc=%d: %s" line below
+# always logged an empty %s. Without it, rc=1 says
+# "hdiutil: detach failed - No such file or directory". Preserving that is the
+# whole point of the change; #211 cost days partly to diagnostic poverty.
+_DETACH_ATTEMPTS = ([], ["-force"])
+
+
+def _detach_dmg(mount_point: Path) -> bool:
+    """Unmount a DMG. Returns whether it worked; NEVER raises.
+
+    #211: this used to raise from `_extract_from_dmg`'s `finally`, which threw
+    away an update that had already succeeded. `shutil.copytree` completes
+    inside the `try`; by the time we get here the .app is sitting in the extract
+    directory and the only thing left is housekeeping. Martin's Mac hit
+    `hdiutil detach failed (rc=1)` on 2026-08-23, the update aborted, and the
+    machine ran 1.5.119 for days — below the server's own minimum version floor,
+    logging "update required" on every sync.
+
+    The trade is not close. A failed unmount leaks a mount until the next
+    reboot; because we attach with `-mountpoint <mkdtemp>` and `-nobrowse` that
+    lives under /var/folders and never appears in /Volumes, so find it with
+    `hdiutil info` or `mount | grep betterflow-dmg-mount`, not in Finder.
+    Aborting costs a device stuck on an old build — and `apply_staged_update`'s
+    own `finally` rmtree's the artifact, so the abort also discards the whole
+    downloaded DMG and the device re-downloads on the next check.
+
+    Raising from a `finally` has a second cost that the incident log cannot
+    show: it REPLACES any exception still in flight. A genuine failure in the
+    copy above would have been relabelled as a detach problem, and its cause
+    discarded.
+
+    Two attempts. The first is polite; the retry adds `-force`.
+
+    Be precise about what `-force` does and does not buy, because an earlier
+    version of this docstring got it wrong. Measured on Darwin 24.6.0:
+
+        rc=1   the path is not a mount / never was   -force does NOT help
+        rc=16  the volume is busy (a holder)          -force fixes it (16 -> 0)
+
+    #211 logged **rc=1**, so the "straggling process" story this comment used to
+    tell is not that incident's mechanism, and `-force` would not have rescued
+    it. rc=1 is consistent with `attach` having failed first — a corrupt or
+    truncated download failing hdiutil's checksum verify — which is why the
+    `mounted` gate in the caller matters more here than the retry does.
+
+    That reading is INFERRED, not witnessed: betterflow.log had rotated past
+    2026-08-23 before it could be fetched, so the one line that would settle it
+    (`Extracted BetterFlow.app from DMG`, immediately before the failure) is
+    gone. The retry is kept because rc=16 is real and cheap to survive; the
+    load-bearing fixes are not raising, and not detaching what never attached.
+    """
+    for attempt, extra in enumerate(_DETACH_ATTEMPTS, start=1):
+        try:
+            result = subprocess.run(
+                ["hdiutil", "detach", str(mount_point), *extra],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            # SubprocessError is TimeoutExpired's base; OSError covers the family
+            # subprocess.run raises before the child ever starts —
+            # FileNotFoundError when hdiutil is unresolvable, ENOMEM/EAGAIN when
+            # posix_spawn fails under pressure (this is a long-lived
+            # multi-threaded tray app), PermissionError under a sandbox profile.
+            #
+            # Catching only TimeoutExpired left BOTH of #211's defects reachable
+            # through a second door: called from a `finally`, an escaping OSError
+            # destroys an update whose copytree already succeeded AND replaces
+            # the exception in flight. A reviewer proved it with three failing
+            # probes. "NEVER raises" has to be true of the function, not of the
+            # paths I happened to imagine.
+            logger.warning(
+                "hdiutil detach failed to run (attempt %d): %r — "
+                "the update is unaffected",
+                attempt, e,
+            )
+            continue
+        if result.returncode == 0:
+            return True
+        logger.warning(
+            "hdiutil detach failed (attempt %d, rc=%d): %s",
+            attempt, result.returncode, (result.stderr or "").strip(),
+        )
+    # warning, not error: this module reserves ERROR for decisions that ABORT an
+    # update ("Rejecting update", "update aborted") and warning for non-fatal
+    # degradations. Logging ERROR for something this function has just declared
+    # non-fatal breaks that split, and grepping betterflow.log for ERROR is a
+    # real triage route here.
+    logger.warning(
+        "Could not unmount %s (leaked until reboot; `hdiutil info` to find it). "
+        "The extracted update is unaffected and the install continues.",
+        mount_point,
+    )
+    return False
+
+
 def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
     """Mount a DMG, copy the .app out, and unmount."""
     mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
+    mounted = False
     try:
         # Mount DMG read-only, hidden from Finder.
         # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
         # mount time. Signature verification still happens post-extract.
-        subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly",
-             "-mountpoint", str(mount_point), str(dmg_path)],
-            capture_output=True, text=True, timeout=60, check=True,
-        )
+        #
+        # The attach gets its OWN try so the two failure modes can be told apart;
+        # they need opposite cleanup.
+        try:
+            subprocess.run(
+                ["hdiutil", "attach", "-nobrowse", "-readonly",
+                 "-mountpoint", str(mount_point), str(dmg_path)],
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+        except subprocess.TimeoutExpired:
+            # hdiutil was SIGKILLed by subprocess.run's own timeout, mid-flight.
+            # It may have attached first, and SIGKILL runs no cleanup handler —
+            # so the image can be live with nothing left to release it.
+            #
+            # Witnessed on a real 400 MB DMG by sweeping the timeout: at
+            # t=0.05/0.10/0.15s the process died with the image STILL ATTACHED,
+            # 3 leaks in 8 runs. rmtree cannot recover it (a live mount point
+            # survives rmtree), so mount and temp dir persist until reboot.
+            #
+            # origin/main detached here unconditionally. Gating on `mounted`
+            # alone made this a REGRESSION against it — the gate was right about
+            # the cause and wrong about the discriminator.
+            mounted = True
+            raise
+        # A CalledProcessError needs no clause: hdiutil DECLINED cleanly (a
+        # corrupt or truncated download failing its checksum verify), nothing
+        # attached, so `mounted` stays False and the detach is skipped. That is
+        # the case the gate exists for.
+        mounted = True
+
         # Find .app inside mounted volume
         app_found = None
         for item in mount_point.iterdir():
@@ -627,23 +756,19 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         shutil.copytree(str(app_found), str(dest), symlinks=True)
         logger.info(f"Extracted {app_found.name} from DMG")
     finally:
-        # Always attempt to detach, then clean up the mount point directory
-        try:
-            result = subprocess.run(
-                ["hdiutil", "detach", str(mount_point), "-quiet"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
-                logger.error(
-                    f"hdiutil detach failed (rc={result.returncode}): {result.stderr.strip()}"
-                )
-                raise RuntimeError("Failed to detach DMG mount - aborting update")
-        except subprocess.TimeoutExpired as e:
-            logger.error("hdiutil detach timed out - DMG may still be mounted")
-            raise RuntimeError("Failed to detach DMG mount - aborting update") from e
-        finally:
-            # Remove the mount point directory itself
-            shutil.rmtree(mount_point, ignore_errors=True)
+        # Housekeeping only — see _detach_dmg. It never raises, deliberately.
+        #
+        # Gated on `mounted`, because `attach` runs with check=True and a corrupt
+        # or truncated download fails its checksum there. Detaching a mount that
+        # never existed spends two hdiutil calls to produce "no such volume" and
+        # then logs a confident "could not unmount" ABOVE the real cause — which
+        # on this fleet's diagnosis route (fetch the device log, grep it) sends
+        # the next reader at #211's ghost instead of at the download.
+        if mounted:
+            _detach_dmg(mount_point)
+        # Unconditional: gating this too would leak an empty temp dir on every
+        # attach failure.
+        shutil.rmtree(mount_point, ignore_errors=True)
 
 
 def _fix_permissions(app_path: Path) -> None:
