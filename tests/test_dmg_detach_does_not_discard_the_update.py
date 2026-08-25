@@ -254,3 +254,87 @@ def test_the_happy_path_returns_true(tmp_path):
     mount = _dmg_with_app(tmp_path)
     with patch.object(su.subprocess, "run", _run_stub(mount, detach_rc=0)):
         assert su._detach_dmg(mount) is True
+
+
+# ── The contract, not just the paths I imagined ─────────────────────────
+#
+# `_detach_dmg` promises it never raises. It caught only TimeoutExpired, so an
+# OSError from subprocess.run — raised BEFORE the child starts — escaped through
+# the `finally` and restored both of #211's defects: it destroys an update whose
+# copytree already succeeded, and it replaces the exception in flight. A
+# reviewer found this with three failing probes; they are kept here so the
+# contract is tested rather than asserted in a docstring.
+
+
+@pytest.mark.parametrize("boom", [
+    FileNotFoundError(2, "No such file or directory: 'hdiutil'"),
+    OSError(12, "Cannot allocate memory"),
+    BlockingIOError(35, "Resource temporarily unavailable"),
+    PermissionError(1, "Operation not permitted"),
+], ids=["hdiutil-absent", "ENOMEM", "EAGAIN", "sandboxed"])
+def test_detach_never_raises_whatever_subprocess_does(tmp_path, boom):
+    """The contract itself. Each of these is a real way `subprocess.run` fails
+    before the child exists: hdiutil unresolvable on PATH, fork/posix_spawn
+    under memory or process pressure in a long-lived multi-threaded tray app,
+    or a sandbox profile."""
+    mount = _dmg_with_app(tmp_path)
+
+    def run(cmd, *a, **k):
+        raise boom
+
+    with patch.object(su.subprocess, "run", run):
+        assert su._detach_dmg(mount) is False  # returns, does not raise
+
+
+def test_an_oserror_during_cleanup_does_not_destroy_the_extract(tmp_path, monkeypatch):
+    """#211's first defect, reached through the door TimeoutExpired-only left
+    open."""
+    mount = _dmg_with_app(tmp_path)
+    extract = tmp_path / "out"
+    extract.mkdir()
+    monkeypatch.setattr(su.tempfile, "mkdtemp", lambda **kw: str(mount))
+
+    def run(cmd, *a, **k):
+        if cmd[:2] == ["hdiutil", "detach"]:
+            raise OSError(12, "Cannot allocate memory")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch.object(su.subprocess, "run", run):
+        su._extract_from_dmg(tmp_path / "x.dmg", extract)
+
+    assert (extract / "BetterFlow.app").is_dir()
+
+
+def test_an_oserror_during_cleanup_does_not_relabel_the_real_failure(tmp_path, monkeypatch):
+    """#211's second defect, same door. The image has no .app, so the caller
+    must still see FileNotFoundError from the extraction — not whatever the
+    cleanup tripped over on the way out."""
+    mount = tmp_path / "mnt"
+    mount.mkdir()
+    extract = tmp_path / "out"
+    extract.mkdir()
+    monkeypatch.setattr(su.tempfile, "mkdtemp", lambda **kw: str(mount))
+
+    def run(cmd, *a, **k):
+        if cmd[:2] == ["hdiutil", "detach"]:
+            raise OSError(12, "Cannot allocate memory")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch.object(su.subprocess, "run", run), \
+            pytest.raises(FileNotFoundError):
+        su._extract_from_dmg(tmp_path / "x.dmg", extract)
+
+
+def test_the_detach_command_keeps_its_stderr(tmp_path):
+    """`-quiet` blanked the only diagnostic we get — measured, both rc=1 and
+    rc=16 return empty stderr with it, so the "rc=%d: %s" log line always
+    printed an empty %s. Asserted on the command, because the emptiness is
+    invisible from inside a stubbed test."""
+    mount = _dmg_with_app(tmp_path)
+    calls: list[list[str]] = []
+
+    with patch.object(su.subprocess, "run", _run_stub(mount, detach_rc=[1, 1], calls=calls)):
+        su._detach_dmg(mount)
+
+    for c in [c for c in calls if c[:2] == ["hdiutil", "detach"]]:
+        assert "-quiet" not in c, "restored the flag that blanks stderr"

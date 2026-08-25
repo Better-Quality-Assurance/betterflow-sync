@@ -602,7 +602,15 @@ def _find_app_in(directory: Path) -> Optional[Path]:
 
 # Polite first, then force. `-force` is what clears the usual cause of a failed
 # unmount: a straggling process still holding the volume.
-_DETACH_ATTEMPTS = (["-quiet"], ["-force", "-quiet"])
+# Polite first, then force.
+#
+# No `-quiet`: output is captured, not printed, so it bought nothing and it
+# BLANKED the only diagnostic we get. Measured on Darwin 24.6.0 — with `-quiet`
+# both rc=1 and rc=16 return an empty stderr, so the "rc=%d: %s" line below
+# always logged an empty %s. Without it, rc=1 says
+# "hdiutil: detach failed - No such file or directory". Preserving that is the
+# whole point of the change; #211 cost days partly to diagnostic poverty.
+_DETACH_ATTEMPTS = ([], ["-force"])
 
 
 def _detach_dmg(mount_point: Path) -> bool:
@@ -638,10 +646,23 @@ def _detach_dmg(mount_point: Path) -> bool:
                 ["hdiutil", "detach", str(mount_point), *extra],
                 capture_output=True, text=True, timeout=30,
             )
-        except subprocess.TimeoutExpired:
+        except (subprocess.SubprocessError, OSError) as e:
+            # SubprocessError is TimeoutExpired's base; OSError covers the family
+            # subprocess.run raises before the child ever starts —
+            # FileNotFoundError when hdiutil is unresolvable, ENOMEM/EAGAIN when
+            # posix_spawn fails under pressure (this is a long-lived
+            # multi-threaded tray app), PermissionError under a sandbox profile.
+            #
+            # Catching only TimeoutExpired left BOTH of #211's defects reachable
+            # through a second door: called from a `finally`, an escaping OSError
+            # destroys an update whose copytree already succeeded AND replaces
+            # the exception in flight. A reviewer proved it with three failing
+            # probes. "NEVER raises" has to be true of the function, not of the
+            # paths I happened to imagine.
             logger.warning(
-                "hdiutil detach timed out (attempt %d) — the update is unaffected",
-                attempt,
+                "hdiutil detach failed to run (attempt %d): %r — "
+                "the update is unaffected",
+                attempt, e,
             )
             continue
         if result.returncode == 0:
