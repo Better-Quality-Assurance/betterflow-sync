@@ -600,6 +600,11 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
+# Polite first, then force. `-force` is what clears the usual cause of a failed
+# unmount: a straggling process still holding the volume.
+_DETACH_ATTEMPTS = (["-quiet"], ["-force", "-quiet"])
+
+
 def _detach_dmg(mount_point: Path) -> bool:
     """Unmount a DMG. Returns whether it worked; NEVER raises.
 
@@ -611,10 +616,13 @@ def _detach_dmg(mount_point: Path) -> bool:
     machine ran 1.5.119 for days — below the server's own minimum version floor,
     logging "update required" on every sync.
 
-    The trade is not close. A failed unmount costs a stale entry in /Volumes
-    until the next reboot. Aborting costs a device stuck on an old build, and
-    the abort also strands `staged_update/`, so the retry loop then fails on a
-    missing `staged.json` and reports THAT instead.
+    The trade is not close. A failed unmount leaks a mount until the next
+    reboot; because we attach with `-mountpoint <mkdtemp>` and `-nobrowse` that
+    lives under /var/folders and never appears in /Volumes, so find it with
+    `hdiutil info` or `mount | grep betterflow-dmg-mount`, not in Finder.
+    Aborting costs a device stuck on an old build — and `apply_staged_update`'s
+    own `finally` rmtree's the artifact, so the abort also discards the whole
+    downloaded DMG and the device re-downloads on the next check.
 
     Raising from a `finally` has a second cost that the incident log cannot
     show: it REPLACES any exception still in flight. A genuine failure in the
@@ -624,7 +632,7 @@ def _detach_dmg(mount_point: Path) -> bool:
     Two attempts. The first is polite; the retry adds `-force`, which is what
     clears the usual cause — a straggling process still holding the volume.
     """
-    for attempt, extra in enumerate((["-quiet"], ["-force", "-quiet"]), start=1):
+    for attempt, extra in enumerate(_DETACH_ATTEMPTS, start=1):
         try:
             result = subprocess.run(
                 ["hdiutil", "detach", str(mount_point), *extra],
@@ -642,9 +650,14 @@ def _detach_dmg(mount_point: Path) -> bool:
             "hdiutil detach failed (attempt %d, rc=%d): %s",
             attempt, result.returncode, (result.stderr or "").strip(),
         )
-    logger.error(
-        "Could not unmount %s. The extracted update is unaffected and the "
-        "install continues; this leaves a stale mount until the next reboot.",
+    # warning, not error: this module reserves ERROR for decisions that ABORT an
+    # update ("Rejecting update", "update aborted") and warning for non-fatal
+    # degradations. Logging ERROR for something this function has just declared
+    # non-fatal breaks that split, and grepping betterflow.log for ERROR is a
+    # real triage route here.
+    logger.warning(
+        "Could not unmount %s (leaked until reboot; `hdiutil info` to find it). "
+        "The extracted update is unaffected and the install continues.",
         mount_point,
     )
     return False
@@ -653,6 +666,7 @@ def _detach_dmg(mount_point: Path) -> bool:
 def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
     """Mount a DMG, copy the .app out, and unmount."""
     mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
+    mounted = False
     try:
         # Mount DMG read-only, hidden from Finder.
         # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
@@ -662,6 +676,7 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
              "-mountpoint", str(mount_point), str(dmg_path)],
             capture_output=True, text=True, timeout=60, check=True,
         )
+        mounted = True
         # Find .app inside mounted volume
         app_found = None
         for item in mount_point.iterdir():
@@ -678,7 +693,17 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         logger.info(f"Extracted {app_found.name} from DMG")
     finally:
         # Housekeeping only — see _detach_dmg. It never raises, deliberately.
-        _detach_dmg(mount_point)
+        #
+        # Gated on `mounted`, because `attach` runs with check=True and a corrupt
+        # or truncated download fails its checksum there. Detaching a mount that
+        # never existed spends two hdiutil calls to produce "no such volume" and
+        # then logs a confident "could not unmount" ABOVE the real cause — which
+        # on this fleet's diagnosis route (fetch the device log, grep it) sends
+        # the next reader at #211's ghost instead of at the download.
+        if mounted:
+            _detach_dmg(mount_point)
+        # Unconditional: gating this too would leak an empty temp dir on every
+        # attach failure.
         shutil.rmtree(mount_point, ignore_errors=True)
 
 
