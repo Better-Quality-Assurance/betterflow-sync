@@ -600,9 +600,11 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
-# Polite first, then force. `-force` is what clears the usual cause of a failed
-# unmount: a straggling process still holding the volume.
-# Polite first, then force.
+# Polite first, then force. See _detach_dmg for what `-force` does and does not
+# buy — it fixes rc=16 (a holder) and does NOT help rc=1 (never mounted), which
+# is the code #211 actually logged. This comment used to assert the rc=16 story
+# as that incident's cause; it was refuted by measurement and the correction
+# landed 45 lines below without touching the text a reader meets FIRST.
 #
 # No `-quiet`: output is captured, not printed, so it bought nothing and it
 # BLANKED the only diagnostic we get. Measured on Darwin 24.6.0 — with `-quiet`
@@ -709,12 +711,36 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         # Mount DMG read-only, hidden from Finder.
         # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
         # mount time. Signature verification still happens post-extract.
-        subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly",
-             "-mountpoint", str(mount_point), str(dmg_path)],
-            capture_output=True, text=True, timeout=60, check=True,
-        )
+        #
+        # The attach gets its OWN try so the two failure modes can be told apart;
+        # they need opposite cleanup.
+        try:
+            subprocess.run(
+                ["hdiutil", "attach", "-nobrowse", "-readonly",
+                 "-mountpoint", str(mount_point), str(dmg_path)],
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+        except subprocess.TimeoutExpired:
+            # hdiutil was SIGKILLed by subprocess.run's own timeout, mid-flight.
+            # It may have attached first, and SIGKILL runs no cleanup handler —
+            # so the image can be live with nothing left to release it.
+            #
+            # Witnessed on a real 400 MB DMG by sweeping the timeout: at
+            # t=0.05/0.10/0.15s the process died with the image STILL ATTACHED,
+            # 3 leaks in 8 runs. rmtree cannot recover it (a live mount point
+            # survives rmtree), so mount and temp dir persist until reboot.
+            #
+            # origin/main detached here unconditionally. Gating on `mounted`
+            # alone made this a REGRESSION against it — the gate was right about
+            # the cause and wrong about the discriminator.
+            mounted = True
+            raise
+        # A CalledProcessError needs no clause: hdiutil DECLINED cleanly (a
+        # corrupt or truncated download failing its checksum verify), nothing
+        # attached, so `mounted` stays False and the detach is skipped. That is
+        # the case the gate exists for.
         mounted = True
+
         # Find .app inside mounted volume
         app_found = None
         for item in mount_point.iterdir():

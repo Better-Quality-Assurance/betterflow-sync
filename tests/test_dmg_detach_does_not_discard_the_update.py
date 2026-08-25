@@ -22,7 +22,7 @@ The same construct has a second defect that is invisible in the incident logs:
 operator would be told the problem was `detach`. `test_a_real_failure_is_not_relabelled` pins that direction, because fixing only the first defect leaves it.
 
 So detach now retries (the second attempt with `-force`, which is what clears
-the usual cause — a straggling process holding the volume) and, if it still
+rc=16, a holder — though NOT #211's rc=1, see _detach_dmg) and, if it still
 fails, LOGS rather than raising.
 """
 
@@ -83,9 +83,12 @@ def test_a_failed_detach_keeps_the_extracted_app(tmp_path, monkeypatch):
 
 
 def test_it_retries_the_detach_with_force(tmp_path, monkeypatch):
-    """A straggling process holding the volume is the usual cause, and `-force`
-    is what clears it. Asserted on the ARGUMENTS, so a retry that just repeats
-    the same failing command does not pass."""
+    """`-force` clears rc=16 (a holder). It does NOT help rc=1, which is what
+    #211 logged — see `_detach_dmg` for the measured rc table. The retry is kept
+    because rc=16 is real and cheap to survive, not because it explains #211.
+
+    Asserted on the ARGUMENTS, so a retry that just repeats the same failing
+    command does not pass."""
     mount = _dmg_with_app(tmp_path)
     extract = tmp_path / "out"
     extract.mkdir()
@@ -338,3 +341,71 @@ def test_the_detach_command_keeps_its_stderr(tmp_path):
 
     for c in [c for c in calls if c[:2] == ["hdiutil", "detach"]]:
         assert "-quiet" not in c, "restored the flag that blanks stderr"
+
+
+# ── The gate has two attach failures, not one ───────────────────────────
+
+
+def test_an_attach_killed_by_its_own_timeout_is_still_detached(tmp_path, monkeypatch):
+    """The regression the `mounted` gate introduced, found by refutation.
+
+    `subprocess.run`'s timeout SIGKILLs hdiutil, and SIGKILL runs no cleanup
+    handler — so the image can already be attached with nothing left to release
+    it. Witnessed on a real 400 MB DMG by sweeping the timeout: at t=0.05/0.10/
+    0.15s the process died with the image STILL ATTACHED, 3 leaks in 8 runs.
+    `rmtree` cannot recover it, because a live mount point survives rmtree.
+
+    `origin/main` detached here. Gating on `mounted` alone made this branch a
+    regression against it — right about the cause, wrong about the
+    discriminator. A clean `CalledProcessError` means hdiutil declined and
+    nothing attached; a `TimeoutExpired` means it was killed mid-flight.
+    """
+    mount = _dmg_with_app(tmp_path)
+    extract = tmp_path / "out"
+    extract.mkdir()
+    monkeypatch.setattr(su.tempfile, "mkdtemp", lambda **kw: str(mount))
+    calls: list[list[str]] = []
+
+    def run(cmd, *a, **k):
+        calls.append(list(cmd))
+        if cmd[:2] == ["hdiutil", "attach"]:
+            raise subprocess.TimeoutExpired(cmd, 60)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch.object(su.subprocess, "run", run), \
+            pytest.raises(subprocess.TimeoutExpired):
+        su._extract_from_dmg(tmp_path / "x.dmg", extract)
+
+    assert [c for c in calls if c[:2] == ["hdiutil", "detach"]], (
+        "a timed-out attach may have left the image live; nothing else can free it"
+    )
+
+
+def test_the_mount_is_detached_before_the_directory_is_removed(tmp_path, monkeypatch):
+    """Order matters and was unwitnessed — swapping the two lines survived all
+    17 tests. Measured against a real mount: rmtree on a LIVE mount point fails
+    silently, the detach then succeeds, and the temp dir is never removed. So
+    the reversed order leaks an empty temp dir on every SUCCESSFUL update."""
+    mount = _dmg_with_app(tmp_path)
+    extract = tmp_path / "out"
+    extract.mkdir()
+    monkeypatch.setattr(su.tempfile, "mkdtemp", lambda **kw: str(mount))
+    order: list[str] = []
+
+    real_rmtree = su.shutil.rmtree
+
+    def rmtree(path, *a, **k):
+        if str(path) == str(mount):
+            order.append("rmtree")
+        return real_rmtree(path, *a, **k)
+
+    def run(cmd, *a, **k):
+        if cmd[:2] == ["hdiutil", "detach"]:
+            order.append("detach")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(su.shutil, "rmtree", rmtree)
+    with patch.object(su.subprocess, "run", run):
+        su._extract_from_dmg(tmp_path / "x.dmg", extract)
+
+    assert order == ["detach", "rmtree"], order
