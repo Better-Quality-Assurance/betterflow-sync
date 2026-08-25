@@ -637,8 +637,25 @@ def _detach_dmg(mount_point: Path) -> bool:
     copy above would have been relabelled as a detach problem, and its cause
     discarded.
 
-    Two attempts. The first is polite; the retry adds `-force`, which is what
-    clears the usual cause — a straggling process still holding the volume.
+    Two attempts. The first is polite; the retry adds `-force`.
+
+    Be precise about what `-force` does and does not buy, because an earlier
+    version of this docstring got it wrong. Measured on Darwin 24.6.0:
+
+        rc=1   the path is not a mount / never was   -force does NOT help
+        rc=16  the volume is busy (a holder)          -force fixes it (16 -> 0)
+
+    #211 logged **rc=1**, so the "straggling process" story this comment used to
+    tell is not that incident's mechanism, and `-force` would not have rescued
+    it. rc=1 is consistent with `attach` having failed first — a corrupt or
+    truncated download failing hdiutil's checksum verify — which is why the
+    `mounted` gate in the caller matters more here than the retry does.
+
+    That reading is INFERRED, not witnessed: betterflow.log had rotated past
+    2026-08-23 before it could be fetched, so the one line that would settle it
+    (`Extracted BetterFlow.app from DMG`, immediately before the failure) is
+    gone. The retry is kept because rc=16 is real and cheap to survive; the
+    load-bearing fixes are not raising, and not detaching what never attached.
     """
     for attempt, extra in enumerate(_DETACH_ATTEMPTS, start=1):
         try:
