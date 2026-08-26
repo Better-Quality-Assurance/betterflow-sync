@@ -115,6 +115,16 @@ jobs:
 
       - name: Download ActivityWatch binaries
         run: python scripts/download_aw.py
+        env:
+          # REQUIRED, not decorative. download_aw.py picks the macOS archive by
+          # architecture, and without this it falls back to the RUNNER's
+          # platform.machine() while the app itself is built for
+          # matrix.target_arch — so a cross-arch leg would bundle trackers of one
+          # architecture inside a DMG of the other. That decoupling is exactly
+          # what get_asset_key() exists to remove, and it is masked whenever a
+          # runner label's arch happens to equal its target_arch, which nothing
+          # asserts.
+          TARGET_ARCH: ${{ matrix.target_arch }}
 
       - name: Build with PyInstaller
         run: pyinstaller build.spec --clean

@@ -37,9 +37,13 @@ clean-dist:
 	@rm -rf dist/BetterFlow.app dist/BetterFlow
 	@echo "[clean-dist] removed dist/BetterFlow.app and dist/BetterFlow (if present)"
 
-# Download ActivityWatch binaries for current platform
+# Download ActivityWatch binaries for the target platform AND ARCHITECTURE.
+# TARGET_ARCH must be EXPORTED here: `TARGET_ARCH ?=` above is a make variable,
+# so without this assignment download_aw.py sees nothing in its environment and
+# falls back to the host's architecture. On macOS that silently fetches the
+# wrong archive for any cross-arch build.
 download-aw:
-	python scripts/download_aw.py
+	TARGET_ARCH=$(TARGET_ARCH) python scripts/download_aw.py
 
 # Clean tracker binaries
 clean-aw:
@@ -210,6 +214,12 @@ ship-arm64:
 	# Use the arm64 venv directly. `make build-mac` resolves to
 	# /usr/local/bin/pyinstaller (Homebrew x86_64 Python), which
 	# cannot satisfy TARGET_ARCH=arm64.
+	# Fetch the arm64 trackers BEFORE PyInstaller bundles them. Without this
+	# neither ship leg depends on download-aw, so both DMGs are built from
+	# whatever tree happened to be on disk — shipping one architecture's
+	# trackers inside both installers. Harmless while macOS had a single
+	# asset; a live defect now that it has two.
+	TARGET_ARCH=arm64 $(MAKE) download-aw
 	TARGET_ARCH=arm64 .venv-arm64/bin/python -m PyInstaller build.spec --clean
 	./scripts/sign-mac.sh dist/BetterFlow.app
 	TARGET_ARCH=arm64 $(MAKE) _dmg-only
@@ -228,6 +238,10 @@ ship-x86_64:
 	rm -rf build dist/BetterFlow dist/BetterFlow.app
 	# build.spec reads TARGET_ARCH; PyInstaller runs under Rosetta via
 	# the x86_64 venv. .app overwrites the renamed arm64 build above.
+	# Same as the arm64 leg: re-fetch, because the tree on disk is now the
+	# arm64 one this target just built with. download_aw.py detects the
+	# mismatch and replaces it.
+	TARGET_ARCH=x86_64 $(MAKE) download-aw
 	TARGET_ARCH=x86_64 arch -x86_64 .venv-x86_64/bin/python -m PyInstaller build.spec --clean
 	./scripts/sign-mac.sh dist/BetterFlow.app
 	TARGET_ARCH=x86_64 $(MAKE) _dmg-only

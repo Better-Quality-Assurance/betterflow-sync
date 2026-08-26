@@ -86,6 +86,62 @@ if aw_dir.exists():
             target_dir = Path("resources/trackers") / aw_platform / rel_parent
             aw_binaries.append((str(binary), str(target_dir)))
 
+# Fail the BUILD rather than ship a DMG whose trackers do not match it.
+#
+# Two ways that happened, both silent, and neither visible in the artifact's
+# filename — which is the whole problem, since the filename is what a human
+# checks:
+#
+#   1. No trackers at all. `aw_dir.exists()` above is optional, so a clean tree
+#      built without `make download-aw` produced an installer that looks normal
+#      and captures nothing.
+#   2. The OTHER architecture's trackers. `resources/trackers/darwin` has no
+#      arch dimension — one build ships one architecture — so an arm64 tree left
+#      by a previous leg sails into an x86_64 DMG. That is #216 recreated on
+#      Intel, and the runtime gate CANNOT catch it: on a real Intel Mac
+#      `_rosetta_required()` answers False (the host is not arm64) and
+#      `_tracker_reinstall_reason()` answers None (the bundled copy is equally
+#      unrunnable there), so it spawns and EBADARCHes every 60s forever.
+#
+# This is the only check on that path: `make ship` calls PyInstaller directly,
+# so download_aw.py's own arch guard never runs there.
+if is_mac:
+    if not aw_binaries:
+        raise SystemExit(
+            "build.spec: no tracker binaries under %s — run `make download-aw` "
+            "first. Shipping without them produces an installer that captures "
+            "nothing and says nothing." % aw_dir
+        )
+    if TARGET_ARCH:
+        # `macho_arches` owns the rule, exactly as it does for the start gate,
+        # the reinstall decision and download_aw.arch_mismatch — the fourth
+        # caller of one implementation, not a fourth spelling of it. A private
+        # header reader here would be narrower than the shipped one (it would
+        # miss byte-swapped and 32-bit magics, and universal binaries) and,
+        # since every unparsed file is skipped, it would fail toward SHIPPING.
+        # It is also the only rule on this path with no test of its own:
+        # `make ship` calls PyInstaller directly, so download_aw.py's guard
+        # never runs. `src/` is already on sys.path above, and machine_arch is
+        # stdlib-only by design.
+        from machine_arch import macho_arches
+
+        _wrong = []
+        for _src, _ in aw_binaries:
+            _arches = macho_arches(_src)
+            # An empty set is "could not tell" (data files, scripts, anything
+            # not Mach-O), never evidence of a mismatch. A universal binary
+            # carries the target among its slices and satisfies any leg.
+            if _arches and TARGET_ARCH not in _arches:
+                _wrong.append((_src, "/".join(sorted(_arches))))
+        if _wrong:
+            raise SystemExit(
+                "build.spec: TARGET_ARCH=%s but %d bundled tracker file(s) are a "
+                "different architecture, e.g. %s (%s). Run "
+                "`TARGET_ARCH=%s make download-aw` before building, or this DMG "
+                "ships trackers it cannot execute."
+                % (TARGET_ARCH, len(_wrong), _wrong[0][0], _wrong[0][1], TARGET_ARCH)
+            )
+
 # Collect Tcl/Tk data files so tkinter works in the bundle
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 tcl_tk_datas = collect_data_files("tkinter")

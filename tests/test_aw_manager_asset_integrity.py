@@ -3,7 +3,7 @@
 `_download_aw_binaries` verifies the downloaded ActivityWatch archive against
 `RELEASE_SHA256` and fails CLOSED on a mismatch or a missing pin. That makes a
 routine `AW_VERSION` bump dangerous: forget to recompute the hashes and every
-machine that needs a bootstrap (or a `_should_reinstall_trackers` reinstall)
+machine that needs a bootstrap (or a `_tracker_reinstall_reason` reinstall)
 silently installs nothing — no trackers, zero activity captured, one log line.
 
 These tests make that mistake fail in CI instead of on the fleet.
@@ -20,7 +20,7 @@ from src import aw_manager
 from src.aw_manager import AW_VERSION, RELEASE_ASSETS, RELEASE_SHA256
 
 # The AW_VERSION whose archives were hand-vetted (shasum -a 256 on the release
-# assets) to produce the RELEASE_SHA256 values in src/aw_manager.py. Bumping
+# assets) to produce the RELEASE_SHA256 values in src/aw_release.py. Bumping
 # AW_VERSION without re-vetting and updating BOTH this constant and the hashes
 # is exactly the silent-outage scenario above, so it must break the build.
 #
@@ -33,6 +33,16 @@ VETTED_HASHES = {
         "darwin": "e62a76c0ec3c0e69d58ba207bb8da6d8d47d0c7ad1bc871ddf702168f291cf5b",
         "windows": "a067fa765678a411991826c4da811fd2d8ca260c2db9d6d897957565b61c369f",
         "linux": "8f62b10babf8a8f108cbdf7267c02fbc1ce2a970fa9535f230b3416b803e3360",
+    },
+    # v0.14.0b4 is the first pin with a per-architecture macOS key, because it
+    # is the first release that publishes both. That is the whole point of the
+    # bump (#216): the arm64 archive is what lets Apple Silicon run the
+    # trackers natively instead of through Rosetta 2.
+    "v0.14.0b4": {
+        "darwin-arm64": "98a142c47aadc3873cf3e6f4e71c28c4897a4b48868e4586ed08680c23f06584",
+        "darwin-x86_64": "090b91b269b2d18049c44b4d10f9142bcd7c72269b199a570665927d5521f665",
+        "windows": "c7acb66d5824aeeef17e0c941efd1f0dbaf216e112260972efa21cff40c25832",
+        "linux": "5f608c7c1a717e98b9e46738a0d6aca2906b73d70271fc9882bbabb9aebbbf76",
     },
 }
 
