@@ -2754,6 +2754,45 @@ class BetterFlowApp:
     def _ensure_update_checks_started(self) -> None:
         self.update_handler.ensure_update_checks_started()
 
+    def _announce_session(self, state, *, cold_launch: bool) -> None:
+        """Tell the user they are logged in, and record whether that arrived.
+
+        This notification is the only signal a user gets that BetterFlow
+        started and is tracking them. When it silently does not arrive the
+        app is indistinguishable from one that never launched, and #220
+        found the deeper cost: the caller threw away the delivery outcome
+        #204 added, so support could not tell "macOS suppressed it" from
+        "the code path never ran". send_notification never raises and
+        never lies -- it returns the strongest claim the platform
+        supports -- so the only way to get a silent failure here is to
+        discard what it said.
+
+        Four login paths used to build this notification inline, three of
+        them byte-identical, so a fix to one reached none of the others.
+        """
+        first_name = (state.user_name or "").split()[0] if state.user_name else ""
+        if cold_launch:
+            title = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
+        else:
+            # A resumed session, not a cold launch: "Welcome back" rather
+            # than the time-of-day launch greeting.
+            title = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
+
+        outcome = send_notification(title, _day_greeting())
+        # NotificationOutcome.__bool__ is truthy ONLY for a verified
+        # delivery, so this cannot read FAILED as success.
+        if outcome:
+            logger.info(
+                "Session greeting delivered (not proof the user saw it)"
+            )
+        else:
+            logger.warning(
+                "Session greeting NOT delivered (%s) -- the user has no "
+                "confirmation that BetterFlow started or that tracking is "
+                "running",
+                outcome.name,
+            )
+
     def _finish_logged_in_startup(
         self,
         state,
@@ -2786,9 +2825,7 @@ class BetterFlowApp:
         self._ensure_update_checks_started()
 
         if send_greeting:
-            first_name = (state.user_name or "").split()[0] if state.user_name else ""
-            greeting = f"{_greeting()}, {first_name}!" if first_name else f"{_greeting()}!"
-            send_notification(greeting, _day_greeting())
+            self._announce_session(state, cold_launch=True)
 
     def _background_startup(self, wizard_login_state=None) -> None:
         """Restore session and services without delaying tray visibility."""
@@ -2900,9 +2937,7 @@ class BetterFlowApp:
                     # "Welcome back" convention as the manual re-login path
                     # (do_browser_login), not the time-of-day launch greeting.
                     self._finish_logged_in_startup(state, send_greeting=False)
-                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
-                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
-                    send_notification(greeting, _day_greeting())
+                    self._announce_session(state, cold_launch=False)
                     return
                 if not getattr(state, "transient", False):
                     # Credentials are genuinely gone now — prompt re-auth. This
@@ -3488,9 +3523,7 @@ class BetterFlowApp:
                         send_greeting=False,
                         initial_permissions_delay_seconds=1.0,
                     )
-                    first_name = (state.user_name or "").split()[0] if state.user_name else ""
-                    greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
-                    send_notification(greeting, _day_greeting())
+                    self._announce_session(state, cold_launch=False)
                 else:
                     self.coordinator.logged_in = False
                     error = state.error or "Login failed"
@@ -3889,9 +3922,7 @@ class BetterFlowApp:
                     send_greeting=False,
                     initial_permissions_delay_seconds=1.0,
                 )
-                first_name = (state.user_name or "").split()[0] if state.user_name else ""
-                greeting = f"Welcome back, {first_name}!" if first_name else "Welcome back!"
-                send_notification(greeting, _day_greeting())
+                self._announce_session(state, cold_launch=False)
             else:
                 self.coordinator.logged_in = False
                 error = state.error or "Login failed"
