@@ -553,6 +553,13 @@ class AWManager:
         # every few minutes for the life of an outage — that is the 60-second
         # log spam the preflight was written to end, arriving by another door.
         self._rosetta_logged: Optional[bool] = None
+        # The last answer the probe actually GAVE, as opposed to the memo above
+        # which force_restart clears on purpose. A probe that raised is not an
+        # answer, and once re-probing exists a transient fork refusal
+        # (EAGAIN/EMFILE, or the 10s timeout) can overwrite a known "Rosetta is
+        # missing" with a guessed "available". Deliberately NOT cleared by
+        # force_restart: its whole job is to survive the memo.
+        self._rosetta_missing_conclusive: Optional[bool] = None
         self._rosetta_notified: bool = False
         # Components whose binary is on disk but cannot EXECUTE (EBADARCH /
         # ENOEXEC). Keeps the capture-dead latch honest when only SOME binaries
@@ -932,6 +939,7 @@ class AWManager:
 
         if sys.platform != "darwin" or platform.machine() != "arm64":
             self._rosetta_missing_cached = False
+            self._rosetta_missing_conclusive = False
             return False
 
         try:
@@ -942,13 +950,33 @@ class AWManager:
                 timeout=10,
             )
             missing = result.returncode != 0
+            self._rosetta_missing_conclusive = missing
         except Exception as e:
             # Probe itself failed. Do NOT claim Rosetta is missing on a broken
             # probe — that would refuse to start trackers on a machine that is
             # fine. Fail towards attempting the start; the EBADARCH handler in
             # _start_component still catches the real thing.
-            logger.warning("Rosetta probe failed, assuming available: %s", e)
-            missing = False
+            # "Fail toward available" is the right default only when we have
+            # never had a real answer. force_restart re-probes every
+            # ROSETTA_REPROBE_INTERVAL, so on an affected Mac this path runs
+            # ~288 times a day, and each run is a fresh chance for a fork
+            # refusal to replace a KNOWN "missing" with a guess. That guess is
+            # not free: it makes capture_blocked_remedy() return None, so the
+            # tray drops the one actionable sentence and falls back to
+            # "ActivityWatch not responding" -- the string #188 exists to
+            # delete -- and it flips _rosetta_logged so the log claims "Rosetta
+            # 2 is now available" on a machine where nothing changed.
+            #
+            # So carry the last CONCLUSIVE answer forward and guess only when
+            # there has never been one. Same determined/conclusive split
+            # machine_arch.ProbeResult already uses, for the same reason: a
+            # failed probe must not masquerade as a result.
+            logger.warning("Rosetta probe failed, keeping last answer: %s", e)
+            missing = (
+                self._rosetta_missing_conclusive
+                if self._rosetta_missing_conclusive is not None
+                else False
+            )
 
         self._rosetta_missing_cached = missing
         self._rosetta_probed_at = time.monotonic()

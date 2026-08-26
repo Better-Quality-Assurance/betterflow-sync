@@ -4032,7 +4032,7 @@ class SyncEngine:
         except Exception as e:
             logger.debug("logs_requested: could not resolve log dir: %s", e)
             return
-        log_tail = self._read_log_tail(log_dir / "betterflow.log")
+        log_tail = self._read_rotated_log_tail(log_dir / "betterflow.log")
         if not log_tail:
             # WARNING (not debug) so the next successful upload carries a record
             # of why earlier ones were skipped — the admin's flag stays set and
@@ -4172,6 +4172,85 @@ class SyncEngine:
             return None
         # Re-encode so the result is always valid UTF-8 the server can store.
         return raw.decode("utf-8", errors="replace").encode("utf-8")
+
+    @staticmethod
+    def _read_rotated_log_tail(path, max_bytes: int = 512 * 1024) -> bytes:
+        """The last ``max_bytes`` of the LOGICAL log, spanning rotations.
+
+        ``_read_log_tail`` reads one file. ``setup_logging`` configures
+        ``RotatingFileHandler(maxBytes=5 MiB, backupCount=3)``, so up to ~20 MB
+        of history sits beside it in ``betterflow.log.1/.2/.3`` and none of it
+        was ever uploaded — the moment the live file rotated, an incident became
+        unreachable by any means we have.
+
+        #225, and it cost a real answer: a capture from device 14 on 2026-08-25
+        covered only that day, so the line that would have settled #211's
+        diagnosis (2026-08-23) was gone and the fix shipped marked *inferred*.
+
+        This deliberately costs nothing from the trade-offs #225 weighed. The
+        budget is enforced on the RETURNED bytes, so the payload cannot grow. The
+        server still gets one ``log`` file, so the contract is unchanged. Nothing
+        new is written to disk. It only fills the SAME budget from further back
+        when the live file does not fill it alone — which is exactly the
+        post-rotation state that lost the evidence.
+
+        The final cap is not belt-and-braces. ``_read_log_tail`` normalises each
+        chunk with ``errors="replace"``, and U+FFFD is THREE bytes, so an invalid
+        byte expands 1→3 *after* the budget was decremented. Measured at the real
+        512 KB budget, a rotated file of invalid bytes returned **1,572,864** —
+        three times the cap. That matters twice over, because the server
+        (``AgentLogController``) enforces ``max:1024`` KB and hard-422s above it,
+        and ``logs_requested_at`` clears only on success, so the agent would
+        retry every heartbeat forever and the admin would never get logs. Below
+        that it silently keeps the LAST 512 KB — trimming from the opposite end
+        to the one we fill, which would discard exactly the rotated history this
+        function exists to deliver.
+
+        When ``betterflow.log`` already exceeds the budget the result is
+        byte-identical to reading it alone, so the common case on every device in
+        the fleet is untouched.
+
+        Returns oldest-first so a reader can follow it, and ``b""`` when there is
+        nothing — callers use ``if not tail``, which is unchanged.
+        """
+        from pathlib import Path
+
+        live = Path(path)
+        # Newest first, taking each file's own tail; reversed at the end.
+        candidates = [live] + [
+            Path(f"{live}.{i}") for i in range(1, 4)
+        ]
+
+        chunks: list[bytes] = []
+        remaining = max_bytes
+        for candidate in candidates:
+            if remaining <= 0:
+                break
+            # _read_log_tail already normalises each chunk to valid UTF-8, so the
+            # concatenation is valid too. One invalid byte makes the server's
+            # INSERT fail with MySQL 1366 and drops the whole upload silently.
+            part = SyncEngine._read_log_tail(candidate, remaining)
+            if not part:
+                # None (unreadable) and b"" (empty) both just mean "nothing here";
+                # keep going, because one bad rotation must not cost us the rest.
+                continue
+            chunks.append(part)
+            remaining -= len(part)
+
+        joined = b"".join(reversed(chunks))
+        if len(joined) > max_bytes:
+            # Keep the NEWEST max_bytes — the same end the server keeps, so the
+            # two agree instead of the server silently trimming the other one.
+            joined = joined[-max_bytes:]
+            # A byte slice can land inside a multi-byte character. Drop leading
+            # continuation bytes (0x80-0xBF) so the result stays valid UTF-8 —
+            # one invalid byte makes the server's INSERT fail with MySQL 1366 and
+            # drops the whole upload.
+            i = 0
+            while i < len(joined) and 0x80 <= joined[i] < 0xC0:
+                i += 1
+            joined = joined[i:]
+        return joined
 
     @staticmethod
     def _version_below(current: str, minimum: str) -> bool:

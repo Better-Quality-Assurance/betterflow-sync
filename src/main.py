@@ -814,6 +814,16 @@ class SyncCoordinator:
                 else:
                     if current_state == TrayState.NEEDS_PERMISSIONS:
                         self.tray.model.state = TrayState.SYNCING
+                        # Clear the hint we wrote above. This block is the only
+                        # place that moves state WITHOUT going through
+                        # set_state, so neither of its clears runs here. The
+                        # stale text is currently unreachable — SYNCING does not
+                        # render the field, and every later entry into a state
+                        # that does trips the entry-clear — but that is an
+                        # argument about the whole state machine holding, made
+                        # afresh by anyone who adds an owner. One line removes
+                        # the dependency on it.
+                        self.tray.model.status_text = None
                         should_update_icon = True
                     else:
                         should_update_icon = False
@@ -1808,7 +1818,8 @@ class SyncCoordinator:
             is_idle = self.idle_paused
 
             if self.paused_by_network:
-                self.tray.set_state(TrayState.QUEUED, "Offline")
+                # No text: the label is STATUS_TEXT_STATES[QUEUED].
+                self.tray.set_state(TrayState.QUEUED)
                 self.tray.update_stats(queue_size=self.queue.size())
                 # A network outage suspends UPLOAD, not capture: suspend_upload()
                 # keeps the trackers recording and queueing locally, often for
@@ -2022,7 +2033,8 @@ class SyncCoordinator:
         except Exception:
             reachable = False
         if not reachable:
-            self.tray.set_state(TrayState.QUEUED, "Offline")
+            # No text: the label is STATUS_TEXT_STATES[QUEUED].
+            self.tray.set_state(TrayState.QUEUED)
         else:
             self.tray.set_state(TrayState.ERROR, error_message)
 
@@ -2968,6 +2980,8 @@ class BetterFlowApp:
             except Exception as e:
                 logger.warning("Auto-start sync failed (non-fatal): %s", e)
 
+        self._sweep_stale_bundle_copies()
+
         # First-run setup wizard.
         #
         # Gate on stored CREDENTIALS, not on the setup_complete flag alone. The
@@ -3277,6 +3291,64 @@ class BetterFlowApp:
             ],
             start_new_session=True,
         )
+
+    def _sweep_stale_bundle_copies(self) -> None:
+        """Remove sibling copies of ourselves left by earlier updates (#211).
+
+        A device carried three copies in /Applications under one bundle id,
+        booted the oldest (below the server's minimum version floor) for days,
+        and had its Accessibility grant flap — macOS keeps one row per app and
+        which copy that row means is not ours to decide.
+
+        Called from run() after _maybe_relocate_to_applications(). An earlier
+        version of this docstring said that was "because that call can move us"
+        — which is wrong, and wrong in the direction that misleads: if it moves
+        us it ends in os._exit(0) (main.py:3275), so the sweep never runs in
+        this process at all. What the ordering actually means is that the sweep
+        only ever runs when we were NOT relocated, i.e. on wherever we happen to
+        be — which for a declined prompt can be ~/Downloads, a mounted DMG, or a
+        Gatekeeper AppTranslocation path, not /Applications.
+
+        That is acceptable rather than intended: every candidate must still be a
+        sibling, match a closed name list, and claim our bundle id, so a sweep
+        from an odd location finds nothing to do. Saying so plainly because this
+        is exactly the kind of rationale a later reader reasons from.
+
+        It also runs after ensure_autostart_synced(), which is the wrong way
+        round on principle — clear the sediment, then write the plist — but
+        sweeping first does not rescue the case that matters, where we are on a
+        non-canonical copy and the sweep correctly finds nothing either way.
+
+        Non-fatal on every path. Failing to tidy up must not stop the agent
+        starting, which is the one job it has.
+        """
+        if sys.platform != "darwin":
+            return
+        try:
+            try:
+                from .self_updater import (
+                    get_app_bundle_path,
+                    purge_stale_bundle_copies,
+                )
+            except ImportError:
+                from self_updater import (  # type: ignore[no-redef]
+                    get_app_bundle_path,
+                    purge_stale_bundle_copies,
+                )
+            running = get_app_bundle_path()
+            if running is None:
+                return  # dev mode, or not running from a bundle
+            removed = purge_stale_bundle_copies(running)
+            if removed:
+                # One line per DEVICE, not per file. The useful fleet question
+                # is "how many machines carried sediment", which a per-removal
+                # log inside purge_ cannot answer.
+                logger.info(
+                    "Removed %d stale copies of this app: %s",
+                    len(removed), [p.name for p in removed],
+                )
+        except Exception as e:
+            logger.warning("Stale-copy sweep failed (non-fatal): %s", e)
 
     def _maybe_relocate_to_applications(self) -> None:
         """On macOS, offer to move a non-installed .app into /Applications.

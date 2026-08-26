@@ -226,11 +226,11 @@ def test_a_repeat_queue_warning_keeps_its_own_sentence():
     test — a `previous_state == TrayState.ERROR` special-case would satisfy
     every other test in this file and silently blank this one.
 
-    Asserted on the MODEL, deliberately, and it is the one test here that
-    cannot use the menu row: `_get_status_text`'s QUEUE_WARNING branch returns
-    the constant "Offline (queue full)" and reads no field. So this pins what
-    `set_state` stores rather than what is drawn — the honest scope, and it
-    stops being a lie the day that branch starts rendering too.
+    Asserted on the model AND on the menu row. The original could only do the
+    former — the QUEUE_WARNING branch returned a constant and read no field —
+    and its docstring said so, adding that it "stops being a lie the day that
+    branch starts rendering too". #214 is that day, so the row assertion is
+    added rather than the note left standing.
     """
     tray = _make_tray()
 
@@ -239,6 +239,7 @@ def test_a_repeat_queue_warning_keeps_its_own_sentence():
 
     with tray.model.lock:
         assert tray.model.status_text == "Queue 92% full"
+    assert _app_status_row(tray) == "App status: Queue 92% full"
 
 
 def test_a_repeat_escalation_keeps_the_sentence_it_already_carries():

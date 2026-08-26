@@ -43,6 +43,34 @@ except ImportError:  # PyInstaller bundle (src/ is import root)
 
 logger = logging.getLogger(__name__)
 
+# Our bundle id. Already spelled in src/autostart.py (as the launchd label,
+# which happens to be the same string) and src/ui/permissions.py; a guard test
+# pins all three rather than a refactor threading one constant through modules
+# that have no other reason to depend on each other.
+BUNDLE_ID = "co.betterqa.betterflow"
+
+# What _apply_macos_update leaves aside mid-replace. Spelled once because the
+# sweep below has to recognise exactly what that function creates: change the
+# writer and an independent copy in the sweep silently stops matching it, in the
+# reassuring direction ("nothing to clean up") with no test failing.
+_MACOS_BACKUP_SUFFIX = ".old.app"
+
+# The bundle stem every shipped build installs under (build.spec's CFBundleName).
+# The sweep derives its patterns from the RUNNING bundle's stem, so running from
+# anything else means it cannot see the canonical copy's siblings.
+_CANONICAL_STEM = "BetterFlow"
+
+# Names our updater has left in /Applications across versions. Each is a
+# FORMAT over the running bundle's stem, so the sweep can only ever match a
+# sibling of the app that is running.
+#
+# Deliberately closed rather than a glob. A leftover copy costs disk; a wrong
+# deletion costs somebody an application, so anything outside the shapes we can
+# show we produced stays put:
+#   <stem>.app.old   the Linux AppImage form, seen on a Mac in #211
+#   <stem>.old.app   what _apply_macos_update creates today
+#   <stem>-<ver>-backup.app   provenance unknown, seen on the #211 device
+
 # The only Apple Developer ID team we ever ship production releases under.
 # Pinned to make _verify_codesign reject updates signed by any other team,
 # even on a fresh install with no prior team-ID context to compare against.
@@ -388,7 +416,7 @@ def _apply_local_artifact(
                 return False
 
             # 3. Replace: move old aside, move new in place
-            backup_path = app_path.parent / f"{app_path.stem}.old.app"
+            backup_path = _macos_backup_path(app_path)
             if backup_path.exists():
                 shutil.rmtree(backup_path)
 
@@ -572,18 +600,147 @@ def _find_app_in(directory: Path) -> Optional[Path]:
     return None
 
 
+# Polite first, then force. See _detach_dmg for what `-force` does and does not
+# buy — it fixes rc=16 (a holder) and does NOT help rc=1 (never mounted), which
+# is the code #211 actually logged. This comment used to assert the rc=16 story
+# as that incident's cause; it was refuted by measurement and the correction
+# landed 45 lines below without touching the text a reader meets FIRST.
+#
+# No `-quiet`: output is captured, not printed, so it bought nothing and it
+# BLANKED the only diagnostic we get. Measured on Darwin 24.6.0 — with `-quiet`
+# both rc=1 and rc=16 return an empty stderr, so the "rc=%d: %s" line below
+# always logged an empty %s. Without it, rc=1 says
+# "hdiutil: detach failed - No such file or directory". Preserving that is the
+# whole point of the change; #211 cost days partly to diagnostic poverty.
+_DETACH_ATTEMPTS = ([], ["-force"])
+
+
+def _detach_dmg(mount_point: Path) -> bool:
+    """Unmount a DMG. Returns whether it worked; NEVER raises.
+
+    #211: this used to raise from `_extract_from_dmg`'s `finally`, which threw
+    away an update that had already succeeded. `shutil.copytree` completes
+    inside the `try`; by the time we get here the .app is sitting in the extract
+    directory and the only thing left is housekeeping. Martin's Mac hit
+    `hdiutil detach failed (rc=1)` on 2026-08-23, the update aborted, and the
+    machine ran 1.5.119 for days — below the server's own minimum version floor,
+    logging "update required" on every sync.
+
+    The trade is not close. A failed unmount leaks a mount until the next
+    reboot; because we attach with `-mountpoint <mkdtemp>` and `-nobrowse` that
+    lives under /var/folders and never appears in /Volumes, so find it with
+    `hdiutil info` or `mount | grep betterflow-dmg-mount`, not in Finder.
+    Aborting costs a device stuck on an old build — and `apply_staged_update`'s
+    own `finally` rmtree's the artifact, so the abort also discards the whole
+    downloaded DMG and the device re-downloads on the next check.
+
+    Raising from a `finally` has a second cost that the incident log cannot
+    show: it REPLACES any exception still in flight. A genuine failure in the
+    copy above would have been relabelled as a detach problem, and its cause
+    discarded.
+
+    Two attempts. The first is polite; the retry adds `-force`.
+
+    Be precise about what `-force` does and does not buy, because an earlier
+    version of this docstring got it wrong. Measured on Darwin 24.6.0:
+
+        rc=1   the path is not a mount / never was   -force does NOT help
+        rc=16  the volume is busy (a holder)          -force fixes it (16 -> 0)
+
+    #211 logged **rc=1**, so the "straggling process" story this comment used to
+    tell is not that incident's mechanism, and `-force` would not have rescued
+    it. rc=1 is consistent with `attach` having failed first — a corrupt or
+    truncated download failing hdiutil's checksum verify — which is why the
+    `mounted` gate in the caller matters more here than the retry does.
+
+    That reading is INFERRED, not witnessed: betterflow.log had rotated past
+    2026-08-23 before it could be fetched, so the one line that would settle it
+    (`Extracted BetterFlow.app from DMG`, immediately before the failure) is
+    gone. The retry is kept because rc=16 is real and cheap to survive; the
+    load-bearing fixes are not raising, and not detaching what never attached.
+    """
+    for attempt, extra in enumerate(_DETACH_ATTEMPTS, start=1):
+        try:
+            result = subprocess.run(
+                ["hdiutil", "detach", str(mount_point), *extra],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            # SubprocessError is TimeoutExpired's base; OSError covers the family
+            # subprocess.run raises before the child ever starts —
+            # FileNotFoundError when hdiutil is unresolvable, ENOMEM/EAGAIN when
+            # posix_spawn fails under pressure (this is a long-lived
+            # multi-threaded tray app), PermissionError under a sandbox profile.
+            #
+            # Catching only TimeoutExpired left BOTH of #211's defects reachable
+            # through a second door: called from a `finally`, an escaping OSError
+            # destroys an update whose copytree already succeeded AND replaces
+            # the exception in flight. A reviewer proved it with three failing
+            # probes. "NEVER raises" has to be true of the function, not of the
+            # paths I happened to imagine.
+            logger.warning(
+                "hdiutil detach failed to run (attempt %d): %r — "
+                "the update is unaffected",
+                attempt, e,
+            )
+            continue
+        if result.returncode == 0:
+            return True
+        logger.warning(
+            "hdiutil detach failed (attempt %d, rc=%d): %s",
+            attempt, result.returncode, (result.stderr or "").strip(),
+        )
+    # warning, not error: this module reserves ERROR for decisions that ABORT an
+    # update ("Rejecting update", "update aborted") and warning for non-fatal
+    # degradations. Logging ERROR for something this function has just declared
+    # non-fatal breaks that split, and grepping betterflow.log for ERROR is a
+    # real triage route here.
+    logger.warning(
+        "Could not unmount %s (leaked until reboot; `hdiutil info` to find it). "
+        "The extracted update is unaffected and the install continues.",
+        mount_point,
+    )
+    return False
+
+
 def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
     """Mount a DMG, copy the .app out, and unmount."""
     mount_point = Path(tempfile.mkdtemp(prefix="betterflow-dmg-mount-"))
+    mounted = False
     try:
         # Mount DMG read-only, hidden from Finder.
         # NOTE: no -noverify — we want hdiutil to verify the DMG checksum at
         # mount time. Signature verification still happens post-extract.
-        subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly",
-             "-mountpoint", str(mount_point), str(dmg_path)],
-            capture_output=True, text=True, timeout=60, check=True,
-        )
+        #
+        # The attach gets its OWN try so the two failure modes can be told apart;
+        # they need opposite cleanup.
+        try:
+            subprocess.run(
+                ["hdiutil", "attach", "-nobrowse", "-readonly",
+                 "-mountpoint", str(mount_point), str(dmg_path)],
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+        except subprocess.TimeoutExpired:
+            # hdiutil was SIGKILLed by subprocess.run's own timeout, mid-flight.
+            # It may have attached first, and SIGKILL runs no cleanup handler —
+            # so the image can be live with nothing left to release it.
+            #
+            # Witnessed on a real 400 MB DMG by sweeping the timeout: at
+            # t=0.05/0.10/0.15s the process died with the image STILL ATTACHED,
+            # 3 leaks in 8 runs. rmtree cannot recover it (a live mount point
+            # survives rmtree), so mount and temp dir persist until reboot.
+            #
+            # origin/main detached here unconditionally. Gating on `mounted`
+            # alone made this a REGRESSION against it — the gate was right about
+            # the cause and wrong about the discriminator.
+            mounted = True
+            raise
+        # A CalledProcessError needs no clause: hdiutil DECLINED cleanly (a
+        # corrupt or truncated download failing its checksum verify), nothing
+        # attached, so `mounted` stays False and the detach is skipped. That is
+        # the case the gate exists for.
+        mounted = True
+
         # Find .app inside mounted volume
         app_found = None
         for item in mount_point.iterdir():
@@ -599,23 +756,19 @@ def _extract_from_dmg(dmg_path: Path, extract_dir: Path) -> None:
         shutil.copytree(str(app_found), str(dest), symlinks=True)
         logger.info(f"Extracted {app_found.name} from DMG")
     finally:
-        # Always attempt to detach, then clean up the mount point directory
-        try:
-            result = subprocess.run(
-                ["hdiutil", "detach", str(mount_point), "-quiet"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
-                logger.error(
-                    f"hdiutil detach failed (rc={result.returncode}): {result.stderr.strip()}"
-                )
-                raise RuntimeError("Failed to detach DMG mount - aborting update")
-        except subprocess.TimeoutExpired as e:
-            logger.error("hdiutil detach timed out - DMG may still be mounted")
-            raise RuntimeError("Failed to detach DMG mount - aborting update") from e
-        finally:
-            # Remove the mount point directory itself
-            shutil.rmtree(mount_point, ignore_errors=True)
+        # Housekeeping only — see _detach_dmg. It never raises, deliberately.
+        #
+        # Gated on `mounted`, because `attach` runs with check=True and a corrupt
+        # or truncated download fails its checksum there. Detaching a mount that
+        # never existed spends two hdiutil calls to produce "no such volume" and
+        # then logs a confident "could not unmount" ABOVE the real cause — which
+        # on this fleet's diagnosis route (fetch the device log, grep it) sends
+        # the next reader at #211's ghost instead of at the download.
+        if mounted:
+            _detach_dmg(mount_point)
+        # Unconditional: gating this too would leak an empty temp dir on every
+        # attach failure.
+        shutil.rmtree(mount_point, ignore_errors=True)
 
 
 def _fix_permissions(app_path: Path) -> None:
@@ -987,3 +1140,175 @@ def apply_staged_update(
         # finally never runs. On failure we leak hundreds of MB (the DMG)
         # in /tmp unless we clean up here.
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _macos_backup_path(app_path: Path) -> Path:
+    """Where _apply_macos_update moves the old bundle mid-replace.
+
+    A function rather than an inline f-string so the sweep can be tested against
+    the WRITER's own expression instead of against a copy of it. Sharing
+    _MACOS_BACKUP_SUFFIX was not enough on its own: a test that rebuilt the name
+    from the constant had both sides of its assertion tracing back to one
+    artifact, so reverting this line to a literal changed nothing it could see.
+    """
+    return app_path.parent / f"{app_path.stem}{_MACOS_BACKUP_SUFFIX}"
+
+
+def _bundle_identifier(app: Path) -> Optional[str]:
+    """The bundle id an .app claims, or None if it will not say.
+
+    None means "I do not know whose this is", which is not permission to delete
+    it — every caller must treat it as a refusal, not as a mismatch.
+    """
+    import plistlib
+
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as f:
+            data = plistlib.load(f)
+    except Exception:
+        return None
+    value = data.get("CFBundleIdentifier")
+    return value if isinstance(value, str) else None
+
+
+# Public name for the module-private resolver above. Renaming the original
+# would touch 10 call sites across three test files this change has no other
+# business in; an alias gives callers outside the module a public symbol
+# without that blast radius.
+def get_app_bundle_path() -> Optional[Path]:
+    """Public wrapper, deliberately a function and not `= _get_app_bundle_path`.
+
+    An assignment binds the function OBJECT at import time, so a test that
+    monkeypatches the private name leaves the alias pointing at the original and
+    silently gets the real resolver — measured: after patching
+    `_get_app_bundle_path`, the alias still returned None. Three existing test
+    files patch only the private name, so that trap was one test away from a
+    green assertion about an early return that never happened.
+    """
+    return _get_app_bundle_path()
+
+
+def find_stale_bundle_copies(running_app: Path) -> list[Path]:
+    """Sibling copies of THIS app left behind by an earlier update.
+
+    Returns paths only; deleting is the caller's job, so the decision can be
+    tested without a filesystem that can lose something.
+
+    #211: a device carried three copies under one bundle id, booted the oldest
+    (below the server's minimum version floor) and had its Accessibility grant
+    flap, because macOS keeps one row per app and which copy that row means is
+    not ours to decide.
+
+    Four guards, in order of how much they matter:
+
+    1. **Identity.** The candidate's own Info.plist must name OUR bundle id.
+       This is the one doing the real work: a name pattern is a guess about
+       provenance, and an Info.plist is the bundle stating who it is. Anything
+       that will not answer is left alone.
+    2. **Name.** One of the shapes we can show our updater has produced,
+       derived from the running bundle's stem. Closed list, not a glob.
+    3. **Siblings only**, never recursive. A sweep of /Applications by
+       directory walk is not a thing this should ever grow into.
+    4. **No symlinks.** Deleting through one deletes its target, which by
+       definition is not a copy our updater left here.
+    """
+    parent = running_app.parent
+    stem = running_app.stem  # "BetterFlow" from "BetterFlow.app"
+    patterns = [
+        # IGNORECASE because /Applications is APFS, which is case-INSENSITIVE:
+        # `betterflow.app.old` and `BetterFlow.app.old` are the same file to the
+        # filesystem and were two different strings to this list, so a copy the
+        # sweep exists to remove survived under a different capitalisation.
+        # Safe to widen — the running bundle still cannot self-match under any
+        # casing, since `{stem}.app` is not equal to any of the three shapes
+        # below however it is cased, and the identity guard is unchanged.
+        re.compile(rf"^{re.escape(stem)}\.app\.old$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(stem + _MACOS_BACKUP_SUFFIX)}$", re.IGNORECASE),
+        re.compile(rf"^{re.escape(stem)}-[0-9][0-9.]*-backup\.app$", re.IGNORECASE),
+    ]
+
+    if stem != _CANONICAL_STEM:
+        # Every pattern is built from the RUNNING bundle's stem, so from a
+        # non-canonical copy the sweep cannot see the canonical install's
+        # siblings and returns [] — which is exactly the state #211 reported:
+        # that device had booted BetterFlow-1.5.119-backup.app, where this
+        # function finds nothing and both duplicates survive.
+        #
+        # Returning [] is still the RIGHT action. The alternative — resolving
+        # the canonical stem from our own Info.plist and sweeping from here —
+        # would have a backup copy delete the newer BetterFlow.app beside it,
+        # which is worse than the sediment. The real repair is to get back into
+        # the canonical bundle; the sweep then works on the next launch.
+        #
+        # What was missing is any trace of it. A device in this state produced
+        # no output at all, and #211 was found by grepping one machine's log.
+        logger.warning(
+            "Running from %r, not the canonical %s.app — the stale-copy sweep "
+            "cannot see the canonical install's siblings and is doing nothing "
+            "(#211). This device is running a non-canonical copy of the agent.",
+            running_app.name, _CANONICAL_STEM,
+        )
+        return []
+
+    stale: list[Path] = []
+    try:
+        entries = sorted(parent.iterdir())
+    except OSError as e:
+        logger.warning("Could not list %s while looking for stale copies: %s", parent, e)
+        return []
+
+    for entry in entries:
+        # `entry == running_app` is DEFENCE IN DEPTH and a mutation run will
+        # flag it as unwitnessed. It is not a gap — it is unreachable while the
+        # name patterns below are correct, because the running bundle's own
+        # name cannot match a pattern built from its own stem. Proven as a pair
+        # rather than left to argument:
+        #
+        #   neuter the name filter alone       -> running bundle NOT returned
+        #   neuter the name filter AND this    -> running bundle IS returned
+        #
+        # So this line is the only thing standing between a broken name pattern
+        # and deleting the app that is currently executing. Keep it.
+        # `not entry.is_dir()` is also unwitnessed and also kept: a plain file
+        # wearing the name is already refused by the identity guard, because
+        # _bundle_identifier cannot read Contents/Info.plist out of a file. Same
+        # defence-in-depth reasoning as the line's other two clauses.
+        if entry == running_app or entry.is_symlink() or not entry.is_dir():
+            continue
+        # fullmatch rather than match. Redundant against the ^...$ anchors for
+        # every ordinary name — reverting EITHER alone survives mutation, only
+        # dropping both reds — and kept for the one case it covers: `$` also
+        # matches before a trailing newline, and APFS permits newlines in
+        # filenames, so `BetterFlow.app.old\n` satisfied a list this comment
+        # calls closed. Same defence-in-depth footing as `entry == running_app`
+        # below, recorded here for the same reason.
+        if not any(p.fullmatch(entry.name) for p in patterns):
+            continue
+        identifier = _bundle_identifier(entry)
+        if identifier != BUNDLE_ID:
+            logger.info(
+                "Leaving %s alone: bundle id is %r, not ours",
+                entry, identifier,
+            )
+            continue
+        stale.append(entry)
+    return stale
+
+
+def purge_stale_bundle_copies(running_app: Path) -> list[Path]:
+    """Delete what find_stale_bundle_copies names. Returns what went.
+
+    Best-effort by design: a copy we cannot remove (permissions, a file in use)
+    is logged and skipped. Failing to tidy up must never stop the agent
+    starting, which is the one job it has.
+    """
+    removed: list[Path] = []
+    for app in find_stale_bundle_copies(running_app):
+        try:
+            shutil.rmtree(app)
+        except Exception as e:
+            logger.warning("Could not remove stale copy %s: %s", app, e)
+            continue
+        logger.info("Removed stale copy of this app: %s", app)
+        removed.append(app)
+    return removed

@@ -100,15 +100,43 @@ def test_passing_explicit_status_text_still_overrides():
     assert tray.model.status_text == "Second"
 
 
-def test_transition_between_two_healthy_states_preserves_existing_text():
-    """If status_text was set by something OTHER than ERROR/QUEUE_WARNING
-    (e.g. permissions hint), a transition between two non-error states
-    must NOT clear it — only the explicit recovery path clears."""
+def test_entering_a_state_that_renders_the_field_clears_a_foreign_sentence():
+    """Inverted by #214, deliberately — and this test's own docstring is the
+    argument for inverting it.
+
+    It used to assert that SYNCING → PAUSED preserves a leftover sentence, on
+    the grounds that the writer might be "a permissions hint". That was safe
+    only while PAUSED rendered the constant "Paused": the field was carried but
+    never shown. PAUSED now renders ``status_text``, so preserving a foreign
+    sentence means a permissions hint appearing under a Paused icon on a
+    sleeping laptop — the exact leak the entry-clear exists to stop.
+
+    A state that renders the field must be cleared on entry to it. That is one
+    rule, and STATUS_TEXT_STATES is where it is written.
+    """
     tray = _make_tray()
 
     tray.set_state(TrayState.SYNCING)
     tray.model.status_text = "Some informational status"
     tray.set_state(TrayState.PAUSED)
+
+    assert tray.model.status_text is None
+    assert tray._get_status_text() == "Paused"
+
+
+def test_two_states_that_ignore_the_field_still_leave_it_alone():
+    """The control, and the half of the original test that is still true.
+
+    Neither SYNCING nor PRIVATE renders ``status_text``, so neither clear
+    applies and a hint written by something else survives. Without this, a
+    clear-everything fix would pass the test above while quietly discarding
+    state no render path was harming.
+    """
+    tray = _make_tray()
+
+    tray.set_state(TrayState.SYNCING)
+    tray.model.status_text = "Some informational status"
+    tray.set_state(TrayState.PRIVATE)
 
     assert tray.model.status_text == "Some informational status"
 
