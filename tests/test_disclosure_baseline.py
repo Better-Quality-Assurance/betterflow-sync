@@ -464,7 +464,7 @@ def test_heartbeat_egress_allowlist_still_holds():
 
 
 def test_hostname_is_still_embedded_in_every_bucket_id():
-    source = (_SRC / "sync" / "sync_engine.py").read_text()
+    source = (_SRC / "sync" / "sync_engine.py").read_text(encoding="utf-8")
 
     reads_hostname = "self._hostname = socket.gethostname()" in source
     in_bucket_ids = 'bucket_id": f"' in source and "{self._hostname}" in source
@@ -512,7 +512,7 @@ def test_the_baseline_points_at_the_regulament():
     """Greppable from both ends: someone reading the Regulament must be able to
     find the code, and someone reading the code must be able to find the
     Regulament."""
-    text = (_SRC / "disclosure_baseline.py").read_text()
+    text = (_SRC / "disclosure_baseline.py").read_text(encoding="utf-8")
     assert REGULAMENT_ARTICLE in text
     assert DISCLOSURE_CONTACT in text
     assert "art. 68^1" in REGULAMENT_ARTICLE

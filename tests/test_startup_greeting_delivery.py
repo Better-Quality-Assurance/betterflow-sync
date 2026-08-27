@@ -118,7 +118,7 @@ class TestNoLoginPathRerollsTheGreeting:
         # Skip comment lines rather than regex-stripping comment BLOCKS: a
         # path glob inside a `#` comment would open a block that never closes.
         code = "\n".join(
-            l for l in src.read_text().splitlines() if not l.strip().startswith("#")
+            l for l in src.read_text(encoding="utf-8").splitlines() if not l.strip().startswith("#")
         )
         assert not re.search(r"send_notification\(\s*greeting\b", code), (
             "a login path is building the greeting inline again instead of "
