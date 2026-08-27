@@ -24,8 +24,8 @@ import src.sync.sync_engine as mod
 from src.config import Config
 from src.sync.sync_engine import SyncEngine
 
-_SOURCE = Path(mod.__file__).read_text()
-_AFK_SOURCE = Path(afk_mod.__file__).read_text()
+_SOURCE = Path(mod.__file__).read_text(encoding="utf-8")
+_AFK_SOURCE = Path(afk_mod.__file__).read_text(encoding="utf-8")
 
 
 def test_current_project_is_read_in_exactly_one_place():

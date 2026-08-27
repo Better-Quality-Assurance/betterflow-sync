@@ -325,7 +325,7 @@ def test_the_identity_macos_knows_us_by_is_written_once_per_reason():
 
     assert permissions._BUNDLE_ID == BUNDLE_ID, "same concept, must agree"
 
-    spec = (Path(__file__).parent.parent / "build.spec").read_text()
+    spec = (Path(__file__).parent.parent / "build.spec").read_text(encoding="utf-8")
 
     # The bundle NAME is a second authority, and this branch made it
     # load-bearing: _CANONICAL_STEM is the switch deciding whether the sweep

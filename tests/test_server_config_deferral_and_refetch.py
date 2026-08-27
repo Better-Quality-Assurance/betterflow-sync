@@ -406,7 +406,7 @@ def test_logging_is_configured_before_config_is_loaded():
     import ast
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+    src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
 
     init = next(
