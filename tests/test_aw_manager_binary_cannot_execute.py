@@ -153,6 +153,7 @@ def test_an_attached_external_server_is_not_reported_as_a_blackout():
     with patch("src.aw_manager._resolve_binary_path", return_value="/fake/bf-window-tracker"), \
          patch("src.aw_manager.subprocess.Popen", side_effect=exc), \
          patch.object(mgr, "_port_in_use", return_value=True), \
+         patch.object(mgr, "_server_responding", return_value=True), \
          patch.object(mgr, "_dispatch_download_failure_report") as dispatch:
         started = mgr._start_component("bf-window-tracker", "/fake")
 
@@ -164,8 +165,14 @@ def test_an_attached_external_server_is_not_reported_as_a_blackout():
 
 def test_a_stale_external_flag_still_reports_the_blackout():
     # _using_external is only refreshed on the health tick, so it can outlive
-    # the server it describes. Fall back to the live port check: no listener
+    # the server it describes. Fall back to the live check: nothing SERVING
     # means nothing is capturing and the user must be told.
+    #
+    # #215 — this asks _server_responding now, not _port_in_use. Both are pinned
+    # here deliberately: a bare listener that no longer answers /api/0/info is
+    # exactly the case the old probe could not see, and leaving _server_responding
+    # unpatched let this test reach a real ActivityWatch on the developer's own
+    # machine and pass or fail on whether one happened to be running.
     mgr = _mgr()
     mgr._using_external = True
     exc = OSError(EBADARCH, "Bad CPU type in executable")
@@ -173,6 +180,7 @@ def test_a_stale_external_flag_still_reports_the_blackout():
     with patch("src.aw_manager._resolve_binary_path", return_value="/fake/bf-window-tracker"), \
          patch("src.aw_manager.subprocess.Popen", side_effect=exc), \
          patch.object(mgr, "_port_in_use", return_value=False), \
+         patch.object(mgr, "_server_responding", return_value=False), \
          patch.object(mgr, "_dispatch_download_failure_report") as dispatch:
         mgr._start_component("bf-window-tracker", "/fake")
 
