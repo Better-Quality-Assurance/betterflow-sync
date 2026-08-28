@@ -1531,7 +1531,16 @@ class AWManager:
         """Check if all managed components are still running."""
         with self._lifecycle_lock:
             if self._using_external:
-                return self._port_in_use()
+                # #215 — ASK THE SERVER, not the socket. A process holding port
+                # 5600 that no longer answers HTTP satisfies a bare TCP connect,
+                # so this branch used to report capture as healthy on a device
+                # recording nothing, and the fleet was told everything was fine.
+                #
+                # `_server_responding()` is the /api/0/info ask `_wait_for_server`
+                # already performs, extracted by PR 213 so the callers cannot
+                # drift. One request, 2s timeout — a health check is exactly the
+                # caller that should pay that.
+                return self._server_responding()
 
             if not self._processes:
                 return False
@@ -1996,10 +2005,22 @@ class AWManager:
                 if permanent else "",
             )
             if permanent:
+                # #215 — same conflation as check_health: a listener is not a
+                # capturing server, and this carve-out decides whether to tell
+                # the machine's owner their tracking is dead.
+                #
+                # Asked BEFORE the lock, deliberately. `_server_responding()`
+                # blocks for up to 2s and `_lifecycle_lock` is held across
+                # component lifecycle work, so doing it inside would hold the
+                # lock on an HTTP timeout. `_using_external` is read-mostly —
+                # it flips only when we adopt or abandon an external server —
+                # so reading it a moment early is a far better trade than a
+                # 2s network wait under the lock.
+                external_serving = self._using_external and self._server_responding()
                 with self._lifecycle_lock:
                     self._exec_failed_components.add(name)
                     self._managed_components_unavailable = True
-                    if self._using_external and self._port_in_use():
+                    if external_serving:
                         # Same carve-out the download-failure path makes: a
                         # server we attached to (never one we started — that
                         # leaves _using_external False) is still capturing on
