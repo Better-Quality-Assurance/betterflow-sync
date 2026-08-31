@@ -50,6 +50,44 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# A definitive rejection is formatted by http_client as ``API error (NNN): <body>``.
+# Anchoring on that PREFIX rather than searching for any 3-digit run is what makes
+# this a PROVENANCE test instead of a shape test: a free-text search reports a digit
+# run from a rejected filename ("Bug 404 fix.txt" -> "server status 404") or from our
+# OWN reason strings ("shed after 137 transient failures" -> "server status 137", on
+# a string that says it is not a rejection). Both were live before this anchor.
+_SERVER_STATUS_RE = re.compile(r"^API error \((\d{3})\)")
+
+
+def server_status_summary(reasons) -> str:
+    """Reduce server rejection text to bare HTTP status codes for the OPS ingest.
+
+    ONE implementation, shared by SyncEngine's drop report and
+    BetterFlowApp._note_sync_failure, because they answer the same question about
+    the same strings and two spellings of that rule would drift.
+
+    Only digits matched by ``_SERVER_STATUS_RE`` are ever emitted, so no
+    server-authored text can leave the device by this path. That matters because
+    the ops ingest is CROSS-TENANT and a validation error routinely echoes the
+    value it rejected — and our payloads carry window titles. The full text stays
+    in betterflow.log, which is uploaded only on explicit admin request.
+    """
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    items = [str(r) for r in (reasons or []) if r]
+    if not items:
+        return ""
+    codes = sorted({m.group(1) for m in
+                    (_SERVER_STATUS_RE.match(r) for r in items) if m})
+    if codes and len(codes) == len(items):
+        return f"; server status {','.join(codes)}, full reason in local dead-letter"
+    if codes:
+        return (f"; server status {','.join(codes)} plus "
+                f"{len(items) - len(codes)} local reason(s), "
+                "full detail in local dead-letter")
+    return f"; {len(items)} local reason(s) recorded in local dead-letter"
+
+
 # Sentinel for "no project id has been rejected yet" — distinct from None,
 # which is itself a rejectable value (a project dict with no "id").
 _NO_REJECTED_PROJECT_ID = object()
@@ -3762,7 +3800,19 @@ class SyncEngine:
                         stats.events_sent += len(succeeded_ids)
                         self._clear_queue_backoff("queue batch partially accepted")
                     if failed_ids:
-                        self.queue.increment_retry(failed_ids)
+                        # NOT result.error — the SyncResult on this branch is
+                        # built from a 200 with a per-event verdict and carries
+                        # no error string. Passing it writes nothing, so the
+                        # event would keep whatever reason an unrelated earlier
+                        # whole-batch failure stamped on it, and the drop would
+                        # be attributed to a status from a different cycle.
+                        # This IS the more specific rejection: the server named
+                        # these events individually.
+                        self.queue.increment_retry(
+                            failed_ids,
+                            "per-event rejection: omitted from accepted_ids "
+                            "(server gave no batch-level reason)",
+                        )
                     processed += len(succeeded_ids)
                 else:
                     # Whole-batch failure with no per-event verdict. Only count
@@ -3776,7 +3826,12 @@ class SyncEngine:
                     # against unbounded growth, and a genuinely poison 4xx batch
                     # still increments so it can't head-of-line-block the queue.
                     if not result.transient:
-                        self.queue.increment_retry(event_ids)
+                        # Record WHY. send_events already captured the server's
+                        # own text on SyncResult.error; nothing downstream had
+                        # ever read it, so every dead-lettered event carried the
+                        # agent's generic "definitive rejection" and the cause
+                        # was unrecoverable by the time anyone looked.
+                        self.queue.increment_retry(event_ids, result.error)
                     elif (
                         self._queue_consecutive_failures >= self._STUCK_HEAD_CEILING
                         and not self._batch_has_storable_activity(events)
@@ -3798,7 +3853,12 @@ class SyncEngine:
                             "— counting it toward the drop to unblock the queue.",
                             len(event_ids), self._queue_consecutive_failures,
                         )
-                        self.queue.increment_retry(event_ids)
+                        self.queue.increment_retry(
+                            event_ids,
+                            "shed as unstorable after "
+                            f"{self._queue_consecutive_failures} transient "
+                            "failures — not a server rejection",
+                        )
                     self._apply_queue_backoff()
                     break
             except BetterFlowAuthError:
@@ -4088,6 +4148,15 @@ class SyncEngine:
             if real > 0:
                 other = count - real
                 extra = f"; {other} other unstorable" if other > 0 else ""
+                # The server's status code, and ONLY that. The full rejection
+                # text is kept in the local dead-letter row where an engineer can
+                # pull it deliberately; it must not ride to the cross-tenant ops
+                # ingest, because a validation error routinely echoes the value
+                # it rejected and our event payloads carry window titles
+                # (privacy F4, same reason bucket ids are reduced to types).
+                # Allowlist a safe shape rather than blocklisting unsafe ones —
+                # the ways free text can carry a title are unbounded.
+                extra += self._dropped_reason_code(summary.get("last_errors"))
                 self.error_reporter.capture(
                     f"Dropped {real} queued event(s) after max retries — the "
                     f"server rejected them; held in dead-letter for replay, not "
@@ -4106,6 +4175,33 @@ class SyncEngine:
                 )
         except Exception:
             logger.debug("dropped-events report failed", exc_info=True)
+
+    # A definitive rejection is formatted by http_client as
+    # ``API error (NNN): <body>``. Anchoring on that PREFIX rather than
+    # searching for any 3-digit run is what makes this a PROVENANCE test
+    # instead of a shape test: a free-text search happily reports a digit run
+    # from a rejected filename ("Bug 404 fix.txt" -> "server status 404") or
+    # from our OWN agent-authored reason ("shed after 137 transient failures"
+    # -> "server status 137", on a string that says it is not a rejection).
+    # Both were live before this anchor existed.
+    _SERVER_STATUS_RE = _SERVER_STATUS_RE
+
+    @staticmethod
+    def _dropped_reason_code(last_errors) -> str:
+        """Render the servers' rejections as bare HTTP statuses, or nothing.
+
+        Answers "malformed event or receiving-side change?" at the class level
+        without shipping any server-authored text off the device: only digits
+        matched by ``_SERVER_STATUS_RE`` are ever emitted. Anything else yields
+        the locally-recorded pointer, so the message cannot carry a payload
+        echo.
+
+        Takes the DISTINCT set from ``failed_event_summary``. One drop cycle
+        routinely spans several batches with several rejections, and naming one
+        of them as "the" cause is a confident wrong answer to the question this
+        exists to settle.
+        """
+        return server_status_summary(last_errors)
 
     @staticmethod
     def _dropped_window_age(oldest, newest, now: Optional[datetime] = None) -> str:

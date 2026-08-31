@@ -9,6 +9,12 @@ from src.notifications import (
 )
 import src.notifications as notifications_module
 
+# Tests the senders themselves (it patches subprocess/pyobjc beneath them), so
+# it needs the real functions rather than the conftest block.
+import pytest
+
+pytestmark = pytest.mark.real_notifications
+
 
 class TestSendNotification:
     """Tests for send_notification()."""

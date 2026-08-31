@@ -28,6 +28,10 @@ import pytest
 
 import src.notifications as notifications
 
+# Exercises the senders' own internals and mocks the OS boundary itself, so it
+# must see the real functions rather than the conftest block.
+pytestmark = pytest.mark.real_notifications
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------

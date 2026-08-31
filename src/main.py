@@ -37,6 +37,7 @@ try:
     )
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
+    from .sync.sync_engine import server_status_summary
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .sync.os_idle import get_system_idle_seconds
     from .system_events import start_system_event_listener
@@ -72,6 +73,7 @@ except ImportError:
     )
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
+    from sync.sync_engine import server_status_summary
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from sync.os_idle import get_system_idle_seconds
     from system_events import start_system_event_listener
@@ -2161,12 +2163,23 @@ class SyncCoordinator:
         re-login is expected, not a failure worth alerting on.
         """
         self._consecutive_sync_failures += 1
+        # Full text to the LOCAL log only. `reason` is the server's own response
+        # body, passed through verbatim by http_client, and a validation error
+        # routinely echoes the value it rejected — which for us can be a window
+        # title. betterflow.log stays on the device and is uploaded only on an
+        # explicit admin request; the ops ingest below is cross-tenant and
+        # always on, so it gets the status code and nothing else.
+        logger.warning(
+            "Sync failing repeatedly (%d×): %s",
+            self._consecutive_sync_failures, reason,
+        )
         if (
             self.error_reporter is not None
             and self._consecutive_sync_failures >= self._SYNC_FAILURE_ALERT_THRESHOLD
         ):
+            safe = server_status_summary(reason).lstrip("; ") or "no server status"
             self.error_reporter.capture(
-                f"Sync failing repeatedly ({self._consecutive_sync_failures}×): {reason}",
+                f"Sync failing repeatedly ({self._consecutive_sync_failures}×): {safe}",
                 level="error",
                 exc=exc,
                 tags={"component": "sync"},

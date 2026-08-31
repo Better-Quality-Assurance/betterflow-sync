@@ -75,6 +75,9 @@ ignore = ["E501"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+markers = [
+    "real_notifications: test exercises a notification sender's own internals; exempt from the conftest block (it mocks the OS boundary itself)",
+]
 # `from src.* import ...` works today only because pytest's default
 # rootdir-on-sys.path heuristic happens to add the repo root. Pin it
 # explicitly so CI runners or invocations from inside tests/ also

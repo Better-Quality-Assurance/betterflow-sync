@@ -15,6 +15,7 @@ import src.notifications as notifications_module
 import src.self_updater as self_updater
 from src.notifications import send_notification
 from src.update_checker import _ASSET_PATTERNS, _find_platform_asset
+import pytest
 
 # ---------------------------------------------------------------------------
 # update_checker: Linux .AppImage asset selection
@@ -151,6 +152,7 @@ class TestAutostartLinux:
 # notifications: notify-send dispatch
 # ---------------------------------------------------------------------------
 
+@pytest.mark.real_notifications  # tests the Linux sender itself; mocks subprocess beneath it
 class TestNotificationsLinux:
     def test_dispatch_calls_notify_send(self, monkeypatch):
         monkeypatch.setattr(notifications_module.platform, "system", lambda: "Linux")

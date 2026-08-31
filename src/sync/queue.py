@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # whole-batch retry bump then drags its storable neighbours to the drop ceiling
 # in lockstep. Evicting the over-long span first keeps every batch clean.
 MAX_EVENT_DURATION_SECONDS = 86400  # 24h, mirrors the server-side validator
+# Cap on the stored rejection text. Server-controlled and unbounded at the
+# source, written to every event in a failing batch.
+_MAX_LAST_ERROR_CHARS = 500
 
 # The server's retention window: it rejects an event whose timestamp is older
 # than this, so the agent treats such an event as unstorable rather than holding
@@ -266,10 +269,20 @@ class OfflineQueue:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_data TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    retry_count INTEGER DEFAULT 0
+                    retry_count INTEGER DEFAULT 0,
+                    last_error TEXT
                 )
                 """
             )
+            # Additive migration for queues created before this column existed.
+            # The reason a batch was REJECTED has to be recorded when the send
+            # fails and read when the event is finally dropped, and those happen
+            # on different sync cycles — remove_failed runs at the top of
+            # _process_queue, decoupled from the batch that failed. Nullable and
+            # unread by delivery, so an agent that downgrades still works.
+            cols = {r[1] for r in cursor.execute("PRAGMA table_info(queued_events)")}
+            if "last_error" not in cols:
+                cursor.execute("ALTER TABLE queued_events ADD COLUMN last_error TEXT")
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_created_at ON queued_events(created_at)
@@ -511,25 +524,47 @@ class OfflineQueue:
             )
             return cursor.rowcount
 
-    def increment_retry(self, event_ids: list[int]) -> None:
-        """Increment retry count for events.
+    def increment_retry(
+        self, event_ids: list[int], last_error: Optional[str] = None
+    ) -> None:
+        """Increment retry count for events, recording WHY the send failed.
 
         Args:
             event_ids: List of event IDs to update
+            last_error: The server's own rejection text, when it gave one. Only
+                written when supplied, so a later reason-less failure cannot
+                erase a definitive 4xx we already captured — the drop happens
+                cycles later and that string is the only evidence of the cause.
+                Truncated at the WRITE: this is unbounded server-controlled
+                text (http_client passes the response body's "message"
+                through verbatim) landing on every event in a failing batch,
+                and the queue holds up to max_size of them.
         """
         if not event_ids:
             return
+        if last_error is not None:
+            last_error = str(last_error)[:_MAX_LAST_ERROR_CHARS]
 
         with self._cursor() as cursor:
             placeholders = ",".join("?" * len(event_ids))
-            cursor.execute(
-                f"""
-                UPDATE queued_events
-                SET retry_count = retry_count + 1
-                WHERE id IN ({placeholders})
-                """,
-                event_ids,
-            )
+            if last_error is None:
+                cursor.execute(
+                    f"""
+                    UPDATE queued_events
+                    SET retry_count = retry_count + 1
+                    WHERE id IN ({placeholders})
+                    """,
+                    event_ids,
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    UPDATE queued_events
+                    SET retry_count = retry_count + 1, last_error = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    [last_error, *event_ids],
+                )
 
     def failed_event_summary(
         self,
@@ -550,7 +585,15 @@ class OfflineQueue:
         log the benign flushes quietly instead of paging ops.
 
         Returns {count, bucket_ids, oldest, newest, real_loss_count,
-        unstorable_count} — all zero/empty when clean.
+        unstorable_count, last_errors} — all zero/empty when clean.
+
+        ``last_errors`` is the sorted set of DISTINCT rejection texts recorded
+        by ``increment_retry``, so ``_report_dropped_events`` can name the
+        CAUSE rather than only the count. A set rather than one string because
+        a single drop cycle routinely carries events from several batches with
+        several different rejections, and reporting one of them as "the" cause
+        answers the malformed-vs-receiving-side question wrongly and
+        confidently.
 
         ``now`` is injectable for deterministic tests (defaults to UTC now).
         """
@@ -559,7 +602,8 @@ class OfflineQueue:
 
         with self._cursor() as cursor:
             cursor.execute(
-                "SELECT event_data FROM queued_events WHERE retry_count >= ?",
+                "SELECT event_data, last_error FROM queued_events "
+                "WHERE retry_count >= ?",
                 (max_retries,),
             )
             rows = cursor.fetchall()
@@ -568,7 +612,16 @@ class OfflineQueue:
         timestamps: list[str] = []
         real_loss = 0
         unstorable = 0
+        # Every DISTINCT reason, not one row's. The predicate here is
+        # ``retry_count >= max_retries`` over the WHOLE table, so these rows
+        # accumulate across many batches and many cycles — they do NOT share a
+        # rejection. There is also no ORDER BY and nothing records WHEN a reason
+        # was written, so "the newest" is not computable from what is stored;
+        # picking one row's string reports a confident wrong cause for the rest.
+        reasons: set[str] = set()
         for row in rows:
+            if row[1]:
+                reasons.add(str(row[1]))
             try:
                 ev = json.loads(row[0])
             except (json.JSONDecodeError, TypeError):
@@ -595,6 +648,7 @@ class OfflineQueue:
             "newest": timestamps[-1] if timestamps else None,
             "real_loss_count": real_loss,
             "unstorable_count": unstorable,
+            "last_errors": sorted(reasons),
         }
 
     @staticmethod
@@ -656,7 +710,7 @@ class OfflineQueue:
         with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 """
-                SELECT id, event_data, created_at, retry_count
+                SELECT id, event_data, created_at, retry_count, last_error
                 FROM queued_events
                 WHERE retry_count >= ?
                 """,
@@ -677,8 +731,14 @@ class OfflineQueue:
                     # Keep the raw event_data regardless; only the queryable
                     # bucket_id column is left NULL for an unparseable payload.
                     bucket_id = None
+                # The server's own words win over the agent's generic string.
+                # "exceeded max retries (5); definitive rejection" describes what
+                # WE did, never why the server refused — and that distinction is
+                # the whole difference between a malformed event and a
+                # receiving-side change, which have opposite fixes.
+                reason = row[4] or last_error
                 dead_rows.append(
-                    (row[0], row[1], bucket_id, row[2], row[3], last_error, now)
+                    (row[0], row[1], bucket_id, row[2], row[3], reason, now)
                 )
 
             cursor.executemany(
@@ -769,7 +829,8 @@ class OfflineQueue:
         # write it to dead_letter twice.
         with self._cursor(immediate=True) as cursor:
             cursor.execute(
-                "SELECT id, event_data, created_at, retry_count FROM queued_events"
+                "SELECT id, event_data, created_at, retry_count, last_error "
+                "FROM queued_events"
             )
             rows = cursor.fetchall()
             if not rows:
@@ -783,6 +844,12 @@ class OfflineQueue:
             unstorable = 0
             for row in rows:
                 rid, raw, created_at, retry_count = row[0], row[1], row[2], row[3]
+                # A reason already recorded against this row (a real 4xx the
+                # server gave) outranks the eviction's generic string. Without
+                # this an event that took a definitive rejection and LATER aged
+                # past retention is dead-lettered as "unstorable — evicted",
+                # silently overwriting the only evidence of why it failed.
+                row_error = row[4]
                 ev = None
                 try:
                     parsed = json.loads(raw)
@@ -811,7 +878,8 @@ class OfflineQueue:
                 else:
                     unstorable += 1
                 dead_rows.append(
-                    (rid, raw, bucket_id, created_at, retry_count, last_error, dropped_at)
+                    (rid, raw, bucket_id, created_at, retry_count,
+                     row_error or last_error, dropped_at)
                 )
 
             if not evict_ids:
