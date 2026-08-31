@@ -1287,6 +1287,23 @@ class AWManager:
                     self._download_retry_interval,
                 )
                 self._managed_components_unavailable = True
+                if server_already_running and self._server_responding():
+                    # The comment above says "an attached external server still
+                    # captures" and this branch did not carry it out: it left
+                    # tracker_download_failed latched and _using_external False,
+                    # so a Mac that IS recording kept reporting itself
+                    # capture-dead to the fleet -- for nearly every 60s cycle,
+                    # because the retry interval escalates to an hour (#223).
+                    #
+                    # Guarded on _server_responding(), NOT on the bare
+                    # server_already_running TCP connect, for the same reason
+                    # the Rosetta attach path forty lines up is: a held socket
+                    # proves a process, never a capture. Clearing the flag on a
+                    # held-but-dead port would report a silent device healthy,
+                    # which is the failure this flag exists to catch.
+                    self._using_external = True
+                    self.tracker_download_failed = False
+                    return True
                 return server_already_running
             self._last_download_attempt = now
             logger.info("Tracker components not found, downloading...")
