@@ -3762,7 +3762,19 @@ class SyncEngine:
                         stats.events_sent += len(succeeded_ids)
                         self._clear_queue_backoff("queue batch partially accepted")
                     if failed_ids:
-                        self.queue.increment_retry(failed_ids, result.error)
+                        # NOT result.error — the SyncResult on this branch is
+                        # built from a 200 with a per-event verdict and carries
+                        # no error string. Passing it writes nothing, so the
+                        # event would keep whatever reason an unrelated earlier
+                        # whole-batch failure stamped on it, and the drop would
+                        # be attributed to a status from a different cycle.
+                        # This IS the more specific rejection: the server named
+                        # these events individually.
+                        self.queue.increment_retry(
+                            failed_ids,
+                            "per-event rejection: omitted from accepted_ids "
+                            "(server gave no batch-level reason)",
+                        )
                     processed += len(succeeded_ids)
                 else:
                     # Whole-batch failure with no per-event verdict. Only count
@@ -4106,7 +4118,7 @@ class SyncEngine:
                 # (privacy F4, same reason bucket ids are reduced to types).
                 # Allowlist a safe shape rather than blocklisting unsafe ones —
                 # the ways free text can carry a title are unbounded.
-                extra += self._dropped_reason_code(summary.get("last_error"))
+                extra += self._dropped_reason_code(summary.get("last_errors"))
                 self.error_reporter.capture(
                     f"Dropped {real} queued event(s) after max retries — the "
                     f"server rejected them; held in dead-letter for replay, not "
@@ -4126,22 +4138,48 @@ class SyncEngine:
         except Exception:
             logger.debug("dropped-events report failed", exc_info=True)
 
-    @staticmethod
-    def _dropped_reason_code(last_error: Optional[str]) -> str:
-        """Render the server's rejection as a bare HTTP status, or nothing.
+    # A definitive rejection is formatted by http_client as
+    # ``API error (NNN): <body>``. Anchoring on that PREFIX rather than
+    # searching for any 3-digit run is what makes this a PROVENANCE test
+    # instead of a shape test: a free-text search happily reports a digit run
+    # from a rejected filename ("Bug 404 fix.txt" -> "server status 404") or
+    # from our OWN agent-authored reason ("shed after 137 transient failures"
+    # -> "server status 137", on a string that says it is not a rejection).
+    # Both were live before this anchor existed.
+    _SERVER_STATUS_RE = re.compile(r"^API error \((\d{3})\)")
+
+    @classmethod
+    def _dropped_reason_code(cls, last_errors) -> str:
+        """Render the servers' rejections as bare HTTP statuses, or nothing.
 
         Answers "malformed event or receiving-side change?" at the class level
-        (a 4xx validation refusal vs a 5xx/other) without shipping any
-        server-authored text off the device. Anything that is not a recognisable
-        3-digit status yields the locally-recorded pointer instead, so the
-        message never carries a payload echo.
+        without shipping any server-authored text off the device: only digits
+        matched by ``_SERVER_STATUS_RE`` are ever emitted. Anything else yields
+        the locally-recorded pointer, so the message cannot carry a payload
+        echo.
+
+        Takes the DISTINCT set from ``failed_event_summary``. One drop cycle
+        routinely spans several batches with several rejections, and naming one
+        of them as "the" cause is a confident wrong answer to the question this
+        exists to settle.
         """
-        if not last_error:
+        if isinstance(last_errors, str):
+            last_errors = [last_errors]
+        reasons = [str(r) for r in (last_errors or []) if r]
+        if not reasons:
             return ""
-        m = re.search(r"\b([1-5]\d{2})\b", str(last_error)[:80])
-        if m:
-            return f"; server status {m.group(1)}, full reason in local dead-letter"
-        return "; full reason recorded in local dead-letter"
+        codes = sorted({m.group(1) for m in
+                        (cls._SERVER_STATUS_RE.match(r) for r in reasons) if m})
+        if codes and len(codes) == len(reasons):
+            return (f"; server status {','.join(codes)}, "
+                    "full reason in local dead-letter")
+        if codes:
+            # Mixed: some rows carry a server rejection, others a locally
+            # authored reason. Say so rather than implying one cause.
+            return (f"; server status {','.join(codes)} plus "
+                    f"{len(reasons) - len(codes)} local reason(s), "
+                    "full detail in local dead-letter")
+        return f"; {len(reasons)} local reason(s) recorded in local dead-letter"
 
     @staticmethod
     def _dropped_window_age(oldest, newest, now: Optional[datetime] = None) -> str:

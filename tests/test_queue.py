@@ -413,7 +413,7 @@ class TestOfflineQueue:
         summary = self.queue.failed_event_summary(max_retries=5)
         assert summary == {
             "count": 0, "bucket_ids": [], "oldest": None, "newest": None,
-            "real_loss_count": 0, "unstorable_count": 0, "last_error": None,
+            "real_loss_count": 0, "unstorable_count": 0, "last_errors": [],
         }
 
     def _drop_n(self, events):
