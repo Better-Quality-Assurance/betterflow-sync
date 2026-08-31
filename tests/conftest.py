@@ -98,3 +98,71 @@ def _no_real_mic_probe(monkeypatch):
     monkeypatch.setattr(
         sync_engine_module, "create_mic_detector", lambda *a, **k: None
     )
+
+
+# ---------------------------------------------------------------------------
+# Second safety net, same class as the config one above: the suite must not be
+# able to touch the machine RUNNING it.
+#
+# send_notification() dispatches to per-platform senders that really post — on
+# macOS via NSUserNotification, falling back to `osascript` when pyobjc is
+# missing (the usual state of a dev venv). Nothing mocked that, so any test
+# exercising break_manager, reminders, system_event_handler, aw_manager or main
+# fired a REAL notification into the developer's Notification Center. A single
+# full-suite run posts a burst of "Break Over", "Break Time" and "BetterFlow
+# tracking unavailable" banners, and the osascript ones are attributed to
+# Script Editor — which clear_notifications() documents it CANNOT clear
+# programmatically, so they have to be dismissed by hand.
+#
+# Observed 2026-08-31, four full-suite runs during unrelated work. Same shape as
+# the config incident: not hypothetical, and invisible to whoever writes the
+# test because the side effect lands outside the test process.
+#
+# We patch the PRIVATE senders rather than send_notification() because callers
+# bind that name at import time (src/main.py says so explicitly), so patching
+# the public function would miss every module-level importer. Every path funnels
+# into these four, whatever the import style.
+#
+# Tests that exercise a sender's own internals opt out with
+# @pytest.mark.real_notifications — they already mock the OS boundary beneath it.
+# ---------------------------------------------------------------------------
+
+_BLOCKED_NOTIFICATIONS: list[tuple[str, str]] = []
+
+
+@pytest.fixture(autouse=True)
+def _block_real_notifications(request, monkeypatch):
+    if request.node.get_closest_marker("real_notifications"):
+        yield
+        return
+
+    import src.notifications as notif
+
+    def _blocked(title="", message="", *a, **kw):
+        _BLOCKED_NOTIFICATIONS.append((str(title), str(message)))
+        return notif.NotificationOutcome.DELIVERED
+
+    for name in (
+        "_send_macos_pyobjc",
+        "_send_macos_osascript",
+        "_send_windows",
+        "_send_linux",
+    ):
+        monkeypatch.setattr(notif, name, _blocked, raising=True)
+    for name in ("_clear_macos_pyobjc", "_clear_windows"):
+        monkeypatch.setattr(notif, name, lambda *a, **kw: None, raising=True)
+    yield
+
+
+def pytest_terminal_summary(terminalreporter):
+    """Report how many real notifications the block intercepted.
+
+    A non-zero count is exactly how many banners this run would have posted to
+    the developer's Notification Center before the fixture above existed.
+    """
+    n = len(_BLOCKED_NOTIFICATIONS)
+    if n:
+        terminalreporter.write_line(
+            f"[notifications] blocked {n} real notification(s) that would have "
+            f"reached this machine"
+        )
