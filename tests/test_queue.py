@@ -222,11 +222,21 @@ class TestOfflineQueue:
         assert result["skipped_unstorable"] == 3
         assert self.queue.size() == 1
         # The three unstorable rows stay dead-lettered — not resurrected, not lost.
-        assert self.queue.dead_letter_count() == 3
+        # 2, not 3: one of the three skipped rows is past retention + the prune
+        # margin, so the replay scan pruned it on the way through. That pruning
+        # is what stops terminal rows piling up at the head of the candidate
+        # ordering and starving the replay - see
+        # tests/test_dead_letter_replay_starvation.py.
+        assert result["pruned"] == 1
+        assert self.queue.dead_letter_count() == 2
         assert {
             json.loads(row["event_data"])["id"]
             for row in self.queue.get_dead_letter_events()
-        } == {"nobucket-1", "stale-1", "overlong-1"}
+        } == {"nobucket-1", "overlong-1"}
+        # "stale-1" is gone: past retention + the prune margin, so terminal.
+        # The other two are unstorable but RECENT — a missing bucket_id or an
+        # over-long duration is repairable by a code change, so those are NOT
+        # pruned. The prune rule is bounded strictly by timestamp age.
         # The resurrected event is the storable one, retry_count reset so it gets
         # a fresh delivery attempt (not instantly re-dropped at the ceiling).
         back = self.queue.dequeue(batch_size=10)

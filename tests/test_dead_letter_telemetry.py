@@ -158,11 +158,13 @@ def test_process_queue_replays_storable_dead_letter():
         engine._cycle_start_monotonic = None
         engine._process_queue(SyncStats())
 
-        # The storable row was resurrected and then delivered; the stale row is
-        # still dead-lettered (never resurrected — the server would reject it).
-        assert queue.dead_letter_count() == 1
-        remaining = queue.get_dead_letter_events()
-        assert remaining[0]["bucket_id"] == "aw-watcher-window_h"
+        # The storable row was resurrected and then delivered. The stale row is
+        # never resurrected (the server would reject it) AND is now pruned by
+        # the replay scan, because it is past retention + the prune margin -
+        # terminal rows left in place starve the replay once enough accumulate
+        # (tests/test_dead_letter_replay_starvation.py).
+        assert queue.dead_letter_count() == 0
+        assert queue.get_dead_letter_events() == []
         # The resurrected event actually reached the server this cycle.
         sent_ids = {
             e.get("id")

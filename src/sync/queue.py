@@ -1048,6 +1048,58 @@ class OfflineQueue:
     # than the bad-deploy windows seen in the incident history (~1-2h would still
     # get a retry every cooldown until it succeeds or ages out of retention).
     _DEAD_LETTER_REPLAY_COOLDOWN_SECONDS = 1800  # 30 min
+    # Replay scan budget. Terminal (past-retention) rows are skipped rather than
+    # removed, so the scan has to be able to walk PAST them to reach recoverable
+    # rows behind them — a fixed one-page window let 200 of them starve the
+    # replay permanently. Page size keeps each query small; the max bounds
+    # per-cycle cost on a large table. Parsing is the cost, ~1.5ms per 1000 rows.
+    _REPLAY_SCAN_PAGE = 500
+    _REPLAY_MAX_SCAN = 20000
+    # Extra margin BEYOND the retention window before a terminal row is pruned.
+    # At retention+margin the server has refused the event for a fortnight and
+    # always will, so the row no longer preserves recoverable ACTIVITY - only
+    # the fact that some was lost, which the prune WARNING keeps. The margin
+    # exists so anything a human might still be asked to inspect survives well
+    # past the point it stopped being deliverable.
+    _REPLAY_PRUNE_MARGIN_DAYS = 7
+
+    def _prune_terminal_rows(self, cursor, prune_ids, prune_stamps, prune_buckets) -> int:
+        """Delete dead letters that are provably past ANY use, loudly.
+
+        Called only from the replay scan, inside its transaction. A row here has
+        a timestamp older than retention + ``_REPLAY_PRUNE_MARGIN_DAYS``, so the
+        server has refused it for a fortnight and always will.
+
+        The DDL comments argue a blind DELETE of dead letters was permanent data
+        loss, and that is right at DROP time — the event might still be
+        deliverable. It stops being true once the timestamp is past retention:
+        the row then preserves a RECORD that activity was lost, not the activity.
+        This keeps that record as a WARNING naming the count, the bucket types
+        and the age span, which is what separates it from the blind DELETE.
+
+        Bucket TYPES only, never ids — a bucket id embeds the hostname, and this
+        line goes to a log that is uploadable on admin request (privacy F4).
+        """
+        if not prune_ids:
+            return 0
+        placeholders = ",".join("?" * len(prune_ids))
+        cursor.execute(
+            f"DELETE FROM dead_letter_events WHERE id IN ({placeholders})",
+            prune_ids,
+        )
+        prune_stamps.sort()
+        span = (
+            f"{prune_stamps[0]}..{prune_stamps[-1]}" if prune_stamps else "unknown"
+        )
+        logger.warning(
+            "Pruned %d dead-lettered event(s) the server can never accept "
+            "(older than retention + %dd). This is activity that was captured "
+            "and never delivered; the events are gone, this line is the record. "
+            "buckets=%s span=%s",
+            len(prune_ids), self._REPLAY_PRUNE_MARGIN_DAYS,
+            ",".join(sorted(prune_buckets)) or "unknown", span,
+        )
+        return len(prune_ids)
 
     def requeue_storable_dead_letter(
         self,
@@ -1124,6 +1176,7 @@ class OfflineQueue:
         if min_dead_age_seconds is None:
             min_dead_age_seconds = self._DEAD_LETTER_REPLAY_COOLDOWN_SECONDS
         stale_cutoff = now - timedelta(days=stale_after_days)
+        prune_cutoff = stale_cutoff - timedelta(days=self._REPLAY_PRUNE_MARGIN_DAYS)
         cooldown_cutoff = (now - timedelta(seconds=min_dead_age_seconds)).isoformat()
         requeued_at = now.isoformat()
 
@@ -1167,52 +1220,118 @@ class OfflineQueue:
             # Only rows that have sat past the cooldown are candidates. The
             # lexical comparison on ISO-8601 strings is chronological (every
             # dropped_at is a tz-aware UTC isoformat), matching set_checkpoint_forward.
-            cursor.execute(
-                """
-                SELECT id, event_data FROM dead_letter_events
-                WHERE dropped_at <= ?
-                ORDER BY dropped_at ASC, id ASC
-                LIMIT ?
-                """,
-                (cooldown_cutoff, effective_limit),
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
-
+            # Scan PAST terminal rows instead of letting them own the window.
+            #
+            # This was a single `ORDER BY dropped_at ASC LIMIT effective_limit`.
+            # A row whose timestamp has aged past retention can never become
+            # storable again — wall-clock only moves forward — and the check
+            # below SKIPS such a row without removing it, so it holds its slot
+            # in that ordering permanently. Once a device carried `limit` of
+            # them the replay examined the same terminal rows every cycle and
+            # resurrected nothing; any genuinely recoverable event dead-lettered
+            # afterwards then aged out of retention and was lost for real.
+            # Measured on the pre-fix code at the default limit=200:
+            #     terminal=199 -> requeued 1      terminal=200 -> requeued 0
+            # Silent loss of billable activity, on the one path whose entire
+            # purpose is to preserve it.
+            #
+            # Keyset pagination over the same ordering (not OFFSET, which
+            # rescans from the start on every page), stopping as soon as enough
+            # storable rows are found or the scan budget is spent. The budget
+            # bounds per-cycle cost on a large table.
             move_ids: list[int] = []
             new_rows: list[tuple] = []
-            for row in rows:
-                dead_id, raw = row[0], row[1]
-                try:
-                    ev = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    # Unparseable → can never be stored → leave it dead-lettered.
-                    # is_event_storable also returns False for a non-dict, so
-                    # this None needs no separate branch below.
-                    ev = None
-                # THE shared classifier — never a local re-implementation of it.
-                # A hand-rolled `bucket_id AND timestamp-in-window` pair (what
-                # this was) silently omits the duration bound, so the exact
-                # poison ``evict_unstorable`` had just removed — an over-long
-                # weekend lid-close span — was resurrected a cooldown later,
-                # AFTER that cycle's eviction gate had already run. It then
-                # 4xx-rejected the whole batch it rode in, and _process_queue's
-                # whole-batch retry bump dragged its healthy neighbours to the
-                # drop ceiling; the re-eviction restamped ``dropped_at``, which
-                # restarted the cooldown, so the loop repeated every 30 min for
-                # the full retention window.
-                if not is_event_storable(ev, stale_cutoff=stale_cutoff):
-                    continue
-                move_ids.append(dead_id)
-                # Re-enter with a fresh created_at and default retry_count (0).
-                new_rows.append((raw, requeued_at))
+            prune_ids: list[int] = []
+            prune_stamps: list[str] = []
+            prune_buckets: set[str] = set()
+            examined = 0
+            cursor_key = None
+            while len(new_rows) < effective_limit and examined < self._REPLAY_MAX_SCAN:
+                page = min(self._REPLAY_SCAN_PAGE, self._REPLAY_MAX_SCAN - examined)
+                if cursor_key is None:
+                    cursor.execute(
+                        """
+                        SELECT id, event_data, dropped_at FROM dead_letter_events
+                        WHERE dropped_at <= ?
+                        ORDER BY dropped_at ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (cooldown_cutoff, page),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, event_data, dropped_at FROM dead_letter_events
+                        WHERE dropped_at <= ?
+                          AND (dropped_at, id) > (?, ?)
+                        ORDER BY dropped_at ASC, id ASC
+                        LIMIT ?
+                        """,
+                        (cooldown_cutoff, cursor_key[0], cursor_key[1], page),
+                    )
+                rows = cursor.fetchall()
+                if not rows:
+                    break
+                cursor_key = (rows[-1][2], rows[-1][0])
+                examined += len(rows)
+                for row in rows:
+                    if len(new_rows) >= effective_limit:
+                        break
+                    dead_id, raw = row[0], row[1]
+                    try:
+                        ev = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        # Unparseable -> can never be stored -> leave it
+                        # dead-lettered. is_event_storable also returns False
+                        # for a non-dict, so this None needs no separate branch.
+                        ev = None
+                    # THE shared classifier — never a local re-implementation.
+                    # A hand-rolled `bucket_id AND timestamp-in-window` pair
+                    # (what this was) silently omits the duration bound, so the
+                    # exact poison ``evict_unstorable`` had just removed — an
+                    # over-long weekend lid-close span — was resurrected a
+                    # cooldown later, AFTER that cycle's eviction gate had run.
+                    # It then 4xx-rejected the whole batch it rode in, and
+                    # _process_queue's whole-batch retry bump dragged its
+                    # healthy neighbours to the drop ceiling; the re-eviction
+                    # restamped ``dropped_at``, restarting the cooldown, so the
+                    # loop repeated every 30 min for the full retention window.
+                    if not is_event_storable(ev, stale_cutoff=stale_cutoff):
+                        # Terminal AND long past any use: prune, so terminal
+                        # rows cannot accumulate at the head of this ordering
+                        # and starve the scan the way they starved the fixed
+                        # window. Bounded strictly by timestamp age. An
+                        # unparseable row (ev is None) is NEVER pruned — its
+                        # timestamp cannot be read, and it is the only trace of
+                        # a serialisation bug.
+                        if isinstance(ev, dict) and not _timestamp_within(
+                            ev.get("timestamp"), prune_cutoff
+                        ):
+                            prune_ids.append(dead_id)
+                            ts = ev.get("timestamp")
+                            if ts:
+                                prune_stamps.append(str(ts))
+                            bid = ev.get("bucket_id")
+                            if bid:
+                                prune_buckets.add(str(bid).rsplit("_", 1)[0])
+                        continue
+                    move_ids.append(dead_id)
+                    # Re-enter with a fresh created_at and retry_count 0.
+                    new_rows.append((raw, requeued_at))
+
+            if examined == 0:
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+
+            pruned = self._prune_terminal_rows(
+                cursor, prune_ids, prune_stamps, prune_buckets
+            )
 
             if not move_ids:
                 return {
-                    "examined": len(rows),
+                    "examined": examined,
                     "requeued": 0,
-                    "skipped_unstorable": len(rows),
+                    "skipped_unstorable": examined,
+                    "pruned": pruned,
                 }
 
             cursor.executemany(
@@ -1233,9 +1352,10 @@ class OfflineQueue:
                 requeued,
             )
         return {
-            "examined": len(rows),
+            "examined": examined,
             "requeued": requeued,
-            "skipped_unstorable": len(rows) - requeued,
+            "skipped_unstorable": examined - requeued,
+            "pruned": pruned,
         }
 
     def size(self) -> int:
