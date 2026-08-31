@@ -26,6 +26,10 @@ every tests/test_*.py, so a literal here would find itself (a detector poisoned
 by its own sentinel). It is assembled from parts below.
 """
 
+# ruff: noqa: N802 -- the Foundation fakes below must answer to the
+# Objective-C selector names src/notifications.py calls, verbatim.
+# Same convention as tests/test_notification_delivery_verification.py.
+
 from pathlib import Path
 
 import pytest
