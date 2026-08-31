@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from src.sync.queue import OfflineQueue
+from src.sync.queue import MAX_EVENT_DURATION_SECONDS, OfflineQueue
 
 
 class TestTerminalRowsDoNotStarveReplay:
@@ -217,3 +217,81 @@ class TestUnreadableTimestampsAreNeverMarked:
         assert result["marked_terminal"] == 0, (
             "a caller-supplied window moved the durable mark"
         )
+
+
+class TestRecentButPermanentlyUnstorableAlsoConverges:
+    """The second starvation class, found by a refutation reviewer.
+
+    Marking used to key on timestamp AGE alone, so a row that is unstorable for
+    a reason age cannot see — an over-long `duration`, or no `bucket_id` — was
+    never marked and held its slot while its timestamp stayed recent. Since the
+    queue holds MAX_QUEUE_SIZE (100,000) and the scan budget is 20,000, that is
+    one full-queue drain away, not a theoretical bound. Measured before the fix:
+
+        recent-unstorable=19999 -> requeued 1
+        recent-unstorable=20000 -> requeued 0, marked 0   <- starved
+        recent-unstorable=60000 -> requeued 0, marked 0
+
+    Both reasons are PERMANENT: a dead-letter payload is immutable (the only
+    UPDATE on that table sets the terminal flag) and `backfill_status_bucket_ids`
+    repairs `queued_events` only. So they are marked on a value that was READ,
+    which is the distinction that keeps this rule away from the deleted-data bug
+    (see TestUnreadableTimestampsAreNeverMarked).
+    """
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.queue = OfflineQueue(db_path=Path(self.temp_dir) / "q.db", max_size=200000)
+        self.now = datetime.now(timezone.utc)
+
+    def teardown_method(self):
+        self.queue.close()
+
+    def _dead_letter(self, events):
+        self.queue.enqueue(events)
+        ids = [e.id for e in self.queue.dequeue(batch_size=len(events))]
+        for _ in range(5):
+            self.queue.increment_retry(ids, "API error (422): rejected")
+        self.queue.remove_failed(max_retries=5, last_error="generic")
+
+    def _overlong(self):
+        return {"timestamp": self.now.isoformat(),
+                "duration": MAX_EVENT_DURATION_SECONDS + 1,
+                "bucket_id": "bf-status_h", "bucket_type": "idle_time", "data": {}}
+
+    def _recoverable(self):
+        return {"timestamp": self.now.isoformat(), "duration": 60,
+                "bucket_id": "bf-status_h", "bucket_type": "idle_time", "data": {}}
+
+    def test_recent_overlong_rows_past_the_budget_still_converge(self):
+        for _ in range(25):
+            self._dead_letter([self._overlong() for _ in range(1000)])
+        self._dead_letter([self._recoverable()])
+        total_before = self.queue.dead_letter_count()
+
+        for cycle in range(1, 6):
+            result = self.queue.requeue_storable_dead_letter(
+                now=self.now + timedelta(hours=2 + cycle)
+            )
+            if result["requeued"] == 1:
+                break
+            assert result["marked_terminal"] > 0, (
+                f"cycle {cycle} made no progress: {result}. Recent-but-permanently"
+                "-unstorable rows are starving the replay again."
+            )
+        else:
+            pytest.fail("did not recover within 5 cycles")
+
+        assert self.queue.dead_letter_count() == total_before - 1, (
+            "marking must never delete — only the requeued row leaves"
+        )
+
+    def test_a_bucketless_row_is_marked_but_retained(self):
+        self._dead_letter([{"timestamp": self.now.isoformat(), "duration": 60}])
+
+        result = self.queue.requeue_storable_dead_letter(
+            now=self.now + timedelta(hours=1), min_dead_age_seconds=0
+        )
+
+        assert result["marked_terminal"] == 1, "unroutable forever, so mark it"
+        assert self.queue.dead_letter_count() == 1, "but never delete it"

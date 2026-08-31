@@ -20,6 +20,7 @@ __all__ = [
     "OfflineQueue",
     "QueuedEvent",
     "is_event_storable",
+    "is_permanently_unstorable",
     "normalized_project_id",
     "MAX_EVENT_DURATION_SECONDS",
     "EVENT_RETENTION_DAYS",
@@ -76,6 +77,49 @@ def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
     or unparseable timestamp is treated as NOT within (unstorable)."""
     parsed = _parse_timestamp(ts)
     return parsed is not None and parsed >= cutoff
+
+
+def is_permanently_unstorable(ev: object, *, terminal_cutoff: datetime) -> bool:
+    """True only when the payload POSITIVELY SHOWS the server can never accept it.
+
+    The counterpart to ``is_event_storable``, and deliberately NOT its negation.
+    "Unstorable right now" and "unstorable forever" are different questions, and
+    the first version of the replay's terminal rule conflated them: it acted on
+    `not _timestamp_within(...)`, which is False for an unreadable timestamp as
+    well as an old one, and marked rows whose age it had no evidence about.
+
+    So every branch here is a value that was READ, never a value that was
+    missing. Absence of evidence marks nothing.
+
+    A dead-letter payload is immutable — the only UPDATE on that table sets the
+    terminal flag, and ``backfill_status_bucket_ids`` repairs ``queued_events``
+    only — so each of these is genuinely terminal rather than merely current:
+
+    - a timestamp that PARSES and is older than ``terminal_cutoff``: the server
+      refuses it on retention and always will;
+    - a ``duration`` that IS a number and lies outside the accepted bounds: the
+      value cannot change, so the 4xx cannot stop;
+    - a MISSING ``bucket_id``: unroutable by construction, and nothing can add
+      one to a dead-lettered row. This is the one absence that qualifies,
+      because the absence IS the disqualifying fact rather than a gap in what we
+      know about some other property.
+
+    A missing or unreadable timestamp is NOT terminal: it is the likely shape of
+    a serialisation bug and must stay visible and replayable.
+    """
+    if not isinstance(ev, dict):
+        return False  # unparseable: preserve it, it is evidence
+    if not ev.get("bucket_id"):
+        return True
+    duration = ev.get("duration")
+    if isinstance(duration, bool):
+        return False
+    if isinstance(duration, (int, float)) and not (
+        0 <= duration <= MAX_EVENT_DURATION_SECONDS
+    ):
+        return True
+    parsed = _parse_timestamp(ev.get("timestamp"))
+    return parsed is not None and parsed < terminal_cutoff
 
 
 def is_event_storable(ev: object, *, stale_cutoff: datetime) -> bool:
@@ -1350,8 +1394,9 @@ class OfflineQueue:
                         # caller's stale_after_days: a caller may legitimately
                         # shrink the window for a SKIP (reversible), and must
                         # not thereby widen a durable mark.
-                        parsed = _parse_timestamp(ev.get("timestamp")) if isinstance(ev, dict) else None
-                        if parsed is not None and parsed < terminal_cutoff:
+                        if is_permanently_unstorable(
+                            ev, terminal_cutoff=terminal_cutoff
+                        ):
                             terminal_ids.append(dead_id)
                         continue
                     move_ids.append(dead_id)
