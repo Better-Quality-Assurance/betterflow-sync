@@ -50,6 +50,44 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# A definitive rejection is formatted by http_client as ``API error (NNN): <body>``.
+# Anchoring on that PREFIX rather than searching for any 3-digit run is what makes
+# this a PROVENANCE test instead of a shape test: a free-text search reports a digit
+# run from a rejected filename ("Bug 404 fix.txt" -> "server status 404") or from our
+# OWN reason strings ("shed after 137 transient failures" -> "server status 137", on
+# a string that says it is not a rejection). Both were live before this anchor.
+_SERVER_STATUS_RE = re.compile(r"^API error \((\d{3})\)")
+
+
+def server_status_summary(reasons) -> str:
+    """Reduce server rejection text to bare HTTP status codes for the OPS ingest.
+
+    ONE implementation, shared by SyncEngine's drop report and
+    BetterFlowApp._note_sync_failure, because they answer the same question about
+    the same strings and two spellings of that rule would drift.
+
+    Only digits matched by ``_SERVER_STATUS_RE`` are ever emitted, so no
+    server-authored text can leave the device by this path. That matters because
+    the ops ingest is CROSS-TENANT and a validation error routinely echoes the
+    value it rejected — and our payloads carry window titles. The full text stays
+    in betterflow.log, which is uploaded only on explicit admin request.
+    """
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    items = [str(r) for r in (reasons or []) if r]
+    if not items:
+        return ""
+    codes = sorted({m.group(1) for m in
+                    (_SERVER_STATUS_RE.match(r) for r in items) if m})
+    if codes and len(codes) == len(items):
+        return f"; server status {','.join(codes)}, full reason in local dead-letter"
+    if codes:
+        return (f"; server status {','.join(codes)} plus "
+                f"{len(items) - len(codes)} local reason(s), "
+                "full detail in local dead-letter")
+    return f"; {len(items)} local reason(s) recorded in local dead-letter"
+
+
 # Sentinel for "no project id has been rejected yet" — distinct from None,
 # which is itself a rejectable value (a project dict with no "id").
 _NO_REJECTED_PROJECT_ID = object()
@@ -4146,10 +4184,10 @@ class SyncEngine:
     # from our OWN agent-authored reason ("shed after 137 transient failures"
     # -> "server status 137", on a string that says it is not a rejection).
     # Both were live before this anchor existed.
-    _SERVER_STATUS_RE = re.compile(r"^API error \((\d{3})\)")
+    _SERVER_STATUS_RE = _SERVER_STATUS_RE
 
-    @classmethod
-    def _dropped_reason_code(cls, last_errors) -> str:
+    @staticmethod
+    def _dropped_reason_code(last_errors) -> str:
         """Render the servers' rejections as bare HTTP statuses, or nothing.
 
         Answers "malformed event or receiving-side change?" at the class level
@@ -4163,23 +4201,7 @@ class SyncEngine:
         of them as "the" cause is a confident wrong answer to the question this
         exists to settle.
         """
-        if isinstance(last_errors, str):
-            last_errors = [last_errors]
-        reasons = [str(r) for r in (last_errors or []) if r]
-        if not reasons:
-            return ""
-        codes = sorted({m.group(1) for m in
-                        (cls._SERVER_STATUS_RE.match(r) for r in reasons) if m})
-        if codes and len(codes) == len(reasons):
-            return (f"; server status {','.join(codes)}, "
-                    "full reason in local dead-letter")
-        if codes:
-            # Mixed: some rows carry a server rejection, others a locally
-            # authored reason. Say so rather than implying one cause.
-            return (f"; server status {','.join(codes)} plus "
-                    f"{len(reasons) - len(codes)} local reason(s), "
-                    "full detail in local dead-letter")
-        return f"; {len(reasons)} local reason(s) recorded in local dead-letter"
+        return server_status_summary(last_errors)
 
     @staticmethod
     def _dropped_window_age(oldest, newest, now: Optional[datetime] = None) -> str:

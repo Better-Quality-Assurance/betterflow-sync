@@ -307,3 +307,36 @@ class TestSummaryCollectsEveryDistinctCause:
             "API error (400): unknown project",
             "API error (422): duration out of range",
         ], f"summary collapsed several causes into one: {summary['last_errors']!r}"
+
+
+class TestSyncFailureAlertDoesNotEchoServerText:
+    """The OTHER path to the same cross-tenant ingest. `result.error` reaches
+    _note_sync_failure verbatim via stats.errors, and on the 3rd consecutive
+    failure it was captured as-is — so the drop report could be perfectly
+    sanitized while the identical text left by a different door."""
+
+    def test_only_the_status_reaches_the_ops_ingest(self):
+        from src.main import SyncCoordinator
+
+        captured = {}
+
+        class FakeReporter:
+            def capture(self, message, **kw):
+                captured["msg"] = message
+
+        app = SyncCoordinator.__new__(SyncCoordinator)
+        app._consecutive_sync_failures = 2  # next one crosses the threshold
+        app._SYNC_FAILURE_ALERT_THRESHOLD = 3
+        app.error_reporter = FakeReporter()
+
+        SyncCoordinator._note_sync_failure(
+            app,
+            'API error (422): rejected {"title": "Q3 layoffs CONFIDENTIAL.xlsx"}',
+        )
+
+        msg = captured.get("msg", "")
+        assert msg, "no alert captured — threshold logic changed?"
+        assert "422" in msg, msg
+        assert "CONFIDENTIAL" not in msg, f"payload reached the ops ingest: {msg}"
+        assert "layoffs" not in msg
+        assert "title" not in msg

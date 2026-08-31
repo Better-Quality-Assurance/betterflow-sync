@@ -605,7 +605,8 @@ class BetterFlowClient(BaseApiClient):
 
         Privacy note: this is an admin-initiated diagnostic pull. The log can
         contain app names, the device hostname (in bucket ids), and OS usernames
-        in stack-trace paths — but NOT window titles, URLs, or auth tokens
+        in stack-trace paths, and server RESPONSE text (which can echo a value the
+        server rejected, including a window title) — but NOT auth tokens
         (those are never logged). Acceptable within the tenant-admin trust model.
         """
         files: dict = {"log": ("betterflow.log", log_tail, "text/plain")}
