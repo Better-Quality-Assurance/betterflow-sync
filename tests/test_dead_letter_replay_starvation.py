@@ -128,19 +128,23 @@ class TestBacklogConverges:
         pytest.fail("did not recover within 5 cycles")
 
 
-class TestUnreadableTimestampsAreNeverMarked:
-    """The fixture class the first version of this fix did not have.
+class TestUnreadableTimestampsAreNeverDeleted:
+    """The Critical this branch was reworked to fix.
 
-    That version marked-and-DELETED on `not _timestamp_within(...)`, which is
-    False for a missing, null, wrong-typed or unparseable timestamp as well as
-    for a genuinely old one — so "provably ancient" and "age unreadable"
-    collapsed into one branch. Six rows with unreadable timestamps were deleted,
-    including one captured an hour earlier.
+    An earlier version DELETED rows on `not _timestamp_within(...)`, which is
+    False for a missing, null, wrong-typed or unparseable timestamp as well as a
+    genuinely old one. Six rows were destroyed, including one captured an hour
+    earlier, because the code had no evidence of their age and acted anyway.
 
-    It survived its own test file because every fixture there built events
-    through one helper that always emitted `ts.isoformat()`: the only two inputs
-    the file could produce were the two where a correct rule and a broken one
-    agree. These cases are the ones that disagree.
+    The property that matters is RETENTION, not the flag. These rows ARE marked
+    terminal now — they can never be storable, since `is_event_storable` needs a
+    timestamp that parses, and a dead-letter payload is immutable — but marking
+    keeps them: still stored, still returned by `get_dead_letter_events`, still
+    counted by `dead_letter_count`. A serialisation bug stays fully diagnosable.
+
+    Asserting "not marked" was the wrong invariant: it left these rows holding
+    slots in the replay ordering and starved it at 20,000
+    (TestUnmarkableBacklogStillConverges below).
     """
 
     def setup_method(self):
@@ -167,7 +171,7 @@ class TestUnreadableTimestampsAreNeverMarked:
         ("rfc1123",       {"timestamp": "Sun, 31 Aug 2026 11:00:00 GMT"}),
         ("nested dict",   {"timestamp": {"$date": "2026-08-31T11:00:00+00:00"}}),
     ])
-    def test_an_unreadable_timestamp_is_retained_and_not_marked(self, label, payload):
+    def test_an_unreadable_timestamp_is_retained_and_inspectable(self, label, payload):
         self._dead_letter(payload)
 
         self.queue.requeue_storable_dead_letter(
@@ -175,20 +179,14 @@ class TestUnreadableTimestampsAreNeverMarked:
         )
 
         assert self.queue.dead_letter_count() == 1, (
-            f"{label}: the row was DELETED — its age was never readable, so "
-            "nothing justified acting on it"
+            f"{label}: the row was DELETED. This is the likely shape of a "
+            "serialisation bug and is the only trace of it."
         )
-        with self.queue._cursor() as cur:
-            flags = [r[0] for r in cur.execute(
-                "SELECT terminal FROM dead_letter_events")]
-        assert flags == [0], (
-            f"{label}: marked terminal on an unreadable timestamp — this is the "
-            "likely shape of a serialisation bug and must stay replayable"
-        )
+        rows = self.queue.get_dead_letter_events()
+        assert len(rows) == 1, f"{label}: not inspectable after marking"
+        assert rows[0]["event_data"], f"{label}: payload lost"
 
-    def test_a_provably_old_timestamp_IS_marked(self):
-        """The positive control: without this, the test above passes for a rule
-        that never marks anything."""
+    def test_a_provably_old_timestamp_is_marked_and_retained(self):
         self._dead_letter(
             {"timestamp": (self.now - timedelta(days=30)).isoformat()}
         )
@@ -200,10 +198,27 @@ class TestUnreadableTimestampsAreNeverMarked:
         assert result["marked_terminal"] == 1
         assert self.queue.dead_letter_count() == 1, "marking must never delete"
 
+    def test_a_boolean_duration_does_not_exempt_an_ancient_row(self):
+        """The bool guard stops True being read as the number 1. It must skip
+        the DURATION branch only — returning early let an unrelated field
+        exempt a provably-ancient row from marking."""
+        self._dead_letter({
+            "timestamp": (self.now - timedelta(days=400)).isoformat(),
+            "duration": True,
+        })
+
+        result = self.queue.requeue_storable_dead_letter(
+            now=self.now + timedelta(hours=1), min_dead_age_seconds=0
+        )
+
+        assert result["marked_terminal"] == 1, (
+            "a boolean duration short-circuited the independent timestamp test"
+        )
+
     def test_the_caller_window_cannot_widen_the_mark(self):
-        """`stale_after_days` legitimately shrinks the SKIP window, which is
-        reversible. It must not move the durable mark: a 10-day-old row is
-        skipped under stale_after_days=1 but must NOT be marked terminal."""
+        """`stale_after_days` legitimately shrinks the SKIP window. It must not
+        move the durable mark: a 10-day-old row is skipped under
+        stale_after_days=1 but must NOT be marked terminal."""
         self._dead_letter(
             {"timestamp": (self.now - timedelta(days=10)).isoformat()}
         )
@@ -216,6 +231,61 @@ class TestUnreadableTimestampsAreNeverMarked:
 
         assert result["marked_terminal"] == 0, (
             "a caller-supplied window moved the durable mark"
+        )
+
+
+class TestUnmarkableBacklogStillConverges:
+    """The composition no test made: MORE THAN THE SCAN BUDGET of rows the rule
+    refuses to mark, in front of one recoverable event.
+
+    Every other convergence test here uses a MARKABLE class, and the
+    unreadable-timestamp tests use a single row. Neither arrangement can see a
+    backlog of unmarkable rows starving the scan — which is exactly the shape a
+    systematic serialisation bug produces.
+    """
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.queue = OfflineQueue(db_path=Path(self.temp_dir) / "q.db", max_size=200000)
+        self.now = datetime.now(timezone.utc)
+
+    def teardown_method(self):
+        self.queue.close()
+
+    def _dead_letter(self, events):
+        self.queue.enqueue(events)
+        ids = [e.id for e in self.queue.dequeue(batch_size=len(events))]
+        for _ in range(5):
+            self.queue.increment_retry(ids, "API error (422): rejected")
+        self.queue.remove_failed(max_retries=5, last_error="generic")
+
+    def test_timestampless_backlog_past_the_budget_does_not_starve(self):
+        # no timestamp at all: the class the old rule refused to mark
+        for _ in range(21):
+            self._dead_letter([
+                {"duration": 60, "bucket_id": "bf-status_h"} for _ in range(1000)
+            ])
+        self._dead_letter([{
+            "timestamp": self.now.isoformat(), "duration": 60,
+            "bucket_id": "bf-status_h", "bucket_type": "idle_time", "data": {},
+        }])
+        total_before = self.queue.dead_letter_count()
+
+        for cycle in range(1, 6):
+            result = self.queue.requeue_storable_dead_letter(
+                now=self.now + timedelta(hours=2 + cycle)
+            )
+            if result["requeued"] == 1:
+                break
+            assert result["marked_terminal"] > 0, (
+                f"cycle {cycle} made no progress: {result}. Unmarkable rows are "
+                "starving the replay — the original bug at a higher threshold."
+            )
+        else:
+            pytest.fail("did not recover within 5 cycles")
+
+        assert self.queue.dead_letter_count() == total_before - 1, (
+            "only the requeued row may leave; nothing is deleted"
         )
 
 

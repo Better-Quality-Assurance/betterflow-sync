@@ -80,46 +80,57 @@ def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
 
 
 def is_permanently_unstorable(ev: object, *, terminal_cutoff: datetime) -> bool:
-    """True only when the payload POSITIVELY SHOWS the server can never accept it.
+    """True when this row can never be delivered, so the replay should stop
+    re-examining it. MARKS ONLY — the caller never deletes.
 
-    The counterpart to ``is_event_storable``, and deliberately NOT its negation.
-    "Unstorable right now" and "unstorable forever" are different questions, and
-    the first version of the replay's terminal rule conflated them: it acted on
-    `not _timestamp_within(...)`, which is False for an unreadable timestamp as
-    well as an old one, and marked rows whose age it had no evidence about.
+    That distinction is the whole rule, and getting it wrong cost real data. An
+    earlier version DELETED on `not _timestamp_within(...)`, which is False for
+    an unreadable timestamp as well as an old one, so it destroyed rows whose
+    age it had no evidence about — including one captured an hour earlier.
 
-    So every branch here is a value that was READ, never a value that was
-    missing. Absence of evidence marks nothing.
+    The correction was to stop deleting, and the caution about absent evidence
+    was inherited from that design. Under MARKING it is the wrong caution and it
+    caused a second bug: unreadable rows were left unmarked, held their slots in
+    the replay's `ORDER BY dropped_at` ordering, and starved it at
+    ``_REPLAY_MAX_SCAN`` — reproducing the original defect at 20,000 rows
+    instead of 200. Worse, the exception existed to protect "the likely shape of
+    a serialisation bug", and a serialisation bug is SYSTEMATIC: it produces
+    that shape in bulk, which is the only volume at which starvation happens.
+    The shape the exception protected was the shape that defeated it.
 
-    A dead-letter payload is immutable — the only UPDATE on that table sets the
-    terminal flag, and ``backfill_status_bucket_ids`` repairs ``queued_events``
-    only — so each of these is genuinely terminal rather than merely current:
+    Permanence never required knowing the AGE. ``is_event_storable`` demands a
+    timestamp that PARSES, so a row whose timestamp cannot be read can never be
+    storable; and a dead-letter payload is immutable (the only UPDATE on that
+    table sets this flag, and ``backfill_status_bucket_ids`` repairs
+    ``queued_events`` only). Every branch below is therefore terminal in fact:
 
-    - a timestamp that PARSES and is older than ``terminal_cutoff``: the server
-      refuses it on retention and always will;
-    - a ``duration`` that IS a number and lies outside the accepted bounds: the
-      value cannot change, so the 4xx cannot stop;
-    - a MISSING ``bucket_id``: unroutable by construction, and nothing can add
-      one to a dead-lettered row. This is the one absence that qualifies,
-      because the absence IS the disqualifying fact rather than a gap in what we
-      know about some other property.
+    - a payload that is not a dict, or whose timestamp is missing or unparseable
+      — unroutable, and nothing can repair it;
+    - a MISSING ``bucket_id`` — nowhere to route it;
+    - a ``duration`` that IS a number and outside the accepted bounds;
+    - a timestamp that parses and is older than ``terminal_cutoff``.
 
-    A missing or unreadable timestamp is NOT terminal: it is the likely shape of
-    a serialisation bug and must stay visible and replayable.
+    Marking one of these costs nothing that deleting it would have cost: the row
+    is RETAINED, still returned by ``get_dead_letter_events``, and still counted
+    by ``dead_letter_count`` — which is the only fleet-visible signal that this
+    device lost activity. A serialisation bug stays just as diagnosable; it
+    simply stops blocking the replay for every other event behind it.
     """
     if not isinstance(ev, dict):
-        return False  # unparseable: preserve it, it is evidence
+        return True
     if not ev.get("bucket_id"):
         return True
     duration = ev.get("duration")
-    if isinstance(duration, bool):
-        return False
-    if isinstance(duration, (int, float)) and not (
-        0 <= duration <= MAX_EVENT_DURATION_SECONDS
-    ):
-        return True
+    # bool is an int subclass and is never a valid duration. Skip only THIS
+    # branch — returning here would let an unrelated field exempt a provably
+    # ancient row from marking.
+    if not isinstance(duration, bool) and isinstance(duration, (int, float)):
+        if not (0 <= duration <= MAX_EVENT_DURATION_SECONDS):
+            return True
     parsed = _parse_timestamp(ev.get("timestamp"))
-    return parsed is not None and parsed < terminal_cutoff
+    if parsed is None:
+        return True
+    return parsed < terminal_cutoff
 
 
 def is_event_storable(ev: object, *, stale_cutoff: datetime) -> bool:
