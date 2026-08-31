@@ -272,3 +272,38 @@ class TestPartialAcceptRecordsItsOwnReason:
         assert "per-event rejection" in src, (
             "the partial-accept branch records no reason of its own"
         )
+
+
+class TestSummaryCollectsEveryDistinctCause:
+    """Witnesses the COLLECTOR, not the renderer. Reverting
+    failed_event_summary to keep one arbitrary row's reason reddened nothing
+    while the multi-cause test above still passed, because that test hands
+    _dropped_reason_code a list directly."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "q3.db"
+        self.queue = OfflineQueue(db_path=self.db_path, max_size=100)
+
+    def teardown_method(self):
+        self.queue.close()
+
+    def test_two_batches_two_causes_both_reported(self):
+        now = datetime.now(timezone.utc).isoformat()
+        base = {"duration": 60, "bucket_id": "bf-status_host",
+                "bucket_type": "idle_time", "data": {}}
+        self.queue.enqueue([{**base, "timestamp": now, "id": "a"}])
+        self.queue.enqueue([{**base, "timestamp": now, "id": "b"}])
+        queued = self.queue.dequeue(batch_size=10)
+        id_a, id_b = queued[0].id, queued[1].id
+
+        for _ in range(5):
+            self.queue.increment_retry([id_a], "API error (422): duration out of range")
+            self.queue.increment_retry([id_b], "API error (400): unknown project")
+
+        summary = self.queue.failed_event_summary(max_retries=5)
+        assert summary["count"] == 2
+        assert summary["last_errors"] == [
+            "API error (400): unknown project",
+            "API error (422): duration out of range",
+        ], f"summary collapsed several causes into one: {summary['last_errors']!r}"
