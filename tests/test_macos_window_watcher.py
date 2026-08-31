@@ -2,7 +2,6 @@
 
 import platform
 import threading
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +10,45 @@ import pytest
 pytest.importorskip("AppKit", reason="PyObjC not installed - macOS-only")
 
 from src.sync.macos_window_watcher import MacOSWindowWatcher
+
+# Generous by design. Every wait below is on a CONDITION the watcher thread
+# signals, so this bound is only ever reached when the thread genuinely never
+# did the work — i.e. a real failure. A slow machine waits longer; it does not
+# go red. See _PollSignal.
+_WAIT_SECONDS = 10.0
+
+
+class _PollSignal:
+    """Wait for the watcher thread to have DONE the work, not for the clock.
+
+    These tests used to start the poll thread and ``time.sleep(0.2)`` with a
+    0.05s poll interval, betting that at least one iteration lands inside the
+    window. That bet loses on a loaded runner: ``test_browser_url_included``
+    failed the v1.5.129 release build on macos-latest/arm64 and passed on
+    re-run with byte-identical code, having passed on macos-14-large/x86_64 in
+    the same run. There is no sleep duration that fixes it — any wall-clock
+    margin is a bet on the slowest machine that will ever run the suite
+    (tests/test_watchdog_overrun_outcome.py makes the same argument).
+
+    So the thread signals each poll and the test blocks until the count it
+    needs has arrived. ``target=2`` is used by the negative tests, where
+    "nothing was posted" is only evidence if the loop demonstrably ran.
+    """
+
+    def __init__(self, target: int = 1):
+        self._target = target
+        self._reached = threading.Event()
+        self._lock = threading.Lock()
+        self.calls = 0
+
+    def note(self) -> None:
+        with self._lock:
+            self.calls += 1
+            if self.calls >= self._target:
+                self._reached.set()
+
+    def wait(self) -> bool:
+        return self._reached.wait(_WAIT_SECONDS)
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="macOS-only watcher")
@@ -48,10 +86,12 @@ class TestMacOSWindowWatcher:
 
         watcher, aw = self._make_watcher(poll_interval=0.05)
         watcher._stop_event = threading.Event()
+        posted = _PollSignal()
+        aw.post_heartbeat.side_effect = lambda *a, **k: posted.note()
 
         watcher._thread = threading.Thread(target=watcher._run, daemon=True)
         watcher._thread.start()
-        time.sleep(0.2)
+        assert posted.wait(), "the watcher thread never posted a heartbeat"
         watcher.stop()
 
         assert aw.post_heartbeat.called
@@ -74,10 +114,12 @@ class TestMacOSWindowWatcher:
 
         watcher, aw = self._make_watcher(poll_interval=0.05)
         watcher._stop_event = threading.Event()
+        posted = _PollSignal()
+        aw.post_heartbeat.side_effect = lambda *a, **k: posted.note()
 
         watcher._thread = threading.Thread(target=watcher._run, daemon=True)
         watcher._thread.start()
-        time.sleep(0.2)
+        assert posted.wait(), "the watcher thread never posted a heartbeat"
         watcher.stop()
 
         assert aw.post_heartbeat.called
@@ -88,14 +130,23 @@ class TestMacOSWindowWatcher:
     @patch("src.sync.macos_window_watcher.MacOSWindowWatcher._get_active_window")
     def test_none_result_skips_heartbeat(self, mock_get_window):
         """Test that None from _get_active_window doesn't post heartbeat."""
-        mock_get_window.return_value = None
+        # Two polls, so "nothing was posted" is evidence about the loop having
+        # RUN rather than about it never having started (the vacuous pass a
+        # too-short sleep produces here).
+        polled = _PollSignal(target=2)
+
+        def _none(*_a, **_k):
+            polled.note()
+            return None
+
+        mock_get_window.side_effect = _none
 
         watcher, aw = self._make_watcher(poll_interval=0.05)
         watcher._stop_event = threading.Event()
 
         watcher._thread = threading.Thread(target=watcher._run, daemon=True)
         watcher._thread.start()
-        time.sleep(0.2)
+        assert polled.wait(), "the watcher thread never polled twice"
         watcher.stop()
 
         aw.post_heartbeat.assert_not_called()
@@ -103,14 +154,23 @@ class TestMacOSWindowWatcher:
     @patch("src.sync.macos_window_watcher.MacOSWindowWatcher._get_active_window")
     def test_exception_handled_gracefully(self, mock_get_window):
         """Test that exceptions in polling don't crash the watcher thread."""
-        mock_get_window.side_effect = Exception("some error")
+        # Two raising polls: surviving ONE proves nothing about a loop that
+        # re-enters. Waiting on the count rather than on 0.2s of clock is what
+        # makes "repeated" true on a loaded machine as well as an idle one.
+        raised = _PollSignal(target=2)
+
+        def _boom(*_a, **_k):
+            raised.note()
+            raise Exception("some error")
+
+        mock_get_window.side_effect = _boom
 
         watcher, aw = self._make_watcher(poll_interval=0.05)
         watcher._stop_event = threading.Event()
 
         watcher._thread = threading.Thread(target=watcher._run, daemon=True)
         watcher._thread.start()
-        time.sleep(0.2)
+        assert raised.wait(), "the watcher thread never raised twice"
 
         # Thread should still be alive despite repeated exceptions
         assert watcher._thread.is_alive()
