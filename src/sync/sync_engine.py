@@ -3762,7 +3762,7 @@ class SyncEngine:
                         stats.events_sent += len(succeeded_ids)
                         self._clear_queue_backoff("queue batch partially accepted")
                     if failed_ids:
-                        self.queue.increment_retry(failed_ids)
+                        self.queue.increment_retry(failed_ids, result.error)
                     processed += len(succeeded_ids)
                 else:
                     # Whole-batch failure with no per-event verdict. Only count
@@ -3776,7 +3776,12 @@ class SyncEngine:
                     # against unbounded growth, and a genuinely poison 4xx batch
                     # still increments so it can't head-of-line-block the queue.
                     if not result.transient:
-                        self.queue.increment_retry(event_ids)
+                        # Record WHY. send_events already captured the server's
+                        # own text on SyncResult.error; nothing downstream had
+                        # ever read it, so every dead-lettered event carried the
+                        # agent's generic "definitive rejection" and the cause
+                        # was unrecoverable by the time anyone looked.
+                        self.queue.increment_retry(event_ids, result.error)
                     elif (
                         self._queue_consecutive_failures >= self._STUCK_HEAD_CEILING
                         and not self._batch_has_storable_activity(events)
@@ -3798,7 +3803,12 @@ class SyncEngine:
                             "— counting it toward the drop to unblock the queue.",
                             len(event_ids), self._queue_consecutive_failures,
                         )
-                        self.queue.increment_retry(event_ids)
+                        self.queue.increment_retry(
+                            event_ids,
+                            "shed as unstorable after "
+                            f"{self._queue_consecutive_failures} transient "
+                            "failures — not a server rejection",
+                        )
                     self._apply_queue_backoff()
                     break
             except BetterFlowAuthError:
@@ -4088,6 +4098,15 @@ class SyncEngine:
             if real > 0:
                 other = count - real
                 extra = f"; {other} other unstorable" if other > 0 else ""
+                # The server's status code, and ONLY that. The full rejection
+                # text is kept in the local dead-letter row where an engineer can
+                # pull it deliberately; it must not ride to the cross-tenant ops
+                # ingest, because a validation error routinely echoes the value
+                # it rejected and our event payloads carry window titles
+                # (privacy F4, same reason bucket ids are reduced to types).
+                # Allowlist a safe shape rather than blocklisting unsafe ones —
+                # the ways free text can carry a title are unbounded.
+                extra += self._dropped_reason_code(summary.get("last_error"))
                 self.error_reporter.capture(
                     f"Dropped {real} queued event(s) after max retries — the "
                     f"server rejected them; held in dead-letter for replay, not "
@@ -4106,6 +4125,23 @@ class SyncEngine:
                 )
         except Exception:
             logger.debug("dropped-events report failed", exc_info=True)
+
+    @staticmethod
+    def _dropped_reason_code(last_error: Optional[str]) -> str:
+        """Render the server's rejection as a bare HTTP status, or nothing.
+
+        Answers "malformed event or receiving-side change?" at the class level
+        (a 4xx validation refusal vs a 5xx/other) without shipping any
+        server-authored text off the device. Anything that is not a recognisable
+        3-digit status yields the locally-recorded pointer instead, so the
+        message never carries a payload echo.
+        """
+        if not last_error:
+            return ""
+        m = re.search(r"\b([1-5]\d{2})\b", str(last_error)[:80])
+        if m:
+            return f"; server status {m.group(1)}, full reason in local dead-letter"
+        return "; full reason recorded in local dead-letter"
 
     @staticmethod
     def _dropped_window_age(oldest, newest, now: Optional[datetime] = None) -> str:
