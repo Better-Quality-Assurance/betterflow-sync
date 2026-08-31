@@ -50,18 +50,32 @@ _MAX_LAST_ERROR_CHARS = 500
 EVENT_RETENTION_DAYS = 7
 
 
+def _parse_timestamp(ts: object) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp, or None if it cannot be read.
+
+    Split out from ``_timestamp_within`` because the two questions are NOT the
+    same and conflating them deleted data. ``_timestamp_within`` answers "is
+    this provably fresh?", and returns False for both "provably old" and "age
+    unknown" — correct there, because an unreadable event is unstorable either
+    way. Any caller acting IRREVERSIBLY on age needs to tell those apart, so it
+    asks this and requires a non-None answer first.
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def _timestamp_within(ts: Optional[str], cutoff: datetime) -> bool:
     """True when ``ts`` (ISO-8601) parses and is at/after ``cutoff``. A missing
     or unparseable timestamp is treated as NOT within (unstorable)."""
-    if not ts:
-        return False
-    try:
-        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed >= cutoff
+    parsed = _parse_timestamp(ts)
+    return parsed is not None and parsed >= cutoff
 
 
 def is_event_storable(ev: object, *, stale_cutoff: datetime) -> bool:
@@ -307,10 +321,23 @@ class OfflineQueue:
                     created_at TEXT NOT NULL,
                     retry_count INTEGER,
                     last_error TEXT,
-                    dropped_at TEXT NOT NULL
+                    dropped_at TEXT NOT NULL,
+                    terminal INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            # Additive migration. `terminal` marks a row the server can never
+            # accept again, so the replay can exclude it from its candidate
+            # ordering instead of re-examining it every cycle forever. Marking
+            # rather than DELETING is deliberate: a mis-marked row costs a
+            # missed replay, a wrongly-deleted one costs the activity.
+            dl_cols = {r[1] for r in cursor.execute(
+                "PRAGMA table_info(dead_letter_events)")}
+            if "terminal" not in dl_cols:
+                cursor.execute(
+                    "ALTER TABLE dead_letter_events "
+                    "ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0"
+                )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_dead_letter_dropped_at
@@ -1055,51 +1082,51 @@ class OfflineQueue:
     # per-cycle cost on a large table. Parsing is the cost, ~1.5ms per 1000 rows.
     _REPLAY_SCAN_PAGE = 500
     _REPLAY_MAX_SCAN = 20000
-    # Extra margin BEYOND the retention window before a terminal row is pruned.
+    # Extra margin BEYOND retention before a row is MARKED terminal.
     # At retention+margin the server has refused the event for a fortnight and
     # always will, so the row no longer preserves recoverable ACTIVITY - only
     # the fact that some was lost, which the prune WARNING keeps. The margin
     # exists so anything a human might still be asked to inspect survives well
     # past the point it stopped being deliverable.
-    _REPLAY_PRUNE_MARGIN_DAYS = 7
+    _REPLAY_TERMINAL_MARGIN_DAYS = 7
 
-    def _prune_terminal_rows(self, cursor, prune_ids, prune_stamps, prune_buckets) -> int:
-        """Delete dead letters that are provably past ANY use, loudly.
+    def _mark_terminal_rows(self, cursor, terminal_ids: list[int]) -> int:
+        """Flag dead letters the server can never accept again. Never deletes.
 
-        Called only from the replay scan, inside its transaction. A row here has
-        a timestamp older than retention + ``_REPLAY_PRUNE_MARGIN_DAYS``, so the
-        server has refused it for a fortnight and always will.
+        Called only from the replay scan, inside its transaction. A row reaching
+        here has a timestamp that PARSED and is older than retention plus
+        ``_REPLAY_TERMINAL_MARGIN_DAYS``, so the server has refused it for a
+        fortnight and always will.
 
-        The DDL comments argue a blind DELETE of dead letters was permanent data
-        loss, and that is right at DROP time — the event might still be
-        deliverable. It stops being true once the timestamp is past retention:
-        the row then preserves a RECORD that activity was lost, not the activity.
-        This keeps that record as a WARNING naming the count, the bucket types
-        and the age span, which is what separates it from the blind DELETE.
+        Marking rather than deleting is the whole point. The row keeps its
+        payload, its ``last_error`` and its ``dropped_at``, so it stays
+        inspectable and stays counted by ``dead_letter_count`` — which is the
+        only fleet-visible signal that this device lost activity. Deleting would
+        have walked that number back down to zero, and a metric returning to
+        zero reads as recovery rather than loss.
 
-        Bucket TYPES only, never ids — a bucket id embeds the hostname, and this
-        line goes to a log that is uploadable on admin request (privacy F4).
+        A mis-marked row costs one missed replay attempt. A wrongly-deleted row
+        costs the activity. Those are not the same mistake.
         """
-        if not prune_ids:
+        if not terminal_ids:
             return 0
-        placeholders = ",".join("?" * len(prune_ids))
-        cursor.execute(
-            f"DELETE FROM dead_letter_events WHERE id IN ({placeholders})",
-            prune_ids,
+        marked = 0
+        for i in range(0, len(terminal_ids), 500):  # keep well under SQLITE_MAX_VARIABLE_NUMBER
+            chunk = terminal_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                f"UPDATE dead_letter_events SET terminal = 1 "
+                f"WHERE id IN ({placeholders})",
+                chunk,
+            )
+            marked += len(chunk)
+        logger.info(
+            "Marked %d dead-lettered event(s) terminal (past retention + %dd; "
+            "the server will never accept them). They are RETAINED and still "
+            "counted — this only takes them out of the replay's candidate scan.",
+            marked, self._REPLAY_TERMINAL_MARGIN_DAYS,
         )
-        prune_stamps.sort()
-        span = (
-            f"{prune_stamps[0]}..{prune_stamps[-1]}" if prune_stamps else "unknown"
-        )
-        logger.warning(
-            "Pruned %d dead-lettered event(s) the server can never accept "
-            "(older than retention + %dd). This is activity that was captured "
-            "and never delivered; the events are gone, this line is the record. "
-            "buckets=%s span=%s",
-            len(prune_ids), self._REPLAY_PRUNE_MARGIN_DAYS,
-            ",".join(sorted(prune_buckets)) or "unknown", span,
-        )
-        return len(prune_ids)
+        return marked
 
     def requeue_storable_dead_letter(
         self,
@@ -1176,7 +1203,11 @@ class OfflineQueue:
         if min_dead_age_seconds is None:
             min_dead_age_seconds = self._DEAD_LETTER_REPLAY_COOLDOWN_SECONDS
         stale_cutoff = now - timedelta(days=stale_after_days)
-        prune_cutoff = stale_cutoff - timedelta(days=self._REPLAY_PRUNE_MARGIN_DAYS)
+        # Anchored to the module constant, NOT stale_after_days — see the
+        # marking branch below for why the caller's window must not move it.
+        terminal_cutoff = now - timedelta(
+            days=EVENT_RETENTION_DAYS + self._REPLAY_TERMINAL_MARGIN_DAYS
+        )
         cooldown_cutoff = (now - timedelta(seconds=min_dead_age_seconds)).isoformat()
         requeued_at = now.isoformat()
 
@@ -1214,7 +1245,8 @@ class OfflineQueue:
                     "cycle — never dropped to make room.",
                     self.max_size - headroom, self.max_size,
                 )
-                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0,
+                        "marked_terminal": 0}
             effective_limit = min(limit, headroom)
 
             # Only rows that have sat past the cooldown are candidates. The
@@ -1241,9 +1273,7 @@ class OfflineQueue:
             # bounds per-cycle cost on a large table.
             move_ids: list[int] = []
             new_rows: list[tuple] = []
-            prune_ids: list[int] = []
-            prune_stamps: list[str] = []
-            prune_buckets: set[str] = set()
+            terminal_ids: list[int] = []
             examined = 0
             cursor_key = None
             while len(new_rows) < effective_limit and examined < self._REPLAY_MAX_SCAN:
@@ -1252,7 +1282,7 @@ class OfflineQueue:
                     cursor.execute(
                         """
                         SELECT id, event_data, dropped_at FROM dead_letter_events
-                        WHERE dropped_at <= ?
+                        WHERE dropped_at <= ? AND terminal = 0
                         ORDER BY dropped_at ASC, id ASC
                         LIMIT ?
                         """,
@@ -1262,7 +1292,7 @@ class OfflineQueue:
                     cursor.execute(
                         """
                         SELECT id, event_data, dropped_at FROM dead_letter_events
-                        WHERE dropped_at <= ?
+                        WHERE dropped_at <= ? AND terminal = 0
                           AND (dropped_at, id) > (?, ?)
                         ORDER BY dropped_at ASC, id ASC
                         LIMIT ?
@@ -1297,41 +1327,49 @@ class OfflineQueue:
                     # restamped ``dropped_at``, restarting the cooldown, so the
                     # loop repeated every 30 min for the full retention window.
                     if not is_event_storable(ev, stale_cutoff=stale_cutoff):
-                        # Terminal AND long past any use: prune, so terminal
-                        # rows cannot accumulate at the head of this ordering
-                        # and starve the scan the way they starved the fixed
-                        # window. Bounded strictly by timestamp age. An
-                        # unparseable row (ev is None) is NEVER pruned — its
-                        # timestamp cannot be read, and it is the only trace of
-                        # a serialisation bug.
-                        if isinstance(ev, dict) and not _timestamp_within(
-                            ev.get("timestamp"), prune_cutoff
-                        ):
-                            prune_ids.append(dead_id)
-                            ts = ev.get("timestamp")
-                            if ts:
-                                prune_stamps.append(str(ts))
-                            bid = ev.get("bucket_id")
-                            if bid:
-                                prune_buckets.add(str(bid).rsplit("_", 1)[0])
+                        # Mark - never delete - a row the server can never
+                        # accept again, so it leaves the candidate ordering
+                        # instead of holding its slot forever.
+                        #
+                        # The predicate must be POSITIVE: parse the timestamp,
+                        # require the parse to SUCCEED, then require it to be
+                        # old. `not _timestamp_within(...)` is not that test —
+                        # it returns False for a missing, null, wrong-typed or
+                        # unparseable timestamp too, so "provably ancient" and
+                        # "age unreadable" collapse into one branch. Measured on
+                        # the first version of this fix: six rows with
+                        # unreadable timestamps were marked terminal, including
+                        # one captured an hour earlier, because the code had no
+                        # evidence of their age at all and acted anyway.
+                        #
+                        # An unreadable timestamp is the likely shape of a
+                        # serialisation bug and must stay visible and
+                        # replayable, so it is deliberately NOT marked.
+                        #
+                        # Anchored to EVENT_RETENTION_DAYS, never to the
+                        # caller's stale_after_days: a caller may legitimately
+                        # shrink the window for a SKIP (reversible), and must
+                        # not thereby widen a durable mark.
+                        parsed = _parse_timestamp(ev.get("timestamp")) if isinstance(ev, dict) else None
+                        if parsed is not None and parsed < terminal_cutoff:
+                            terminal_ids.append(dead_id)
                         continue
                     move_ids.append(dead_id)
                     # Re-enter with a fresh created_at and retry_count 0.
                     new_rows.append((raw, requeued_at))
 
             if examined == 0:
-                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0}
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0,
+                        "marked_terminal": 0}
 
-            pruned = self._prune_terminal_rows(
-                cursor, prune_ids, prune_stamps, prune_buckets
-            )
+            marked = self._mark_terminal_rows(cursor, terminal_ids)
 
             if not move_ids:
                 return {
                     "examined": examined,
                     "requeued": 0,
                     "skipped_unstorable": examined,
-                    "pruned": pruned,
+                    "marked_terminal": marked,
                 }
 
             cursor.executemany(
@@ -1355,7 +1393,7 @@ class OfflineQueue:
             "examined": examined,
             "requeued": requeued,
             "skipped_unstorable": examined - requeued,
-            "pruned": pruned,
+            "marked_terminal": marked,
         }
 
     def size(self) -> int:

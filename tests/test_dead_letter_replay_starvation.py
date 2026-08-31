@@ -121,8 +121,99 @@ class TestBacklogConverges:
             )
             if result["requeued"] == 1:
                 return  # converged
-            assert result["pruned"] > 0, (
-                f"cycle {cycle} made NO progress: {result}. The backlog is not "
+            assert result["marked_terminal"] > 0, (
+                f"cycle {cycle} made NO progress: {result}. The candidate set is not "
                 "shrinking, so this is permanent starvation, not slow recovery."
             )
         pytest.fail("did not recover within 5 cycles")
+
+
+class TestUnreadableTimestampsAreNeverMarked:
+    """The fixture class the first version of this fix did not have.
+
+    That version marked-and-DELETED on `not _timestamp_within(...)`, which is
+    False for a missing, null, wrong-typed or unparseable timestamp as well as
+    for a genuinely old one — so "provably ancient" and "age unreadable"
+    collapsed into one branch. Six rows with unreadable timestamps were deleted,
+    including one captured an hour earlier.
+
+    It survived its own test file because every fixture there built events
+    through one helper that always emitted `ts.isoformat()`: the only two inputs
+    the file could produce were the two where a correct rule and a broken one
+    agree. These cases are the ones that disagree.
+    """
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.queue = OfflineQueue(db_path=Path(self.temp_dir) / "q.db", max_size=1000)
+        self.now = datetime.now(timezone.utc)
+
+    def teardown_method(self):
+        self.queue.close()
+
+    def _dead_letter(self, extra):
+        self.queue.enqueue([{"duration": 60, "bucket_id": "bf-status_h", **extra}])
+        ids = [e.id for e in self.queue.dequeue(batch_size=1)]
+        for _ in range(5):
+            self.queue.increment_retry(ids, "API error (422): rejected")
+        self.queue.remove_failed(max_retries=5, last_error="generic")
+
+    @pytest.mark.parametrize("label,payload", [
+        ("absent",        {}),
+        ("null",          {"timestamp": None}),
+        ("epoch int",     {"timestamp": 1756641600}),
+        ("epoch float",   {"timestamp": 1756641600.5}),
+        ("empty string",  {"timestamp": ""}),
+        ("rfc1123",       {"timestamp": "Sun, 31 Aug 2026 11:00:00 GMT"}),
+        ("nested dict",   {"timestamp": {"$date": "2026-08-31T11:00:00+00:00"}}),
+    ])
+    def test_an_unreadable_timestamp_is_retained_and_not_marked(self, label, payload):
+        self._dead_letter(payload)
+
+        self.queue.requeue_storable_dead_letter(
+            now=self.now + timedelta(hours=1), min_dead_age_seconds=0
+        )
+
+        assert self.queue.dead_letter_count() == 1, (
+            f"{label}: the row was DELETED — its age was never readable, so "
+            "nothing justified acting on it"
+        )
+        with self.queue._cursor() as cur:
+            flags = [r[0] for r in cur.execute(
+                "SELECT terminal FROM dead_letter_events")]
+        assert flags == [0], (
+            f"{label}: marked terminal on an unreadable timestamp — this is the "
+            "likely shape of a serialisation bug and must stay replayable"
+        )
+
+    def test_a_provably_old_timestamp_IS_marked(self):
+        """The positive control: without this, the test above passes for a rule
+        that never marks anything."""
+        self._dead_letter(
+            {"timestamp": (self.now - timedelta(days=30)).isoformat()}
+        )
+
+        result = self.queue.requeue_storable_dead_letter(
+            now=self.now + timedelta(hours=1), min_dead_age_seconds=0
+        )
+
+        assert result["marked_terminal"] == 1
+        assert self.queue.dead_letter_count() == 1, "marking must never delete"
+
+    def test_the_caller_window_cannot_widen_the_mark(self):
+        """`stale_after_days` legitimately shrinks the SKIP window, which is
+        reversible. It must not move the durable mark: a 10-day-old row is
+        skipped under stale_after_days=1 but must NOT be marked terminal."""
+        self._dead_letter(
+            {"timestamp": (self.now - timedelta(days=10)).isoformat()}
+        )
+
+        result = self.queue.requeue_storable_dead_letter(
+            now=self.now + timedelta(hours=1),
+            min_dead_age_seconds=0,
+            stale_after_days=1,
+        )
+
+        assert result["marked_terminal"] == 0, (
+            "a caller-supplied window moved the durable mark"
+        )
