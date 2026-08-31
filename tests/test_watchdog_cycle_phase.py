@@ -11,23 +11,32 @@ abandoned by _acquire_sync_slot's takeover keeps running, and an instance
 attribute would let that zombie overwrite its successor's phase.
 """
 
-import time
 from unittest.mock import Mock
 
 from src.main import _CyclePhase
 
 from ._watchdog_harness import CoordinatorHarness, _ok_stats
 
-_OVERRUN = 1.2
-
 
 class TestCyclePhase(CoordinatorHarness):
+    """Each overrunning stage below WAITS for the watchdog Timer instead of
+    sleeping 1.2s and hoping it fired inside that window.
+
+    A wall-clock margin is a bet on the slowest machine that will ever run the
+    suite — the bet that killed the v1.5.122 build in
+    tests/test_watchdog_overrun_outcome.py, and that is still what a
+    time.sleep(_OVERRUN) here is. Blocking on the Timer's own fire-time report
+    makes a loaded machine wait longer rather than report phase='unknown'.
+    """
+
     def test_a_fresh_box_starts_at_startup(self):
         assert _CyclePhase().name == "startup"
 
     def test_overrun_inside_sync_reports_phase_sync(self):
+        fired = self.watchdog_signal()
+
         def _slow_sync(*_a, **_k):
-            time.sleep(_OVERRUN)
+            fired.wait()
             return _ok_stats()
 
         self.sync_engine.sync.side_effect = _slow_sync
@@ -41,8 +50,10 @@ class TestCyclePhase(CoordinatorHarness):
         """The discriminating case: if the stamp were only ever set to 'sync',
         the test above would pass and this one would not."""
 
+        fired = self.watchdog_signal()
+
         def _slow_health():
-            time.sleep(_OVERRUN)
+            fired.wait()
             return True
 
         self.coord._monitor_capture_health = Mock(side_effect=_slow_health)
@@ -56,8 +67,10 @@ class TestCyclePhase(CoordinatorHarness):
         """Global constraint: adding context must not move the fingerprint,
         level or message of the group that already holds 34 occurrences."""
 
+        fired = self.watchdog_signal()
+
         def _slow_sync(*_a, **_k):
-            time.sleep(_OVERRUN)
+            fired.wait()
             return _ok_stats()
 
         self.sync_engine.sync.side_effect = _slow_sync

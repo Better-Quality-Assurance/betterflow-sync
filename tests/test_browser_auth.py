@@ -14,6 +14,29 @@ from src.auth.browser_auth import (
 )
 from src.auth.pkce import generate_pkce_pair
 
+# Generous by design: it is only ever reached when flow.start() genuinely never
+# opened the browser, which is a real failure. See _browser_opened.
+_OPEN_WAIT_SECONDS = 15.0
+
+
+def _browser_opened(mock_browser):
+    """An Event set when flow.start() actually calls webbrowser.open().
+
+    The callback simulators below used to time.sleep(0.1) and then read
+    mock_browser.call_args, betting that the main thread had reached
+    webbrowser.open() inside 100ms. Lose that bet and call_args is None, the
+    simulator dies on a TypeError in a daemon thread nobody joins, no callback
+    is ever made, and flow.start() returns error="timeout" — a red test that
+    names the SUT rather than the fixture.
+
+    start() binds and serves the callback server BEFORE opening the browser
+    (browser_auth.py: HTTPServer -> serve_forever thread -> webbrowser.open),
+    so this Event is also proof the port is listening.
+    """
+    opened = threading.Event()
+    mock_browser.side_effect = lambda *_a, **_k: opened.set()
+    return opened
+
 
 class TestPKCEGeneration:
     """Tests for PKCE code generation."""
@@ -242,14 +265,16 @@ class TestBrowserAuthFlow:
     def test_start_returns_code_and_verifier(self, mock_browser):
         """Test successful flow returns code and verifier."""
         flow = BrowserAuthFlow("https://betterflow.eu/sync/auth/authorize")
-        flow.TIMEOUT_SECONDS = 2
+        flow.TIMEOUT_SECONDS = 30
+
+        opened = _browser_opened(mock_browser)
 
         def simulate_callback():
-            """Simulate browser callback after short delay."""
-            import time
+            """Simulate the browser callback once the browser has been opened."""
             import requests
 
-            time.sleep(0.1)
+            if not opened.wait(_OPEN_WAIT_SECONDS):
+                return  # start() never opened the browser; it will report timeout
             # Extract port from browser URL
             url = mock_browser.call_args[0][0]
             port = url.split("callback_port=")[1].split("&")[0]
@@ -280,14 +305,16 @@ class TestBrowserAuthFlow:
     def test_start_state_mismatch_returns_failure(self, mock_browser):
         """Test state mismatch returns failure."""
         flow = BrowserAuthFlow("https://betterflow.eu/sync/auth/authorize")
-        flow.TIMEOUT_SECONDS = 2
+        flow.TIMEOUT_SECONDS = 30
+
+        opened = _browser_opened(mock_browser)
 
         def simulate_wrong_state_callback():
-            """Simulate callback with wrong state."""
-            import time
+            """Simulate callback with wrong state, once the browser is open."""
             import requests
 
-            time.sleep(0.1)
+            if not opened.wait(_OPEN_WAIT_SECONDS):
+                return
             url = mock_browser.call_args[0][0]
             port = url.split("callback_port=")[1].split("&")[0]
 
@@ -312,14 +339,16 @@ class TestBrowserAuthFlow:
     def test_start_error_callback_returns_failure(self, mock_browser):
         """Test error callback returns failure with error message."""
         flow = BrowserAuthFlow("https://betterflow.eu/sync/auth/authorize")
-        flow.TIMEOUT_SECONDS = 2
+        flow.TIMEOUT_SECONDS = 30
+
+        opened = _browser_opened(mock_browser)
 
         def simulate_error_callback():
-            """Simulate OAuth error callback."""
-            import time
+            """Simulate the OAuth error callback, once the browser is open."""
             import requests
 
-            time.sleep(0.1)
+            if not opened.wait(_OPEN_WAIT_SECONDS):
+                return
             url = mock_browser.call_args[0][0]
             port = url.split("callback_port=")[1].split("&")[0]
             state = url.split("state=")[1].split("&")[0]

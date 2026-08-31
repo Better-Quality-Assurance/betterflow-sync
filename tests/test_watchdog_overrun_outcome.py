@@ -8,8 +8,8 @@ The predicate is `elapsed >= deadline`, deliberately NOT "did the watchdog
 fire": deriving it from elapsed avoids racing the in-flight Timer thread, and
 means most of these tests never need the timer to fire at all.
 
-Duration is SCRIPTED, not slept
--------------------------------
+Duration is SCRIPTED, not slept; the Timer is WAITED FOR, not slept past
+-----------------------------------------------------------------------
 These tests used to choose a band by sleeping inside sync() and letting the
 real clock decide which band the cycle landed in. That cannot work at test
 scale: the bands are ratios of the deadline, so with TEST_DEADLINE = 0.3 the
@@ -23,16 +23,22 @@ validating on an idle laptop, which proved nothing about the runner. There is
 no sleep duration that fixes this, because any wall-clock margin is a bet on
 the slowest machine that will ever run the suite.
 
-So the duration _do_sync MEASURES now comes from a scripted clock
+So the duration _do_sync MEASURES comes from a scripted clock
 (`_ScriptedClock`, driving `SyncCoordinator._monotonic`) and is exact on any
 machine, while the duration the cycle really TAKES is a separate knob used
-only by the tests that need the watchdog Timer to have fired. Those get a
-generous multiple of the deadline (`_TIMER_SLEEP`, 3x) rather than a marginal
-one, because that margin is the only wall-clock dependency left in this file.
+only by the tests that need the watchdog Timer to have fired.
+
+That knob used to be a generous multiple of the deadline (`_TIMER_SLEEP`, 3x),
+described here as the only wall-clock dependency left in the file. It is now
+not a duration at all: those cycles BLOCK on the Timer's own fire-time report
+(`WatchdogSignal`). 3x was chosen as four times the worst overhead the runner
+had been SEEN to add, which is the same shape of bet as the 45ms margin the
+paragraph above rejects — just with better odds. Waiting on the condition
+removes the bet rather than improving it, and a loaded machine now waits
+longer instead of reporting phase_at_deadline='unknown'.
 """
 
 import threading
-import time
 
 import src.main as main_module
 from src.error_reporter import ErrorReporter
@@ -52,12 +58,6 @@ MODERATE_ELAPSED = 0.42  # 1.40x -> "0.4"
 SEVERE_ELAPSED = 0.81  # 2.70x -> "0.8"
 HEALTHY_ELAPSED = 0.02  # 0.07x -> no report at all
 
-# How long a cycle really runs when a test needs the Timer to have fired. 3x
-# the deadline, so there is 0.6s of slack on a deadline of 0.3 — four times the
-# worst overhead the CI runner has been seen to add. Deliberately generous: the
-# consequence of it being marginal is a phase_at_deadline of 'unknown', which
-# reads as a product defect rather than as the timing artifact it would be.
-_TIMER_SLEEP = 0.9
 
 
 def _outcome_captures(recorder):
@@ -112,18 +112,22 @@ class _Harness(CoordinatorHarness):
             "was added"
         )
 
-    def run_cycle(self, reports, real_sleep=0.0):
-        """Measured as `reports`; really takes `real_sleep`.
+    def run_cycle(self, reports, await_timer=False):
+        """Measured as `reports`; blocks in sync() until the Timer has fired if
+        `await_timer`.
 
-        Pass real_sleep=_TIMER_SLEEP only when the test needs the watchdog
-        Timer to have fired (i.e. it asserts on phase_at_deadline, or on the
-        fire-time report the Timer emits). Everything else leaves it at 0 and
-        runs in microseconds.
+        Pass await_timer=True only when the test needs the watchdog Timer to
+        have fired (i.e. it asserts on phase_at_deadline, or on the fire-time
+        report the Timer emits). Everything else leaves it False and runs in
+        microseconds.
         """
+        fired = self.watchdog_signal() if await_timer else None
+        if fired is not None:
+            fired.rearm()  # a second cycle must wait for ITS own firing
 
         def _sync(*_a, **_k):
-            if real_sleep:
-                time.sleep(real_sleep)
+            if fired is not None:
+                fired.wait()
             return _ok_stats()
 
         self.sync_engine.sync.side_effect = _sync
@@ -156,7 +160,7 @@ class TestOverrunIsMeasured(_Harness):
         assert self.recorder.by_fingerprint(MODERATE) == []
 
     def test_the_report_carries_the_elapsed_time_and_the_phase(self):
-        self.run_cycle(MODERATE_ELAPSED, real_sleep=_TIMER_SLEEP)
+        self.run_cycle(MODERATE_ELAPSED, await_timer=True)
 
         got = self.recorder.by_fingerprint(MODERATE)[0]
         assert got["context"]["phase_at_deadline"] == "sync"
@@ -208,7 +212,7 @@ class TestOverrunIsMeasured(_Harness):
         Needs the Timer, and asserts the deadline phase positively — a cycle
         where the Timer never fired would report 'unknown', which also differs
         from 'hours_fetch' and would pass this vacuously."""
-        self.run_cycle(MODERATE_ELAPSED, real_sleep=_TIMER_SLEEP)
+        self.run_cycle(MODERATE_ELAPSED, await_timer=True)
 
         got = self.recorder.by_fingerprint(MODERATE)[0]
         assert got["context"]["phase_at_deadline"] == "sync"
@@ -222,8 +226,10 @@ class TestOverrunIsMeasured(_Harness):
         agreement-region trap: test-fixture-discipline.md Phantom 12). This is
         the one fixture where the deadline is breached in a DIFFERENT phase,
         so only this test can tell a real snapshot from a constant."""
+        fired = self.watchdog_signal()
+
         def _slow_health():
-            time.sleep(_TIMER_SLEEP)
+            fired.wait()
             return True
 
         self.coord._monitor_capture_health = _slow_health
@@ -250,8 +256,10 @@ class TestOverrunIsMeasured(_Harness):
         (the same agreement-region shape as the capture_health test above,
         this time on the exit field). aw_bucket_fetch_failed returns _do_sync
         right after the post_sync stamp, before hours_fetch is ever reached."""
+        fired = self.watchdog_signal()
+
         def _slow_failed_sync(*_a, **_k):
-            time.sleep(_TIMER_SLEEP)
+            fired.wait()
             stats = _ok_stats()
             stats.aw_bucket_fetch_failed = True
             return stats
@@ -368,7 +376,7 @@ class TestExistingReportsAreUnchanged(_Harness):
         """The outcome report is additive. The group that already holds 34
         occurrences must keep firing exactly as before. Emitted by the Timer
         thread, so this one genuinely has to outlive the deadline."""
-        self.run_cycle(MODERATE_ELAPSED, real_sleep=_TIMER_SLEEP)
+        self.run_cycle(MODERATE_ELAPSED, await_timer=True)
 
         hung = self.recorder.by_fingerprint("sync-watchdog-timeout")
         assert len(hung) == 1, self.recorder.captures
@@ -453,8 +461,8 @@ class TestEveryOverrunIsCounted(_Harness):
 
         Both cycles must genuinely fire the Timer, or a single 'Sync hung'
         would mean 'suppressed once' and 'only fired once' indistinguishably."""
-        self.run_cycle(MODERATE_ELAPSED, real_sleep=_TIMER_SLEEP)
-        self.run_cycle(MODERATE_ELAPSED, real_sleep=_TIMER_SLEEP)
+        self.run_cycle(MODERATE_ELAPSED, await_timer=True)
+        self.run_cycle(MODERATE_ELAPSED, await_timer=True)
         self._drain()
 
         hung = [p for p in self.posted if p["message"].startswith("Sync hung")]

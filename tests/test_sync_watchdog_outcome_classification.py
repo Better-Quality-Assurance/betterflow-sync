@@ -23,7 +23,6 @@ reporter actually captured — never on arguments forwarded between functions
 """
 
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -37,11 +36,11 @@ from src.sync.http_client import (
     transient_failure_count,
 )
 from src.sync.sync_engine import SyncEngine
+from tests._watchdog_harness import WatchdogSignal
 
 # Shrunk deadline so the watchdog fires inside a test, not in 150s. The
 # production value is pinned by tests/test_sync_watchdog_budget.py.
 _TEST_DEADLINE = 0.3
-_OVERRUN = 1.2  # comfortably past _TEST_DEADLINE, so the watchdog always fires
 
 
 def _ok_stats():
@@ -135,12 +134,20 @@ class _CoordinatorHarness:
         self.coord._DO_SYNC_DEADLINE = _TEST_DEADLINE
 
     def _run_overrunning_cycle(self, before_overrun=None):
-        """Drive one real _do_sync whose body outlives the watchdog deadline."""
+        """Drive one real _do_sync whose body outlives the watchdog deadline.
+
+        The body waits for the watchdog Timer to have FIRED rather than
+        sleeping a fixed 1.2s and assuming it did. A wall-clock margin is a bet
+        on the slowest machine that will ever run the suite; overshoot it here
+        and the cycle finishes before the Timer runs, so no report is captured
+        at all and every assertion below fails as if the classifier were broken.
+        """
+        fired = WatchdogSignal(self.coord.error_reporter)
 
         def _slow_sync(*_args, **_kwargs):
             if before_overrun is not None:
                 before_overrun()
-            time.sleep(_OVERRUN)
+            fired.wait()
             return _ok_stats()
 
         self.sync_engine.sync.side_effect = _slow_sync
