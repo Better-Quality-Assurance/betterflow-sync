@@ -225,7 +225,17 @@ class SystemEventHandler:
         self.tray.set_state(TrayState.SYNCING)
         self.reminder_manager.on_tracking_started()
         self.coordinator.trigger_sync("unlock_sync")
-        send_notification("Welcome back!", _day_greeting(), sound=False)
+        # Coalesced (#221): this fires on EVERY unlock -- 18 times in one
+        # measured day -- and nothing reads its outcome. A stable key makes
+        # macOS replace the previous one instead of stacking another, which
+        # matters because the same channel carries the Rosetta and
+        # Accessibility notices a user must actually read.
+        #
+        # Distinct from the once-per-session greeting in main.py, which DOES
+        # read the delivery verdict and therefore keeps its unique identifier.
+        send_notification(
+            "Welcome back!", _day_greeting(), sound=False, coalesce_key="welcome-back"
+        )
 
     def on_network_change(self, is_online: bool) -> None:
         """Handle network connectivity change."""
