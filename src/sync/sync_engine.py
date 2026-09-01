@@ -4029,6 +4029,12 @@ class SyncEngine:
                 logger.warning(
                     f"Agent {AGENT_VERSION} is below minimum {min_version} — update required"
                 )
+                # Off-device too. Both actions below are LOCAL — a log nobody
+                # pulls and a staged update that may keep failing — so a device
+                # stuck under the floor was invisible to ops for days. #211
+                # caught one at 1.5.119 against a 1.5.124 floor, losing
+                # window-title categorisation the whole time.
+                self._report_below_minimum(min_version)
                 # Act on it, don't just log: stage the latest build now (applied
                 # on next idle) so a server-pushed urgent fix lands in minutes
                 # instead of waiting up to 6h for the periodic check. The handler
@@ -4185,6 +4191,44 @@ class SyncEngine:
     # -> "server status 137", on a string that says it is not a rejection).
     # Both were live before this anchor existed.
     _SERVER_STATUS_RE = _SERVER_STATUS_RE
+
+    def _report_below_minimum(self, min_version: str) -> None:
+        """Tell ops this device is running under the server's version floor.
+
+        The two existing responses are local: a warning in a log that is only
+        uploaded on request, and a staged update that a broken updater may never
+        apply. So "this machine has been stuck for days" was answerable only by
+        visiting it — the fail-closed test ("if this failed, would anything be
+        different?") answered no.
+
+        DURATION IS DELIBERATELY NOT TRACKED HERE. The ops ingest keys by
+        fingerprint and records first_seen/last_seen, so "below the floor for
+        more than a day" is a question the monitor answers from the report
+        stream. Persisting a first-seen timestamp on the device would need its
+        own table, would reset whenever the queue DB is rebuilt, and would
+        answer worse a question the ingest already answers for free.
+
+        Hourly dedup rather than the reporter's 300s default: this is a
+        slow-moving condition, and one report an hour is enough to establish a
+        span without burying the ingest.
+
+        Swallowed on failure — telemetry must never break the heartbeat it
+        rides on.
+        """
+        if self.error_reporter is None:
+            return
+        try:
+            self.error_reporter.capture(
+                f"Agent {AGENT_VERSION} is below the server minimum "
+                f"{min_version} and is still running — the update has not "
+                f"applied. Window-title categorisation degrades while stuck.",
+                level="warning",
+                tags={"component": "self-update"},
+                fingerprint="agent-below-minimum-version",
+                dedup_window=3600.0,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("below-minimum report failed", exc_info=True)
 
     @staticmethod
     def _dropped_reason_code(last_errors) -> str:
