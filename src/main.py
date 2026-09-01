@@ -3584,7 +3584,16 @@ class BetterFlowApp:
         self.sync_engine.pause()
         self.tray.set_paused(True)
         self.reminder_manager.on_tracking_stopped()
-        send_notification("Tracking Paused", "Your activity is no longer being recorded.", sound=False)
+        # Paused/Resumed share ONE key (#221): they are two values of the same
+        # state, so the later must replace the earlier rather than sit under
+        # it. A user who pauses and resumes four times should see the current
+        # state once, not eight entries.
+        send_notification(
+            "Tracking Paused",
+            "Your activity is no longer being recorded.",
+            sound=False,
+            coalesce_key="tracking-state",
+        )
         logger.info("Tracking paused")
 
     def _on_resume(self) -> None:
@@ -3593,7 +3602,12 @@ class BetterFlowApp:
         self.sync_engine.resume()
         self.tray.set_paused(False)
         self.reminder_manager.on_tracking_started()
-        send_notification("Tracking Resumed", "Your activity is being recorded again.", sound=False)
+        send_notification(
+            "Tracking Resumed",
+            "Your activity is being recorded again.",
+            sound=False,
+            coalesce_key="tracking-state",
+        )
         logger.info("Tracking resumed")
 
     def _on_project_change(self, project: Optional[dict]) -> None:
@@ -3614,7 +3628,12 @@ class BetterFlowApp:
             self.tray.set_paused(True)
             self.reminder_manager.on_tracking_stopped()
             self.reminder_manager.on_private_started()
-            send_notification("Private Time", "Tracking is paused — your activity is private.", sound=False)
+            send_notification(
+                "Private Time",
+                "Tracking is paused — your activity is private.",
+                sound=False,
+                coalesce_key="private-time",
+            )
         else:
             logger.info("Private time ended — recording resumed")
             self._set_user_paused(False)
@@ -3623,7 +3642,12 @@ class BetterFlowApp:
             self.tray.set_paused(False)
             self.reminder_manager.on_private_ended()
             self.reminder_manager.on_tracking_started()
-            send_notification("Private Time Ended", "Tracking has resumed.", sound=False)
+            send_notification(
+                "Private Time Ended",
+                "Tracking has resumed.",
+                sound=False,
+                coalesce_key="private-time",
+            )
 
     def _auto_end_private(self, elapsed_seconds: float) -> None:
         """End Private Time the same way the user toggle does, with a message

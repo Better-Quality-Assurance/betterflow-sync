@@ -161,7 +161,7 @@ def _try_load_macos_pyobjc() -> bool:
 
 
 def send_notification(
-    title: str, message: str, sound: bool = True
+    title: str, message: str, sound: bool = True, coalesce_key: str | None = None
 ) -> NotificationOutcome:
     """Send a native OS notification and report what we know about it.
 
@@ -179,6 +179,14 @@ def send_notification(
         title: Notification title.
         message: Notification body text.
         sound: Whether to play a sound (macOS only).
+        coalesce_key: For ROUTINE, repeating notices. Posts under a stable
+            identifier so macOS REPLACES the previous notice of the same
+            kind instead of stacking another one (#221). Costs the delivery
+            verdict: with a stable id the read-back cannot tell this post's
+            record from the previous post's leftover, so the return is
+            ``UNKNOWN`` rather than ``DELIVERED``. Leave it None for any
+            notice carrying an instruction the agent cannot otherwise
+            deliver — those need the verdict more than they need tidiness.
 
     Returns:
         The strongest claim the platform actually supports. Only
@@ -190,7 +198,7 @@ def send_notification(
         if system == "Darwin":
             outcome = NotificationOutcome.UNKNOWN
             if _try_load_macos_pyobjc():
-                outcome = _send_macos_pyobjc(title, message, sound)
+                outcome = _send_macos_pyobjc(title, message, sound, coalesce_key)
                 if outcome is NotificationOutcome.DELIVERED:
                     return outcome
             # Reachable again. It never was while the pyobjc path returned a
@@ -249,7 +257,7 @@ def clear_notifications() -> None:
 
 
 def _send_macos_pyobjc(
-    title: str, message: str, sound: bool
+    title: str, message: str, sound: bool, coalesce_key: str | None = None
 ) -> NotificationOutcome:
     """Post a notification via NSUserNotification and verify it landed.
 
@@ -291,11 +299,27 @@ def _send_macos_pyobjc(
             except Exception as e:
                 logger.debug("Failed to attach notification icon: %s", e)
 
-        # Unique per send, so the read below is attributable to THIS post
-        # and macOS never coalesces two notices into one. Notifications
-        # posted before this change carry no identifier at all, which is
-        # why nothing could be attributed to a send.
-        marker = f"betterflow-{uuid.uuid4()}"
+        # THE IDENTIFIER DECIDES BOTH THINGS, AND THEY PULL OPPOSITE WAYS.
+        #
+        # Unique per send makes the read below attributable to THIS post,
+        # which is the whole basis of DELIVERED (#204). It is also exactly
+        # what tells macOS these are different notifications, so it never
+        # replaces an earlier one — 18 screen unlocks in one log produced 18
+        # separate "Welcome back!" entries (#221).
+        #
+        # That trains people to dismiss BetterFlow notifications without
+        # reading them, and this is the same channel that carries the Rosetta
+        # (#188) and Accessibility (#194, #205) notices — one-shot messages a
+        # user must read and act on, sitting in a stack of twenty routine
+        # ones. So the volume problem is a delivery problem for the notices
+        # that matter most.
+        #
+        # Split rather than pick one: routine repeating notices pass a
+        # coalesce_key and give up the verdict they never read; instruction
+        # notices keep the unique id and the verdict.
+        marker = (
+            f"betterflow-{coalesce_key}" if coalesce_key else f"betterflow-{uuid.uuid4()}"
+        )
         note.setIdentifier_(marker)
 
         center = NSUserNotificationCenter.defaultUserNotificationCenter()
@@ -308,6 +332,21 @@ def _send_macos_pyobjc(
     except Exception as e:
         logger.warning("pyobjc notification failed, will fall back: %s", e)
         return NotificationOutcome.FAILED
+
+    if coalesce_key:
+        # NOT VERIFIED, AND SAYING SO IS THE POINT (#221).
+        #
+        # A stable identifier is what makes macOS replace the previous notice,
+        # and it is also what makes the read-back unattributable: a hit could
+        # be this post's record or the leftover of the one it just replaced.
+        # Returning DELIVERED off that would be a guess wearing a verdict's
+        # clothes, which is the exact failure NotificationOutcome exists to
+        # close.
+        #
+        # UNKNOWN is honest and costs nothing real: the callers that pass a
+        # coalesce_key are routine notices whose return value nobody reads.
+        # Any caller that DOES need the verdict must not pass one.
+        return NotificationOutcome.UNKNOWN
 
     return _confirm_macos_delivery(marker)
 
