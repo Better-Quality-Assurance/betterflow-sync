@@ -608,6 +608,36 @@ class AWManager:
         with self._lifecycle_lock:
             was_active = self._inproc_afk_active
             self._inproc_afk_active = active
+
+            # RETRACT THE LATCH THIS SUBSYSTEM CAN NO LONGER SET (#2413).
+            #
+            # Both writes to `_idle_tracker_blind` -- the latch after
+            # IDLE_BLIND_RESTART_THRESHOLD failed restarts and the clear on
+            # recovery -- live inside `_restart_if_needed_locked`'s
+            # `if not self._inproc_afk_active` branch. So a device that latched
+            # blind while on the external bf-idle-tracker and then moved to
+            # in-process AFK kept publishing `idle_tracker_blind: true` with
+            # nothing on either side able to take it back: the agent cannot reach
+            # its own clear, and the server's readLatchedFlag falls back to the
+            # stored column when a heartbeat omits the key.
+            #
+            # `health_snapshot()` publishes the flag every cycle regardless of
+            # which AFK source is live, so an unretractable true is an alert that
+            # outlives the thing it describes.
+            #
+            # BEFORE the early return below, deliberately: that return is gated
+            # on `_stop_external_when_inproc`, and this defect does not depend on
+            # that setting. Putting the clear after it would fix the config we
+            # happen to run and leave the other one latched.
+            #
+            # Unconditional rather than transition-only. The latch is reachable
+            # only from the `not _inproc_afk_active` branch, so a transition-only
+            # clear would be sufficient -- but this is one boolean under a lock
+            # already held, and "cannot leave a stale latch" is worth more than
+            # the saved write.
+            if active:
+                self._idle_tracker_blind = False
+
             if not self._stop_external_when_inproc or active == was_active:
                 return
             if active:
