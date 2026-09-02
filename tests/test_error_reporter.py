@@ -266,3 +266,82 @@ class TestNonBlocking:
                 if t.name == "error-report":
                     t.join(timeout=5)
             post.assert_called_once()
+
+
+class TestPerCallWindowSurvivesPruning:
+    """A per-call `dedup_window` LONGER than the instance default has to
+    actually hold for its full length.
+
+    Pruning ran on `self._dedup_window` and deleted the entry BEFORE the
+    suppression check read it, so a 3600s request expired after 300s and the
+    fingerprint went back to sending. Nothing caught it because every fixture in
+    `TestDedupWindowOverride` sets the instance default to 10_000 -- larger than
+    any override it passes -- and none of them advances the clock, so pruning
+    can never evict anything there. Correct and broken behave identically in
+    that region.
+
+    The live caller is sync_engine's `agent-below-minimum-version` alert
+    (dedup_window=3600 against the 300s default), which is the only override in
+    the tree larger than the default. main.py's `dedup_window=0` is smaller, so
+    it was never affected.
+    """
+
+    def test_a_window_longer_than_the_default_is_not_pruned_early(self) -> None:
+        r = _reporter(dedup_window=300.0)
+        with patch("src.error_reporter.requests.post") as post, patch(
+            "src.error_reporter.time.monotonic"
+        ) as clock:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            clock.return_value = 1000.0
+            r.capture("stuck", fingerprint="fp", block=True, dedup_window=3600.0)
+            # Past the 300s instance default, well inside the 3600s asked for.
+            clock.return_value = 1000.0 + 305.0
+            r.capture("stuck", fingerprint="fp", block=True, dedup_window=3600.0)
+            assert post.call_count == 1
+
+    def test_a_realistic_heartbeat_cadence_sends_once_per_window_not_once_per_beat(
+        self,
+    ) -> None:
+        """The shape that made this operational: a ~5-minute heartbeat re-reports
+        the same fingerprint. Asking for 3600s must mean roughly one send an
+        hour, not one per beat."""
+        r = _reporter(dedup_window=300.0)
+        with patch("src.error_reporter.requests.post") as post, patch(
+            "src.error_reporter.time.monotonic"
+        ) as clock:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            t = 1000.0
+            for _ in range(24):  # 24 beats x 310s = 2h04m
+                clock.return_value = t
+                r.capture("stuck", fingerprint="fp", block=True, dedup_window=3600.0)
+                t += 310.0
+            # Two hours, 3600s window: 2 sends. Pre-fix this was 24.
+            assert post.call_count == 2
+
+    def test_the_entry_still_expires_at_its_own_window(self) -> None:
+        """The dict must stay bounded. An entry carrying a long window is kept
+        for that window and no longer -- it does not become permanent."""
+        r = _reporter(dedup_window=300.0)
+        with patch("src.error_reporter.requests.post") as post, patch(
+            "src.error_reporter.time.monotonic"
+        ) as clock:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            clock.return_value = 1000.0
+            r.capture("stuck", fingerprint="fp", block=True, dedup_window=3600.0)
+            clock.return_value = 1000.0 + 3601.0
+            r.capture("stuck", fingerprint="fp", block=True, dedup_window=3600.0)
+            assert post.call_count == 2
+
+    def test_a_default_window_entry_is_still_pruned_on_the_default(self) -> None:
+        """The allowance: an ordinary caller's entry must not be held for longer
+        than it asked for just because the storage now carries a window."""
+        r = _reporter(dedup_window=300.0)
+        with patch("src.error_reporter.requests.post") as post, patch(
+            "src.error_reporter.time.monotonic"
+        ) as clock:
+            post.return_value = MagicMock(status_code=200, text="ok")
+            clock.return_value = 1000.0
+            r.capture("ordinary", fingerprint="fp2", block=True)
+            clock.return_value = 1000.0 + 301.0
+            r.capture("ordinary", fingerprint="fp2", block=True)
+            assert post.call_count == 2
