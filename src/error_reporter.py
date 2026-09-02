@@ -78,7 +78,8 @@ class ErrorReporter:
         self._dedup_window = dedup_window
 
         # fingerprint -> monotonic timestamp of last send; guarded by _lock.
-        self._recent: dict[str, float] = {}
+        # fingerprint -> (monotonic timestamp, the window it was recorded under)
+        self._recent: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
 
     @property
@@ -144,21 +145,41 @@ class ErrorReporter:
         """True if this fingerprint hasn't been sent within the cooldown window.
 
         ``dedup_window`` overrides the instance default for this call only;
-        ``None`` means use the default. Pruning always uses the instance
-        default, since it only exists to bound the dict's growth.
+        ``None`` means use the default.
+
+        Each entry stores the window it was recorded under, and pruning keeps it
+        for the LONGER of that window and the instance default. Pruning on the
+        instance default alone deleted a longer-lived entry before the
+        suppression check below could read it, so a caller asking for 3600s got
+        300s of suppression and then started sending again -- on a ~5-minute
+        heartbeat that is one send per beat instead of one per hour.
+
+        The `max` is not belt-and-braces, it is the other half of the contract:
+        a `dedup_window=0` call still has to STAMP the fingerprint so the next
+        caller -- one that asked for nothing -- is suppressed by the instance
+        default. Pruning on the entry's own window alone would make a
+        zero-window entry instantly stale and let that next call through, which
+        is the override leaking into a caller that never used it.
+
+        Pruning exists only to bound the dict's growth, so it must never evict
+        something a later check could still need. Every entry does still expire.
         """
         window = self._dedup_window if dedup_window is None else dedup_window
         now = time.monotonic()
         with self._lock:
             # Prune stale entries so the dict can't grow without bound.
-            stale = [k for k, ts in self._recent.items() if now - ts > self._dedup_window]
+            stale = [
+                k
+                for k, (ts, w) in self._recent.items()
+                if now - ts > max(w, self._dedup_window)
+            ]
             for k in stale:
                 del self._recent[k]
 
             last = self._recent.get(key)
-            if last is not None and now - last < window:
+            if last is not None and now - last[0] < window:
                 return False
-            self._recent[key] = now
+            self._recent[key] = (now, window)
             return True
 
     def _build_payload(
