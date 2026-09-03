@@ -201,6 +201,24 @@ def send_notification(
                 outcome = _send_macos_pyobjc(title, message, sound, coalesce_key)
                 if outcome is NotificationOutcome.DELIVERED:
                     return outcome
+                if coalesce_key and outcome is not NotificationOutcome.FAILED:
+                    # A coalesced post is UNKNOWN BY CONSTRUCTION, not because
+                    # anything went wrong: the stable identifier that makes
+                    # macOS replace the previous notice is the same thing that
+                    # makes the read-back unattributable, so this branch
+                    # declined to guess. Falling through would read that
+                    # deliberate silence as "may not have arrived" and post the
+                    # notice a SECOND time via osascript -- which is the worst
+                    # copy available, because it is Script-Editor-attributed
+                    # (clear_notifications cannot remove it) and carries no
+                    # identifier (it cannot coalesce). That turns #221's
+                    # declutter into a permanent stack, at double the volume,
+                    # plus an osascript subprocess on every screen unlock.
+                    #
+                    # FAILED is excluded deliberately: there the mechanism
+                    # itself broke, nothing reached the user, and the second
+                    # channel is exactly what should run.
+                    return outcome
             # Reachable again. It never was while the pyobjc path returned a
             # bare True, so a suppressed notification had no second chance.
             # osascript posts under Script Editor's identity, which carries
