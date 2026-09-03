@@ -28,6 +28,10 @@ def test_restarts_stale_idle_tracker_in_external_mode():
     mgr = AWManager()
     mgr._using_external = True
     mgr._port_in_use = MagicMock(return_value=True)  # external server healthy
+    # ...and healthy means it ANSWERS, not merely that it holds the socket
+    # (#246). The comment above always claimed this; only the port was stubbed,
+    # because a held socket was all the code read.
+    mgr._server_responding = MagicMock(return_value=True)
     window = MagicMock()
     window.poll.return_value = None
     idle = MagicMock()

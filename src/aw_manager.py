@@ -1240,7 +1240,7 @@ class AWManager:
             # is, in fact, running an ARM ActivityWatch which just failed to
             # answer /info within 2s — visible, wrong for one cycle, and it
             # self-corrects on the next probe.
-            if server_already_running and self._server_responding():
+            if self._external_server_capturing():
                 # ...but an external server IS capturing on this port, so this
                 # is not a "capturing nothing" device. Verbatim the rule the
                 # download-failure branch below already applies: attach, log,
@@ -1317,7 +1317,7 @@ class AWManager:
                     self._download_retry_interval,
                 )
                 self._managed_components_unavailable = True
-                if server_already_running and self._server_responding():
+                if self._external_server_capturing():
                     # The comment above says "an attached external server still
                     # captures" and this branch did not carry it out: it left
                     # tracker_download_failed latched and _using_external False,
@@ -1334,7 +1334,18 @@ class AWManager:
                     self._using_external = True
                     self.tracker_download_failed = False
                     return True
-                return server_already_running
+                # RE-LATCH, symmetric with the clear above and with the Rosetta
+                # sibling's `else` forty lines up. #230 copied the clear and not
+                # this, so the clear from a PREVIOUS cycle of this same branch
+                # survived into one where nothing is capturing: the device kept
+                # publishing tracker_download_failed=False while recording
+                # nothing, for up to DOWNLOAD_RETRY_MAX_INTERVAL (an hour) per
+                # cycle, which the fleet's no-capture alert reads as healthy.
+                # Its own tests could not see it -- every fixture hard-set the
+                # flag True, so no test drove this branch twice.
+                self._using_external = False
+                self.tracker_download_failed = True
+                return False
             self._last_download_attempt = now
             logger.info("Tracker components not found, downloading...")
             install_dir = _get_install_dir()
@@ -1351,7 +1362,14 @@ class AWManager:
                     self._download_retry_interval * 2, DOWNLOAD_RETRY_MAX_INTERVAL
                 )
                 self._managed_components_unavailable = True
-                if server_already_running:
+                if self._external_server_capturing():
+                    # Asked, not assumed. This branch read the bare TCP connect
+                    # until #246: a socket held by a process that no longer
+                    # answers /api/0/info reported this device as started and
+                    # attached while it captured nothing. #233 closed this class
+                    # at two sites and its message said "the last two"; this was
+                    # the third.
+                    #
                     # An external server is already capturing on this port, so
                     # this is NOT a "capturing nothing" situation — only our
                     # managed watchers are unavailable. Log it; don't latch the
@@ -1370,13 +1388,27 @@ class AWManager:
                 self._dispatch_download_failure_report()
                 return False
 
-        if server_already_running:
+        if self._external_server_capturing():
             logger.info(
                 f"Tracker server already running on port {self.aw_port}, "
                 "using external instance"
             )
             self._using_external = True
         else:
+            if server_already_running:
+                # Held, but not answering. The widest member of this class and
+                # the only one needing no download failure and no Rosetta: with
+                # perfectly good binaries on disk we deferred to whatever owned
+                # the port, then ran our watchers into a server that answers
+                # nothing. Starting our own is the same thing we do when the
+                # port is free; if the corpse still holds the bind we fail
+                # loudly here instead of reporting a healthy attach.
+                logger.warning(
+                    "Port %s is held by a process that does not answer "
+                    "/api/0/info — starting our own trackers rather than "
+                    "attaching to it",
+                    self.aw_port,
+                )
             logger.info(f"Starting tracker components from {binaries_dir}")
 
             # Start server first
@@ -1699,8 +1731,11 @@ class AWManager:
         # special — otherwise fall through to watcher health/stale recovery,
         # which MUST run in external mode too. Returning early there was why a
         # blind/orphaned bf-idle-tracker never self-healed after an update.
-        if self._using_external and not self._port_in_use():
-            logger.warning("External tracker server no longer running — starting our own")
+        if self._using_external and not self._external_server_capturing():
+            logger.warning(
+                "External tracker server no longer answering /api/0/info — "
+                "starting our own"
+            )
             self._using_external = False
             return self._start_locked()
 
@@ -2093,6 +2128,24 @@ class AWManager:
         except Exception as e:
             logger.error(f"Failed to start {name}: {e}")
             return False
+
+    def _external_server_capturing(self) -> bool:
+        """True only if an external tracker server is ACTUALLY capturing here.
+
+        One rule for the question every attach point in this file asks. The
+        probe below was extracted by #213 "so the two callers cannot drift";
+        it did not drift, the CARVE-OUTS around it did. This same judgement
+        ended up written at four attach points in ``_start_locked`` plus the
+        recovery predicate in ``restart_if_needed``, and the copies disagreed:
+        two asked ``/api/0/info``, three trusted the bare TCP connect, and one
+        of the two that asked forgot to re-latch. Each disagreement shipped as
+        its own defect (#230's missing re-latch, #233's third site).
+
+        A held socket proves a PROCESS, never a CAPTURE, and the difference is
+        a device silently recording nothing. Both halves belong together, so
+        there is one place to be wrong.
+        """
+        return self._port_in_use() and self._server_responding()
 
     def _server_responding(self) -> bool:
         """True only if a tracker server ANSWERS ``/api/0/info`` on our port.

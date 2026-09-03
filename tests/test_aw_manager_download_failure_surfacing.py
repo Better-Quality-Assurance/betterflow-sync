@@ -19,11 +19,21 @@ def _join_report_threads():
             thread.join(timeout=5)
 
 
-def _failing_manager(monkeypatch, *, port_in_use=False, download=None):
+def _failing_manager(
+    monkeypatch, *, port_in_use=False, download=None, server_responding=None
+):
     mgr = AWManager(aw_port=5600)
     mgr.error_reporter = Mock()
     monkeypatch.setattr(mgr, "_get_binaries_dir", lambda: None)
     monkeypatch.setattr(mgr, "_port_in_use", lambda: port_in_use)
+    # These tests predate the attach points asking /api/0/info (#246). They
+    # stubbed the port alone because a held socket was all the code read, and
+    # every one of them MEANT "an external server is running" -- so the default
+    # answers that question the same way. Pass server_responding=False for the
+    # held-but-dead case, which the fixture could not express before.
+    if server_responding is None:
+        server_responding = port_in_use
+    monkeypatch.setattr(mgr, "_server_responding", lambda: server_responding)
     monkeypatch.setattr(
         "src.aw_manager._download_aw_binaries", download or (lambda _dir: False)
     )
