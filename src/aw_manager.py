@@ -1219,20 +1219,24 @@ class AWManager:
             # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
             # `server_already_running` is a TCP connect, and a held socket is
-            # NOT a running tracker. Here — and ONLY here — that distinction
-            # decides whether the user is told anything at all, so this branch
-            # pays for one HTTP ask before granting the carve-out.
+            # NOT a running tracker. This branch pays for one HTTP ask before
+            # granting the carve-out.
             #
-            # Why this branch and not the download-failure one below: the other
-            # paths use the port answer to decide whether to START something,
-            # and a hung-but-listening server there is recoverable — the
-            # unreachable watchdog escalates to force_restart(), which reaps the
-            # orphan and rebuilds (that is what its docstring describes). On a
-            # Rosetta-missing Mac there is no such recovery: _reap_orphan_
-            # processes is path-scoped to binaries_dir, and OUR binaries have
-            # never executed on this machine, so the listener is un-reapable by
-            # construction. The only decision left on this branch is what to
-            # TELL the person, and getting that wrong cost ~90 minutes once.
+            # It used to read "Here — and ONLY here", with a paragraph below
+            # explaining why the other paths could get away with the TCP answer
+            # because they only decide whether to START something. That was
+            # already half-false after #233. Today THIS branch and the two
+            # download-path attaches ask, through _external_server_capturing();
+            # the normal-path attach still does not, deliberately -- see the
+            # deferral note above it. So "only here" is wrong, and "every attach
+            # point asks" would be wrong too.
+            #
+            # What is still TRUE and specific to this branch: on a
+            # Rosetta-missing Mac the listener is un-reapable by construction --
+            # _reap_orphan_processes is path-scoped to binaries_dir and OUR
+            # binaries have never executed on this machine -- so the only
+            # decision left here is what to TELL the person, and getting that
+            # wrong cost ~90 minutes once.
             #
             # Failing this way is also the safe direction: a false "responding"
             # withholds the remedy (the regression below), while a false "not
@@ -1240,7 +1244,7 @@ class AWManager:
             # is, in fact, running an ARM ActivityWatch which just failed to
             # answer /info within 2s — visible, wrong for one cycle, and it
             # self-corrects on the next probe.
-            if server_already_running and self._server_responding():
+            if self._external_server_capturing():
                 # ...but an external server IS capturing on this port, so this
                 # is not a "capturing nothing" device. Verbatim the rule the
                 # download-failure branch below already applies: attach, log,
@@ -1317,7 +1321,7 @@ class AWManager:
                     self._download_retry_interval,
                 )
                 self._managed_components_unavailable = True
-                if server_already_running and self._server_responding():
+                if self._external_server_capturing():
                     # The comment above says "an attached external server still
                     # captures" and this branch did not carry it out: it left
                     # tracker_download_failed latched and _using_external False,
@@ -1334,7 +1338,18 @@ class AWManager:
                     self._using_external = True
                     self.tracker_download_failed = False
                     return True
-                return server_already_running
+                # RE-LATCH, symmetric with the clear above and with the Rosetta
+                # sibling's `else` forty lines up. #230 copied the clear and not
+                # this, so the clear from a PREVIOUS cycle of this same branch
+                # survived into one where nothing is capturing: the device kept
+                # publishing tracker_download_failed=False while recording
+                # nothing, for up to DOWNLOAD_RETRY_MAX_INTERVAL (an hour) per
+                # cycle, which the fleet's no-capture alert reads as healthy.
+                # Its own tests could not see it -- every fixture hard-set the
+                # flag True, so no test drove this branch twice.
+                self._using_external = False
+                self.tracker_download_failed = True
+                return False
             self._last_download_attempt = now
             logger.info("Tracker components not found, downloading...")
             install_dir = _get_install_dir()
@@ -1351,7 +1366,14 @@ class AWManager:
                     self._download_retry_interval * 2, DOWNLOAD_RETRY_MAX_INTERVAL
                 )
                 self._managed_components_unavailable = True
-                if server_already_running:
+                if self._external_server_capturing():
+                    # Asked, not assumed. This branch read the bare TCP connect
+                    # until #246: a socket held by a process that no longer
+                    # answers /api/0/info reported this device as started and
+                    # attached while it captured nothing. #233 closed this class
+                    # at two sites and its message said "the last two"; this was
+                    # the third.
+                    #
                     # An external server is already capturing on this port, so
                     # this is NOT a "capturing nothing" situation — only our
                     # managed watchers are unavailable. Log it; don't latch the
@@ -1370,6 +1392,45 @@ class AWManager:
                 self._dispatch_download_failure_report()
                 return False
 
+        # NOT _external_server_capturing(), and that is a DEFERRAL rather than
+        # an oversight. Every other attach point in this file asks /api/0/info;
+        # this one still trusts the bare TCP connect, so a port held by a
+        # process that answers nothing is still preferred over starting our own
+        # trackers. That is a real bug (a healthy machine runs its watchers into
+        # a server that answers nothing) and it is NOT fixed here.
+        #
+        # Asking here was written, measured and reverted twice. The problem is
+        # not the question, it is what you can do with a "no": the only answer
+        # available is to start our own server, it cannot bind a port somebody
+        # else owns, and `_wait_for_server` failing then runs the blanket
+        # `self.stop()` below. Both repairs made things WORSE than leaving it
+        # alone. Driven through main.py's real tick order against a corpse that
+        # releases the port at tick 4:
+        #
+        #   as-is (this code)     watchers=2 throughout, and recovers the
+        #                         moment the corpse dies
+        #   ask + blanket stop()  watchers=0
+        #   ask + skip the stop() watchers=0, AND a dead bf-data-service left
+        #                         in _processes, which disarms
+        #                         set_capture_suppressed's
+        #                         `elif not self._processes` rebuild route (:752)
+        #
+        # SCOPE OF THAT MEASUREMENT, because the first draft of this note
+        # overstated it and then prescribed work on the strength of the
+        # overstatement: it drove set_capture_suppressed and restart_if_needed
+        # only. It did NOT drive the unreachable watchdog, and force_restart()
+        # is a SECOND route into _start_locked -- main.py's
+        # `elif not self.aw.is_running()` is a SIBLING of the is_managing gate,
+        # not inside it, so after _AW_UNREACHABLE_ESCALATE_SECONDS (180s) it
+        # fires and rebuilds. Measured from the wedge state: force_restart ->
+        # _start_locked called, watchers restored. So both reverted variants
+        # cost an outage BOUNDED by that escalation, not a permanent one. They
+        # are still worse than this code, which never loses the watchers.
+        #
+        # The fix likely belongs at a DIFFERENT LAYER -- the rebuild route, or a
+        # spawn that reaps only the server it started -- but that is now an
+        # opinion rather than something the measurement establishes. Do not flip
+        # this line on its own; two attempts produced two different regressions.
         if server_already_running:
             logger.info(
                 f"Tracker server already running on port {self.aw_port}, "
@@ -1386,6 +1447,16 @@ class AWManager:
             # Wait for server to be ready
             if not self._wait_for_server():
                 logger.error("Tracker server failed to start")
+                # The blanket stop() is deliberate and load-bearing: emptying
+                # `_processes` is what re-arms set_capture_suppressed's
+                # `elif not self._processes` rebuild route (:752). A guard that
+                # skipped this to preserve watchers was tried and reverted -- it
+                # left a dead bf-data-service in `_processes` and disarmed that
+                # route, so the device sat with zero watchers until the 180s
+                # unreachable escalation fired force_restart (which IS a second
+                # route in; the first draft of this note wrongly called :752 the
+                # only one). Bounded, not permanent -- and still worse than
+                # keeping the watchers. See the deferral note above.
                 self.stop()
                 return False
 
@@ -1699,6 +1770,24 @@ class AWManager:
         # special — otherwise fall through to watcher health/stale recovery,
         # which MUST run in external mode too. Returning early there was why a
         # blind/orphaned bf-idle-tracker never self-healed after an update.
+        # DELIBERATELY the bare port read, not _external_server_capturing().
+        # Asking /api/0/info here was tried and reverted: on a HEALTHY shared
+        # ActivityWatch that missed two answers (a load spike, a wake from
+        # sleep, a long AW query) it dropped external mode, spawned our own
+        # server against the port that healthy server still owns, failed to
+        # bind, and the teardown below cleared every watcher. `is_managing`
+        # then reads False, so main.py's 60s tick stops calling this method and
+        # nothing re-enters the branch -- permanent, on a healthy machine, with
+        # both capture-dead flags reading False. Measured against a control
+        # that reverted only this predicate:
+        #
+        #   asked /info   rc=False  _using_external=False  watchers=[]
+        #   bare port     rc=True   _using_external=True   watchers=[2]
+        #
+        # A held socket is not a capture, AND one unanswered ask is not a
+        # vanished server. Making this ask needs a debounce (N consecutive
+        # non-answers, resetting on any success) so a blip cannot fire it; that
+        # is its own change with its own evidence, not a line to flip here.
         if self._using_external and not self._port_in_use():
             logger.warning("External tracker server no longer running — starting our own")
             self._using_external = False
@@ -2093,6 +2182,24 @@ class AWManager:
         except Exception as e:
             logger.error(f"Failed to start {name}: {e}")
             return False
+
+    def _external_server_capturing(self) -> bool:
+        """True only if an external tracker server is ACTUALLY capturing here.
+
+        One rule for the question every attach point in this file asks. The
+        probe below was extracted by #213 "so the two callers cannot drift";
+        it did not drift, the CARVE-OUTS around it did. This same judgement
+        ended up written at four attach points in ``_start_locked`` plus the
+        recovery predicate in ``restart_if_needed``, and the copies disagreed:
+        two asked ``/api/0/info``, three trusted the bare TCP connect, and one
+        of the two that asked forgot to re-latch. Each disagreement shipped as
+        its own defect (#230's missing re-latch, #233's third site).
+
+        A held socket proves a PROCESS, never a CAPTURE, and the difference is
+        a device silently recording nothing. Both halves belong together, so
+        there is one place to be wrong.
+        """
+        return self._port_in_use() and self._server_responding()
 
     def _server_responding(self) -> bool:
         """True only if a tracker server ANSWERS ``/api/0/info`` on our port.
