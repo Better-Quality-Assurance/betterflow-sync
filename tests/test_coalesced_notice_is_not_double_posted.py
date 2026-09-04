@@ -112,3 +112,26 @@ class TestUncoalescedNoticesAreUnchanged:
         )
         assert posts["osascript"] == 1
         assert outcome is NotificationOutcome.UNKNOWN
+
+
+class TestTheCarveOutIsAPositiveAssertion:
+    """`is UNKNOWN`, never `is not FAILED` (design-lens M-5).
+
+    Both are correct today: a coalesced post can only return UNKNOWN (the
+    by-construction value) or FAILED (the mechanism broke), because the
+    coalesce return precedes the read-back. But a negative test says "anything
+    except the one failure I thought of". If the coalesced path ever learns to
+    read back, SUPPRESSED -- the OS dropped it, the user was NOT reached --
+    would be silently swallowed by `is not FAILED`, which is the exact
+    reassuring-direction failure NotificationOutcome exists to close.
+    """
+
+    def test_a_suppressed_coalesced_post_would_still_reach_the_fallback(self):
+        outcome, posts = _drive(
+            "tracking-state", pyobjc_outcome=NotificationOutcome.SUPPRESSED
+        )
+        assert posts["osascript"] == 1, (
+            "the OS dropped this notice and the carve-out swallowed it; a "
+            "coalesced post that was SUPPRESSED reached nobody"
+        )
+        assert outcome is NotificationOutcome.UNKNOWN

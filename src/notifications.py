@@ -188,6 +188,13 @@ def send_notification(
             notice carrying an instruction the agent cannot otherwise
             deliver — those need the verdict more than they need tidiness.
 
+            macOS ONLY. ``_send_windows`` and ``_send_linux`` do not take it and
+            still stack, so a coalesced caller repeats on those platforms. Not
+            hidden behind a platform check because the right fix is to honour it
+            there — Windows exposes ``ToastNotification.Tag``/``.Group`` for
+            exactly this — and a silent no-op that nothing names is how that
+            never gets written.
+
     Returns:
         The strongest claim the platform actually supports. Only
         ``DELIVERED`` means the OS kept the notification, and even that is
@@ -201,7 +208,7 @@ def send_notification(
                 outcome = _send_macos_pyobjc(title, message, sound, coalesce_key)
                 if outcome is NotificationOutcome.DELIVERED:
                     return outcome
-                if coalesce_key and outcome is not NotificationOutcome.FAILED:
+                if coalesce_key and outcome is NotificationOutcome.UNKNOWN:
                     # A coalesced post is UNKNOWN BY CONSTRUCTION, not because
                     # anything went wrong: the stable identifier that makes
                     # macOS replace the previous notice is the same thing that
@@ -215,9 +222,18 @@ def send_notification(
                     # declutter into a permanent stack, at double the volume,
                     # plus an osascript subprocess on every screen unlock.
                     #
-                    # FAILED is excluded deliberately: there the mechanism
-                    # itself broke, nothing reached the user, and the second
-                    # channel is exactly what should run.
+                    # Asserted POSITIVELY -- `is UNKNOWN`, not `is not
+                    # FAILED`. Both are correct today, because UNKNOWN and
+                    # FAILED are the only two values a coalesced post can
+                    # return (the coalesce return precedes the read-back, so
+                    # DELIVERED and SUPPRESSED are unreachable on this path).
+                    # But a negative test says "anything except the one failure
+                    # I thought of", so if the coalesced path ever learns to
+                    # read back, a SUPPRESSED -- the OS dropped it, the user was
+                    # NOT reached -- would be silently swallowed here. The
+                    # positive form fails open to the second channel for
+                    # anything that is not the by-construction UNKNOWN, which is
+                    # the claim the comment above actually makes.
                     return outcome
             # Reachable again. It never was while the pyobjc path returned a
             # bare True, so a suppressed notification had no second chance.
