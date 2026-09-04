@@ -1252,11 +1252,14 @@ class AWManager:
             # It used to read "Here — and ONLY here", with a paragraph below
             # explaining why the other paths could get away with the TCP answer
             # because they only decide whether to START something. That was
-            # already half-false after #233. Today THIS branch and the two
-            # download-path attaches ask, through _external_server_capturing();
-            # the normal-path attach still does not, deliberately -- see the
-            # deferral note above it. So "only here" is wrong, and "every attach
-            # point asks" would be wrong too.
+            # already half-false after #233, and now every attach point asks:
+            # this branch and the two download-path attaches ask through
+            # _external_server_capturing(); the normal-path attach asks too, via
+            # _server_responding() directly (see the external-attach design note
+            # above it) -- it just does not ACT on a "no", only reports it
+            # through _external_server_not_responding. So "only here" is wrong,
+            # and so is "the normal-path attach doesn't ask" -- it asks, it just
+            # doesn't decide anything on the answer.
             #
             # What is still TRUE and specific to this branch: on a
             # Rosetta-missing Mac the listener is un-reapable by construction --
@@ -1462,7 +1465,7 @@ class AWManager:
         # this line on its own; two attempts produced two different regressions.
         if server_already_running:
             # ASK -- and deliberately do NOT act on the answer here. Read the
-            # deferral note above: a foreign holder is unreapable
+            # external-attach design note above: a foreign holder is unreapable
             # (_reap_orphan_processes is path-scoped to our own binaries), so
             # attaching is the behaviour that keeps the watchers alive and
             # self-heals when the holder dies. Two attempts to change that both
@@ -1482,9 +1485,6 @@ class AWManager:
                 )
             self._using_external = True
         else:
-            # We own the server here, so the external-server verdict is not ours
-            # to carry -- clear it or a stale True outlives its condition.
-            self._external_server_not_responding = False
             logger.info(f"Starting tracker components from {binaries_dir}")
 
             # Start server first
@@ -1503,7 +1503,7 @@ class AWManager:
                 # unreachable escalation fired force_restart (which IS a second
                 # route in; the first draft of this note wrongly called :752 the
                 # only one). Bounded, not permanent -- and still worse than
-                # keeping the watchers. See the deferral note above.
+                # keeping the watchers. See the external-attach design note above.
                 self.stop()
                 return False
 
@@ -1568,6 +1568,14 @@ class AWManager:
 
     def _stop_locked(self) -> None:
         """Terminate every tracked process. Caller must hold _lifecycle_lock."""
+        # Reset here too, before the early return below, mirroring the reset at
+        # the top of _start_locked: once we stop, we are not attached to
+        # anything, so "attached to a non-responding external server" cannot be
+        # true. set_capture_suppressed(True) calls ONLY this method, never
+        # _start_locked -- so without this reset a corpse-attach flag latched on
+        # a prior cycle survives suppression, and a device that is not
+        # capturing BY DESIGN reports itself as attached to a dead server.
+        self._external_server_not_responding = False
         if not self._processes:
             return
 
@@ -1889,6 +1897,17 @@ class AWManager:
             age = self._get_latest_window_event_age()
             running_for = self._component_running_seconds(watcher)
             reachable = self._window_tracker_reachable()
+            if reachable:
+                # The tick already asked /api/0/info to judge window-tracker staleness,
+                # and a server that ANSWERS is by definition not the non-responding
+                # holder this flag reports. Without this the flag is a latch on one 2s
+                # probe: an ActivityWatch that was merely still booting when the agent
+                # started sets it True and nothing re-derives it, because the routine
+                # tick never re-enters _start_locked while the port stays held. The
+                # asymmetry is what made it worth fixing -- on a real corpse the
+                # watchdog forces a restart and the flag refreshes, so it only latched
+                # in the case where it was WRONG.
+                self._external_server_not_responding = False
             if not self._is_window_tracker_stale(age, running_for, reachable):
                 # Emitting fresh window events again. (age None here is just
                 # launch lag or an AW outage, not recovery — don't count it.)

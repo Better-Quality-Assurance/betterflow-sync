@@ -83,6 +83,38 @@ class TestItReachesTheWire:
         )
 
 
+class TestTheFlagIsNotALatch:
+    def test_a_boot_blip_clears_on_the_next_reachable_tick(self):
+        """Finding 1 (fix round 3): health_snapshot() reads a value re-derived
+        ONLY inside _start_locked, and the routine 60s tick does not reach
+        _start_locked while the port stays held. So an ActivityWatch that was
+        merely still BOOTING when the agent started (port held, /info not yet
+        answering, 2s timeout) sets the flag True and it never clears on its
+        own -- UNTIL the routine tick's OWN reachability check (already
+        computed every tick to judge window-tracker staleness) notices AW now
+        answers and clears it. Drives restart_if_needed(), the real routine
+        tick, not _start_locked a second time.
+        """
+        m = _mgr(port_held=True, answers=False)
+        m._start_locked()
+        assert m._external_server_not_responding is True
+
+        # AW finishes booting. Give the instance a live watcher process so the
+        # routine tick's window-tracker section -- not _start_locked -- is
+        # what runs and does the clearing.
+        window = MagicMock()
+        window.poll.return_value = None
+        m._processes = {"bf-window-tracker": window}
+        m._get_latest_window_event_age = MagicMock(return_value=5)
+        m._get_latest_afk_event_age = MagicMock(return_value=5)
+        m._server_responding = MagicMock(return_value=True)
+
+        for _ in range(3):
+            m.restart_if_needed()
+
+        assert m._external_server_not_responding is False
+
+
 class TestTheFlagDoesNotOutliveTheCondition:
     def test_the_flag_does_not_outlive_the_condition_that_set_it(self):
         """The reviewer's exact two-cycle repro (Finding 1, fix round 1).
@@ -105,23 +137,26 @@ class TestTheFlagDoesNotOutliveTheCondition:
         assert m._external_server_not_responding is False
 
     def test_the_flag_does_not_outlive_suppressed_capture(self):
-        """Fix round 2, Finding 2. My own re-review reproduction:
+        """Fix round 2, Finding 2. My own re-review reproduction, THEN
+        corrected (fix round 3) to drive the real production entrypoint.
 
         cycle 1 (corpse):             flag=True
-        cycle 2 (capture suppressed): rc=False  flag=True   <- outlived its
-                                                                condition
+        cycle 2 (capture suppressed): flag=True   <- outlived its condition
 
-        The reset was sitting AFTER the _capture_suppressed early return, so a
-        suppressed evaluation never reached it. False is also the honest value
-        here: while capture is suppressed the device is not attached to a dead
-        external server, it is not attached to anything.
+        set_capture_suppressed(True) is the ONLY production caller that
+        suppresses capture, and it calls _stop_locked() -- never
+        _start_locked(). The public start() has zero callers in src/ or
+        tests/, so a test driving _start_locked() a second time to simulate
+        suppression witnesses a path production never takes; it was green
+        even while _stop_locked() left the flag latched. False is also the
+        honest value here: while capture is suppressed the device is not
+        attached to a dead external server, it is not attached to anything.
         """
         m = _mgr(port_held=True, answers=False)
         m._start_locked()
         assert m._external_server_not_responding is True
 
-        m._capture_suppressed = True
-        rc = m._start_locked()
+        m.set_capture_suppressed(True)
 
-        assert rc is False
+        assert m._capture_suppressed is True
         assert m._external_server_not_responding is False

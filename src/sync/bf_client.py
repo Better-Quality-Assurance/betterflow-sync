@@ -522,14 +522,20 @@ class BetterFlowClient(BaseApiClient):
         # wire and can CLEAR a degraded episode rather than latching it.
         "tracker_download_failed",
         "managed_components_unavailable",
-        # True when the most recent evaluation attached to a process that holds
-        # the tracker port and does not answer /api/0/info -- the device is
-        # capturing NOTHING that cycle. Re-derived on every AWManager start
-        # evaluation, so it cannot outlive its condition: a corpse that later
-        # gets replaced by a genuinely responding server clears this on the
-        # very next evaluation, no restart needed. Distinct from
-        # tracker_download_failed (our binaries are fine) and from
-        # managed_components_unavailable (we did start our watchers).
+        # True when we are attached to a process that holds the tracker port
+        # and does not answer /api/0/info -- the device is capturing NOTHING.
+        # Not a per-cycle verdict: it is set once, in AWManager's normal-path
+        # attach, and stays latched until something actually re-derives it --
+        # the routine 60s tick does not re-enter that attach while the port
+        # stays held. What clears it: the SAME tick's window-tracker
+        # reachability check clears it the moment /api/0/info answers (a
+        # corpse that gets replaced by a genuinely responding server, or a
+        # server that was merely still booting when we first attached), and
+        # stopping the trackers (capture suppression, force-restart) clears it
+        # too, since a device attached to nothing cannot be attached to a dead
+        # server. Distinct from tracker_download_failed (our binaries are
+        # fine) and from managed_components_unavailable (we did start our
+        # watchers).
         "external_server_not_responding",
         # Third field of the same shape, found while fixing the two above: the
         # window watcher has stayed blind across repeated restarts (the macOS
