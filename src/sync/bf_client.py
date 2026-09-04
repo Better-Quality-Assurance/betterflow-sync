@@ -522,9 +522,12 @@ class BetterFlowClient(BaseApiClient):
         # wire and can CLEAR a degraded episode rather than latching it.
         "tracker_download_failed",
         "managed_components_unavailable",
-        # Attached to a process holding the tracker port that does not answer
-        # /api/0/info: the device is capturing NOTHING, and no restart can fix
-        # it because a foreign holder is unreapable. Distinct from
+        # True when the most recent evaluation attached to a process that holds
+        # the tracker port and does not answer /api/0/info -- the device is
+        # capturing NOTHING that cycle. Re-derived on every AWManager start
+        # evaluation, so it cannot outlive its condition: a corpse that later
+        # gets replaced by a genuinely responding server clears this on the
+        # very next evaluation, no restart needed. Distinct from
         # tracker_download_failed (our binaries are fine) and from
         # managed_components_unavailable (we did start our watchers).
         "external_server_not_responding",

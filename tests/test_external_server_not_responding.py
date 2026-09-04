@@ -81,3 +81,25 @@ class TestItReachesTheWire:
             "external_server_not_responding"
             in BetterFlowClient.HEARTBEAT_HEALTH_KEYS
         )
+
+
+class TestTheFlagDoesNotOutliveTheCondition:
+    def test_the_flag_does_not_outlive_the_condition_that_set_it(self):
+        """The reviewer's exact two-cycle repro (Finding 1, fix round 1).
+
+        cycle 1: normal path, corpse holds the port -> flag correctly True.
+        cycle 2: Rosetta branch, external server now genuinely capturing
+                 (_port_in_use=True, _server_responding=True) -> attaches
+                 through a DIFFERENT branch than the normal path, and the
+                 stale True from cycle 1 must not survive.
+        """
+        m = _mgr(port_held=True, answers=False)
+        m._start_locked()
+        assert m._external_server_not_responding is True
+
+        m._rosetta_required = MagicMock(return_value=True)
+        m._port_in_use = MagicMock(return_value=True)
+        m._server_responding = MagicMock(return_value=True)
+        m._start_locked()
+
+        assert m._external_server_not_responding is False

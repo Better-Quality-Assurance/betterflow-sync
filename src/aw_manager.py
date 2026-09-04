@@ -540,12 +540,16 @@ class AWManager:
         # port we still capture, but restart_if_needed/force_restart manage
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
-        # True only while we are attached to a process that holds the tracker
-        # port and does not answer /api/0/info. Deliberately NOT one of the two
-        # capture-dead flags: _start_component clears those on Popen success
+        # True when the most recent evaluation attached to a process that holds
+        # the tracker port and does not answer /api/0/info. Re-derived on every
+        # _start_locked call, so it cannot outlive its condition -- reset to
+        # False at the top of that method and set True only on the normal-path
+        # attach branch; the other three attach branches only fire when
+        # _external_server_capturing() is already true, so False is correct
+        # there without them touching this field. Deliberately NOT one of the
+        # two capture-dead flags: _start_component clears those on Popen success
         # (:2110), and the watcher loop runs after the attach, so anything
         # latched there is wiped inside the same _start_locked call (measured).
-        # Nothing else writes this one.
         self._external_server_not_responding = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
         # not probed yet. Installing Rosetta needs no reboot, so force_restart()
@@ -1194,6 +1198,15 @@ class AWManager:
         if self._capture_suppressed:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
+
+        # Reset per evaluation, so this cannot outlive the condition that set it.
+        # There are four branches that attach to an external server (:1266 Rosetta,
+        # :1345 backoff, :1393 download-failure, :1461 normal path) and only the
+        # normal path can attach to a NON-responding one -- the other three attach
+        # only when _external_server_capturing() is already true. So resetting here
+        # and setting True in that one branch is the whole invariant: every other
+        # attach, and every early return below, correctly reads False.
+        self._external_server_not_responding = False
 
         # Probed BEFORE the Rosetta branch below, not after it. Our managed
         # binaries being unrunnable says nothing about whether SOMETHING is
