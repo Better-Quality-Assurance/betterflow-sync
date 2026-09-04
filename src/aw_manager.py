@@ -1419,12 +1419,14 @@ class AWManager:
                 self._dispatch_download_failure_report()
                 return False
 
-        # NOT _external_server_capturing(), and that is a DEFERRAL rather than
-        # an oversight. Every other attach point in this file asks /api/0/info;
-        # this one still trusts the bare TCP connect, so a port held by a
-        # process that answers nothing is still preferred over starting our own
-        # trackers. That is a real bug (a healthy machine runs its watchers into
-        # a server that answers nothing) and it is NOT fixed here.
+        # NOT _external_server_capturing(), deliberately, and this is no longer
+        # a deferred bug -- it is a decided design. A foreign holder is
+        # unreapable (_reap_orphan_processes is path-scoped to our binaries), so
+        # attaching is the behaviour that keeps the watchers alive and recovers
+        # when the holder dies; both attempts to change it regressed (table
+        # below). The device now REPORTS the condition instead, via
+        # _external_server_not_responding on the heartbeat. Change the reporting
+        # if it is wrong; do not change this line.
         #
         # Asking here was written, measured and reverted twice. The problem is
         # not the question, it is what you can do with a "no": the only answer
@@ -1823,16 +1825,24 @@ class AWManager:
         # special — otherwise fall through to watcher health/stale recovery,
         # which MUST run in external mode too. Returning early there was why a
         # blind/orphaned bf-idle-tracker never self-healed after an update.
-        # DELIBERATELY the bare port read, not _external_server_capturing().
-        # Asking /api/0/info here was tried and reverted: on a HEALTHY shared
-        # ActivityWatch that missed two answers (a load spike, a wake from
-        # sleep, a long AW query) it dropped external mode, spawned our own
-        # server against the port that healthy server still owns, failed to
-        # bind, and the teardown below cleared every watcher. `is_managing`
-        # then reads False, so main.py's 60s tick stops calling this method and
-        # nothing re-enters the branch -- permanent, on a healthy machine, with
-        # both capture-dead flags reading False. Measured against a control
-        # that reverted only this predicate:
+        # DELIBERATELY the bare port read, not _external_server_capturing() --
+        # and not _external_server_not_responding either. That field reports
+        # the ATTACH-side condition (does the server we are attached to answer
+        # /info); it is set True only in _start_locked's normal-path attach
+        # branch, and every other write resets it to False. This predicate
+        # asks something that field cannot answer: has the external server's
+        # socket disappeared. Tearing down external mode achieves nothing when
+        # the holder is unreapable (_reap_orphan_processes is path-scoped to
+        # our own binaries), so asking /info and acting on a "no" was tried
+        # and reverted instead: on a HEALTHY shared ActivityWatch that missed
+        # two answers (a load spike, a wake from sleep, a long AW query) it
+        # dropped external mode, spawned our own server against the port that
+        # healthy server still owns, failed to bind, and the teardown below
+        # cleared every watcher. `is_managing` then reads False, so main.py's
+        # 60s tick stops calling this method and nothing re-enters the branch
+        # -- permanent, on a healthy machine, with both capture-dead flags
+        # reading False. Measured against a control that reverted only this
+        # predicate:
         #
         #   asked /info   rc=False  _using_external=False  watchers=[]
         #   bare port     rc=True   _using_external=True   watchers=[2]
