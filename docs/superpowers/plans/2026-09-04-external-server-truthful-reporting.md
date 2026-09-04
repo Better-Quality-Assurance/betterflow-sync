@@ -483,6 +483,8 @@ git commit -m "docs(aw): the attach sites are decided and reported, not deferred
 
 ### Task 5: the consumers — WITHOUT THIS, TASKS 1-2 CHANGE NOTHING
 
+**STATUS: hand-off, not executed in the 2026-09-04 session.** Rule 1 — at that time `internal-tool2` had three worktrees carrying commits from that morning and `betterqa-bot` had three open PRs and sixteen worktrees. Dispatching a writing agent at either is what Rule 1 forbids. **Re-run the Rule 1 check before starting; it has a shelf life measured in hours.**
+
 **Files (other repos — read `rules/cross-repo-safety.md` Rule 0 and Rule 1 before branching):**
 - `internal-tool2` — the `agent_devices` column + the heartbeat controller that persists it
 - `betterqa-bot` — the fleet alert rule that reads it
@@ -493,9 +495,25 @@ A heartbeat key nobody stores and nobody alerts on is a write with no reader (`r
 
 Query the live schema rather than reading a migration; `mcp__betterflow__betterflow_admin_artisan` or the MCP `betterflow_agent_devices` tool will show which fields come back per device. An `unknown_fields` bucket in the response means the agent is sending something the server drops.
 
-- [ ] **Step 2: Add the column in `internal-tool2`** via a migration, and persist it in `AgentHeartbeatController` alongside `tracker_download_failed`. **Run the migration against prod BEFORE merging** — Railway auto-deploys `main`, so merging is deploying, and a read path selecting a column the DB lacks 500s (`rules/schema-rename-drift.md` §additive columns).
+- [ ] **Step 2: Accept the key — NO MIGRATION, corrected 2026-09-04.**
+
+  The plan originally said to add a column. There is none, and there never was one for the siblings. Verified in `internal-tool2` (with a control, because the first probe used `app/` instead of `src/app` and returned a false empty):
+
+  ```
+  src/app/Models/AgentDevice.php:474
+    "Both ride on request-only heartbeat fields (tracker_download_failed,"
+  src/app/Http/Controllers/Api/Agent/AgentHeartbeatController.php:363
+    'tracker_download_failed',
+  src/database/migrations                 no match
+  ```
+
+  So the change is: add `external_server_not_responding` to the request-only field list in `AgentHeartbeatController`, and give it a reason in `AgentDevice::evaluateTrackingHealth()` beside `tracker_install_failed` and `no_managed_watchers`. Nothing is persisted, so the migration-before-merge hazard does not apply here.
 
 - [ ] **Step 3: Add the alert rule in `betterqa-bot`.** It must say *"another process owns port 5600 on this device"*, NOT *"tracker download failed"* — the whole reason for a distinct key is that the remedy is different and no restart will help.
+
+  `betterflow-device-health.ts` already has a `no_managed_watchers` case whose comment says a foreign server *"needs its own evidence before it earns an exemption"* from the stale-offline suppression. This key IS that evidence, so that comment is the anchor to work from.
+
+  **Ship-day side effect to state in the PR:** the dedup key is device+reason, so inserting a new reason ABOVE `no_managed_watchers` in priority rotates it for any currently-alerting device and causes a one-time off-cycle re-alert.
 
 - [ ] **Step 4: Verify end to end against a real device**, not a unit test: set the condition on one machine, confirm the value lands in `agent_devices`, and confirm the alert fires with the right wording.
 
