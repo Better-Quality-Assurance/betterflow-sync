@@ -103,3 +103,25 @@ class TestTheFlagDoesNotOutliveTheCondition:
         m._start_locked()
 
         assert m._external_server_not_responding is False
+
+    def test_the_flag_does_not_outlive_suppressed_capture(self):
+        """Fix round 2, Finding 2. My own re-review reproduction:
+
+        cycle 1 (corpse):             flag=True
+        cycle 2 (capture suppressed): rc=False  flag=True   <- outlived its
+                                                                condition
+
+        The reset was sitting AFTER the _capture_suppressed early return, so a
+        suppressed evaluation never reached it. False is also the honest value
+        here: while capture is suppressed the device is not attached to a dead
+        external server, it is not attached to anything.
+        """
+        m = _mgr(port_held=True, answers=False)
+        m._start_locked()
+        assert m._external_server_not_responding is True
+
+        m._capture_suppressed = True
+        rc = m._start_locked()
+
+        assert rc is False
+        assert m._external_server_not_responding is False

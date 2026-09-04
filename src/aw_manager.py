@@ -541,15 +541,16 @@ class AWManager:
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
         # True when the most recent evaluation attached to a process that holds
-        # the tracker port and does not answer /api/0/info. Re-derived on every
-        # _start_locked call, so it cannot outlive its condition -- reset to
-        # False at the top of that method and set True only on the normal-path
-        # attach branch; the other three attach branches only fire when
-        # _external_server_capturing() is already true, so False is correct
-        # there without them touching this field. Deliberately NOT one of the
-        # two capture-dead flags: _start_component clears those on Popen success
-        # (:2110), and the watcher loop runs after the attach, so anything
-        # latched there is wiped inside the same _start_locked call (measured).
+        # the tracker port and does not answer /api/0/info. Re-derived as the
+        # FIRST statement of _start_locked, before even the capture-suppressed
+        # guard, so it cannot outlive its condition -- reset to False there and
+        # set True only on the normal-path attach branch; the other three
+        # attach branches only fire when _external_server_capturing() is
+        # already true, so False is correct there without them touching this
+        # field. Deliberately NOT one of the two capture-dead flags:
+        # _start_component clears those on Popen success, and the watcher loop
+        # runs after the attach, so anything latched there is wiped inside the
+        # same _start_locked call (measured).
         self._external_server_not_responding = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
         # not probed yet. Installing Rosetta needs no reboot, so force_restart()
@@ -1192,21 +1193,27 @@ class AWManager:
                 )
 
     def _start_locked(self) -> bool:
+        # Reset per evaluation -- the FIRST statement in this method, before
+        # even the capture-suppressed guard, so "re-derived on every
+        # _start_locked call" is literally true with no exception to document.
+        # False is also the honest value while capture is suppressed: the
+        # device is not attached to a dead external server, it is not attached
+        # to anything. Of the four branches below that can attach to an
+        # external server -- the Rosetta attach, the backoff attach, the
+        # download-failure attach, and the normal-path attach -- only the
+        # normal-path attach can attach to a NON-responding one; the other
+        # three attach only when _external_server_capturing() is already true
+        # and each returns immediately after, so False is already correct
+        # there without them touching this field. Resetting here and setting
+        # True in the one normal-path branch is the whole invariant.
+        self._external_server_not_responding = False
+
         # Every route back to a running tracker funnels through here, so this one
         # guard is enough to keep start()/restart_if_needed()/force_restart() from
         # resurrecting capture while it is suppressed.
         if self._capture_suppressed:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
-
-        # Reset per evaluation, so this cannot outlive the condition that set it.
-        # There are four branches that attach to an external server (:1266 Rosetta,
-        # :1345 backoff, :1393 download-failure, :1461 normal path) and only the
-        # normal path can attach to a NON-responding one -- the other three attach
-        # only when _external_server_capturing() is already true. So resetting here
-        # and setting True in that one branch is the whole invariant: every other
-        # attach, and every early return below, correctly reads False.
-        self._external_server_not_responding = False
 
         # Probed BEFORE the Rosetta branch below, not after it. Our managed
         # binaries being unrunnable says nothing about whether SOMETHING is
