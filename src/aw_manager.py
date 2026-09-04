@@ -1825,7 +1825,7 @@ class AWManager:
         ):
             age = self._get_latest_window_event_age()
             running_for = self._component_running_seconds(watcher)
-            reachable = self._port_in_use()
+            reachable = self._window_tracker_reachable()
             if not self._is_window_tracker_stale(age, running_for, reachable):
                 # Emitting fresh window events again. (age None here is just
                 # launch lag or an AW outage, not recovery — don't count it.)
@@ -2223,6 +2223,21 @@ class AWManager:
             return True
         except (urllib.error.URLError, OSError):
             return False
+
+    def _window_tracker_reachable(self) -> bool:
+        """Is AW reachable for the purpose of judging window-tracker staleness?
+
+        Named rather than inlined because the question is not "is the port
+        held". _is_window_tracker_stale reads this as "AW is reachable", and a
+        corpse holding the port answers True to a TCP connect -- so an AW
+        OUTAGE was being classified as a blind tracker, force-restarted, and
+        latched as _window_tracker_blind, which tells the user to check a
+        permission when the real fault is a dead server.
+
+        One HTTP ask, no port pre-check: a server that answers necessarily
+        holds the port, so the TCP connect would only add latency.
+        """
+        return self._server_responding()
 
     def _wait_for_server(self) -> bool:
         """Wait for tracker server to accept connections."""
