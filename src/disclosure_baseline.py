@@ -623,6 +623,10 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # field and update the notice text, not to drop it and go back to blind.
     "tracker_download_failed",
     "managed_components_unavailable",
+    # Whether some OTHER process owns the tracker port and is not serving.
+    # Reports a property of the MACHINE's port 5600, never anything about what
+    # the user did.
+    "external_server_not_responding",
     # The window watcher has stayed blind across repeated restarts. Exactly the
     # same category as idle_tracker_blind, which this list already carries: a
     # fact about whether a watcher on this machine is working, never about what

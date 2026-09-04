@@ -60,3 +60,24 @@ class TestTheAllowanceDirection:
         m._external_server_not_responding = True
         m._start_locked()
         assert m._external_server_not_responding is False
+
+
+class TestItReachesTheWire:
+    def test_health_snapshot_publishes_it(self):
+        m = _mgr(port_held=True, answers=False)
+        m._get_latest_window_event_age = MagicMock(return_value=5)
+        m._get_latest_afk_event_age = MagicMock(return_value=5)
+        m._window_titles_captured_recently = MagicMock(return_value=True)
+        m._start_locked()
+
+        assert m.health_snapshot()["external_server_not_responding"] is True
+
+    def test_the_key_is_on_the_heartbeat_allowlist(self):
+        """A field missing from HEARTBEAT_HEALTH_KEYS never leaves the machine,
+        silently -- health_snapshot publishing it is not enough."""
+        from src.sync.bf_client import BetterFlowClient
+
+        assert (
+            "external_server_not_responding"
+            in BetterFlowClient.HEARTBEAT_HEALTH_KEYS
+        )

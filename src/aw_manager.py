@@ -1730,6 +1730,7 @@ class AWManager:
             # Written under this same lock in _start_locked, so read under it too
             # instead of racing a concurrent start/restart.
             download_failed = self.tracker_download_failed
+            external_dead = self._external_server_not_responding
 
         window_age = self._get_latest_window_event_age()
         # When the agent owns the AFK stream in-process, the external
@@ -1775,6 +1776,13 @@ class AWManager:
             # be flowing via an external server on the port, but nothing here can
             # restart or self-heal it, so an outage will not recover on its own.
             "managed_components_unavailable": managed_unavailable,
+            # We are attached to a process that holds the tracker port and does
+            # not answer /api/0/info, so nothing is being captured -- but this is
+            # NOT tracker_download_failed: our binaries are fine and there is
+            # nothing to reap (the holder is not ours). Distinct key so the alert
+            # can say "something else owns port 5600" instead of blaming the
+            # download.
+            "external_server_not_responding": external_dead,
         }
 
     def restart_if_needed(self) -> bool:

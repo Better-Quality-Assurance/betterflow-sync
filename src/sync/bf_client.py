@@ -522,6 +522,12 @@ class BetterFlowClient(BaseApiClient):
         # wire and can CLEAR a degraded episode rather than latching it.
         "tracker_download_failed",
         "managed_components_unavailable",
+        # Attached to a process holding the tracker port that does not answer
+        # /api/0/info: the device is capturing NOTHING, and no restart can fix
+        # it because a foreign holder is unreapable. Distinct from
+        # tracker_download_failed (our binaries are fine) and from
+        # managed_components_unavailable (we did start our watchers).
+        "external_server_not_responding",
         # Third field of the same shape, found while fixing the two above: the
         # window watcher has stayed blind across repeated restarts (the macOS
         # Accessibility counterpart of idle_tracker_blind, which IS forwarded).
