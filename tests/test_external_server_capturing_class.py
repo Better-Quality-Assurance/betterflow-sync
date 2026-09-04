@@ -72,7 +72,11 @@ class TestF1BackoffAttachReLatches:
     def test_a_held_but_dead_port_does_not_clear_the_flag(self):
         m = _mgr(binaries=None, port_held=True, answers=False, backed_off=True)
         m.tracker_download_failed = True
-        m._start_locked()
+        # The RETURN matters as much as the flag, and leaving it unasserted let
+        # a mutant survive the first cut of this branch: restoring the pre-fix
+        # `return server_already_running` here reports a device as *started*
+        # while a corpse holds the port and nothing is capturing.
+        assert m._start_locked() is False
         assert m.tracker_download_failed is True
 
     def test_a_live_external_server_still_clears_it(self):
@@ -149,21 +153,50 @@ class TestF3NormalPathAttachAsksTheServer:
         assert A.BF_SERVER in started
 
 
-class TestF4ExternalVanishedRecovery:
-    """The recovery keyed on the port being RELEASED. A corpse holds it
-    forever, so a device that attached to one could never self-heal."""
+class TestF4RecoveryStillReadsTheBarePort_Deliberately:
+    """F-4 is DEFERRED, and this pins the deferral so nobody flips it back.
 
-    def test_recovery_fires_when_the_holder_stops_answering(self):
+    Making the external-vanished recovery ask /api/0/info is the obvious fourth
+    member of this class, and it was written, measured and reverted. On a
+    HEALTHY shared ActivityWatch that missed two answers it dropped external
+    mode, spawned our own server against the port that healthy server still
+    owned, failed to bind, and cleared every watcher -- after which is_managing
+    reads False, main.py stops calling restart_if_needed, and nothing ever
+    re-enters the branch. Permanent, on a healthy machine, both capture-dead
+    flags reading False. Control that reverted only that predicate:
+
+        asked /info   rc=False  _using_external=False  watchers=[]
+        bare port     rc=True   _using_external=True   watchers=[2]
+
+    So it needs a debounce -- N consecutive non-answers, resetting on any
+    success -- which is its own change with its own evidence. Until then a
+    corpse holding the port keeps external mode, and the device recovers on the
+    next app start via the normal-path attach (F-3), which no longer defers to
+    a corpse in the first place.
+    """
+
+    def test_a_corpse_holding_the_port_does_NOT_trigger_recovery_yet(self):
         m = _mgr(binaries="/tmp/fake-binaries", port_held=True, answers=False)
         m._using_external = True
         m._processes = {}
         m._start_locked = MagicMock(return_value=True)
 
-        assert m.restart_if_needed() is True
-        assert m._start_locked.called, (
-            "the external server is a corpse and recovery never ran, because "
-            "the corpse still holds the port"
+        m.restart_if_needed()
+        assert not m._start_locked.called, (
+            "recovery fired on a single unanswered ask -- that is the reverted "
+            "behaviour, and it destroys watchers on a healthy machine that "
+            "merely blipped. It needs a debounce first."
         )
+
+    def test_recovery_still_fires_when_the_port_is_actually_released(self):
+        """The case this branch has always handled, and must keep handling."""
+        m = _mgr(binaries="/tmp/fake-binaries", port_held=False, answers=False)
+        m._using_external = True
+        m._processes = {}
+        m._start_locked = MagicMock(return_value=True)
+
+        assert m.restart_if_needed() is True
+        assert m._start_locked.called
 
     def test_recovery_does_not_fire_on_a_live_external_server(self):
         """Control: a healthy shared server must not be torn down."""
@@ -174,3 +207,72 @@ class TestF4ExternalVanishedRecovery:
 
         m.restart_if_needed()
         assert not m._start_locked.called
+
+
+class TestABlipMustNotDestroyOurWatchers:
+    """C-1, found by the pre-merge gate refuting the first cut of this branch.
+
+    The first version made the external-vanished recovery ask /api/0/info. On a
+    HEALTHY shared ActivityWatch that missed two answers -- a load spike, a wake
+    from sleep, a long AW query -- it dropped external mode, spawned our own
+    server against the port that healthy server still owned, failed to bind, and
+    `_start_locked`'s `self.stop()` cleared every watcher. `is_managing` then
+    reads False, so main.py's 60s tick stops calling restart_if_needed at all
+    and nothing re-enters the branch. Permanent, on a healthy machine, with both
+    capture-dead flags reading False.
+
+    Measured against a control that reverted only that one predicate:
+
+        post-fix  rc=False  _using_external=False  watchers=[]      is_managing=False
+        control   rc=True   _using_external=True   watchers=[2]     is_managing=True
+
+    So the rule this file exists for cuts both ways: a held socket is not a
+    capture, AND a single unanswered ask is not a vanished server.
+    """
+
+    def _blipping(self, answers):
+        m = _mgr(binaries="/tmp/bin", port_held=True, answers=True)
+        seq = list(answers)
+        m._server_responding = MagicMock(
+            side_effect=lambda: seq.pop(0) if seq else True
+        )
+        m._wait_for_server = MagicMock(return_value=False)  # cannot bind: port taken
+        m._using_external = True
+        m._processes = {
+            "bf-window-tracker": MagicMock(**{"poll.return_value": None}),
+            "bf-idle-tracker": MagicMock(**{"poll.return_value": None}),
+        }
+        m.check_health = MagicMock(return_value=True)
+        m._get_latest_afk_event_age = MagicMock(return_value=5)
+        m._get_latest_window_event_age = MagicMock(return_value=5)
+        return m
+
+    def test_a_failed_bind_against_a_held_port_keeps_our_watchers(self):
+        """The holder is still there, so the bind failing is evidence ABOUT the
+        holder, never a reason to tear down watchers that are working."""
+        m = self._blipping([False, False])
+        m._start_locked()
+
+        assert sorted(m._processes) == ["bf-idle-tracker", "bf-window-tracker"], (
+            "our watchers were destroyed because a server we should never have "
+            "started could not bind a port somebody else owns"
+        )
+
+    def test_the_device_stays_supervised_after_a_blip(self):
+        m = self._blipping([False, False])
+        m.restart_if_needed()
+
+        assert m.is_managing, (
+            "is_managing went False, so main.py's 60s tick stops calling "
+            "restart_if_needed and nothing can ever re-enter recovery"
+        )
+
+    def test_a_failed_bind_on_a_FREE_port_still_tears_down(self):
+        """Control: the ordinary failure. Nobody holds the port, our server just
+        did not come up, and the pre-existing cleanup must still run."""
+        m = _mgr(binaries="/tmp/bin", port_held=False, answers=False)
+        m._wait_for_server = MagicMock(return_value=False)
+        m._processes = {"bf-idle-tracker": MagicMock(**{"poll.return_value": None})}
+
+        assert m._start_locked() is False
+        assert m._processes == {}, "the ordinary teardown must be untouched"

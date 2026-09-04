@@ -1219,20 +1219,24 @@ class AWManager:
             # not execute on this machine, so nothing here self-heals.
             self._managed_components_unavailable = True
             # `server_already_running` is a TCP connect, and a held socket is
-            # NOT a running tracker. Here — and ONLY here — that distinction
-            # decides whether the user is told anything at all, so this branch
-            # pays for one HTTP ask before granting the carve-out.
+            # NOT a running tracker. This branch pays for one HTTP ask before
+            # granting the carve-out.
             #
-            # Why this branch and not the download-failure one below: the other
-            # paths use the port answer to decide whether to START something,
-            # and a hung-but-listening server there is recoverable — the
-            # unreachable watchdog escalates to force_restart(), which reaps the
-            # orphan and rebuilds (that is what its docstring describes). On a
-            # Rosetta-missing Mac there is no such recovery: _reap_orphan_
-            # processes is path-scoped to binaries_dir, and OUR binaries have
-            # never executed on this machine, so the listener is un-reapable by
-            # construction. The only decision left on this branch is what to
-            # TELL the person, and getting that wrong cost ~90 minutes once.
+            # It used to read "Here — and ONLY here", with a paragraph below
+            # explaining why the other paths could get away with the TCP answer
+            # because they only decide whether to START something. That was
+            # already half-false after #233 and is fully false now: every
+            # attach point asks, through _external_server_capturing(). The
+            # "recoverable" argument was also wrong twice over -- it is exactly
+            # what nobody re-derived for the normal-path attach, where deferring
+            # to a corpse is not recoverable at all.
+            #
+            # What is still TRUE and specific to this branch: on a
+            # Rosetta-missing Mac the listener is un-reapable by construction --
+            # _reap_orphan_processes is path-scoped to binaries_dir and OUR
+            # binaries have never executed on this machine -- so the only
+            # decision left here is what to TELL the person, and getting that
+            # wrong cost ~90 minutes once.
             #
             # Failing this way is also the safe direction: a false "responding"
             # withholds the remedy (the regression below), while a false "not
@@ -1418,6 +1422,27 @@ class AWManager:
             # Wait for server to be ready
             if not self._wait_for_server():
                 logger.error("Tracker server failed to start")
+                if self._port_in_use():
+                    # Somebody else owns this port, so failing to bind is
+                    # evidence ABOUT THE HOLDER and never a reason to destroy
+                    # watchers that are working. The blanket stop() below cost
+                    # a Critical in review: it cleared every watcher, and
+                    # is_managing then reads False, so main.py's 60s tick stops
+                    # calling restart_if_needed and the device never recovers.
+                    #
+                    # Latch capture-dead instead. This is also the arm that had
+                    # no flag at all -- every other member of this class
+                    # (Rosetta, backoff, download-failure) latches here, and
+                    # the widest one published a reassuring pair on a device
+                    # capturing nothing.
+                    logger.error(
+                        "Port %s is owned by a process we cannot reap and our "
+                        "own server cannot bind it — this device is capturing "
+                        "nothing",
+                        self.aw_port,
+                    )
+                    self.tracker_download_failed = True
+                    return False
                 self.stop()
                 return False
 
@@ -1731,11 +1756,26 @@ class AWManager:
         # special — otherwise fall through to watcher health/stale recovery,
         # which MUST run in external mode too. Returning early there was why a
         # blind/orphaned bf-idle-tracker never self-healed after an update.
-        if self._using_external and not self._external_server_capturing():
-            logger.warning(
-                "External tracker server no longer answering /api/0/info — "
-                "starting our own"
-            )
+        # DELIBERATELY the bare port read, not _external_server_capturing().
+        # Asking /api/0/info here was tried and reverted: on a HEALTHY shared
+        # ActivityWatch that missed two answers (a load spike, a wake from
+        # sleep, a long AW query) it dropped external mode, spawned our own
+        # server against the port that healthy server still owns, failed to
+        # bind, and the teardown below cleared every watcher. `is_managing`
+        # then reads False, so main.py's 60s tick stops calling this method and
+        # nothing re-enters the branch -- permanent, on a healthy machine, with
+        # both capture-dead flags reading False. Measured against a control
+        # that reverted only this predicate:
+        #
+        #   asked /info   rc=False  _using_external=False  watchers=[]
+        #   bare port     rc=True   _using_external=True   watchers=[2]
+        #
+        # A held socket is not a capture, AND one unanswered ask is not a
+        # vanished server. Making this ask needs a debounce (N consecutive
+        # non-answers, resetting on any success) so a blip cannot fire it; that
+        # is its own change with its own evidence, not a line to flip here.
+        if self._using_external and not self._port_in_use():
+            logger.warning("External tracker server no longer running — starting our own")
             self._using_external = False
             return self._start_locked()
 
