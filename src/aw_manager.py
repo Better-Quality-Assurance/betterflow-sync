@@ -1225,11 +1225,11 @@ class AWManager:
             # It used to read "Here — and ONLY here", with a paragraph below
             # explaining why the other paths could get away with the TCP answer
             # because they only decide whether to START something. That was
-            # already half-false after #233 and is fully false now: every
-            # attach point asks, through _external_server_capturing(). The
-            # "recoverable" argument was also wrong twice over -- it is exactly
-            # what nobody re-derived for the normal-path attach, where deferring
-            # to a corpse is not recoverable at all.
+            # already half-false after #233. Today THIS branch and the two
+            # download-path attaches ask, through _external_server_capturing();
+            # the normal-path attach still does not, deliberately -- see the
+            # deferral note above it. So "only here" is wrong, and "every attach
+            # point asks" would be wrong too.
             #
             # What is still TRUE and specific to this branch: on a
             # Rosetta-missing Mac the listener is un-reapable by construction --
@@ -1407,19 +1407,30 @@ class AWManager:
         # alone. Driven through main.py's real tick order against a corpse that
         # releases the port at tick 4:
         #
-        #   as-is (this code)     watchers=2 throughout, and FULLY RECOVERS
-        #                         the moment the corpse dies
-        #   ask + blanket stop()  watchers=0, permanently
-        #   ask + skip the stop() watchers=0, permanently, AND a dead
-        #                         bf-data-service left in _processes, which
-        #                         disarms set_capture_suppressed's
-        #                         `elif not self._processes` rebuild route
-        #                         (see :752) -- the only path back into
-        #                         _start_locked
+        #   as-is (this code)     watchers=2 throughout, and recovers the
+        #                         moment the corpse dies
+        #   ask + blanket stop()  watchers=0
+        #   ask + skip the stop() watchers=0, AND a dead bf-data-service left
+        #                         in _processes, which disarms
+        #                         set_capture_suppressed's
+        #                         `elif not self._processes` rebuild route (:752)
         #
-        # So the fix belongs at a DIFFERENT LAYER: either the rebuild route
-        # stops being gated on `_processes` being empty, or the spawn reaps only
-        # the server it started. Do not flip this line on its own.
+        # SCOPE OF THAT MEASUREMENT, because the first draft of this note
+        # overstated it and then prescribed work on the strength of the
+        # overstatement: it drove set_capture_suppressed and restart_if_needed
+        # only. It did NOT drive the unreachable watchdog, and force_restart()
+        # is a SECOND route into _start_locked -- main.py's
+        # `elif not self.aw.is_running()` is a SIBLING of the is_managing gate,
+        # not inside it, so after _AW_UNREACHABLE_ESCALATE_SECONDS (180s) it
+        # fires and rebuilds. Measured from the wedge state: force_restart ->
+        # _start_locked called, watchers restored. So both reverted variants
+        # cost an outage BOUNDED by that escalation, not a permanent one. They
+        # are still worse than this code, which never loses the watchers.
+        #
+        # The fix likely belongs at a DIFFERENT LAYER -- the rebuild route, or a
+        # spawn that reaps only the server it started -- but that is now an
+        # opinion rather than something the measurement establishes. Do not flip
+        # this line on its own; two attempts produced two different regressions.
         if server_already_running:
             logger.info(
                 f"Tracker server already running on port {self.aw_port}, "
@@ -1438,12 +1449,14 @@ class AWManager:
                 logger.error("Tracker server failed to start")
                 # The blanket stop() is deliberate and load-bearing: emptying
                 # `_processes` is what re-arms set_capture_suppressed's
-                # `elif not self._processes` rebuild route (:752), which is the
-                # ONLY path back into _start_locked. A guard that skipped this
-                # to preserve watchers was tried and reverted -- it left a dead
-                # bf-data-service in `_processes`, disarmed that route, and the
-                # device sat with zero watchers permanently. See the deferral
-                # note above the external-attach branch.
+                # `elif not self._processes` rebuild route (:752). A guard that
+                # skipped this to preserve watchers was tried and reverted -- it
+                # left a dead bf-data-service in `_processes` and disarmed that
+                # route, so the device sat with zero watchers until the 180s
+                # unreachable escalation fired force_restart (which IS a second
+                # route in; the first draft of this note wrongly called :752 the
+                # only one). Bounded, not permanent -- and still worse than
+                # keeping the watchers. See the deferral note above.
                 self.stop()
                 return False
 

@@ -133,13 +133,19 @@ class TestF3NormalPathStillTrustsTheSocket_Deferred:
     `_wait_for_server` failing then runs a blanket `self.stop()`. Driven through
     main.py's real tick order against a corpse that releases the port at tick 4:
 
-        as-is (this code)      watchers=2 throughout, FULLY RECOVERS on release
-        ask + blanket stop()   watchers=0, permanently
-        ask + skip the stop()  watchers=0 permanently, AND a dead
-                               bf-data-service left in _processes, which
-                               disarms set_capture_suppressed's
-                               `elif not self._processes` rebuild route --
-                               the only path back into _start_locked
+        as-is (this code)      watchers=2 throughout, recovers on release
+        ask + blanket stop()   watchers=0
+        ask + skip the stop()  watchers=0, AND a dead bf-data-service left in
+                               _processes, which disarms
+                               set_capture_suppressed's
+                               `elif not self._processes` rebuild route (:752)
+
+    That measurement drove set_capture_suppressed and restart_if_needed only.
+    force_restart() is a SECOND route into _start_locked, fired by main.py's
+    unreachable watchdog after 180s, so both variants cost a BOUNDED outage
+    rather than a permanent one. Still worse than this code, which never loses
+    the watchers -- but the first draft of this docstring said "permanently"
+    and that was not measured.
 
     Both repairs were worse than the bug. The fix belongs at a different layer
     (the rebuild route, or a spawn that reaps only its own server), so it is not
@@ -229,3 +235,45 @@ class TestF4RecoveryStillReadsTheBarePort_Deliberately:
 
         m.restart_if_needed()
         assert not m._start_locked.called
+
+
+class TestTheTeardownOnAFailedServerStartIsWitnessed:
+    """The blanket `self.stop()` after `_wait_for_server()` fails had NO test.
+
+    Round 3 mutation: replacing it with `pass`, and flipping its `return False`
+    to `return True`, both survived the whole 2111-test suite. Every
+    `_wait_for_server` stub in the repo returns True, so nothing entered that
+    branch -- and the change that annotated it as load-bearing added eight lines
+    of comment and no witness. A comment about a trap does not stop the trap.
+
+    It IS load-bearing: emptying `_processes` re-arms set_capture_suppressed's
+    `elif not self._processes` rebuild route (aw_manager.py:752), and the repair
+    that skipped it to preserve watchers is exactly what round 2 measured as a
+    regression.
+    """
+
+    def _failing_start(self, *, port_held):
+        m = _mgr(binaries="/tmp/bin", port_held=port_held, answers=False)
+        m._wait_for_server = MagicMock(return_value=False)  # server never binds
+        m._processes = {"bf-idle-tracker": MagicMock(**{"poll.return_value": None})}
+        return m
+
+    def test_a_failed_server_start_empties_processes(self):
+        m = self._failing_start(port_held=False)
+        assert m._start_locked() is False, "a failed server start must not report success"
+        assert m._processes == {}, (
+            "_processes still holds entries, so set_capture_suppressed's "
+            "`elif not self._processes` rebuild route is disarmed and nothing "
+            "re-enters _start_locked on the normal tick"
+        )
+
+    def test_the_rebuild_route_is_re_armed_afterwards(self):
+        """Assert the CONSEQUENCE, not just the field: the next tick must be
+        able to call _start_locked again."""
+        m = self._failing_start(port_held=False)
+        m._start_locked()
+
+        reached = []
+        m._start_locked = lambda: reached.append(1)
+        m.set_capture_suppressed(False, "next tick")
+        assert reached, "the rebuild route did not fire, so the device is wedged"
