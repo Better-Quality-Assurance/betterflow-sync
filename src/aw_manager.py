@@ -1392,27 +1392,41 @@ class AWManager:
                 self._dispatch_download_failure_report()
                 return False
 
-        if self._external_server_capturing():
+        # NOT _external_server_capturing(), and that is a DEFERRAL rather than
+        # an oversight. Every other attach point in this file asks /api/0/info;
+        # this one still trusts the bare TCP connect, so a port held by a
+        # process that answers nothing is still preferred over starting our own
+        # trackers. That is a real bug (a healthy machine runs its watchers into
+        # a server that answers nothing) and it is NOT fixed here.
+        #
+        # Asking here was written, measured and reverted twice. The problem is
+        # not the question, it is what you can do with a "no": the only answer
+        # available is to start our own server, it cannot bind a port somebody
+        # else owns, and `_wait_for_server` failing then runs the blanket
+        # `self.stop()` below. Both repairs made things WORSE than leaving it
+        # alone. Driven through main.py's real tick order against a corpse that
+        # releases the port at tick 4:
+        #
+        #   as-is (this code)     watchers=2 throughout, and FULLY RECOVERS
+        #                         the moment the corpse dies
+        #   ask + blanket stop()  watchers=0, permanently
+        #   ask + skip the stop() watchers=0, permanently, AND a dead
+        #                         bf-data-service left in _processes, which
+        #                         disarms set_capture_suppressed's
+        #                         `elif not self._processes` rebuild route
+        #                         (see :752) -- the only path back into
+        #                         _start_locked
+        #
+        # So the fix belongs at a DIFFERENT LAYER: either the rebuild route
+        # stops being gated on `_processes` being empty, or the spawn reaps only
+        # the server it started. Do not flip this line on its own.
+        if server_already_running:
             logger.info(
                 f"Tracker server already running on port {self.aw_port}, "
                 "using external instance"
             )
             self._using_external = True
         else:
-            if server_already_running:
-                # Held, but not answering. The widest member of this class and
-                # the only one needing no download failure and no Rosetta: with
-                # perfectly good binaries on disk we deferred to whatever owned
-                # the port, then ran our watchers into a server that answers
-                # nothing. Starting our own is the same thing we do when the
-                # port is free; if the corpse still holds the bind we fail
-                # loudly here instead of reporting a healthy attach.
-                logger.warning(
-                    "Port %s is held by a process that does not answer "
-                    "/api/0/info — starting our own trackers rather than "
-                    "attaching to it",
-                    self.aw_port,
-                )
             logger.info(f"Starting tracker components from {binaries_dir}")
 
             # Start server first
@@ -1422,27 +1436,14 @@ class AWManager:
             # Wait for server to be ready
             if not self._wait_for_server():
                 logger.error("Tracker server failed to start")
-                if self._port_in_use():
-                    # Somebody else owns this port, so failing to bind is
-                    # evidence ABOUT THE HOLDER and never a reason to destroy
-                    # watchers that are working. The blanket stop() below cost
-                    # a Critical in review: it cleared every watcher, and
-                    # is_managing then reads False, so main.py's 60s tick stops
-                    # calling restart_if_needed and the device never recovers.
-                    #
-                    # Latch capture-dead instead. This is also the arm that had
-                    # no flag at all -- every other member of this class
-                    # (Rosetta, backoff, download-failure) latches here, and
-                    # the widest one published a reassuring pair on a device
-                    # capturing nothing.
-                    logger.error(
-                        "Port %s is owned by a process we cannot reap and our "
-                        "own server cannot bind it — this device is capturing "
-                        "nothing",
-                        self.aw_port,
-                    )
-                    self.tracker_download_failed = True
-                    return False
+                # The blanket stop() is deliberate and load-bearing: emptying
+                # `_processes` is what re-arms set_capture_suppressed's
+                # `elif not self._processes` rebuild route (:752), which is the
+                # ONLY path back into _start_locked. A guard that skipped this
+                # to preserve watchers was tried and reverted -- it left a dead
+                # bf-data-service in `_processes`, disarmed that route, and the
+                # device sat with zero watchers permanently. See the deferral
+                # note above the external-attach branch.
                 self.stop()
                 return False
 

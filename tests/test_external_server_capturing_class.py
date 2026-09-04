@@ -119,19 +119,41 @@ class TestF2DownloadFailureAttachAsksTheServer:
         assert m.tracker_download_failed is False
 
 
-class TestF3NormalPathAttachAsksTheServer:
-    """The widest of the four: no download failure, no Rosetta, binaries fine.
-    A port held by a corpse made a healthy machine attach to it and run its
-    watchers into a server that answers nothing."""
+class TestF3NormalPathStillTrustsTheSocket_Deferred:
+    """F-3 is DEFERRED, and this pins the deferral so nobody flips the line.
 
-    def test_a_dead_holder_does_not_win_over_our_own_trackers(self):
+    The normal-path attach is the widest member of this class -- no download
+    failure, no Rosetta, just a port held by something that answers nothing --
+    and it is genuinely still broken: a healthy machine attaches to the corpse
+    and runs its watchers into a server that answers nothing.
+
+    Making it ask was written, measured and reverted TWICE. The question is not
+    the problem; what you can DO with a "no" is. The only answer available is to
+    start our own server, which cannot bind a port somebody else owns, and
+    `_wait_for_server` failing then runs a blanket `self.stop()`. Driven through
+    main.py's real tick order against a corpse that releases the port at tick 4:
+
+        as-is (this code)      watchers=2 throughout, FULLY RECOVERS on release
+        ask + blanket stop()   watchers=0, permanently
+        ask + skip the stop()  watchers=0 permanently, AND a dead
+                               bf-data-service left in _processes, which
+                               disarms set_capture_suppressed's
+                               `elif not self._processes` rebuild route --
+                               the only path back into _start_locked
+
+    Both repairs were worse than the bug. The fix belongs at a different layer
+    (the rebuild route, or a spawn that reaps only its own server), so it is not
+    being bodged here.
+    """
+
+    def test_a_dead_holder_is_still_attached_to_for_now(self):
         m = _mgr(binaries="/tmp/fake-binaries", port_held=True, answers=False)
         m._start_locked()
 
-        assert m._server_responding.called, "the socket was trusted without asking"
-        assert m._using_external is False, (
-            "attached to a process that does not answer /api/0/info; the "
-            "watchers now report into nothing"
+        assert m._using_external is True, (
+            "this line was flipped without moving the rebuild route -- read the "
+            "class docstring: both repairs left the device with zero watchers "
+            "permanently, which is worse than the bug being fixed"
         )
 
     def test_a_live_external_server_is_still_used(self):
@@ -207,72 +229,3 @@ class TestF4RecoveryStillReadsTheBarePort_Deliberately:
 
         m.restart_if_needed()
         assert not m._start_locked.called
-
-
-class TestABlipMustNotDestroyOurWatchers:
-    """C-1, found by the pre-merge gate refuting the first cut of this branch.
-
-    The first version made the external-vanished recovery ask /api/0/info. On a
-    HEALTHY shared ActivityWatch that missed two answers -- a load spike, a wake
-    from sleep, a long AW query -- it dropped external mode, spawned our own
-    server against the port that healthy server still owned, failed to bind, and
-    `_start_locked`'s `self.stop()` cleared every watcher. `is_managing` then
-    reads False, so main.py's 60s tick stops calling restart_if_needed at all
-    and nothing re-enters the branch. Permanent, on a healthy machine, with both
-    capture-dead flags reading False.
-
-    Measured against a control that reverted only that one predicate:
-
-        post-fix  rc=False  _using_external=False  watchers=[]      is_managing=False
-        control   rc=True   _using_external=True   watchers=[2]     is_managing=True
-
-    So the rule this file exists for cuts both ways: a held socket is not a
-    capture, AND a single unanswered ask is not a vanished server.
-    """
-
-    def _blipping(self, answers):
-        m = _mgr(binaries="/tmp/bin", port_held=True, answers=True)
-        seq = list(answers)
-        m._server_responding = MagicMock(
-            side_effect=lambda: seq.pop(0) if seq else True
-        )
-        m._wait_for_server = MagicMock(return_value=False)  # cannot bind: port taken
-        m._using_external = True
-        m._processes = {
-            "bf-window-tracker": MagicMock(**{"poll.return_value": None}),
-            "bf-idle-tracker": MagicMock(**{"poll.return_value": None}),
-        }
-        m.check_health = MagicMock(return_value=True)
-        m._get_latest_afk_event_age = MagicMock(return_value=5)
-        m._get_latest_window_event_age = MagicMock(return_value=5)
-        return m
-
-    def test_a_failed_bind_against_a_held_port_keeps_our_watchers(self):
-        """The holder is still there, so the bind failing is evidence ABOUT the
-        holder, never a reason to tear down watchers that are working."""
-        m = self._blipping([False, False])
-        m._start_locked()
-
-        assert sorted(m._processes) == ["bf-idle-tracker", "bf-window-tracker"], (
-            "our watchers were destroyed because a server we should never have "
-            "started could not bind a port somebody else owns"
-        )
-
-    def test_the_device_stays_supervised_after_a_blip(self):
-        m = self._blipping([False, False])
-        m.restart_if_needed()
-
-        assert m.is_managing, (
-            "is_managing went False, so main.py's 60s tick stops calling "
-            "restart_if_needed and nothing can ever re-enter recovery"
-        )
-
-    def test_a_failed_bind_on_a_FREE_port_still_tears_down(self):
-        """Control: the ordinary failure. Nobody holds the port, our server just
-        did not come up, and the pre-existing cleanup must still run."""
-        m = _mgr(binaries="/tmp/bin", port_held=False, answers=False)
-        m._wait_for_server = MagicMock(return_value=False)
-        m._processes = {"bf-idle-tracker": MagicMock(**{"poll.return_value": None})}
-
-        assert m._start_locked() is False
-        assert m._processes == {}, "the ordinary teardown must be untouched"
