@@ -540,6 +540,13 @@ class AWManager:
         # port we still capture, but restart_if_needed/force_restart manage
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
+        # True only while we are attached to a process that holds the tracker
+        # port and does not answer /api/0/info. Deliberately NOT one of the two
+        # capture-dead flags: _start_component clears those on Popen success
+        # (:2110), and the watcher loop runs after the attach, so anything
+        # latched there is wiped inside the same _start_locked call (measured).
+        # Nothing else writes this one.
+        self._external_server_not_responding = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
         # not probed yet. Installing Rosetta needs no reboot, so force_restart()
         # clears this to let a device that was fixed recover on its own — but
@@ -1432,12 +1439,30 @@ class AWManager:
         # opinion rather than something the measurement establishes. Do not flip
         # this line on its own; two attempts produced two different regressions.
         if server_already_running:
-            logger.info(
-                f"Tracker server already running on port {self.aw_port}, "
-                "using external instance"
-            )
+            # ASK -- and deliberately do NOT act on the answer here. Read the
+            # deferral note above: a foreign holder is unreapable
+            # (_reap_orphan_processes is path-scoped to our own binaries), so
+            # attaching is the behaviour that keeps the watchers alive and
+            # self-heals when the holder dies. Two attempts to change that both
+            # regressed. What was missing was never the decision -- it was
+            # TELLING THE FLEET, which is all this does.
+            self._external_server_not_responding = not self._server_responding()
+            if self._external_server_not_responding:
+                logger.warning(
+                    "Attached to the process holding port %s, but it does not "
+                    "answer /api/0/info — this device is capturing NOTHING",
+                    self.aw_port,
+                )
+            else:
+                logger.info(
+                    f"Tracker server already running on port {self.aw_port}, "
+                    "using external instance"
+                )
             self._using_external = True
         else:
+            # We own the server here, so the external-server verdict is not ours
+            # to carry -- clear it or a stale True outlives its condition.
+            self._external_server_not_responding = False
             logger.info(f"Starting tracker components from {binaries_dir}")
 
             # Start server first
