@@ -38,6 +38,11 @@ def _mgr(window_age, running_for, reachable=True):
     mgr._get_latest_window_event_age = MagicMock(return_value=window_age)
     mgr._get_latest_afk_event_age = MagicMock(return_value=5)  # afk fresh → idle block no-op
     mgr._port_in_use = MagicMock(return_value=reachable)
+    # `reachable` means "AW is reachable" (see the test names below), which is
+    # now asked via _server_responding() -- a corpse holding the port answers
+    # True to _port_in_use() alone, the same agreement region #246 documented.
+    # Stub both so the fixture answers the question the code actually asks.
+    mgr._server_responding = MagicMock(return_value=reachable)
     mgr._component_started_at = (
         {} if running_for is None
         else {"bf-window-tracker": time.monotonic() - running_for}
