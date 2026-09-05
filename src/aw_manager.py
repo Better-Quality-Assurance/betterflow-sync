@@ -540,6 +540,18 @@ class AWManager:
         # port we still capture, but restart_if_needed/force_restart manage
         # nothing, so the backend should know this device is un-self-healing.
         self._managed_components_unavailable: bool = False
+        # True when the most recent evaluation attached to a process that holds
+        # the tracker port and does not answer /api/0/info. Re-derived as the
+        # FIRST statement of _start_locked, before even the capture-suppressed
+        # guard, so it cannot outlive its condition -- reset to False there and
+        # set True only on the normal-path attach branch; the other three
+        # attach branches only fire when _external_server_capturing() is
+        # already true, so False is correct there without them touching this
+        # field. Deliberately NOT one of the two capture-dead flags:
+        # _start_component clears those on Popen success, and the watcher loop
+        # runs after the attach, so anything latched there is wiped inside the
+        # same _start_locked call (measured).
+        self._external_server_not_responding = False
         # Tri-state cache for the Apple-Silicon-without-Rosetta check. None =
         # not probed yet. Installing Rosetta needs no reboot, so force_restart()
         # clears this to let a device that was fixed recover on its own — but
@@ -1181,6 +1193,21 @@ class AWManager:
                 )
 
     def _start_locked(self) -> bool:
+        # Reset per evaluation -- the FIRST statement in this method, before
+        # even the capture-suppressed guard, so "re-derived on every
+        # _start_locked call" is literally true with no exception to document.
+        # False is also the honest value while capture is suppressed: the
+        # device is not attached to a dead external server, it is not attached
+        # to anything. Of the four branches below that can attach to an
+        # external server -- the Rosetta attach, the backoff attach, the
+        # download-failure attach, and the normal-path attach -- only the
+        # normal-path attach can attach to a NON-responding one; the other
+        # three attach only when _external_server_capturing() is already true
+        # and each returns immediately after, so False is already correct
+        # there without them touching this field. Resetting here and setting
+        # True in the one normal-path branch is the whole invariant.
+        self._external_server_not_responding = False
+
         # Every route back to a running tracker funnels through here, so this one
         # guard is enough to keep start()/restart_if_needed()/force_restart() from
         # resurrecting capture while it is suppressed.
@@ -1225,11 +1252,14 @@ class AWManager:
             # It used to read "Here — and ONLY here", with a paragraph below
             # explaining why the other paths could get away with the TCP answer
             # because they only decide whether to START something. That was
-            # already half-false after #233. Today THIS branch and the two
-            # download-path attaches ask, through _external_server_capturing();
-            # the normal-path attach still does not, deliberately -- see the
-            # deferral note above it. So "only here" is wrong, and "every attach
-            # point asks" would be wrong too.
+            # already half-false after #233, and now every attach point asks:
+            # this branch and the two download-path attaches ask through
+            # _external_server_capturing(); the normal-path attach asks too, via
+            # _server_responding() directly (see the external-attach design note
+            # above it) -- it just does not ACT on a "no", only reports it
+            # through _external_server_not_responding. So "only here" is wrong,
+            # and so is "the normal-path attach doesn't ask" -- it asks, it just
+            # doesn't decide anything on the answer.
             #
             # What is still TRUE and specific to this branch: on a
             # Rosetta-missing Mac the listener is un-reapable by construction --
@@ -1392,12 +1422,14 @@ class AWManager:
                 self._dispatch_download_failure_report()
                 return False
 
-        # NOT _external_server_capturing(), and that is a DEFERRAL rather than
-        # an oversight. Every other attach point in this file asks /api/0/info;
-        # this one still trusts the bare TCP connect, so a port held by a
-        # process that answers nothing is still preferred over starting our own
-        # trackers. That is a real bug (a healthy machine runs its watchers into
-        # a server that answers nothing) and it is NOT fixed here.
+        # NOT _external_server_capturing(), deliberately, and this is no longer
+        # a deferred bug -- it is a decided design. A foreign holder is
+        # unreapable (_reap_orphan_processes is path-scoped to our binaries), so
+        # attaching is the behaviour that keeps the watchers alive and recovers
+        # when the holder dies; both attempts to change it regressed (table
+        # below). The device now REPORTS the condition instead, via
+        # _external_server_not_responding on the heartbeat. Change the reporting
+        # if it is wrong; do not change this line.
         #
         # Asking here was written, measured and reverted twice. The problem is
         # not the question, it is what you can do with a "no": the only answer
@@ -1432,10 +1464,25 @@ class AWManager:
         # opinion rather than something the measurement establishes. Do not flip
         # this line on its own; two attempts produced two different regressions.
         if server_already_running:
-            logger.info(
-                f"Tracker server already running on port {self.aw_port}, "
-                "using external instance"
-            )
+            # ASK -- and deliberately do NOT act on the answer here. Read the
+            # external-attach design note above: a foreign holder is unreapable
+            # (_reap_orphan_processes is path-scoped to our own binaries), so
+            # attaching is the behaviour that keeps the watchers alive and
+            # self-heals when the holder dies. Two attempts to change that both
+            # regressed. What was missing was never the decision -- it was
+            # TELLING THE FLEET, which is all this does.
+            self._external_server_not_responding = not self._server_responding()
+            if self._external_server_not_responding:
+                logger.warning(
+                    "Attached to the process holding port %s, but it does not "
+                    "answer /api/0/info — this device is capturing NOTHING",
+                    self.aw_port,
+                )
+            else:
+                logger.info(
+                    f"Tracker server already running on port {self.aw_port}, "
+                    "using external instance"
+                )
             self._using_external = True
         else:
             logger.info(f"Starting tracker components from {binaries_dir}")
@@ -1456,7 +1503,7 @@ class AWManager:
                 # unreachable escalation fired force_restart (which IS a second
                 # route in; the first draft of this note wrongly called :752 the
                 # only one). Bounded, not permanent -- and still worse than
-                # keeping the watchers. See the deferral note above.
+                # keeping the watchers. See the external-attach design note above.
                 self.stop()
                 return False
 
@@ -1521,6 +1568,14 @@ class AWManager:
 
     def _stop_locked(self) -> None:
         """Terminate every tracked process. Caller must hold _lifecycle_lock."""
+        # Reset here too, before the early return below, mirroring the reset at
+        # the top of _start_locked: once we stop, we are not attached to
+        # anything, so "attached to a non-responding external server" cannot be
+        # true. set_capture_suppressed(True) calls ONLY this method, never
+        # _start_locked -- so without this reset a corpse-attach flag latched on
+        # a prior cycle survives suppression, and a device that is not
+        # capturing BY DESIGN reports itself as attached to a dead server.
+        self._external_server_not_responding = False
         if not self._processes:
             return
 
@@ -1705,6 +1760,7 @@ class AWManager:
             # Written under this same lock in _start_locked, so read under it too
             # instead of racing a concurrent start/restart.
             download_failed = self.tracker_download_failed
+            external_dead = self._external_server_not_responding
 
         window_age = self._get_latest_window_event_age()
         # When the agent owns the AFK stream in-process, the external
@@ -1750,6 +1806,13 @@ class AWManager:
             # be flowing via an external server on the port, but nothing here can
             # restart or self-heal it, so an outage will not recover on its own.
             "managed_components_unavailable": managed_unavailable,
+            # We are attached to a process that holds the tracker port and does
+            # not answer /api/0/info, so nothing is being captured -- but this is
+            # NOT tracker_download_failed: our binaries are fine and there is
+            # nothing to reap (the holder is not ours). Distinct key so the alert
+            # can say "something else owns port 5600" instead of blaming the
+            # download.
+            "external_server_not_responding": external_dead,
         }
 
     def restart_if_needed(self) -> bool:
@@ -1770,16 +1833,24 @@ class AWManager:
         # special — otherwise fall through to watcher health/stale recovery,
         # which MUST run in external mode too. Returning early there was why a
         # blind/orphaned bf-idle-tracker never self-healed after an update.
-        # DELIBERATELY the bare port read, not _external_server_capturing().
-        # Asking /api/0/info here was tried and reverted: on a HEALTHY shared
-        # ActivityWatch that missed two answers (a load spike, a wake from
-        # sleep, a long AW query) it dropped external mode, spawned our own
-        # server against the port that healthy server still owns, failed to
-        # bind, and the teardown below cleared every watcher. `is_managing`
-        # then reads False, so main.py's 60s tick stops calling this method and
-        # nothing re-enters the branch -- permanent, on a healthy machine, with
-        # both capture-dead flags reading False. Measured against a control
-        # that reverted only this predicate:
+        # DELIBERATELY the bare port read, not _external_server_capturing() --
+        # and not _external_server_not_responding either. That field reports
+        # the ATTACH-side condition (does the server we are attached to answer
+        # /info); it is set True only in _start_locked's normal-path attach
+        # branch, and every other write resets it to False. This predicate
+        # asks something that field cannot answer: has the external server's
+        # socket disappeared. Tearing down external mode achieves nothing when
+        # the holder is unreapable (_reap_orphan_processes is path-scoped to
+        # our own binaries), so asking /info and acting on a "no" was tried
+        # and reverted instead: on a HEALTHY shared ActivityWatch that missed
+        # two answers (a load spike, a wake from sleep, a long AW query) it
+        # dropped external mode, spawned our own server against the port that
+        # healthy server still owns, failed to bind, and the teardown below
+        # cleared every watcher. `is_managing` then reads False, so main.py's
+        # 60s tick stops calling this method and nothing re-enters the branch
+        # -- permanent, on a healthy machine, with both capture-dead flags
+        # reading False. Measured against a control that reverted only this
+        # predicate:
         #
         #   asked /info   rc=False  _using_external=False  watchers=[]
         #   bare port     rc=True   _using_external=True   watchers=[2]
@@ -1825,7 +1896,24 @@ class AWManager:
         ):
             age = self._get_latest_window_event_age()
             running_for = self._component_running_seconds(watcher)
-            reachable = self._port_in_use()
+            reachable = self._window_tracker_reachable()
+            # A previous fix wave cleared _external_server_not_responding here
+            # when `reachable` is True, reasoning that a server which just
+            # answered /api/0/info cannot be the non-responding holder the
+            # flag reports. That clear is INERT on macOS: this whole block is
+            # gated on `watcher not in self._disabled_components`, and
+            # main.py unconditionally disables "bf-window-tracker" on darwin
+            # (the in-process window watcher covers it instead). So on the
+            # platform this file's Rosetta/Accessibility complexity exists
+            # for, the clear never ran, and the flag worked on Windows/Linux
+            # only -- a signal whose meaning silently depended on the OS.
+            # Reverted rather than repaired: a uniform latch, refreshed only
+            # by the next _start_locked evaluation (a restart, or
+            # set_capture_suppressed(False) on an empty process set), is
+            # honest everywhere. No consumer reads this key yet, so the
+            # latch costs nothing today. See disclosure_baseline.py and
+            # bf_client.py for what "refreshed only on evaluation" actually
+            # means for this field.
             if not self._is_window_tracker_stale(age, running_for, reachable):
                 # Emitting fresh window events again. (age None here is just
                 # launch lag or an AW outage, not recovery — don't count it.)
@@ -2223,6 +2311,21 @@ class AWManager:
             return True
         except (urllib.error.URLError, OSError):
             return False
+
+    def _window_tracker_reachable(self) -> bool:
+        """Is AW reachable for the purpose of judging window-tracker staleness?
+
+        Named rather than inlined because the question is not "is the port
+        held". _is_window_tracker_stale reads this as "AW is reachable", and a
+        corpse holding the port answers True to a TCP connect -- so an AW
+        OUTAGE was being classified as a blind tracker, force-restarted, and
+        latched as _window_tracker_blind, which tells the user to check a
+        permission when the real fault is a dead server.
+
+        One HTTP ask, no port pre-check: a server that answers necessarily
+        holds the port, so the TCP connect would only add latency.
+        """
+        return self._server_responding()
 
     def _wait_for_server(self) -> bool:
         """Wait for tracker server to accept connections."""

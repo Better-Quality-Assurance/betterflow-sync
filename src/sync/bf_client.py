@@ -522,6 +522,23 @@ class BetterFlowClient(BaseApiClient):
         # wire and can CLEAR a degraded episode rather than latching it.
         "tracker_download_failed",
         "managed_components_unavailable",
+        # True when we are attached to a process that holds the tracker port
+        # and does not answer /api/0/info -- the device is capturing NOTHING.
+        # Not a per-cycle verdict: it is set only inside AWManager's
+        # _start_locked normal-path attach, and re-derived fresh only when
+        # that evaluation runs again. The routine 60s tick does NOT re-enter
+        # _start_locked while the port stays held, so a device attached to a
+        # corpse keeps reporting True until one of: the port is released (the
+        # external server dies and the routine tick starts our own), the
+        # 180s unreachable watchdog fires force_restart(), or capture is
+        # suppressed and later resumed with no processes running. A server
+        # that recovers WITHOUT any of those (still holds the port, starts
+        # answering again) is not re-evaluated by the routine tick and can
+        # leave this flag stuck True for up to that 180s watchdog window --
+        # a known, deliberate limitation, not a bug to chase. Distinct from
+        # tracker_download_failed (our binaries are fine) and from
+        # managed_components_unavailable (we did start our watchers).
+        "external_server_not_responding",
         # Third field of the same shape, found while fixing the two above: the
         # window watcher has stayed blind across repeated restarts (the macOS
         # Accessibility counterpart of idle_tracker_blind, which IS forwarded).
