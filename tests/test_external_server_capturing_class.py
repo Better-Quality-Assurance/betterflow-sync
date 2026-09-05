@@ -120,12 +120,15 @@ class TestF2DownloadFailureAttachAsksTheServer:
 
 
 class TestF3NormalPathStillTrustsTheSocket_Deferred:
-    """F-3 is DEFERRED, and this pins the deferral so nobody flips the line.
+    """F-3 is a DECIDED DESIGN, and this pins it so nobody flips the line.
 
     The normal-path attach is the widest member of this class -- no download
     failure, no Rosetta, just a port held by something that answers nothing --
-    and it is genuinely still broken: a healthy machine attaches to the corpse
-    and runs its watchers into a server that answers nothing.
+    and attaching to it anyway is deliberate: a foreign holder is unreapable
+    (_reap_orphan_processes is path-scoped to our own binaries), so attaching
+    is what keeps the watchers alive and lets the device recover the moment
+    the holder dies. The device now REPORTS the condition instead of hiding
+    it, via _external_server_not_responding on the heartbeat.
 
     Making it ask was written, measured and reverted TWICE. The question is not
     the problem; what you can DO with a "no" is. The only answer available is to
@@ -147,9 +150,8 @@ class TestF3NormalPathStillTrustsTheSocket_Deferred:
     the watchers -- but the first draft of this docstring said "permanently"
     and that was not measured.
 
-    Both repairs were worse than the bug. The fix belongs at a different layer
-    (the rebuild route, or a spawn that reaps only its own server), so it is not
-    being bodged here.
+    Both repairs were worse than this design. Change the reporting if it is
+    wrong; do not change this line.
     """
 
     def test_a_dead_holder_is_still_attached_to_for_now(self):
@@ -182,7 +184,7 @@ class TestF3NormalPathStillTrustsTheSocket_Deferred:
 
 
 class TestF4RecoveryStillReadsTheBarePort_Deliberately:
-    """F-4 is DEFERRED, and this pins the deferral so nobody flips it back.
+    """F-4 is a DECIDED DESIGN, and this pins it so nobody flips it back.
 
     Making the external-vanished recovery ask /api/0/info is the obvious fourth
     member of this class, and it was written, measured and reverted. On a
@@ -196,11 +198,15 @@ class TestF4RecoveryStillReadsTheBarePort_Deliberately:
         asked /info   rc=False  _using_external=False  watchers=[]
         bare port     rc=True   _using_external=True   watchers=[2]
 
-    So it needs a debounce -- N consecutive non-answers, resetting on any
-    success -- which is its own change with its own evidence. Until then a
-    corpse holding the port keeps external mode, and the device recovers on the
-    next app start via the normal-path attach (F-3), which no longer defers to
-    a corpse in the first place.
+    So it still needs a debounce -- N consecutive non-answers, resetting on
+    any success -- which is its own change with its own evidence; that is
+    unchanged by the reporting fix in Tasks 1-2, because THIS predicate never
+    writes _external_server_not_responding. That field is F-3's: set only in
+    _start_locked's normal-path attach branch, and re-derived fresh on every
+    _start_locked call. Until a debounced ask lands, a corpse holding the port
+    keeps external mode here, and the device recovers on the next app start
+    via the normal-path attach (F-3), which no longer defers to a corpse in
+    the first place.
     """
 
     def test_a_corpse_holding_the_port_does_NOT_trigger_recovery_yet(self):
