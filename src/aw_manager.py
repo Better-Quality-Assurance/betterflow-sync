@@ -1897,17 +1897,23 @@ class AWManager:
             age = self._get_latest_window_event_age()
             running_for = self._component_running_seconds(watcher)
             reachable = self._window_tracker_reachable()
-            if reachable:
-                # The tick already asked /api/0/info to judge window-tracker staleness,
-                # and a server that ANSWERS is by definition not the non-responding
-                # holder this flag reports. Without this the flag is a latch on one 2s
-                # probe: an ActivityWatch that was merely still booting when the agent
-                # started sets it True and nothing re-derives it, because the routine
-                # tick never re-enters _start_locked while the port stays held. The
-                # asymmetry is what made it worth fixing -- on a real corpse the
-                # watchdog forces a restart and the flag refreshes, so it only latched
-                # in the case where it was WRONG.
-                self._external_server_not_responding = False
+            # A previous fix wave cleared _external_server_not_responding here
+            # when `reachable` is True, reasoning that a server which just
+            # answered /api/0/info cannot be the non-responding holder the
+            # flag reports. That clear is INERT on macOS: this whole block is
+            # gated on `watcher not in self._disabled_components`, and
+            # main.py unconditionally disables "bf-window-tracker" on darwin
+            # (the in-process window watcher covers it instead). So on the
+            # platform this file's Rosetta/Accessibility complexity exists
+            # for, the clear never ran, and the flag worked on Windows/Linux
+            # only -- a signal whose meaning silently depended on the OS.
+            # Reverted rather than repaired: a uniform latch, refreshed only
+            # by the next _start_locked evaluation (a restart, or
+            # set_capture_suppressed(False) on an empty process set), is
+            # honest everywhere. No consumer reads this key yet, so the
+            # latch costs nothing today. See disclosure_baseline.py and
+            # bf_client.py for what "refreshed only on evaluation" actually
+            # means for this field.
             if not self._is_window_tracker_stale(age, running_for, reachable):
                 # Emitting fresh window events again. (age None here is just
                 # launch lag or an AW outage, not recovery — don't count it.)

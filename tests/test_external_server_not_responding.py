@@ -83,25 +83,42 @@ class TestItReachesTheWire:
         )
 
 
-class TestTheFlagIsNotALatch:
-    def test_a_boot_blip_clears_on_the_next_reachable_tick(self):
-        """Finding 1 (fix round 3): health_snapshot() reads a value re-derived
-        ONLY inside _start_locked, and the routine 60s tick does not reach
-        _start_locked while the port stays held. So an ActivityWatch that was
-        merely still BOOTING when the agent started (port held, /info not yet
-        answering, 2s timeout) sets the flag True and it never clears on its
-        own -- UNTIL the routine tick's OWN reachability check (already
-        computed every tick to judge window-tracker staleness) notices AW now
-        answers and clears it. Drives restart_if_needed(), the real routine
-        tick, not _start_locked a second time.
+class TestTheFlagIsALatchUntilTheNextStartEvaluation:
+    def test_the_flag_is_a_latch_until_the_next_start_evaluation(self):
+        """Known, deliberate limitation -- not a regression to chase.
+
+        A prior fix wave (round 3) tried to clear this flag from the routine
+        60s tick's window-tracker reachability check, the moment /api/0/info
+        started answering again. That clear lived INSIDE the block gated on
+        `watcher not in self._disabled_components` (watcher =
+        "bf-window-tracker"), and main.py unconditionally disables
+        "bf-window-tracker" on darwin -- the in-process macOS window watcher
+        covers it instead. So the clear was inert on exactly the platform
+        this file's Rosetta/Accessibility complexity exists for, and worked
+        on Windows/Linux only: the same flag would mean a different thing
+        depending on the OS the device happened to run.
+
+        Reverted rather than repaired. The honest, platform-independent
+        behaviour pinned here: this flag is set or cleared ONLY inside a
+        `_start_locked` evaluation, and the routine 60s tick does not
+        re-enter `_start_locked` while the port stays held (see
+        _restart_if_needed_locked's bare-port check above). So a corpse that
+        starts answering again with no restart-ish event in between --
+        force_restart() via the 180s unreachable watchdog, or
+        set_capture_suppressed(False) on an empty process set -- keeps this
+        flag at its stale value. No consumer reads this key yet, so the cost
+        of the latch is zero today; fixing it for real needs a
+        platform-independent reachability point under the lock, which this
+        test deliberately does not attempt.
         """
         m = _mgr(port_held=True, answers=False)
         m._start_locked()
         assert m._external_server_not_responding is True
 
-        # AW finishes booting. Give the instance a live watcher process so the
-        # routine tick's window-tracker section -- not _start_locked -- is
-        # what runs and does the clearing.
+        # The corpse "recovers" -- starts answering -- with no restart-ish
+        # event in between. Give the instance a live watcher process so the
+        # routine tick's window-tracker section runs (it used to be where
+        # the now-reverted clear lived).
         window = MagicMock()
         window.poll.return_value = None
         m._processes = {"bf-window-tracker": window}
@@ -112,7 +129,10 @@ class TestTheFlagIsNotALatch:
         for _ in range(3):
             m.restart_if_needed()
 
-        assert m._external_server_not_responding is False
+        assert m._external_server_not_responding is True, (
+            "the routine tick must not clear this -- the clear was inert on "
+            "macOS and is gone on every platform now; see the class docstring"
+        )
 
 
 class TestTheFlagDoesNotOutliveTheCondition:
