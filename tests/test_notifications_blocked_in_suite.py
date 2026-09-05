@@ -221,7 +221,18 @@ def test_send_notification_does_not_reach_the_os(
 
 # Assembled, never written whole: this file is itself a tests/test_*.py and the
 # scan below reads all of them, so a literal here would match itself.
-_MARKER = "real_" + "notifications"
+# Assembled from parts so this file cannot match its own corpus (Rule 9).
+_MARKER_TOKEN = "real_" + "notifications"
+
+# Match the MARKER'S USE, not a bare mention of its name. Every real opt-out
+# writes `pytest.mark.<token>` (module-level `pytestmark` or a decorator), while
+# prose about the mechanism names the FIXTURE -- `_block_<token>` -- which
+# contains the token as a substring. Matching the bare token made any file that
+# merely DESCRIBED the block register as exempting itself: caught 2026-09-05 by
+# a new test file whose docstring explained what the fixture is. The workaround
+# would have been to write round the word, which corrupts the note to protect
+# the parser; the fix is to parse what the marker actually looks like.
+_MARKER = "mark." + _MARKER_TOKEN
 
 # Every file allowed to exempt itself from the conftest block, with the reason.
 # conftest.py is not listed because the scan covers test_*.py only -- conftest
@@ -240,6 +251,22 @@ _KNOWN_OPT_OUTS = {
         "with subprocess.run patched"
     ),
 }
+
+
+def test_naming_the_fixture_in_prose_is_not_an_opt_out():
+    """A file may DESCRIBE the block without exempting itself from it.
+
+    The scan used to match the bare marker token, which is a substring of the
+    fixture's own name, so any file whose comments explained the mechanism
+    registered as an opt-out. That pushes the next author to write round the
+    word rather than fix the parser -- and a note reworded to dodge a grep is
+    worse than the grep.
+    """
+    prose = "the guard is _block_" + _MARKER_TOKEN + ", an autouse fixture"
+    real_use = "pytestmark = pytest.mark." + _MARKER_TOKEN
+
+    assert _MARKER not in prose, "a prose mention of the fixture counts as an opt-out"
+    assert _MARKER in real_use, "control: a genuine module-level opt-out is not detected"
 
 
 def test_the_set_of_files_exempt_from_the_block_is_pinned():
