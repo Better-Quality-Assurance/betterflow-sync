@@ -629,13 +629,16 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # re-derived only when the tracker lifecycle is next EVALUATED (an
     # attach, a restart, or capture resuming with no processes running), and
     # the routine 60s health tick is not one of those moments while the port
-    # stays held. Stopping the trackers clears it immediately (attached to
-    # nothing cannot be attached to a dead server), so the CLEAR direction is
-    # bounded by that tick. The SET direction is not: a server that answers
-    # at attach and later goes unresponsive without releasing the port keeps
-    # this flag at its stale value until the next evaluation, which on a
-    # held port is the unreachable watchdog's force-restart (up to ~180s,
-    # not "one restart cycle"). Known and deliberate for now, not a bug.
+    # stays held -- but the tick DOES clear it the moment the holder answers
+    # /api/0/info again, so the CLEAR direction is bounded by one cycle ON ANY
+    # DEVICE THE TICK RUNS FOR. main.py gates it on `is_managing` (a non-empty
+    # process set), so a device that attached externally and whose watchers never
+    # started has no tick, and there the ~180s force_restart bound still applies.
+    # The SET direction is not: a server that answers at attach and later goes
+    # unresponsive without releasing the port keeps this flag at its stale
+    # value until the next evaluation, which on a held port is the unreachable
+    # watchdog's force-restart (up to ~180s, not "one restart cycle"). That
+    # asymmetry is deliberate: the flag is slow to accuse and quick to retract.
     "external_server_not_responding",
     # The window watcher has stayed blind across repeated restarts. Exactly the
     # same category as idle_tracker_blind, which this list already carries: a

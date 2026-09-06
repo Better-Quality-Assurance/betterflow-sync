@@ -524,18 +524,20 @@ class BetterFlowClient(BaseApiClient):
         "managed_components_unavailable",
         # True when we are attached to a process that holds the tracker port
         # and does not answer /api/0/info -- the device is capturing NOTHING.
-        # Not a per-cycle verdict: it is set only inside AWManager's
-        # _start_locked normal-path attach, and re-derived fresh only when
-        # that evaluation runs again. The routine 60s tick does NOT re-enter
-        # _start_locked while the port stays held, so a device attached to a
-        # corpse keeps reporting True until one of: the port is released (the
-        # external server dies and the routine tick starts our own), the
-        # 180s unreachable watchdog fires force_restart(), or capture is
-        # suppressed and later resumed with no processes running. A server
-        # that recovers WITHOUT any of those (still holds the port, starts
-        # answering again) is not re-evaluated by the routine tick and can
-        # leave this flag stuck True for up to that 180s watchdog window --
-        # a known, deliberate limitation, not a bug to chase. Distinct from
+        # SET only inside AWManager's _start_locked normal-path attach, and
+        # CLEARED by the routine 60s tick as soon as the holder answers
+        # /api/0/info again -- so on any device the tick still runs for, a server
+        # that recovers while holding the port is retracted within a cycle rather
+        # than waiting for the 180s unreachable watchdog. NOT universal: main.py
+        # gates that tick on `is_managing`, i.e. a non-empty process set, so a
+        # device that attached externally and whose watchers never started (they
+        # cannot exec -- the EBADARCH / Apple-Silicon-without-Rosetta state) has
+        # no tick at all, and there the old ~180s force_restart bound still
+        # applies. Verified, not assumed: such a device reports flag True with
+        # is_managing False. The clear sits above the tick's process-set
+        # guard so no component's enabled state can gate it (an earlier one lived
+        # inside the bf-window-tracker block and was inert on macOS, where that
+        # component is disabled). Distinct from
         # tracker_download_failed (our binaries are fine) and from
         # managed_components_unavailable (we did start our watchers).
         "external_server_not_responding",
