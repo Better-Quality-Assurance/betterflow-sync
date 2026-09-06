@@ -139,6 +139,14 @@ run:
 # the in-app updater to pick the correct download.
 TARGET_ARCH ?= $(shell uname -m | sed 's/aarch64/arm64/')
 
+# EXPORT it, so it reaches every recipe's child process -- build.spec reads it
+# from the ENVIRONMENT (`os.environ.get("TARGET_ARCH")`) and its arch-mismatch
+# guard is behind `if TARGET_ARCH:`. Without this the guard is inert on exactly
+# the paths CLAUDE.md tells a human to use (make dmg / build-mac / pkg); only CI
+# and the ship-* targets armed it, because those prefix the command themselves.
+# `?=` above still lets `make TARGET_ARCH=x86_64 ...` and the environment win.
+export TARGET_ARCH
+
 dmg: build-mac
 	@dmg_path="dist/BetterFlow-macOS-$(TARGET_ARCH).dmg"; \
 	rm -f "$$dmg_path"; \
