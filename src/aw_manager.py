@@ -1893,7 +1893,19 @@ class AWManager:
         # nothing to retract -- virtually all of them, virtually always -- pays no
         # probe. Only a device currently REPORTING a non-responding holder spends
         # the /api/0/info ask, which is exactly when the answer is worth having.
-        if self._external_server_not_responding and self._window_tracker_reachable():
+        #
+        # `_server_responding()` directly, not the `_window_tracker_reachable()`
+        # alias: that name is about the WINDOW TRACKER's staleness judgement and
+        # this asks about the SERVER we attached to. Same one-line call today, but
+        # the alias would read as a dependency on the window tracker that is
+        # exactly what this placement exists to avoid.
+        #
+        # Position relative to the process-set guard below is NOT load-bearing --
+        # a mutant moving it below passes the whole suite. What matters is that it
+        # is outside the bf-window-tracker block, which macOS disables. Do not
+        # defend this line's position as covering the empty-_processes case: it
+        # does not, because main.py gates this whole method on is_managing.
+        if self._external_server_not_responding and self._server_responding():
             self._external_server_not_responding = False
 
         if not self._processes:

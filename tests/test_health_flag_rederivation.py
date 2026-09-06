@@ -121,3 +121,68 @@ class TestIdleBlindIsReDerivedOnTheWayOut:
         m._idle_tracker_blind = True
         m.set_inproc_afk_active(True)
         assert m._idle_tracker_blind is False
+
+
+class TestTheOtherConfigAndTheDeviceWithNoTick:
+    """Two states the fixtures above cannot express.
+
+    Every fixture in this file leaves `stop_external_when_inproc` at its ctor
+    default of False, which is the config where the #240 re-derivation is least
+    interesting -- the external tracker keeps running throughout. With it True,
+    leaving in-process AFK STARTS A FRESH PROCESS, and the re-derivation declares
+    that new process blind from the old one's counter. That is intended (the
+    blind latch deliberately survives restarts, and the recovery path clears it
+    on the first fresh AFK event) but nothing pinned it, so the two configs
+    agreed on the value while differing in meaning.
+
+    And the clear added for #247 cannot help a device whose tick never runs:
+    main.py gates `restart_if_needed()` on `is_managing`, i.e. a non-empty
+    process set. A device that attached to a corpse and whose watchers could not
+    exec has none. Pinned so the comments claiming "bounded by one cycle" stay
+    honest about their scope.
+    """
+
+    def test_leaving_inproc_with_the_external_tracker_restarted_still_re_derives(self):
+        m = _ticking(responding=True)
+        m._stop_external_when_inproc = True
+        m._stop_idle_tracker_locked = MagicMock()
+        m._start_idle_tracker_locked = MagicMock()
+        m._idle_consecutive_stale = IDLE_BLIND_RESTART_THRESHOLD
+
+        m.set_inproc_afk_active(True)
+        assert m._idle_tracker_blind is False
+        m.set_inproc_afk_active(False)
+
+        assert m._start_idle_tracker_locked.called, (
+            "precondition: this config must actually restart the external tracker"
+        )
+        assert m._idle_tracker_blind is True, (
+            "the counter is what carries the blind verdict across the switch; a "
+            "fresh process does not clear it until it emits a real AFK event"
+        )
+
+    def test_a_device_with_no_tick_keeps_the_flag(self):
+        """The scope limit the heartbeat comments now state.
+
+        Attached to a corpse, watchers cannot exec, so `_processes` is empty and
+        main.py never calls restart_if_needed(). The flag stays True until the
+        180s force_restart -- documented, not fixed here, and asserted so the
+        claim in bf_client.py/disclosure_baseline.py cannot quietly become a
+        universal again.
+        """
+        m = AWManager()
+        m._capture_suppressed = False
+        m._get_binaries_dir = MagicMock(return_value="/tmp/bin")
+        m._rosetta_required = MagicMock(return_value=False)
+        m._port_in_use = MagicMock(return_value=True)
+        m._server_responding = MagicMock(return_value=False)
+        m._start_component = MagicMock(return_value=False)   # cannot exec
+        m._reap_orphan_processes = MagicMock()
+
+        assert m._start_locked() is True
+        assert m._external_server_not_responding is True
+        assert m._processes == {}
+        assert m.is_managing is False, (
+            "main.py gates restart_if_needed() on this, so the tick -- and the "
+            "clear -- never run for this device"
+        )

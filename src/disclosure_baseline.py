@@ -630,7 +630,10 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # attach, a restart, or capture resuming with no processes running), and
     # the routine 60s health tick is not one of those moments while the port
     # stays held -- but the tick DOES clear it the moment the holder answers
-    # /api/0/info again, so the CLEAR direction is bounded by one cycle.
+    # /api/0/info again, so the CLEAR direction is bounded by one cycle ON ANY
+    # DEVICE THE TICK RUNS FOR. main.py gates it on `is_managing` (a non-empty
+    # process set), so a device that attached externally and whose watchers never
+    # started has no tick, and there the ~180s force_restart bound still applies.
     # The SET direction is not: a server that answers at attach and later goes
     # unresponsive without releasing the port keeps this flag at its stale
     # value until the next evaluation, which on a held port is the unreachable
