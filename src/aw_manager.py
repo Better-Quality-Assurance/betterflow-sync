@@ -649,6 +649,22 @@ class AWManager:
             # the saved write.
             if active:
                 self._idle_tracker_blind = False
+            else:
+                # RE-DERIVE on the way OUT -- the other half of the retraction
+                # above. `_idle_consecutive_stale` survives the whole round trip
+                # (nothing in this method touches it), so a tracker that was
+                # genuinely blind before in-process AFK took over is still blind
+                # when the external one becomes the source again. Clearing on the
+                # way in and never restoring left it reporting healthy, with
+                # main.py's Input Monitoring re-prompt -- gated on this flag --
+                # suppressed, while billing ran off a frozen AFK stream.
+                #
+                # Derived from the counter rather than remembered, so it cannot
+                # disagree with the latch in `_restart_if_needed_locked`, which
+                # applies the same threshold to the same counter.
+                self._idle_tracker_blind = (
+                    self._idle_consecutive_stale >= IDLE_BLIND_RESTART_THRESHOLD
+                )
 
             if not self._stop_external_when_inproc or active == was_active:
                 return
@@ -1864,6 +1880,22 @@ class AWManager:
             self._using_external = False
             return self._start_locked()
 
+        # Clear the attach-side flag as soon as the external server answers
+        # again. HERE, not inside the bf-window-tracker block below: main.py
+        # disables that component unconditionally on darwin, so the block never
+        # runs there. A first attempt at this clear lived inside it and was
+        # therefore inert on the one platform this file's Rosetta and
+        # Accessibility complexity exists for -- correct on Windows and Linux,
+        # silently absent on macOS, which is worse than a uniform latch because
+        # the signal's meaning becomes platform-dependent.
+        #
+        # Gated on the flag being SET, and `and` short-circuits, so a device with
+        # nothing to retract -- virtually all of them, virtually always -- pays no
+        # probe. Only a device currently REPORTING a non-responding holder spends
+        # the /api/0/info ask, which is exactly when the answer is worth having.
+        if self._external_server_not_responding and self._window_tracker_reachable():
+            self._external_server_not_responding = False
+
         if not self._processes:
             return False
 
@@ -1907,13 +1939,11 @@ class AWManager:
             # platform this file's Rosetta/Accessibility complexity exists
             # for, the clear never ran, and the flag worked on Windows/Linux
             # only -- a signal whose meaning silently depended on the OS.
-            # Reverted rather than repaired: a uniform latch, refreshed only
-            # by the next _start_locked evaluation (a restart, or
-            # set_capture_suppressed(False) on an empty process set), is
-            # honest everywhere. No consumer reads this key yet, so the
-            # latch costs nothing today. See disclosure_baseline.py and
-            # bf_client.py for what "refreshed only on evaluation" actually
-            # means for this field.
+            # Reverted, then repaired properly: the clear now lives ABOVE the
+            # process-set guard at the top of this method, where no component's
+            # enabled state can gate it, and is itself gated on the flag being
+            # SET so a device with nothing to retract pays no probe. This block
+            # keeps its own `reachable` for the staleness judgement below.
             if not self._is_window_tracker_stale(age, running_for, reachable):
                 # Emitting fresh window events again. (age None here is just
                 # launch lag or an AW outage, not recovery — don't count it.)

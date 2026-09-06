@@ -83,42 +83,35 @@ class TestItReachesTheWire:
         )
 
 
-class TestTheFlagIsALatchUntilTheNextStartEvaluation:
-    def test_the_flag_is_a_latch_until_the_next_start_evaluation(self):
-        """Known, deliberate limitation -- not a regression to chase.
+class TestTheRoutineTickClearsItOnEveryPlatform:
+    """The latch this class used to DOCUMENT is now fixed.
 
-        A prior fix wave (round 3) tried to clear this flag from the routine
-        60s tick's window-tracker reachability check, the moment /api/0/info
-        started answering again. That clear lived INSIDE the block gated on
-        `watcher not in self._disabled_components` (watcher =
-        "bf-window-tracker"), and main.py unconditionally disables
-        "bf-window-tracker" on darwin -- the in-process macOS window watcher
-        covers it instead. So the clear was inert on exactly the platform
-        this file's Rosetta/Accessibility complexity exists for, and worked
-        on Windows/Linux only: the same flag would mean a different thing
-        depending on the OS the device happened to run.
+    It previously pinned a deliberate limitation: the flag was set or cleared
+    only inside a `_start_locked` evaluation, and the routine 60s tick does not
+    re-enter `_start_locked` while the port stays held -- so a corpse that
+    started answering again, with no restart-ish event in between, kept a stale
+    True. That was accepted because an earlier attempt to clear it from the tick
+    lived INSIDE the block gated on `watcher not in self._disabled_components`
+    (watcher = "bf-window-tracker"), and main.py disables that component
+    unconditionally on darwin. The clear worked on Windows/Linux and was inert on
+    macOS, making the flag mean different things per OS -- worse than a uniform
+    latch -- so it was reverted rather than repaired.
 
-        Reverted rather than repaired. The honest, platform-independent
-        behaviour pinned here: this flag is set or cleared ONLY inside a
-        `_start_locked` evaluation, and the routine 60s tick does not
-        re-enter `_start_locked` while the port stays held (see
-        _restart_if_needed_locked's bare-port check above). So a corpse that
-        starts answering again with no restart-ish event in between --
-        force_restart() via the 180s unreachable watchdog, or
-        set_capture_suppressed(False) on an empty process set -- keeps this
-        flag at its stale value. No consumer reads this key yet, so the cost
-        of the latch is zero today; fixing it for real needs a
-        platform-independent reachability point under the lock, which this
-        test deliberately does not attempt.
-        """
+    The repair is a platform-independent point: the tick now clears the flag
+    before the process-set guard, gated on the flag being SET so a device with
+    nothing to retract pays no probe. The per-platform assertions live in
+    tests/test_health_flag_rederivation.py; this class keeps the recovery
+    scenario that motivated the original limitation.
+    """
+
+    def test_a_corpse_that_starts_answering_clears_the_flag(self):
         m = _mgr(port_held=True, answers=False)
         m._start_locked()
         assert m._external_server_not_responding is True
 
-        # The corpse "recovers" -- starts answering -- with no restart-ish
-        # event in between. Give the instance a live watcher process so the
-        # routine tick's window-tracker section runs (it used to be where
-        # the now-reverted clear lived).
+        # The corpse "recovers" -- starts answering -- with NO restart-ish event
+        # in between (no force_restart, no suppress/resume). This is exactly the
+        # sequence the latch used to survive.
         window = MagicMock()
         window.poll.return_value = None
         m._processes = {"bf-window-tracker": window}
@@ -126,12 +119,12 @@ class TestTheFlagIsALatchUntilTheNextStartEvaluation:
         m._get_latest_afk_event_age = MagicMock(return_value=5)
         m._server_responding = MagicMock(return_value=True)
 
-        for _ in range(3):
-            m.restart_if_needed()
+        m.restart_if_needed()
 
-        assert m._external_server_not_responding is True, (
-            "the routine tick must not clear this -- the clear was inert on "
-            "macOS and is gone on every platform now; see the class docstring"
+        assert m._external_server_not_responding is False, (
+            "the routine tick did not retract the flag; a device whose "
+            "ActivityWatch was merely slow to boot reports capturing nothing "
+            "for the rest of the day"
         )
 
 
