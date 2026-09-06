@@ -308,14 +308,25 @@ def main() -> None:
     finally:
         os.unlink(zip_path)
 
-    # Verify
-    if binaries_exist(output_dir, plat):
-        print()
-        print("Done! All binaries downloaded successfully.")
-    else:
+    # Verify -- BOTH questions, the same pair the skip clause above asks.
+    # Asking only `binaries_exist` here was blind to the case the skip clause was
+    # widened for: extract_binaries returns with no exit code when the archive is
+    # missing launchers, so a complete leftover tree of the OTHER architecture
+    # satisfied a name-only check and this printed "Done!" and exited 0 --
+    # leaving the previous arch's trackers for the next PyInstaller run to bundle.
+    if not binaries_exist(output_dir, plat):
         print()
         print("ERROR: Some binaries are missing after extraction.")
         sys.exit(1)
+    if arch_mismatch(output_dir, plat, key):
+        print()
+        print(
+            "ERROR: the trackers on disk are not the architecture being built "
+            f"({key}). Extraction did not replace them; refusing to report success."
+        )
+        sys.exit(1)
+    print()
+    print("Done! All binaries downloaded successfully.")
 
 
 if __name__ == "__main__":
