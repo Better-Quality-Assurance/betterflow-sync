@@ -78,6 +78,39 @@ class TestGap1PostExtractionAsksTheArchQuestion:
         assert "skipping download" in capsys.readouterr().out
 
 
+    def test_a_real_extraction_that_succeeds_reports_success(self, monkeypatch, capsys, tmp_path):
+        """Witness the ALLOWANCE, through the extraction path.
+
+        The other control returns early on the SKIP clause and never reaches the
+        verify block, so it cannot see an over-refusal there. Without this, a
+        mutant that makes the verify always fail -- which would break every
+        build -- passes the whole suite. It did: found by the mutation matrix,
+        not by reading.
+        """
+        calls = {"n": 0}
+
+        def _exists(*a, **k):
+            # absent at the skip clause (so we download), present after extraction
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        monkeypatch.setattr(download_aw, "binaries_exist", _exists)
+        monkeypatch.setattr(download_aw, "arch_mismatch", lambda *a, **k: False)
+        monkeypatch.setattr(download_aw, "download_release", lambda *a, **k: str(tmp_path / "x.zip"))
+        monkeypatch.setattr(download_aw, "verify_digest", lambda *a, **k: None)
+        monkeypatch.setattr(download_aw, "extract_binaries", lambda *a, **k: None)
+        monkeypatch.setattr(download_aw, "fix_permissions", lambda *a, **k: None)
+        monkeypatch.setattr(download_aw.os, "unlink", lambda *a, **k: None)
+        monkeypatch.setattr(sys, "argv", ["download_aw.py"])
+
+        download_aw.main()
+
+        out = capsys.readouterr().out
+        assert calls["n"] > 1, "precondition: the fixture must reach the post-extraction verify"
+        assert "Done!" in out
+        assert "ERROR" not in out
+
+
 class TestGap2TheMakefileExportsTargetArch:
     """Drives the REAL Makefile, rather than asserting on its text.
 
