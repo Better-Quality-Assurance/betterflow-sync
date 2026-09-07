@@ -50,6 +50,11 @@ PROJECT = "betterflow-sync"  # must match the DSN's bound project on the bot
 
 _MAX_MESSAGE = 10_000
 _MAX_STACK = 50_000
+# The ingest truncates an accepted fingerprint to 128 chars, so send at most
+# that: a longer string would be silently shortened server-side, and two keys
+# differing only past 128 would then group together with nothing local saying
+# why. Ours are short slugs; this is a guard, not a working limit.
+_MAX_FINGERPRINT = 128
 
 
 class ErrorReporter:
@@ -106,7 +111,18 @@ class ErrorReporter:
             exc: Optional exception whose traceback becomes the stack.
             tags: Small string map for grouping (component, platform, ...).
             context: Freeform diagnostic data (merged with user/device context).
-            fingerprint: Stable dedup key; defaults to level + message.
+            fingerprint: Stable dedup key. Used BOTH as the client-side cooldown
+                key and as the grouping key sent to the ingest, which honours it
+                verbatim instead of hashing the message. Omit it and the ingest
+                hashes a normalized message instead (it prefers a normalized top
+                STACK FRAME and only falls back to the message when it cannot
+                extract one — its extractor matches JS `at ` lines, so a Python
+                traceback never yields a frame and we always land on the message
+                path) — fine for one-off reports,
+                wrong for anything whose occurrence COUNT is the measurement,
+                because normalization eats numbers (collapsing distinct buckets)
+                while leaving bare identifiers alone (splitting one fault).
+                Locally it still defaults to level + message.
             block: Send synchronously (only for the about-to-exit fatal path).
             dedup_window: Per-call cooldown override in seconds. ``None`` (the
                 default, and what every caller gets unless it says otherwise)
@@ -120,12 +136,22 @@ class ErrorReporter:
             return
 
         try:
-            key = fingerprint or f"{level}:{message}"
+            # Truncate the SAME way the wire value is truncated, so the local
+            # cooldown key and the ingest's grouping key stay the same string.
+            # Untruncated here, two fingerprints differing only past the cap
+            # would get separate local cooldowns and ONE server-side group —
+            # the docstring's "used for both" quietly false. The
+            # `level:message` fallback is deliberately NOT capped: it never
+            # leaves the machine, and capping it would collapse every long
+            # message into one cooldown key.
+            key = fingerprint[:_MAX_FINGERPRINT] if fingerprint else f"{level}:{message}"
             if not self._should_send(key, dedup_window):
                 logger.debug("Error report suppressed by client-side dedup: %s", key)
                 return
 
-            payload = self._build_payload(message, level, exc, tags, context)
+            payload = self._build_payload(
+                message, level, exc, tags, context, fingerprint
+            )
         except Exception as e:
             # Building the report must never take down the caller.
             logger.warning("Error report skipped (could not build payload): %s", e)
@@ -189,6 +215,7 @@ class ErrorReporter:
         exc: Optional[BaseException],
         tags: Optional[dict],
         context: Optional[dict],
+        fingerprint: Optional[str] = None,
     ) -> dict:
         merged_tags = {
             "component": "unknown",
@@ -217,6 +244,33 @@ class ErrorReporter:
             "tags": merged_tags,
             "context": merged_context,
         }
+
+        # Send the caller's key so the INGEST groups on it. Without this the
+        # ingest derives its own, which is both too coarse and too fine at once:
+        # it eats the elapsed figure, so the watchdog's three duration bands
+        # collapse into one row, and it does NOT eat a bucket type or a reason
+        # code, so one recurring drop fault split across five rows. Every
+        # deliberate fingerprint in this repo was local-cooldown-only until this
+        # line existed (issue #251).
+        #
+        # PRECONDITION, because "it hashes the message" is true here only by an
+        # accident of language: betterqa-bot's `generateFingerprint` prefers a
+        # normalized TOP STACK FRAME and reaches the message only when it cannot
+        # extract one, and its extractor (`monitor/error-fingerprint.ts`) keeps
+        # lines beginning `at ` — a JS shape. A Python traceback line reads
+        # `File "...", line 42, in foo`, so it never matches and we always land
+        # on the message path. Three sites here DO send a stack (both
+        # excepthooks, `main.py`'s crash report). If that extractor ever learns
+        # Python frames — a pure improvement over there, with no reason to think
+        # about this client — those three silently regroup. Re-check this clause,
+        # not just the outcome, before trusting it.
+        #
+        # Omitted entirely when the caller gave none — a missing field means
+        # "hash it yourself" at the ingest, which is what those callers already
+        # get. Sending the local `level:message` fallback instead would change
+        # grouping for every caller that never asked for one.
+        if fingerprint:
+            payload["fingerprint"] = fingerprint[:_MAX_FINGERPRINT]
 
         if exc is not None:
             stack = "".join(

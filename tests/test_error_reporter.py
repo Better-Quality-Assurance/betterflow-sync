@@ -345,3 +345,75 @@ class TestPerCallWindowSurvivesPruning:
             clock.return_value = 1000.0 + 301.0
             r.capture("ordinary", fingerprint="fp2", block=True)
             assert post.call_count == 2
+
+
+class TestFingerprintReachesTheWire:
+    """The fingerprint must be POSTed, not merely passed to capture().
+
+    Pre-fix, `fingerprint=` was accepted and used ONLY as an in-process cooldown
+    key; `_build_payload` never copied it into the body, so every deliberate
+    fingerprint in this repo died on the machine and the ingest fell back to
+    hashing a normalized message. One recurring fault then split across several
+    tracker rows whenever the message embedded a varying non-numeric field
+    (bucket types, a reason code), while the watchdog's three duration bands
+    collapsed into one because normalization eats the elapsed figure.
+
+    These assert on the POSTED BODY. The ~10 existing fingerprint assertions in
+    this repo all check the kwarg against a mocked capture(), which is the
+    producer side and stayed green throughout the defect (Phantom 7).
+    """
+
+    def _posted(self, post) -> dict:
+        return post.call_args.kwargs["json"]
+
+    def test_explicit_fingerprint_is_sent(self) -> None:
+        r = _reporter()
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", fingerprint="offline-queue-events-dropped", block=True)
+            assert self._posted(post)["fingerprint"] == "offline-queue-events-dropped"
+
+    def test_fingerprint_survives_verbatim_when_the_message_would_normalize_away(
+        self,
+    ) -> None:
+        """The ingest number-normalizes a message before hashing it, which is
+        exactly why the duration bands were invisible. A band key carrying
+        digits must arrive unchanged rather than being re-derived from text."""
+        r = _reporter()
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture(
+                "Sync overran the 150s deadline — finished at 164.8s in phase 'sync'",
+                fingerprint="sync-overran-2x",
+                block=True,
+            )
+            assert self._posted(post)["fingerprint"] == "sync-overran-2x"
+
+    def test_no_fingerprint_means_no_field(self) -> None:
+        """Absent, not empty. The ingest treats a missing fingerprint as "hash
+        it yourself"; sending "" or the local level:message fallback would
+        change grouping for every caller that never asked for one."""
+        r = _reporter()
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", block=True)
+            assert "fingerprint" not in self._posted(post)
+
+    def test_cap_is_applied_and_keeps_the_two_keys_in_step(self) -> None:
+        """The 128 cap is the one line that can desync the cooldown key from
+        the wire key, so it needs a witness of its own — both reviewers of #252
+        found it unwitnessed, and deleting the slice reddened nothing.
+
+        Two fingerprints identical through 128 chars are ONE group at the
+        ingest, so they must also share one local cooldown. Pre-fix the local
+        key was untruncated: they got separate cooldowns and one server row.
+        """
+        r = _reporter()
+        long_a = "x" * 128 + "AAAA"
+        long_b = "x" * 128 + "BBBB"
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", fingerprint=long_a, block=True)
+            sent = post.call_args.kwargs["json"]["fingerprint"]
+            assert len(sent) == 128 and sent == "x" * 128
+
+            # Differs only past the cap -> same wire group -> must be
+            # suppressed by the same cooldown, not posted a second time.
+            r.capture("boom", fingerprint=long_b, block=True)
+            assert post.call_count == 1
