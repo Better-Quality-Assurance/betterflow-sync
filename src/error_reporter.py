@@ -114,7 +114,11 @@ class ErrorReporter:
             fingerprint: Stable dedup key. Used BOTH as the client-side cooldown
                 key and as the grouping key sent to the ingest, which honours it
                 verbatim instead of hashing the message. Omit it and the ingest
-                hashes a normalized message instead — fine for one-off reports,
+                hashes a normalized message instead (it prefers a normalized top
+                STACK FRAME and only falls back to the message when it cannot
+                extract one — its extractor matches JS `at ` lines, so a Python
+                traceback never yields a frame and we always land on the message
+                path) — fine for one-off reports,
                 wrong for anything whose occurrence COUNT is the measurement,
                 because normalization eats numbers (collapsing distinct buckets)
                 while leaving bare identifiers alone (splitting one fault).
@@ -132,7 +136,15 @@ class ErrorReporter:
             return
 
         try:
-            key = fingerprint or f"{level}:{message}"
+            # Truncate the SAME way the wire value is truncated, so the local
+            # cooldown key and the ingest's grouping key stay the same string.
+            # Untruncated here, two fingerprints differing only past the cap
+            # would get separate local cooldowns and ONE server-side group —
+            # the docstring's "used for both" quietly false. The
+            # `level:message` fallback is deliberately NOT capped: it never
+            # leaves the machine, and capping it would collapse every long
+            # message into one cooldown key.
+            key = fingerprint[:_MAX_FINGERPRINT] if fingerprint else f"{level}:{message}"
             if not self._should_send(key, dedup_window):
                 logger.debug("Error report suppressed by client-side dedup: %s", key)
                 return
@@ -234,12 +246,24 @@ class ErrorReporter:
         }
 
         # Send the caller's key so the INGEST groups on it. Without this the
-        # ingest falls through to hashing a normalized message, which is both
-        # too coarse and too fine at once: it eats the elapsed figure, so the
-        # watchdog's three duration bands collapse into one row, and it does NOT
-        # eat a bucket type or a reason code, so one recurring drop fault split
-        # across five rows. Every deliberate fingerprint in this repo was
-        # local-cooldown-only until this line existed (issue #251).
+        # ingest derives its own, which is both too coarse and too fine at once:
+        # it eats the elapsed figure, so the watchdog's three duration bands
+        # collapse into one row, and it does NOT eat a bucket type or a reason
+        # code, so one recurring drop fault split across five rows. Every
+        # deliberate fingerprint in this repo was local-cooldown-only until this
+        # line existed (issue #251).
+        #
+        # PRECONDITION, because "it hashes the message" is true here only by an
+        # accident of language: betterqa-bot's `generateFingerprint` prefers a
+        # normalized TOP STACK FRAME and reaches the message only when it cannot
+        # extract one, and its extractor (`monitor/error-fingerprint.ts`) keeps
+        # lines beginning `at ` — a JS shape. A Python traceback line reads
+        # `File "...", line 42, in foo`, so it never matches and we always land
+        # on the message path. Three sites here DO send a stack (both
+        # excepthooks, `main.py`'s crash report). If that extractor ever learns
+        # Python frames — a pure improvement over there, with no reason to think
+        # about this client — those three silently regroup. Re-check this clause,
+        # not just the outcome, before trusting it.
         #
         # Omitted entirely when the caller gave none — a missing field means
         # "hash it yourself" at the ingest, which is what those callers already

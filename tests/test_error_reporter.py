@@ -395,3 +395,25 @@ class TestFingerprintReachesTheWire:
         with patch("src.error_reporter.requests.post") as post:
             r.capture("boom", block=True)
             assert "fingerprint" not in self._posted(post)
+
+    def test_cap_is_applied_and_keeps_the_two_keys_in_step(self) -> None:
+        """The 128 cap is the one line that can desync the cooldown key from
+        the wire key, so it needs a witness of its own — both reviewers of #252
+        found it unwitnessed, and deleting the slice reddened nothing.
+
+        Two fingerprints identical through 128 chars are ONE group at the
+        ingest, so they must also share one local cooldown. Pre-fix the local
+        key was untruncated: they got separate cooldowns and one server row.
+        """
+        r = _reporter()
+        long_a = "x" * 128 + "AAAA"
+        long_b = "x" * 128 + "BBBB"
+        with patch("src.error_reporter.requests.post") as post:
+            r.capture("boom", fingerprint=long_a, block=True)
+            sent = post.call_args.kwargs["json"]["fingerprint"]
+            assert len(sent) == 128 and sent == "x" * 128
+
+            # Differs only past the cap -> same wire group -> must be
+            # suppressed by the same cooldown, not posted a second time.
+            r.capture("boom", fingerprint=long_b, block=True)
+            assert post.call_count == 1
