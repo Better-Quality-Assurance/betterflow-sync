@@ -11,7 +11,7 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional, Union
 
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -1895,9 +1895,11 @@ class SyncCoordinator:
                 self._set_sync_failure_state(
                     stats.errors[0] if stats.errors else "Sync failed"
                 )
-                self._note_sync_failure(
-                    stats.errors[0] if stats.errors else "Sync failed"
-                )
+                # The WHOLE list, not errors[0]: server_status_summary names every
+                # kind it recognises, and the first reason may be the one producer
+                # that is deliberately never named — taking [0] then drops a
+                # nameable reason behind it and ops gets a bare count again.
+                self._note_sync_failure(stats.errors or "Sync failed")
 
             phase.name = "hours_fetch"
             hours = self._fetch_hours_today()
@@ -2155,7 +2157,9 @@ class SyncCoordinator:
             logger.debug("aw_manager.health_snapshot failed: %s", e)
         return telemetry
 
-    def _note_sync_failure(self, reason: str, *, exc: Optional[BaseException] = None) -> None:
+    def _note_sync_failure(
+        self, reason: Union[str, List[str]], *, exc: Optional[BaseException] = None
+    ) -> None:
         """Track a hard sync failure and report once it becomes a streak.
 
         Called from within _do_sync (holding _sync_lock), so the counter needs
@@ -2171,7 +2175,8 @@ class SyncCoordinator:
         # always on, so it gets the status code and nothing else.
         logger.warning(
             "Sync failing repeatedly (%d×): %s",
-            self._consecutive_sync_failures, reason,
+            self._consecutive_sync_failures,
+            reason if isinstance(reason, str) else "; ".join(map(str, reason)),
         )
         if (
             self.error_reporter is not None
