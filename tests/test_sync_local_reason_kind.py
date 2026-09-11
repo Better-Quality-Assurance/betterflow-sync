@@ -13,7 +13,7 @@ But a reason with no HTTP status fell to the last branch, which emitted a COUNT:
 
 That is what reached the board on 2026-09-10T10:39Z (fingerprint
 sync-repeated-failure, release 1.5.133), and it is the whole event: `stack` was
-NULL because the caller at main.py:1898 passes no `exc`, and `context` carries
+NULL because the `not stats.success` caller in _do_sync passes no `exc`, and `context` carries
 only `consecutive_failures`. So an operator is told sync has failed three times
 and the reason is on the user's laptop.
 
@@ -115,8 +115,10 @@ def test_a_mixed_batch_counts_only_the_uncoded_reasons_and_names_them():
 
 def test_two_rejections_sharing_one_status_are_not_reported_as_mixed():
     # `codes` is de-duplicated and `items` is not, so counting them against each
-    # other classified a pure server rejection as mixed and then asserted "plus
-    # 0 local reason(s)" — a sentence that counts the thing it just claimed.
+    # other (len(items) - len(codes) = 2 - 1) classified a pure server rejection
+    # as mixed and invented a local reason. Measured on the pre-#254 bytes:
+    #   "; server status 422 plus 1 local reason(s), full detail in local dead-letter"
+    # ("plus 0" was never reachable: this branch needed len(items) > len(codes).)
     out = server_status_summary(["API error (422): duration",
                                  "API error (422): unknown project"])
     assert out == "; server status 422, full reason in local dead-letter"

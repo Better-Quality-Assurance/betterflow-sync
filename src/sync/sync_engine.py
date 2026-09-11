@@ -129,8 +129,10 @@ def server_status_summary(reasons) -> str:
                     (_SERVER_STATUS_RE.match(r) for r in items) if m})
     uncoded = [r for r in items if not _SERVER_STATUS_RE.match(r)]
     # "every reason carried a status", not "as many statuses as reasons": `codes`
-    # is de-duplicated, so two 422s and nothing else counted as mixed and reported
-    # "plus 0 local reason(s)".
+    # is de-duplicated, so two 422s and nothing else counted as mixed. The old
+    # count was len(items) - len(codes) = 2 - 1, so it reported a local reason
+    # that did not exist — measured on the pre-#254 bytes:
+    # "; server status 422 plus 1 local reason(s), full detail in local dead-letter".
     if codes and not uncoded:
         return f"; server status {','.join(codes)}, full reason in local dead-letter"
     kinds = local_reason_kinds(uncoded)
@@ -139,8 +141,10 @@ def server_status_summary(reasons) -> str:
         return (f"; server status {','.join(codes)} plus "
                 f"{len(uncoded)} local reason(s){named}, "
                 "full detail in local dead-letter")
-    # The count alone was the whole event: the caller at main.py:1898 passes no
-    # `exc`, so nothing else on the wire carries a cause. `named` is what turns
+    # The count alone was the whole event: _do_sync's `not stats.success` branch
+    # calls _note_sync_failure with no `exc`, so on that path nothing else on the
+    # wire carries a cause. (Its `except` branch does pass `exc`, and that
+    # traceback reaches the ingest as `stack` — a separate path, not this one.) `named` is what turns
     # "three failures, reason on the user's laptop" into a subsystem to look at.
     return f"; {len(items)} local reason(s){named} recorded in local dead-letter"
 
