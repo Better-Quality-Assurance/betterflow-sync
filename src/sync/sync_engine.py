@@ -59,6 +59,54 @@ logger = logging.getLogger(__name__)
 _SERVER_STATUS_RE = re.compile(r"^API error \((\d{3})\)")
 
 
+#: Author-written prefixes for the reasons that carry no HTTP status, each
+#: mapped to a bounded kind token.
+#:
+#: WHY PREFIXES AND NOT THE REASON ITSELF. Every entry SyncEngine appends to
+#: `stats.errors` starts with a sentence we wrote and ends with something we did
+#: not: `f"Failed to sync bucket {bucket.id}: {e}"` carries a bucket id (which
+#: embeds the host name) and an exception message. `server_status_summary`
+#: exists precisely so none of that reaches the cross-tenant ops ingest. The
+#: token below is chosen FROM this list rather than derived from the input, so
+#: the redaction property is structural: no arrangement of input text can
+#: produce an output token that is not already written here.
+#:
+#: A reason matching nothing is COUNTED, never named. sync_engine appends
+#: `result.error` verbatim in one place, so an unrecognised string has unknown
+#: provenance and naming it would reopen the hole this function closes.
+#:
+#: The prefixes are the CONSTANTS the producers append, not copies of them:
+#: rewording `_REASON_BUCKET_LIST_FAILED` moves the producer and this table
+#: together. Spelling the sentence twice is how the classification silently
+#: drifts back to `[]` and the ops message reverts to a bare count.
+_REASON_AW_DOWN = "ActivityWatch is not running"
+_REASON_BUCKET_LIST_FAILED = "Failed to get buckets"
+_REASON_BUCKET_SYNC_FAILED = "Failed to sync bucket"
+_REASON_AUTH_ERROR = "Authentication error"
+
+_LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
+    (_REASON_AW_DOWN, "activitywatch-down"),
+    (_REASON_BUCKET_LIST_FAILED, "bucket-list-failed"),
+    (_REASON_BUCKET_SYNC_FAILED, "bucket-sync-failed"),
+    (_REASON_AUTH_ERROR, "auth-error"),
+)
+
+
+def local_reason_kinds(reasons) -> list[str]:
+    """Bounded kinds for reasons that carry no server status.
+
+    Iterates _LOCAL_REASON_KINDS rather than the input, so the order of the
+    result depends on this list and not on which bucket happened to fail first
+    — twenty failing buckets are one kind, and two runs with the same failures
+    produce the same string and therefore group together.
+    """
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    items = [str(r) for r in (reasons or []) if r]
+    return [kind for prefix, kind in _LOCAL_REASON_KINDS
+            if any(item.startswith(prefix) for item in items)]
+
+
 def server_status_summary(reasons) -> str:
     """Reduce server rejection text to bare HTTP status codes for the OPS ingest.
 
@@ -79,13 +127,22 @@ def server_status_summary(reasons) -> str:
         return ""
     codes = sorted({m.group(1) for m in
                     (_SERVER_STATUS_RE.match(r) for r in items) if m})
-    if codes and len(codes) == len(items):
+    uncoded = [r for r in items if not _SERVER_STATUS_RE.match(r)]
+    # "every reason carried a status", not "as many statuses as reasons": `codes`
+    # is de-duplicated, so two 422s and nothing else counted as mixed and reported
+    # "plus 0 local reason(s)".
+    if codes and not uncoded:
         return f"; server status {','.join(codes)}, full reason in local dead-letter"
+    kinds = local_reason_kinds(uncoded)
+    named = f" [{','.join(kinds)}]" if kinds else ""
     if codes:
         return (f"; server status {','.join(codes)} plus "
-                f"{len(items) - len(codes)} local reason(s), "
+                f"{len(uncoded)} local reason(s){named}, "
                 "full detail in local dead-letter")
-    return f"; {len(items)} local reason(s) recorded in local dead-letter"
+    # The count alone was the whole event: the caller at main.py:1898 passes no
+    # `exc`, so nothing else on the wire carries a cause. `named` is what turns
+    # "three failures, reason on the user's laptop" into a subsystem to look at.
+    return f"; {len(items)} local reason(s){named} recorded in local dead-letter"
 
 
 # Sentinel for "no project id has been rejected yet" — distinct from None,
@@ -1150,7 +1207,7 @@ class SyncEngine:
 
         # Check ActivityWatch
         if not self.aw.is_running():
-            stats.errors.append("ActivityWatch is not running")
+            stats.errors.append(_REASON_AW_DOWN)
             # Finalize any in-progress call before bailing. Without window
             # events the detector can never observe the call ending, so
             # is_in_call() would stay True for the whole outage and the idle
@@ -1284,7 +1341,7 @@ class SyncEngine:
             afk_buckets = self.aw.get_afk_buckets()
             input_buckets = self.aw.get_input_buckets()
         except AWClientError as e:
-            stats.errors.append(f"Failed to get buckets: {e}")
+            stats.errors.append(f"{_REASON_BUCKET_LIST_FAILED}: {e}")
             # is_running() (/info) can still pass while /buckets/ 503s on a
             # half-hung bf-data-service. Flag it so the coordinator force_restarts
             # the hung server instead of looping this error forever (the 2 AM 503
@@ -1379,7 +1436,7 @@ class SyncEngine:
                     pending_checkpoints.append(checkpoint)
                 stats.buckets_synced += 1
             except AWClientError as e:
-                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+                stats.errors.append(f"{_REASON_BUCKET_SYNC_FAILED} {bucket.id}: {e}")
 
         if skip_external_afk:
             # Sole-source path: upload the in-process AFK stream for the slice
@@ -1613,7 +1670,7 @@ class SyncEngine:
                         pending_checkpoints.append(checkpoint)
                 stats.buckets_synced += 1
             except AWClientError as e:
-                stats.errors.append(f"Failed to sync bucket {bucket.id}: {e}")
+                stats.errors.append(f"{_REASON_BUCKET_SYNC_FAILED} {bucket.id}: {e}")
         return all_events, call_events, pending_checkpoints
 
     def _send_and_advance_checkpoints(
@@ -3534,7 +3591,7 @@ class SyncEngine:
                     stats.queued_bucket_ids.update(
                         e.get("bucket_id", "") for e in remaining
                     )
-                stats.errors.append(f"Authentication error: {e}")
+                stats.errors.append(f"{_REASON_AUTH_ERROR}: {e}")
                 raise
 
     _QUEUE_PROCESS_TIMEOUT = 30.0  # Max wall-clock seconds for queue drain
