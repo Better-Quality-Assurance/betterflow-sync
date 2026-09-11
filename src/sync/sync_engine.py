@@ -141,8 +141,10 @@ def server_status_summary(reasons) -> str:
         return (f"; server status {','.join(codes)} plus "
                 f"{len(uncoded)} local reason(s){named}, "
                 "full detail in local dead-letter")
-    # The count alone was the whole event: the caller at main.py:1898 passes no
-    # `exc`, so nothing else on the wire carries a cause. `named` is what turns
+    # The count alone was the whole event: _do_sync's `not stats.success` branch
+    # calls _note_sync_failure with no `exc`, so on that path nothing else on the
+    # wire carries a cause. (Its `except` branch does pass `exc`, and that
+    # traceback reaches the ingest as `stack` — a separate path, not this one.) `named` is what turns
     # "three failures, reason on the user's laptop" into a subsystem to look at.
     return f"; {len(items)} local reason(s){named} recorded in local dead-letter"
 

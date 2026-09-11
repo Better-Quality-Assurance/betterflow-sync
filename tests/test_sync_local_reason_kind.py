@@ -13,7 +13,7 @@ But a reason with no HTTP status fell to the last branch, which emitted a COUNT:
 
 That is what reached the board on 2026-09-10T10:39Z (fingerprint
 sync-repeated-failure, release 1.5.133), and it is the whole event: `stack` was
-NULL because the caller at main.py:1898 passes no `exc`, and `context` carries
+NULL because the `not stats.success` caller in _do_sync passes no `exc`, and `context` carries
 only `consecutive_failures`. So an operator is told sync has failed three times
 and the reason is on the user's laptop.
 
