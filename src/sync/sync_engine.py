@@ -247,6 +247,16 @@ class SyncStats:
     # are deliberately not recording" from "the tracker broke" — without it the
     # nightly silence looks identical to an outage.
     capture_suppressed: bool = False
+    # True when _drain_gate_allows forced a drain through on a spent network
+    # budget (the delivery-starvation floor). That is the ONE way this agent
+    # deliberately builds a cycle that overruns _DO_SYNC_DEADLINE — ~94s session
+    # chain + ~94s drain ~= 188s — so it is the difference between "we chose to
+    # overrun rather than freeze uploads" and "something is genuinely hung".
+    # Carried on SyncStats rather than on the engine for the reason _CyclePhase
+    # is a per-cycle box: a cycle abandoned by _acquire_sync_slot keeps running,
+    # and an instance attribute would let that zombie stamp the cycle that
+    # replaced it. Read by SyncCoordinator._report_overrun_outcome.
+    forced_drain: bool = False
 
     @property
     def success(self) -> bool:
@@ -1199,7 +1209,7 @@ class SyncEngine:
             # that were contractually not recorded.
             self.flush_engagement_detectors("capture_suppressed")
             if self.bf.is_reachable() and not self.queue.is_empty():
-                if self._drain_gate_allows():
+                if self._drain_gate_allows(stats):
                     self._process_queue(stats)
             with self._state_lock:
                 self._heartbeat_count += 1
@@ -1515,7 +1525,7 @@ class SyncEngine:
         # next cycle). _drain_gate_allows adds the floor that stops "next cycle"
         # from being the answer forever — see its docstring.
         if self.bf.is_reachable() and not self.queue.is_empty():
-            if self._drain_gate_allows():
+            if self._drain_gate_allows(stats):
                 self._process_queue(stats)
             else:
                 # The regular send already burned most of the watchdog budget
@@ -3621,9 +3631,13 @@ class SyncEngine:
     # ceiling ("Sync wedged") — the Azorel outage 2026-07-02 (fps 707a9ecc /
     # 63a18e4f / d31bb248). Once a cycle has spent this budget, no NEW chain is
     # started: remaining bucket groups / the queue drain are deferred to the next
-    # cycle (durable OfflineQueue). The first bucket group always attempts so a
-    # cycle makes forward progress. 50s + one ~94s chain stays under 150s with
-    # margin. Both gates check it via `_cycle_network_budget_exceeded`.
+    # cycle (durable OfflineQueue). EVERY bucket group is gated, including the
+    # first — the "first group always attempts for forward progress" carve-out
+    # this comment used to describe was removed, because a ~94s session chain
+    # followed by an unconditional ~94s first send reaches ~188s and blows the
+    # watchdog with nothing wedged (see the gate's own comment in _send_events).
+    # 50s + one ~94s chain stays under 150s with margin. Both gates check it via
+    # `_cycle_network_budget_exceeded`.
     _CYCLE_NETWORK_BUDGET_SECONDS = 50  # seconds
     # How often to re-pull /config while running. Config was previously fetched
     # once per process, so a schedule change (e.g. HR marks an employee
@@ -3661,7 +3675,7 @@ class SyncEngine:
         """
         self._cycle_delivered = True
 
-    def _drain_gate_allows(self) -> bool:
+    def _drain_gate_allows(self, stats: SyncStats) -> bool:
         """Whether to drain the offline queue this cycle — budget gate plus a
         floor so it can never refuse forever.
 
@@ -3698,6 +3712,16 @@ class SyncEngine:
         the forced drain itself resets the counter. A noisy watchdog report
         every few cycles is the correct trade against silently losing billed
         time; the report is also how an operator finds out this is happening.
+
+        That last clause was false until the ``stats.forced_drain`` stamp below
+        existed. The floor announced itself in a ``logger.warning`` and nowhere
+        else, and ``betterflow.log`` never leaves the device except on an
+        explicit admin request — so the only artifact an operator could actually
+        see was a bare "Sync overran the 150s deadline" on the ops board, which
+        is byte-for-byte what a genuine hang looks like. Stamping the cycle is
+        what lets ``SyncCoordinator._report_overrun_outcome`` say which of the
+        two it was. It must be set on ``stats``, not logged: the ops digest
+        reads message + count and never reads context or logs.
         """
         if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
             self._consecutive_undelivered_cycles = 0
@@ -3720,6 +3744,13 @@ class SyncEngine:
             self.queue.size(),
         )
         self._consecutive_undelivered_cycles = 0
+        # Stamp the CYCLE, so the overrun this forced drain is about to cause
+        # can name itself on the ops board instead of arriving as an anonymous
+        # "Sync overran". Set after the counter reset, so an exception between
+        # them cannot leave a cycle claiming a forced drain it never ran.
+        # PROVISIONAL: this records the DECISION to force, and _process_queue
+        # clears it again if its own backoff gate refuses the drain — see there.
+        stats.forced_drain = True
         return True
 
     def _process_queue(self, stats: SyncStats) -> None:
@@ -3762,6 +3793,16 @@ class SyncEngine:
         # Skip queue processing if in backoff period
         now = datetime.now(timezone.utc)
         if now < self._queue_backoff_until:
+            # Nothing is sent on this path, so the cycle did NOT buy the
+            # designed overrun the drain gate's stamp claims. _apply_queue_backoff
+            # parks the queue for 60s-600s after a failed drain, and the
+            # starvation floor can engage again well inside that window — so a
+            # forced drain that returns here costs ~0s and cannot be what made
+            # the cycle overrun. Leaving the stamp set would tell
+            # _report_overrun_outcome "designed overrun, not a hang" about a
+            # genuine hang, de-prioritising exactly the row the classification
+            # exists to make triageable.
+            stats.forced_drain = False
             return
 
         # Bounded dead-letter replay: resurrect rows that are storable AGAIN into
@@ -3922,9 +3963,17 @@ class SyncEngine:
                         )
                     self._apply_queue_backoff()
                     break
-            except BetterFlowAuthError:
+            except BetterFlowAuthError as e:
                 # Auth errors won't self-heal with retries; re-raise so
                 # the caller's auth handler can trigger re-login.
+                #
+                # Carry the cycle's stats out on the exception: sync() never
+                # returns on this path, so SyncCoordinator._do_sync reads None
+                # and the forced-drain stamp is lost — a forced drain whose
+                # batch takes a 401 still ran the ~94s session chain plus the
+                # drain, still overran, and would still reach the ops board
+                # anonymous. Read back via getattr in _do_sync's auth handler.
+                e.sync_stats = stats
                 raise
             except BetterFlowClientError as e:
                 # send_events normally returns a SyncResult; reaching here means an

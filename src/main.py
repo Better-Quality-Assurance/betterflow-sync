@@ -196,6 +196,16 @@ _OVERRUN_BANDS = (
     (2.0, "sync-watchdog-overrun-moderate"),
 )
 _OVERRUN_BAND_SEVERE = "sync-watchdog-overrun-severe"
+# An overrun the agent BUILT on purpose. SyncEngine._drain_gate_allows forces one
+# queue drain through a spent network budget after
+# _DELIVERY_STARVATION_FLOOR_CYCLES starved cycles, which costs ~94s (session
+# chain) + ~94s (drain) ~= 188s and is the correct trade against a permanently
+# frozen upload path. It is NOT banded by duration: the duration bands exist to
+# publish the distribution of an unexplained overrun, and this one is explained,
+# so the useful measurement is how often the trade is being taken. Kept out of
+# the bands for the same reason — a designed overrun counted among the hangs
+# inflates exactly the signal the bands exist to report.
+_OVERRUN_FORCED_DRAIN = "sync-watchdog-overrun-forced-drain"
 
 
 def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
@@ -1806,6 +1816,12 @@ class SyncCoordinator:
         watchdog.daemon = True
         watchdog.start()
         stats = None
+        # Set when sync() RAISED out of a forced drain. `stats` stays None on
+        # that path, so the stamp rides out on the exception instead (see
+        # SyncEngine._process_queue's auth re-raise). Kept separate from `stats`
+        # rather than assigned into it: the post-lock heartbeat below reads
+        # `stats` as "the cycle completed", which a raised cycle did not.
+        forced_drain_raised = False
         try:
             if self.sync_engine.is_private:
                 self.tray.set_state(TrayState.PRIVATE)
@@ -1922,6 +1938,9 @@ class SyncCoordinator:
                 )
 
         except BetterFlowAuthError as e:
+            forced_drain_raised = bool(
+                getattr(getattr(e, "sync_stats", None), "forced_drain", False)
+            )
             self._handle_auth_error(e, source="sync")
         except Exception as e:
             logger.exception(f"Sync error: {e}")
@@ -1937,8 +1956,18 @@ class SyncCoordinator:
             watchdog_cancelled.set()
             watchdog.cancel()
             my_lock.release()
+            # `stats` is the per-cycle SyncStats sync() returned, or None when
+            # the cycle returned early (private / on break / capture-health
+            # bail) and never reached sync(). None reads as "no forced drain",
+            # which is correct: no drain gate ran. `forced_drain_raised` covers
+            # the third case — sync() reached the drain and then raised, so the
+            # stamp exists but never came back as a return value.
             self._report_overrun_outcome(
-                self._monotonic() - cycle_started_at, phase.at_deadline, phase.name
+                self._monotonic() - cycle_started_at,
+                phase.at_deadline,
+                phase.name,
+                forced_drain=bool(getattr(stats, "forced_drain", False))
+                or forced_drain_raised,
             )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
@@ -1951,7 +1980,12 @@ class SyncCoordinator:
             self._handle_auth_error(auth_err, source="heartbeat")
 
     def _report_overrun_outcome(
-        self, elapsed: float, phase_at_deadline: Optional[str], phase_at_exit: str
+        self,
+        elapsed: float,
+        phase_at_deadline: Optional[str],
+        phase_at_exit: str,
+        *,
+        forced_drain: bool = False,
     ) -> None:
         """Record how long a cycle that breached the deadline actually ran.
 
@@ -1969,6 +2003,17 @@ class SyncCoordinator:
         sync-wedged cannot give, since sync-wedged records only that we gave up
         at the ceiling.
 
+        forced_drain says this overrun was BUILT, not suffered.
+        SyncEngine._drain_gate_allows forces one queue drain through a spent
+        network budget after _DELIVERY_STARVATION_FLOOR_CYCLES starved cycles
+        (~94s session chain + ~94s drain ~= 188s) rather than let uploads freeze
+        forever behind a degraded /session/start. That is the ONE way this agent
+        deliberately exceeds the deadline, and until this parameter existed it
+        announced itself only in a local log line — so on the ops board it was
+        byte-identical to a genuine hang, and the rows could not be triaged.
+        It gets its own fingerprint AND says so in the message, because the
+        digest reads message + count and nothing else.
+
         phase_at_deadline is the diagnostic value — the stage that was
         actually slow, snapshotted by the watchdog the instant it fired.
         phase_at_exit (phase.name at cycle end) is not a substitute: it is
@@ -1983,6 +2028,21 @@ class SyncCoordinator:
         if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
             return
         headline_phase = phase_at_deadline if phase_at_deadline is not None else "unknown"
+        # WHY the message carries this rather than the context: the ops digest
+        # reads message + count and never reads context (see the dedup_window
+        # note below). A `forced_drain` context key would be true, correct, and
+        # invisible to the only reader that matters — which is how seven
+        # unclassifiable overrun rows reached the board in the first place.
+        if forced_drain:
+            detail = (
+                " after the delivery-starvation floor forced a queue drain "
+                "(designed overrun, not a hang — something ahead of the upload "
+                "is burning the whole network budget)"
+            )
+            fingerprint = _OVERRUN_FORCED_DRAIN
+        else:
+            detail = ""
+            fingerprint = _overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE)
         # capture() documents "never raises", but its final threading.Thread(...)
         # .start() is unguarded and can raise RuntimeError on a resource-starved
         # machine — exactly the machine that overruns its deadline. Unguarded,
@@ -1993,7 +2053,7 @@ class SyncCoordinator:
         try:
             self.error_reporter.capture(
                 f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
-                f"finished at {elapsed:.1f}s in phase '{headline_phase}'",
+                f"finished at {elapsed:.1f}s in phase '{headline_phase}'{detail}",
                 level="warning",
                 tags={"component": "sync-watchdog"},
                 context={
@@ -2001,8 +2061,9 @@ class SyncCoordinator:
                     "phase_at_deadline": headline_phase,
                     "phase_at_exit": phase_at_exit,
                     "deadline_seconds": self._DO_SYNC_DEADLINE,
+                    "forced_drain": forced_drain,
                 },
-                fingerprint=_overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE),
+                fingerprint=fingerprint,
                 # The occurrence counter IS the measurement here — the digest
                 # reads message + count and never reads context, so a band's
                 # count is the only thing that publishes the distribution.
