@@ -210,14 +210,94 @@ class TestARealForcedDrainNamesItself:
             for i in range(count)
         ])
 
-    def _run_cycles(self, monkeypatch, count):
+    def _run_cycles(self, monkeypatch, count, *, clear_backoff=True):
         """`count` cycles through the real _do_sync, each on a fresh budget."""
         monkeypatch.setattr(se.time, "monotonic", self.outage.monotonic)
         for _ in range(count):
-            self.engine._queue_backoff_until = datetime.min.replace(
-                tzinfo=timezone.utc
-            )
+            if clear_backoff:
+                self.engine._queue_backoff_until = datetime.min.replace(
+                    tzinfo=timezone.utc
+                )
             self.coord._do_sync()
+
+    def test_a_forced_drain_that_never_drained_is_not_a_designed_overrun(
+        self, monkeypatch, caplog
+    ):
+        """The stamp is written by the GATE, and the gate is not the drain.
+
+        ``_process_queue`` returns at its own queue-backoff gate before sending
+        anything, so a forced drain that lands in that window costs ~0s and
+        cannot be what made the cycle overrun. Labelling it "designed overrun,
+        not a hang" would de-prioritise exactly the row the classification
+        exists to make triageable — the reassuring direction, on the signal
+        that decides whether anyone looks.
+
+        Found by the pre-commit adversarial review, which noted the gate's
+        stamp is provisional; this is the witness it flagged as missing.
+        """
+        import logging
+
+        cycles = SyncEngine._DELIVERY_STARVATION_FLOOR_CYCLES
+        with caplog.at_level(logging.WARNING, logger="src.sync.sync_engine"):
+            # Starve delivery up to the cycle before the floor...
+            self._run_cycles(monkeypatch, cycles - 1)
+            # ...then park the queue, so the floor engages and _process_queue
+            # bails at the backoff gate having sent nothing.
+            self.engine._queue_backoff_until = datetime.now(
+                timezone.utc
+            ) + timedelta(minutes=10)
+            self._run_cycles(monkeypatch, 1, clear_backoff=False)
+
+        # Two preconditions, because without them this passes vacuously: the
+        # floor must have engaged (else there is no stamp to clear) AND nothing
+        # must have drained (else the overrun really was bought).
+        assert any(
+            "starvation floor engaged" in r.getMessage() for r in caplog.records
+        ), f"the floor never engaged: {[r.getMessage()[:50] for r in caplog.records]}"
+        assert not self.bf.send_events.called, (
+            "the backoff gate did not hold, so this fixture cannot express the "
+            "defect — something drained and the overrun WAS bought"
+        )
+
+        assert self.recorder.by_fingerprint(FORCED_DRAIN) == [], (
+            "a cycle that drained nothing was reported as a designed overrun. "
+            f"Captures: {[(c.get('fingerprint'), c['message'][:70]) for c in self.recorder.captures]}"
+        )
+        assert len(self.recorder.by_fingerprint(MODERATE)) == cycles, (
+            "it must still be reported — as an unexplained overrun, which is "
+            "what it is"
+        )
+
+    def test_a_forced_drain_that_raises_401_still_names_itself(self, monkeypatch):
+        """sync() never RETURNS on the auth path, so the stamp has to survive
+        the exception.
+
+        A forced drain whose batch takes a 401 still ran the ~94s session chain
+        and the ~94s drain, still overran, and — before the review's fix —
+        still reached the board anonymous, because ``stats`` was never assigned
+        in ``_do_sync``. The one cycle most worth explaining was the one that
+        could not explain itself.
+        """
+        from src.sync.http_client import BetterFlowAuthError
+
+        # The auth handler is a separate subsystem (re-login); the property
+        # here is what the OVERRUN report says, not what auth does about it.
+        self.coord._handle_auth_error = Mock()
+        cycles = SyncEngine._DELIVERY_STARVATION_FLOOR_CYCLES
+        self._run_cycles(monkeypatch, cycles - 1)
+        self.bf.send_events.side_effect = BetterFlowAuthError("401 token expired")
+        self._run_cycles(monkeypatch, 1)
+
+        assert self.coord._handle_auth_error.called, (
+            "the 401 never reached the auth handler, so the raise path was not "
+            "exercised and this proves nothing"
+        )
+        forced = self.recorder.by_fingerprint(FORCED_DRAIN)
+        assert len(forced) == 1, (
+            "a forced drain that raised 401 was reported under a duration band "
+            "— the stamp was lost with the return value. Captures: "
+            f"{[(c.get('fingerprint'), c['message'][:70]) for c in self.recorder.captures]}"
+        )
 
     def test_the_forced_drain_overrun_is_its_own_group(self, monkeypatch):
         """The report an operator triages must say which of the two it is.
