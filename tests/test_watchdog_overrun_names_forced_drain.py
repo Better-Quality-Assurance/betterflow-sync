@@ -39,6 +39,7 @@ gate deciding to force a drain.
 
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -49,7 +50,7 @@ from src.main import SyncCoordinator
 from src.reminders import ReminderManager
 from src.sync.bf_client import SyncResult
 from src.sync.daily_time_tracker import DailyTimeTracker
-from src.sync.http_client import BetterFlowClientError
+from src.sync.http_client import BetterFlowAuthError, BetterFlowClientError
 from src.sync.queue import OfflineQueue
 from src.sync.sync_engine import SyncEngine
 from tests._watchdog_harness import CoordinatorHarness, _ok_stats, _Recorder
@@ -437,4 +438,181 @@ class TestAnOrdinaryOverrunIsUnchanged(CoordinatorHarness):
         assert len(self.recorder.by_fingerprint(MODERATE)) == 1, (
             "the early-return cycle still overran and must still be reported — "
             f"captures: {self.recorder.captures}"
+        )
+
+
+class TestARealForcedDrainStillRunningAtTheDeadlineIsNotAHang:
+    """The end-of-cycle report is not the only report a forced drain triggers.
+
+    ``SyncCoordinator._do_sync`` starts a REAL ``threading.Timer(_DO_SYNC_
+    DEADLINE, _watchdog)`` before it does anything else. That Timer fires from
+    the real OS clock, independent of whatever engine-internal clock a test
+    scripts — so for a genuine ~188s forced drain it fires WHILE
+    ``_process_queue`` is still blocked on the network, long before ``sync()``
+    returns and ``_do_sync`` ever sees a ``SyncStats`` with ``forced_drain``
+    set. 40aaaac taught ``_report_overrun_outcome`` (the report ``_do_sync``'s
+    ``finally`` posts once the cycle actually ends) to name a forced drain. It
+    never touched ``_watchdog()`` (the fire-time report), which has no stats
+    object to read at all — only ``phase`` and the transient-failure counter —
+    so a forced drain that is merely slow rather than failing outright still
+    reports exactly like a genuine hang: ``level=error`` / "Sync hung" /
+    ``sync-watchdog-timeout``.
+
+    The starvation floor is driven by an auth failure on ``start_session``
+    rather than the file's usual ``_SessionStartOutage`` (a transient 503) on
+    purpose: ``BetterFlowAuthError._COUNTS_AS_NETWORK_FAILURE`` is False (see
+    ``http_client.py`` — a 401 is definitive for the watchdog's question, not
+    a network outage), so it starves delivery the same way without ever
+    touching the transient-failure counter the fire-time report keys off. A
+    counter left untouched all cycle is what makes this reproduce the gap: the
+    forcing cycle has genuinely had ZERO transient failures by the time the
+    real Timer fires mid-drain, exactly like a merely-slow-but-healthy
+    backend would.
+
+    Real wall-clock time throughout, on purpose — the other classes in this
+    file script ``coord._monotonic`` and the engine's own ``time.monotonic``
+    and never actually wait, so none of them can see whether the real Timer
+    fires before or after a real blocking call returns. The per-cycle network
+    budget is shrunk to make that observable without a real 50s wait.
+    """
+
+    _BUDGET_SECONDS = 0.05
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.queue = OfflineQueue(db_path=self.tmp / "q.db", max_size=1000)
+        self.tracker = DailyTimeTracker(db_path=self.tmp / "t.db")
+
+        aw = Mock()
+        aw.is_running.return_value = True
+        aw.get_window_buckets.return_value = []
+        aw.get_web_buckets.return_value = []
+        aw.get_afk_buckets.return_value = []
+        aw.get_input_buckets.return_value = []
+
+        def _slow_auth_failure():
+            # A little real sleep so the shrunk budget is unambiguously spent
+            # by the time the drain gate is checked afterwards, on any machine.
+            time.sleep(self._BUDGET_SECONDS * 2)
+            raise BetterFlowAuthError("token expired")
+
+        bf = Mock()
+        bf.is_reachable.return_value = True
+        bf.start_session.side_effect = _slow_auth_failure
+        bf.send_events.side_effect = lambda batch: SyncResult(
+            success=True, events_synced=len(batch)
+        )
+        self.bf = bf
+
+        config = Config()
+        config.working_hours.known = True
+        self.engine = SyncEngine(
+            aw=aw, bf=bf, queue=self.queue, config=config, time_tracker=self.tracker
+        )
+        self.engine._config_fetched = True
+        self.engine._backlog_reconciled = True
+        self.engine.send_heartbeat_if_due = Mock(return_value=None)
+
+        tray = Mock()
+        tray.model = Mock()
+        tray.model.lock = threading.RLock()
+        self.recorder = _Recorder()
+
+        self.coord = SyncCoordinator(
+            config=config,
+            aw=aw,
+            bf=bf,
+            queue=self.queue,
+            sync_engine=self.engine,
+            tray=tray,
+            aw_manager=Mock(is_managing=False),
+            reminder_manager=Mock(spec=ReminderManager),
+        )
+        self.coord.scheduler = Mock(running=True)
+        self.coord.error_reporter = self.recorder
+        self.coord._fetch_hours_today = Mock(return_value="1:00")
+        self.coord._monitor_capture_health = Mock(return_value=True)
+        self.coord._DO_SYNC_DEADLINE = CoordinatorHarness.TEST_DEADLINE
+        # Deliberately NOT scripted here (contrast the other classes in this
+        # file): the real elapsed/cycle_started_at values don't matter to this
+        # test, and leaving the real clock in place keeps it obvious that
+        # nothing about the Timer's own firing is being faked.
+
+        now = datetime.now(timezone.utc)
+        self.queue.enqueue([
+            {
+                "id": f"billable-{i}",
+                "bucket_id": "aw-watcher-afk_h",
+                "timestamp": (now - timedelta(minutes=i + 1)).isoformat(),
+                "duration": 60,
+                "data": {"status": "not-afk"},
+            }
+            for i in range(12)
+        ])
+
+    def teardown_method(self):
+        self.queue.close()
+        self.tracker.close()
+
+    def _run_cycles(self, count):
+        for _ in range(count):
+            self.engine._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
+            self.coord._do_sync()
+
+    def test_a_forced_drain_still_draining_at_the_deadline_is_not_reported_as_a_hang(
+        self, monkeypatch
+    ):
+        # Shrink the shared per-cycle network budget so the starvation floor
+        # engages after a couple of real (but tiny) sleeps rather than a real
+        # 50s wait. All three names have to move together — they're aliases of
+        # one constant fixed at class-definition time (see sync_engine.py).
+        monkeypatch.setattr(SyncEngine, "_CYCLE_NETWORK_BUDGET_SECONDS", self._BUDGET_SECONDS)
+        monkeypatch.setattr(SyncEngine, "_QUEUE_SKIP_IF_CYCLE_ELAPSED", self._BUDGET_SECONDS)
+        monkeypatch.setattr(SyncEngine, "_SEND_SKIP_IF_CYCLE_ELAPSED", self._BUDGET_SECONDS)
+
+        # Warm up one cycle short of the floor. Each cycle's own start_session
+        # attempt burns the (shrunk) budget and fails with a definitive auth
+        # rejection — never a transient failure — so nothing is delivered and
+        # the floor's counter advances without ever touching the tally the
+        # fire-time report reads.
+        self._run_cycles(SyncEngine._DELIVERY_STARVATION_FLOOR_CYCLES - 1)
+
+        # Precondition: the floor must not have engaged yet, or the forcing
+        # cycle below proves nothing.
+        assert not self.bf.send_events.called, (
+            "the floor engaged during warm-up; the forcing cycle below would "
+            "prove nothing new"
+        )
+        from src.sync.http_client import transient_failure_count
+
+        # The forcing cycle: the drain's send genuinely blocks in REAL
+        # wall-clock time, well past the real Timer's deadline, and then
+        # succeeds — nothing raises here either, so the transient-failure
+        # counter stays exactly where the auth failures above left it
+        # throughout this whole cycle, just like a slow-but-healthy backend.
+        def _slow_but_healthy_send(batch):
+            time.sleep(CoordinatorHarness.TEST_DEADLINE + 0.5)
+            return SyncResult(success=True, events_synced=len(batch))
+
+        self.bf.send_events.side_effect = _slow_but_healthy_send
+        self.engine._queue_backoff_until = datetime.min.replace(tzinfo=timezone.utc)
+        transient_before = transient_failure_count()
+
+        self.coord._do_sync()
+
+        assert self.bf.send_events.called, (
+            "the floor never forced a drain on the forcing cycle, so this "
+            f"fixture cannot express the defect. queue_size={self.queue.size()}"
+        )
+        assert transient_failure_count() == transient_before, (
+            "the forcing cycle recorded a transient failure — this fixture is "
+            "supposed to isolate the case where it does NOT, so it proves "
+            "nothing about that gap"
+        )
+        hung = self.recorder.by_fingerprint("sync-watchdog-timeout")
+        assert hung == [], (
+            "a forced drain that was still blocked on the network when the "
+            "real watchdog Timer fired was reported exactly like a genuine "
+            "hang. Captures: "
+            f"{[(c.get('fingerprint'), c.get('level'), c['message'][:70]) for c in self.recorder.captures]}"
         )

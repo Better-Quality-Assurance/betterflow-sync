@@ -484,6 +484,16 @@ class SyncEngine:
         # same failure the floor is there to cause on purpose).
         self._cycle_delivered = False
         self._consecutive_undelivered_cycles = 0
+        # Mirrors SyncStats.forced_drain, but readable WHILE the cycle is still
+        # running rather than only once sync() returns it. SyncCoordinator's
+        # watchdog Timer fires from a real threading.Timer at the wall-clock
+        # deadline, which for a forced drain (~188s) lands WHILE _process_queue
+        # is still blocked on the network — long before `stats` comes back to
+        # _do_sync. Without this, the fire-time report (main.py's _watchdog())
+        # has no way to know the overrun in progress is the designed one, only
+        # the cycle-end report (_report_overrun_outcome) does. See
+        # cycle_forced_drain property.
+        self._cycle_forced_drain = False
 
         # Queue retry backoff
         self._queue_consecutive_failures = 0
@@ -785,6 +795,16 @@ class SyncEngine:
     def is_private(self) -> bool:
         with self._state_lock:
             return self._private_mode
+
+    @property
+    def cycle_forced_drain(self) -> bool:
+        """Whether the CURRENTLY RUNNING (or just-finished) cycle has had the
+        delivery-starvation floor force a queue drain through — see
+        _drain_gate_allows. Read by SyncCoordinator's watchdog Timer, which
+        fires mid-cycle and cannot wait for sync() to return SyncStats.
+        No lock: written only on the sync thread, same as _cycle_delivered.
+        """
+        return self._cycle_forced_drain
 
     def is_in_call(self) -> bool:
         """True while the call/meeting detector reports an active call.
@@ -1133,6 +1153,7 @@ class SyncEngine:
         # Fresh cycle, nothing delivered yet. Feeds the drain gate's starvation
         # floor (_drain_gate_allows).
         self._cycle_delivered = False
+        self._cycle_forced_drain = False
 
         # Daily housekeeping before anything else, so it still runs while paused:
         # a long-running agent that never restarts across midnight would
@@ -3751,6 +3772,9 @@ class SyncEngine:
         # PROVISIONAL: this records the DECISION to force, and _process_queue
         # clears it again if its own backoff gate refuses the drain — see there.
         stats.forced_drain = True
+        # Same provisional stamp, mirrored onto the engine so it is readable
+        # before sync() returns — see cycle_forced_drain / self._cycle_forced_drain.
+        self._cycle_forced_drain = True
         return True
 
     def _process_queue(self, stats: SyncStats) -> None:
@@ -3803,6 +3827,7 @@ class SyncEngine:
             # genuine hang, de-prioritising exactly the row the classification
             # exists to make triageable.
             stats.forced_drain = False
+            self._cycle_forced_drain = False
             return
 
         # Bounded dead-letter replay: resurrect rows that are storable AGAIN into

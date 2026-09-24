@@ -48,11 +48,16 @@ class _Recorder:
 # failure. A slow machine waits longer; it does not go red.
 WATCHDOG_WAIT_SECONDS = 30.0
 
-# Both branches of _watchdog() (main.py): a cycle with transient API failures
-# reports "-offline", one without reports the bare fingerprint. Either means
-# the Timer ran and phase.at_deadline is stamped.
+# All three branches of _watchdog() (main.py): a cycle with transient API
+# failures reports "-offline", a forced drain still in flight reports
+# "-forced-drain", and a genuine hang reports the bare fingerprint. Any of the
+# three means the Timer ran and phase.at_deadline is stamped.
 _FIRE_TIME_FINGERPRINTS = frozenset(
-    {"sync-watchdog-timeout", "sync-watchdog-timeout-offline"}
+    {
+        "sync-watchdog-timeout",
+        "sync-watchdog-timeout-offline",
+        "sync-watchdog-timeout-forced-drain",
+    }
 )
 
 
@@ -114,6 +119,11 @@ class CoordinatorHarness:
         self.sync_engine = Mock(spec=SyncEngine)
         self.sync_engine.is_paused = False
         self.sync_engine.is_private = False
+        # Mock(spec=SyncEngine) makes ANY attribute SyncEngine defines —
+        # including this property — an auto-created (truthy) child Mock unless
+        # pinned explicitly, which would make every cycle here look like a
+        # forced drain to _watchdog()'s fire-time branch.
+        self.sync_engine.cycle_forced_drain = False
         self.sync_engine.sync.return_value = _ok_stats()
         self.tray = Mock()
         self.tray.model = Mock()

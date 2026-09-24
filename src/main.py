@@ -206,6 +206,13 @@ _OVERRUN_BAND_SEVERE = "sync-watchdog-overrun-severe"
 # the bands for the same reason — a designed overrun counted among the hangs
 # inflates exactly the signal the bands exist to report.
 _OVERRUN_FORCED_DRAIN = "sync-watchdog-overrun-forced-drain"
+# The fire-time counterpart of _OVERRUN_FORCED_DRAIN. _watchdog() below fires
+# from a real threading.Timer at the wall-clock deadline, WHILE a forced drain
+# can still be blocked on the network — long before sync() returns and
+# _report_overrun_outcome gets to read SyncStats.forced_drain. Without this,
+# a forced drain that is merely slow rather than failing outright (nothing
+# raised, so transient_this_cycle stays 0) reports exactly like a genuine hang.
+_TIMEOUT_FORCED_DRAIN = "sync-watchdog-timeout-forced-drain"
 
 
 def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
@@ -1772,7 +1779,34 @@ class SyncCoordinator:
             # is downgraded at the deadline — acceptable, because
             # _SYNC_WEDGE_CEILING (420s) still pages it as an error.
             transient_this_cycle = cycle_transients.value - transient_at_cycle_start
-            if transient_this_cycle > 0:
+            # Checked BEFORE the transient-failure branch: a forced drain can
+            # legitimately have zero transient failures this cycle (a 401 on
+            # the drain's batch doesn't count — see BetterFlowAuthError — and
+            # a merely slow-but-healthy backend never raises at all), which
+            # would otherwise fall through to the "genuine hang" branch below.
+            # self.sync_engine.cycle_forced_drain is readable WHILE the cycle
+            # is still running (SyncStats isn't, since sync() hasn't returned),
+            # because SyncEngine._drain_gate_allows stamps the engine itself,
+            # not just the stats object it also carries.
+            if getattr(self.sync_engine, "cycle_forced_drain", False):
+                logger.warning(
+                    "_do_sync watchdog: sync exceeded %ss during a forced "
+                    "queue drain (delivery-starvation floor) — designed "
+                    "overrun, not a hang",
+                    self._DO_SYNC_DEADLINE,
+                )
+                if self.error_reporter is not None:
+                    self.error_reporter.capture(
+                        f"Sync slow — exceeded {self._DO_SYNC_DEADLINE}s during a "
+                        "forced queue drain (delivery-starvation floor engaged; "
+                        "designed overrun, not a hang — something ahead of the "
+                        "upload is burning the whole network budget)",
+                        level="warning",
+                        tags={"component": "sync-watchdog"},
+                        context={"phase": phase.at_deadline},
+                        fingerprint=_TIMEOUT_FORCED_DRAIN,
+                    )
+            elif transient_this_cycle > 0:
                 logger.warning(
                     "_do_sync watchdog: sync exceeded %ss with %d transient API "
                     "failure(s) — API unreachable, resetting sessions",

@@ -108,6 +108,11 @@ class _CoordinatorHarness:
         self.sync_engine = Mock(spec=SyncEngine)
         self.sync_engine.is_paused = False
         self.sync_engine.is_private = False
+        # Mock(spec=SyncEngine) makes ANY attribute SyncEngine defines —
+        # including this property — an auto-created (truthy) child Mock unless
+        # pinned explicitly, which would make every cycle here look like a
+        # forced drain to _watchdog()'s fire-time branch.
+        self.sync_engine.cycle_forced_drain = False
         self.sync_engine.sync.return_value = _ok_stats()
         self.tray = Mock()
         self.tray.model = Mock()
