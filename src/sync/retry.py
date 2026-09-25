@@ -62,6 +62,16 @@ def calculate_delay(
     return max(0, delay)
 
 
+def log_retry(attempt: int, error: Exception, delay: float) -> None:
+    """The default per-retry log line. Public so an ``on_retry`` callback that
+    adds behaviour (http_client counts the failure for the sync watchdog) keeps
+    the exact line operators already grep for, from this module's logger."""
+    logger.warning(
+        f"Attempt {attempt + 1} failed: {error}. "
+        f"Retrying in {delay:.1f}s..."
+    )
+
+
 def retry_with_backoff(
     func: Callable[[], T],
     config: Optional[RetryConfig] = None,
@@ -116,10 +126,7 @@ def retry_with_backoff(
             if on_retry:
                 on_retry(attempt, e, delay)
             else:
-                logger.warning(
-                    f"Attempt {attempt + 1} failed: {e}. "
-                    f"Retrying in {delay:.1f}s..."
-                )
+                log_retry(attempt, e, delay)
 
             # Use cancel_event.wait() for interruptible sleep when available
             if cancel_event is not None:
