@@ -18,7 +18,7 @@ try:
     from .. import __version__
 except ImportError:
     from src import __version__
-from .retry import RetryConfig, retry_with_backoff, RetryExhausted
+from .retry import RetryConfig, retry_with_backoff, RetryExhausted, log_retry
 
 __all__ = [
     "BaseApiClient",
@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 # warning) from "the cycle is genuinely hung" (an error) instead of reporting
 # both as "Sync hung" (2026-07-22, device 18: a 150.86s cycle during an
 # hour-long connectivity outage, nothing hung, nothing lost, paged as an ERROR).
+#
+# Also incremented once per FAILED RETRY ATTEMPT (_note_transient_attempt),
+# through the same counting rule as __init__ (BetterFlowClientError._note_failure). A
+# retrying chain swallows its intermediate _TransientErrors, and a
+# BetterFlowClientError is built only once the chain is exhausted — so without
+# the per-attempt count, a chain still retrying when the deadline hits (or one
+# that later recovers) leaves the tally at 0 and the watchdog pages "Sync hung"
+# for a cycle that was plainly waiting on an unreachable API (2026-09-24, device
+# 14: two failed attempts logged before the 150s deadline, reported as a hang).
 #
 # Incremented once per failure OBJECT, in __init__ — never in the is_transient
 # getter, which stays a pure query. A read-counting metric inflates the moment
@@ -228,8 +237,24 @@ class BetterFlowClientError(Exception):
         # threshold, drop real activity — the 2026-06-30 data-loss class. The
         # watchdog's accuracy is not worth billing data, so the exclusion lives
         # here, in the counter, and never in the classifier.
-        if self._COUNTS_AS_NETWORK_FAILURE and self.is_transient:
+        self._note_failure(status_code)
+
+    @classmethod
+    def _note_failure(cls, status_code: Optional[int]) -> None:
+        """Count one failure of this class with this status_code toward the
+        calling thread's watchdog tally, if the counting rule says it counts.
+
+        The ONE counting rule. __init__ calls it for every failure object, and
+        _note_transient_attempt calls it for each failed retry attempt that never
+        becomes an object — so a change to _COUNTS_AS_NETWORK_FAILURE or to the
+        transient rule reaches both paths at once."""
+        if cls._COUNTS_AS_NETWORK_FAILURE and cls._is_transient_status(status_code):
             transient_failure_counter().value += 1
+
+    @staticmethod
+    def _is_transient_status(status_code: Optional[int]) -> bool:
+        # The transient/definitive rule itself; see is_transient.
+        return status_code is None or status_code >= 500
 
     @property
     def is_transient(self) -> bool:
@@ -244,7 +269,7 @@ class BetterFlowClientError(Exception):
         Pure query — free to read as often as you like. This is the codebase's
         ONLY transient/definitive rule; __init__ consults it to maintain the
         counter SyncCoordinator's watchdog reads (_TRANSIENT_FAILURE_COUNT)."""
-        return self.status_code is None or self.status_code >= 500
+        return self._is_transient_status(self.status_code)
 
 
 class BetterFlowAuthError(BetterFlowClientError):
@@ -259,6 +284,20 @@ class BetterFlowAuthError(BetterFlowClientError):
     """
 
     _COUNTS_AS_NETWORK_FAILURE = False
+
+
+def _note_transient_attempt(attempt: int, error: Exception, delay: float) -> None:
+    """``on_retry`` hook for the in-cycle retry chain: count the failed attempt
+    toward this thread's transient tally, then log exactly as the default does.
+
+    Not a second classifier: each failed attempt is judged by the same rule as
+    the BetterFlowClientError an exhausted chain raises (_request builds it with
+    no status_code), via BetterFlowClientError._note_failure. The final attempt
+    is not retried and is counted by that error's __init__ instead, so an
+    exhausted chain of N attempts counts N, not N+1.
+    """
+    BetterFlowClientError._note_failure(status_code=None)
+    log_retry(attempt, error, delay)
 
 
 class _TransientError(Exception):
@@ -301,6 +340,25 @@ class BaseApiClient:
     )
 
     USER_AGENT = f"BetterFlow/{__version__}"
+
+    # Connect-phase timeout, bounded separately from the read timeout. requests
+    # hands a scalar timeout to the connect of EACH address the host resolves
+    # to, so against an unreachable network one "30s" attempt costs 30s x the
+    # address count. app.betterflow.eu sits behind Cloudflare with two A records
+    # (plus two AAAA), so each blackholed attempt took ~60s and the ~94s chain
+    # the watchdog budget was sized for really ran ~153s — past _DO_SYNC_DEADLINE
+    # on its own (2026-09-24, device 14: a 297s cycle, nothing hung). A TCP
+    # handshake to a CDN edge completes in well under a second when the network
+    # works, so 10s per address is generous; the read timeout is unchanged.
+    CONNECT_TIMEOUT = 10  # seconds, per resolved address
+
+    # Timeout for is_reachable() probes. They answer "is the API up at all?"
+    # and run OUTSIDE the in-cycle network budget (before the queue drain, and
+    # again to pick the tray state after a failed sync), each trying up to two
+    # endpoints. At the full 30s timeout an unreachable API made them cost ~120s
+    # per probe pair on top of the failed send. A health check that has not
+    # answered in 5s is not going to accept a batch either.
+    REACHABILITY_TIMEOUT = 5  # seconds
 
     def __init__(
         self,
@@ -446,7 +504,10 @@ class BaseApiClient:
         headers = self._get_headers()
         if extra_headers:
             headers.update(extra_headers)
-        effective_timeout = timeout_override if timeout_override is not None else self.timeout
+        read_timeout = timeout_override if timeout_override is not None else self.timeout
+        # (connect, read): see CONNECT_TIMEOUT. min() so a short override (e.g.
+        # the 5s heartbeat) is never lengthened by the connect bound.
+        effective_timeout = (min(self.CONNECT_TIMEOUT, read_timeout), read_timeout)
         kwargs: dict = {"timeout": effective_timeout, "headers": headers}
 
         if files:
@@ -571,6 +632,7 @@ class BaseApiClient:
                 return retry_with_backoff(
                     do_request,
                     config=effective_retry_config,
+                    on_retry=_note_transient_attempt,
                     retryable_exceptions=(_TransientError,),
                 )
             except RetryExhausted as e:
@@ -621,13 +683,20 @@ class BaseApiClient:
     def is_reachable(self) -> bool:
         """Check if BetterFlow API is reachable."""
         try:
-            self._request("GET", "health", retry=False)
+            self._request(
+                "GET", "health", retry=False, timeout_override=self.REACHABILITY_TIMEOUT
+            )
             return True
         except BetterFlowAuthError:
             return True  # Server is reachable; auth is a separate concern
         except BetterFlowClientError:
             try:
-                self._request("GET", "events/status", retry=False)
+                self._request(
+                    "GET",
+                    "events/status",
+                    retry=False,
+                    timeout_override=self.REACHABILITY_TIMEOUT,
+                )
                 return True
             except BetterFlowAuthError:
                 return True
