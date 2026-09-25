@@ -47,8 +47,8 @@ from src.sync.http_client import (
 )
 from src.sync.retry import RetryConfig
 from tests.test_sync_watchdog_outcome_classification import (
-    _CoordinatorHarness,
     _TEST_DEADLINE,
+    _CoordinatorHarness,
 )
 
 # app.betterflow.eu resolves to two IPv4 addresses (Cloudflare). A connect

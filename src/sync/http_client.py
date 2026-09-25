@@ -18,7 +18,7 @@ try:
     from .. import __version__
 except ImportError:
     from src import __version__
-from .retry import RetryConfig, retry_with_backoff, RetryExhausted, log_retry
+from .retry import RetryConfig, RetryExhausted, log_retry, retry_with_backoff
 
 __all__ = [
     "BaseApiClient",
