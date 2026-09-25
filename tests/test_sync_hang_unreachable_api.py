@@ -108,6 +108,40 @@ class TestConnectTimeoutIsBounded:
         # server still gets its full 30s to answer.
         assert seen_read_timeouts[0][1] == 30, seen_read_timeouts
 
+    def test_multipart_upload_keeps_the_full_timeout_to_send_its_body(self, monkeypatch):
+        """urllib3 applies the CONNECT timeout while sending the body, so a
+        short connect bound would fail a ~1 MB log upload on a slow uplink.
+        Behavioural: a server that accepts but never reads the body, an 8 MB
+        multipart POST, connect bound shrunk to 0.3s, request timeout 1.5s. The
+        send must be allowed the full 1.5s, not cut off at 0.3s."""
+        import time
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        accepted = []
+        threading.Thread(
+            target=lambda: accepted.append(listener.accept()), daemon=True
+        ).start()
+        host, port = listener.getsockname()
+        client = BaseApiClient(api_url=f"http://{host}:{port}", timeout=1.5)
+        monkeypatch.setattr(client, "CONNECT_TIMEOUT", 0.3)
+        start = time.monotonic()
+        try:
+            with pytest.raises(BetterFlowClientError):
+                client._request(
+                    "POST",
+                    "logs",
+                    files={"file": ("betterflow.log", b"x" * 8_000_000, "text/plain")},
+                    retry=False,
+                )
+            elapsed = time.monotonic() - start
+        finally:
+            listener.close()
+            for conn, _ in accepted:
+                conn.close()
+        assert elapsed >= 1.2, f"body send cut off after {elapsed:.2f}s"
+
     def test_short_override_is_not_lengthened_by_the_connect_bound(self, monkeypatch):
         net = _BlackholedNetwork(monkeypatch)
         with pytest.raises(BetterFlowClientError):
@@ -132,8 +166,16 @@ class TestUnreachableCycleFitsTheWatchdog:
         """Replays the network calls one cycle makes when the API is down, on
         the simulated clock: the events/batch retry chain, the pre-drain
         is_reachable(), the tray-state is_reachable() after the failed sync,
-        and the in-cycle hours fetch (events/status). Pre-fix this was ~440s
-        of network wait; the incident cycle ran 297s."""
+        and the in-cycle hours fetch (events/status). Pre-fix this was ~443s
+        of network wait; the incident cycle ran 297s.
+
+        SCOPE, stated so this is not read as a general guarantee: it models
+        every attempt as a CONNECT failure against the two IPv4 addresses. It
+        does not model a read timeout (still 30s — the incident's first
+        attempt was one, making the real chain ~73s, not ~63s), the config
+        re-fetch probe when due (+~20s), or a blackholed IPv6 (4 addresses:
+        ~244s). Those cycles can still overrun; they are then classified as
+        slow, not hung, by TestFailedAttemptsReachTheWatchdog."""
         net = _BlackholedNetwork(monkeypatch)
         client = _client()
 
@@ -153,7 +195,7 @@ class TestUnreachableCycleFitsTheWatchdog:
 
 
 class TestExhaustedChainCountsEachAttemptOnce:
-    def test_three_failed_attempts_count_exactly_three(self, monkeypatch):
+    def test_three_failed_attempts_count_exactly_three(self, monkeypatch, caplog):
         """N-1 attempts are counted by the on_retry hook and the last by the
         BetterFlowClientError the exhausted chain raises. If retry_with_backoff
         ever called on_retry on the final attempt too, or _request stopped
@@ -170,6 +212,12 @@ class TestExhaustedChainCountsEachAttemptOnce:
 
         assert len(net.connect_timeouts) == attempts, net.connect_timeouts
         assert transient_failure_count() - before == attempts
+        # The counting hook must not swallow the retry log line operators grep.
+        retry_lines = [
+            r.getMessage() for r in caplog.records
+            if r.name.endswith("sync.retry") and "Attempt" in r.getMessage()
+        ]
+        assert len(retry_lines) == attempts - 1, retry_lines
 
 
 class _FlakyThenOkHandler(http.server.BaseHTTPRequestHandler):

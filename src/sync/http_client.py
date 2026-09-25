@@ -507,7 +507,14 @@ class BaseApiClient:
         read_timeout = timeout_override if timeout_override is not None else self.timeout
         # (connect, read): see CONNECT_TIMEOUT. min() so a short override (e.g.
         # the 5s heartbeat) is never lengthened by the connect bound.
-        effective_timeout = (min(self.CONNECT_TIMEOUT, read_timeout), read_timeout)
+        #
+        # EXCEPT multipart uploads: urllib3 applies the connect timeout to
+        # SENDING the request body as well (it swaps in the read timeout only
+        # once the body is on the wire), so a 10s bound would fail an
+        # uncompressed ~1 MB log upload on a slow uplink — the admin diagnostic
+        # path. Those keep the full timeout for connect+send, as before.
+        connect_timeout = read_timeout if files else min(self.CONNECT_TIMEOUT, read_timeout)
+        effective_timeout = (connect_timeout, read_timeout)
         kwargs: dict = {"timeout": effective_timeout, "headers": headers}
 
         if files:
