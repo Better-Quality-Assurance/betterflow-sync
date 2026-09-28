@@ -33,7 +33,12 @@ try:
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
-    from .queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
+    from .queue import (
+        EVENT_RETENTION_DAYS,
+        _MAX_LAST_ERROR_CHARS,
+        is_event_storable,
+        normalized_project_id,
+    )
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -46,7 +51,12 @@ except ImportError:
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
-    from sync.queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
+    from sync.queue import (
+        EVENT_RETENTION_DAYS,
+        _MAX_LAST_ERROR_CHARS,
+        is_event_storable,
+        normalized_project_id,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +159,14 @@ def server_status_summary(reasons) -> str:
     return f"; {len(items)} local reason(s){named} recorded in local dead-letter"
 
 
-#: Fixed marker written to the dead-letter row / warning when a whole-batch
-#: definitive rejection carries NEITHER a top-level `SyncResult.error` NOR any
-#: per-event detail (an ancient server, or a body this agent build doesn't
-#: recognise) — never an empty `last_error` column, which reads identically
-#: to "this event never failed".
+#: Fixed marker written to the dead-letter row / warning when a rejection —
+#: whole-batch definitive, OR the failed-but-unattributable subset of a
+#: partial-accept batch (`errors` empty, or every entry names an event that
+#: was actually accepted) — carries no per-event detail (an ancient server, or
+#: a body this agent build doesn't recognise). Never an empty `last_error`
+#: column, which reads identically to "this event never failed". Shared by
+#: both branches below so a reason-less rejection reads the same regardless
+#: of which one produced it — see `_process_queue`.
 _REASON_NONE_GIVEN = "server returned failed without a reason"
 
 
@@ -201,6 +214,22 @@ def summarize_per_event_errors(errors) -> Optional[str]:
         f"{label} x{n}" if n > 1 else label for label, n in counts.most_common()
     )
     return f"{len(errors)} event(s) rejected: {summary}"
+
+
+def _truncate_reason_for_log(reason: str) -> str:
+    """Cap a rejection reason before it reaches betterflow.log.
+
+    `reason` is unbounded, server-controlled text — the same value
+    `queue.increment_retry` already truncates to `_MAX_LAST_ERROR_CHARS` at
+    the write, so the dead-letter row can never hold more than that. The log
+    call sits in front of that write and had no cap of its own, so a large
+    error payload (or a `summarize_per_event_errors` summary over a big
+    batch) landed in the log verbatim. Share the DB's own limit so the log
+    line and the dead-letter row agree on how much of the server's text is
+    worth keeping — the DB write is unaffected, since `increment_retry`
+    truncates independently.
+    """
+    return str(reason)[:_MAX_LAST_ERROR_CHARS]
 
 
 # Sentinel for "no project id has been rejected yet" — distinct from None,
@@ -3978,18 +4007,29 @@ class SyncEngine:
                             or item.get("event") is None
                             or item.get("event") in failed_event_ids
                         ])
-                        if reason:
-                            logger.warning(
-                                "Server rejected %d of %d queued events "
-                                "individually: %s",
-                                len(failed_ids), len(event_ids), reason,
-                            )
-                        self.queue.increment_retry(
-                            failed_ids,
-                            reason
-                            or "per-event rejection: omitted from accepted_ids "
-                            "(server gave no batch-level reason)",
+                        # Hoisted above the log call so the warning and the
+                        # dead-letter row can never disagree. `reason` is
+                        # None whenever the server gave no per-event detail
+                        # at all, OR gave detail that names only events NOT
+                        # in failed_event_ids (every error entry belongs to
+                        # an event that WAS accepted) — either way this is
+                        # still a real rejection and must not vanish
+                        # silently. Previously the `if reason:` guard below
+                        # skipped the log in exactly that case while
+                        # increment_retry still wrote a (different) generic
+                        # marker, so the dead-letter row carried a reason
+                        # nobody had been warned about. Fall back to the
+                        # SAME fixed marker the whole-batch branch below
+                        # uses, so a reason-less rejection reads identically
+                        # from either branch.
+                        reason = reason or _REASON_NONE_GIVEN
+                        logger.warning(
+                            "Server rejected %d of %d queued events "
+                            "individually: %s",
+                            len(failed_ids), len(event_ids),
+                            _truncate_reason_for_log(reason),
                         )
+                        self.queue.increment_retry(failed_ids, reason)
                     processed += len(succeeded_ids)
                 else:
                     # Whole-batch failure with no per-event verdict. Only count
@@ -4035,7 +4075,8 @@ class SyncEngine:
                             reason = reason or _REASON_NONE_GIVEN
                         logger.warning(
                             "Server rejected queued batch (%d events) (%s): %s",
-                            len(event_ids), source, reason,
+                            len(event_ids), source,
+                            _truncate_reason_for_log(reason),
                         )
                         self.queue.increment_retry(event_ids, reason)
                     elif (

@@ -269,8 +269,22 @@ class TestPartialAcceptRecordsItsOwnReason:
             "the partial-accept branch passes result.error, which is None on "
             "that branch — the event keeps a stale reason from another cycle"
         )
-        assert "per-event rejection" in src, (
-            "the partial-accept branch records no reason of its own"
+        # NOT a literal-text check on the fallback string — that string moved
+        # to the shared `_REASON_NONE_GIVEN` marker (the same one the
+        # whole-batch branch falls back to) when the no-attributable-reason
+        # gap was fixed, so pinning old wording here would just re-break on
+        # the next legitimate rewording. `_REASON_NONE_GIVEN` appearing in
+        # this branch's source IS "records a reason of its own" — it proves
+        # the branch falls back to a real marker rather than silently
+        # passing through nothing. The behavioural half (the marker actually
+        # reaches the dead-letter row, and a warning is logged) is covered
+        # by TestPartialAcceptWarnsWithNoAttributableReason in
+        # test_dead_letter_carries_per_event_reason.py.
+        assert "_REASON_NONE_GIVEN" in src, (
+            "the partial-accept branch records no fallback reason of its "
+            "own — it must fall back to the shared no-reason-given marker "
+            "when the server gives no attributable per-event detail, the "
+            "same way the whole-batch branch does"
         )
 
 

@@ -157,9 +157,9 @@ class TestDeadLetterCarriesPerEventReason:
 class TestPartialAcceptCarriesPerEventReason:
     """A mixed batch (server accepts e1, rejects e2 with too_old) takes the
     partial-accept branch. The rejected event's row must carry the server's
-    own reason, not the generic "omitted from accepted_ids" text — otherwise
-    whether the cause survives depends on whether some other event in the
-    same batch happened to be accepted."""
+    own reason, not the generic no-reason-given marker — otherwise whether
+    the cause survives depends on whether some other event in the same batch
+    happened to be accepted."""
 
     def test_rejected_event_in_mixed_batch_carries_the_servers_reason(self):
         tmp = Path(tempfile.mkdtemp())
@@ -190,6 +190,105 @@ class TestPartialAcceptCarriesPerEventReason:
         assert "too_old" in last_error, (
             f"the server's per-event reason was lost on the partial-accept "
             f"branch: {last_error!r}"
+        )
+
+
+class TestPartialAcceptWarnsWithNoAttributableReason:
+    """A partial-accept batch (non-empty `accepted_ids`) whose failed events
+    have NO attributable reason — `errors` is empty, or every entry names an
+    event that was actually accepted — must still warn on the rejecting
+    cycle, and the dead-letter row must carry the SAME marker the warning
+    named.
+
+    Before the fix: `reason` was computed once, tested truthy only to decide
+    whether to log, and a DIFFERENT literal string was passed to
+    `increment_retry` regardless. So this exact case — a real per-event
+    rejection the server gave no attributable cause for — logged nothing on
+    the rejecting cycle while the dead-letter row still got a marker nobody
+    had been warned about.
+    """
+
+    def _partial_accept_no_attributable_reason(self, errors: list) -> SyncResult:
+        return SyncResult(
+            success=False,
+            events_synced=1,
+            events_queued=1,
+            error=None,
+            accepted_ids=["e1"],
+            transient=False,
+            errors=errors,
+        )
+
+    def test_warns_on_the_rejecting_cycle_when_errors_is_empty(self, caplog):
+        tmp = Path(tempfile.mkdtemp())
+        engine = _engine(tmp)
+        engine.queue.enqueue([_event("e1"), _event("e2")])
+
+        engine.bf.send_events = Mock(
+            return_value=self._partial_accept_no_attributable_reason([])
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.sync.sync_engine"):
+            _run_one_drain_cycle(engine)
+
+        assert any(
+            "Server rejected" in r.message and "1 of 2" in r.message
+            for r in caplog.records
+        ), (
+            "no warning was logged for the unattributable partial rejection "
+            f"(errors=[]); records were: {[r.message for r in caplog.records]}"
+        )
+
+    def test_warns_on_the_rejecting_cycle_when_errors_name_only_accepted_events(
+        self, caplog
+    ):
+        tmp = Path(tempfile.mkdtemp())
+        engine = _engine(tmp)
+        engine.queue.enqueue([_event("e1"), _event("e2")])
+
+        # The only error entry names e1 — the event that WAS accepted — so it
+        # cannot be attributed to e2, the one that failed.
+        engine.bf.send_events = Mock(
+            return_value=self._partial_accept_no_attributable_reason(
+                [{"event": "e1", "error": "stale", "reason": "too_old"}]
+            )
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.sync.sync_engine"):
+            _run_one_drain_cycle(engine)
+
+        assert any(
+            "Server rejected" in r.message and "1 of 2" in r.message
+            for r in caplog.records
+        ), (
+            "no warning was logged when the only error entry named an "
+            f"accepted event, not the failed one; records were: "
+            f"{[r.message for r in caplog.records]}"
+        )
+
+    def test_dead_letter_row_carries_the_same_marker_the_warning_named(self):
+        tmp = Path(tempfile.mkdtemp())
+        engine = _engine(tmp)
+        engine.queue.enqueue([_event("e1"), _event("e2")])
+
+        engine.bf.send_events = Mock(
+            return_value=self._partial_accept_no_attributable_reason([])
+        )
+
+        for _ in range(5):
+            _run_one_drain_cycle(engine)
+        _run_one_drain_cycle(engine)
+
+        rows = engine.queue.get_dead_letter_events()
+        assert len(rows) == 1, "only the rejected event should be dead-lettered"
+        last_error = rows[0]["last_error"] or ""
+        assert last_error, (
+            "an unattributable partial rejection left an empty last_error "
+            "column"
+        )
+        assert "without a reason" in last_error, (
+            f"expected the shared fixed no-reason-given marker (the same one "
+            f"the whole-batch branch uses), got {last_error!r}"
         )
 
 
