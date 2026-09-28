@@ -6,7 +6,7 @@ import re
 import socket
 import threading
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -33,7 +33,12 @@ try:
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
     from .os_idle import get_system_idle_seconds
-    from .queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
+    from .queue import (
+        EVENT_RETENTION_DAYS,
+        _MAX_LAST_ERROR_CHARS,
+        is_event_storable,
+        normalized_project_id,
+    )
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
@@ -46,7 +51,12 @@ except ImportError:
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
     from sync.os_idle import get_system_idle_seconds
-    from sync.queue import EVENT_RETENTION_DAYS, is_event_storable, normalized_project_id
+    from sync.queue import (
+        EVENT_RETENTION_DAYS,
+        _MAX_LAST_ERROR_CHARS,
+        is_event_storable,
+        normalized_project_id,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +157,79 @@ def server_status_summary(reasons) -> str:
     # traceback reaches the ingest as `stack` — a separate path, not this one.) `named` is what turns
     # "three failures, reason on the user's laptop" into a subsystem to look at.
     return f"; {len(items)} local reason(s){named} recorded in local dead-letter"
+
+
+#: Fixed marker written to the dead-letter row / warning when a rejection —
+#: whole-batch definitive, OR the failed-but-unattributable subset of a
+#: partial-accept batch (`errors` empty, or every entry names an event that
+#: was actually accepted) — carries no per-event detail (an ancient server, or
+#: a body this agent build doesn't recognise). Never an empty `last_error`
+#: column, which reads identically to "this event never failed". Shared by
+#: both branches below so a reason-less rejection reads the same regardless
+#: of which one produced it — see `_process_queue`.
+_REASON_NONE_GIVEN = "server returned failed without a reason"
+
+
+def summarize_per_event_errors(errors) -> Optional[str]:
+    """Reduce the server's per-event `errors` list to ONE local reason string.
+
+    Used on the whole-batch definitive-rejection path when `SyncResult.error`
+    is None, and on the partial-accept path (filtered to the events that were
+    NOT accepted), so the server's cause survives either way: `send_events` populates `error` from an
+    HTTP-layer exception (a real 4xx/5xx), but a batch rejected on PER-EVENT
+    validation (e.g. every event's timestamp outside internal-tool2's 7-day/
+    5-minute window) comes back as a 200 with `failed > 0` and no top-level
+    error string — nothing ever raises, so `error` stays None. Without this,
+    `queue.increment_retry(event_ids, None)` writes NOTHING (increment_retry's
+    own contract), and a genuine rejection drops after max retries with an
+    empty dead-letter row and no warning anywhere to explain it.
+
+    Each entry falls back in order: `reason` (the stable code
+    internal-tool2's AgentEventProcessor started sending), then `error` (its
+    older free-text field, for a server predating that addition), then a
+    fixed per-item marker — an entry is never silently skipped. Returns None
+    (NOT `_REASON_NONE_GIVEN`) when `errors` itself is empty, so the caller
+    can tell "nothing to summarize" from "summarized to nothing" and choose
+    the fallback itself.
+
+    This is NOT the cross-tenant redaction path — `server_status_summary` /
+    `SyncEngine._dropped_reason_code` still run on whatever reaches the
+    dead-letter row later and reduce it to a bare status code or count before
+    it can leave the device. The string built here only ever reaches the
+    LOCAL dead-letter row and the local log.
+    """
+    if not errors:
+        return None
+    labels = []
+    for item in errors:
+        if isinstance(item, dict):
+            label = item.get("reason") or item.get("error") or "unspecified"
+        else:
+            label = item
+        labels.append(str(label))
+    if not labels:
+        return None
+    counts = Counter(labels)
+    summary = ", ".join(
+        f"{label} x{n}" if n > 1 else label for label, n in counts.most_common()
+    )
+    return f"{len(errors)} event(s) rejected: {summary}"
+
+
+def _truncate_reason_for_log(reason: str) -> str:
+    """Cap a rejection reason before it reaches betterflow.log.
+
+    `reason` is unbounded, server-controlled text — the same value
+    `queue.increment_retry` already truncates to `_MAX_LAST_ERROR_CHARS` at
+    the write, so the dead-letter row can never hold more than that. The log
+    call sits in front of that write and had no cap of its own, so a large
+    error payload (or a `summarize_per_event_errors` summary over a big
+    batch) landed in the log verbatim. Share the DB's own limit so the log
+    line and the dead-letter row agree on how much of the server's text is
+    worth keeping — the DB write is unaffected, since `increment_retry`
+    truncates independently.
+    """
+    return str(reason)[:_MAX_LAST_ERROR_CHARS]
 
 
 # Sentinel for "no project id has been rejected yet" — distinct from None,
@@ -3909,12 +3992,44 @@ class SyncEngine:
                         # whole-batch failure stamped on it, and the drop would
                         # be attributed to a status from a different cycle.
                         # This IS the more specific rejection: the server named
-                        # these events individually.
-                        self.queue.increment_retry(
-                            failed_ids,
-                            "per-event rejection: omitted from accepted_ids "
-                            "(server gave no batch-level reason)",
+                        # these events individually — so carry the server's own
+                        # per-event reason for exactly these events, the same
+                        # way the whole-batch branch below does. Otherwise
+                        # whether "too_old" survives would depend on whether
+                        # some OTHER event in the batch happened to be accepted.
+                        failed_event_ids = {
+                            ev.get("id") for eid, ev in zip(event_ids, events)
+                            if eid in failed_ids
+                        }
+                        reason = summarize_per_event_errors([
+                            item for item in result.errors
+                            if not isinstance(item, dict)
+                            or item.get("event") is None
+                            or item.get("event") in failed_event_ids
+                        ])
+                        # Hoisted above the log call so the warning and the
+                        # dead-letter row can never disagree. `reason` is
+                        # None whenever the server gave no per-event detail
+                        # at all, OR gave detail that names only events NOT
+                        # in failed_event_ids (every error entry belongs to
+                        # an event that WAS accepted) — either way this is
+                        # still a real rejection and must not vanish
+                        # silently. Previously the `if reason:` guard below
+                        # skipped the log in exactly that case while
+                        # increment_retry still wrote a (different) generic
+                        # marker, so the dead-letter row carried a reason
+                        # nobody had been warned about. Fall back to the
+                        # SAME fixed marker the whole-batch branch below
+                        # uses, so a reason-less rejection reads identically
+                        # from either branch.
+                        reason = reason or _REASON_NONE_GIVEN
+                        logger.warning(
+                            "Server rejected %d of %d queued events "
+                            "individually: %s",
+                            len(failed_ids), len(event_ids),
+                            _truncate_reason_for_log(reason),
                         )
+                        self.queue.increment_retry(failed_ids, reason)
                     processed += len(succeeded_ids)
                 else:
                     # Whole-batch failure with no per-event verdict. Only count
@@ -3933,7 +4048,37 @@ class SyncEngine:
                         # ever read it, so every dead-lettered event carried the
                         # agent's generic "definitive rejection" and the cause
                         # was unrecoverable by the time anyone looked.
-                        self.queue.increment_retry(event_ids, result.error)
+                        #
+                        # result.error is only populated from an HTTP-layer
+                        # exception (a real 4xx/5xx). A batch rejected on
+                        # PER-EVENT validation (every event's timestamp out of
+                        # range, say) comes back as a 200 with failed>0 and no
+                        # top-level error string, so error stays None — and
+                        # increment_retry(ids, None) WRITES NOTHING, silently
+                        # discarding whatever reason a previous cycle recorded.
+                        # Fall back to the server's own per-event detail, and
+                        # only when it gave neither, to a fixed marker: a real
+                        # rejection must never leave an empty, undiagnosable
+                        # dead-letter row.
+                        # The log names WHICH source the reason came from: an
+                        # HTTP-layer error and a 200-with-per-event-failures
+                        # are different failure shapes, and the operator
+                        # reading betterflow.log needs to tell them apart.
+                        if result.error:
+                            reason, source = result.error, "batch-level error"
+                        else:
+                            reason = summarize_per_event_errors(result.errors)
+                            source = (
+                                "no batch-level error string; per-event detail"
+                                if reason else "no reason given"
+                            )
+                            reason = reason or _REASON_NONE_GIVEN
+                        logger.warning(
+                            "Server rejected queued batch (%d events) (%s): %s",
+                            len(event_ids), source,
+                            _truncate_reason_for_log(reason),
+                        )
+                        self.queue.increment_retry(event_ids, reason)
                     elif (
                         self._queue_consecutive_failures >= self._STUCK_HEAD_CEILING
                         and not self._batch_has_storable_activity(events)
