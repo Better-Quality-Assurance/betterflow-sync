@@ -103,6 +103,18 @@ class SyncResult:
     # drop threshold: a transient failure must NOT, or a long outage drops good
     # activity (2026-06-30). Only meaningful when success is False.
     transient: bool = False
+    # Raw per-event rejection detail from the server's `errors` field
+    # (`[{"event": id, "error": "...", "reason": "too_old"}, ...]`), forwarded
+    # VERBATIM — no interpretation here. A batch rejected on per-event
+    # validation (every event's timestamp out of range, say) comes back as a
+    # 200 with `failed > 0` and no top-level `error` string: it is not an
+    # exception, so the `except BetterFlowClientError` branch below never
+    # runs and `error` stays None. Without this field the caller had nothing
+    # to fall back on and `_process_queue`'s whole-batch branch passed `None`
+    # straight to `queue.increment_retry`, which WRITES NOTHING when the
+    # reason is None — a real server rejection then dropped after max
+    # retries with an empty dead-letter row and no warning ever logged.
+    errors: list = field(default_factory=list)
 
 
 class BetterFlowClient(BaseApiClient):
@@ -364,6 +376,12 @@ class BetterFlowClient(BaseApiClient):
             accepted_ids = payload.get("accepted_ids") or []
             synced = payload.get("processed", payload.get("synced"))
             queued = payload.get("failed", payload.get("queued", 0))
+            # The server's own per-event detail (internal-tool2's
+            # `errors: [{event, error, reason}]`). Forwarded verbatim — this
+            # function never interprets it, callers do — so an older server
+            # that omits `errors` entirely degrades to the empty default
+            # rather than raising.
+            server_errors = payload.get("errors") or []
 
             # No delivery confirmation — do not assume anything persisted. The
             # server was reached but gave no per-event verdict, so this is
@@ -410,6 +428,7 @@ class BetterFlowClient(BaseApiClient):
                 accepted_ids=(
                     list(accepted_ids) + dropped_ids if accepted_ids else accepted_ids
                 ),
+                errors=list(server_errors),
             )
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login

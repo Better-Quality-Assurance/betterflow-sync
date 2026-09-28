@@ -394,6 +394,81 @@ class TestBetterFlowClient:
         assert result.transient is True
 
     @responses.activate
+    def test_send_events_whole_batch_rejection_carries_the_servers_own_errors(self):
+        """A per-event-validation rejection (e.g. every event's timestamp
+        outside internal-tool2's 7-day/5-minute window) comes back as a 200
+        with `failed > 0`, an empty `accepted_ids`, and NO top-level `error`
+        string — the explanation lives only in the `errors` array. Before this
+        fix that array was read nowhere: SyncResult.error stayed None and
+        `_process_queue`'s whole-batch branch passed it straight to
+        `queue.increment_retry`, which writes NOTHING when given None — a real
+        rejection then dropped after max retries with an empty dead-letter row.
+
+        This pins that send_events() itself forwards the array, independent of
+        anything sync_engine.py later does with it.
+        """
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={
+                "success": True,
+                "data": {
+                    "processed": 0,
+                    "failed": 2,
+                    "accepted_ids": [],
+                    "errors": [
+                        {
+                            "event": "e1",
+                            "error": "Event timestamp out of acceptable range",
+                            "reason": "too_old",
+                        },
+                        {
+                            "event": "e2",
+                            "error": "Event timestamp out of acceptable range",
+                            "reason": "too_old",
+                        },
+                    ],
+                },
+            },
+            status=200,
+        )
+
+        events = [
+            {"id": "e1", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+            {"id": "e2", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}},
+        ]
+        result = self.client.send_events(events)
+
+        assert result.success is False
+        assert result.error is None, (
+            "a 200-with-per-event-failures must not fabricate a top-level "
+            "error string — that is exactly the shape this fix distinguishes "
+            "from an HTTP-layer exception"
+        )
+        assert result.errors == [
+            {"event": "e1", "error": "Event timestamp out of acceptable range", "reason": "too_old"},
+            {"event": "e2", "error": "Event timestamp out of acceptable range", "reason": "too_old"},
+        ], f"the server's per-event errors were not forwarded verbatim: {result.errors!r}"
+
+    @responses.activate
+    def test_send_events_omitted_errors_field_defaults_to_empty(self):
+        """An older server (predating internal-tool2's `errors` per-event
+        detail) must not raise — SyncResult.errors degrades to the empty
+        default rather than KeyError-ing send_events()."""
+        responses.add(
+            responses.POST,
+            "https://betterflow.eu/api/agent/events/batch",
+            json={"success": True, "data": {"processed": 0, "failed": 1}},
+            status=200,
+        )
+
+        events = [{"id": "e1", "timestamp": "2026-02-18T10:00:00Z", "duration": 60, "data": {}}]
+        result = self.client.send_events(events)
+
+        assert result.success is False
+        assert result.errors == []
+
+    @responses.activate
     def test_send_events_empty_list(self):
         """Test sending empty event list."""
         result = self.client.send_events([])
