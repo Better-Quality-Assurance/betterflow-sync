@@ -120,3 +120,55 @@ def test_pause_window_is_skipped_on_resume(monkeypatch):
     leave = T0 + timedelta(minutes=20)
     assert eng.queue.get_checkpoint(WIN_BUCKET) >= leave, "AW window leaked on resume"
     assert eng._afk_inproc_checkpoint >= leave, "in-process AFK leaked on resume"
+
+
+def test_private_window_is_skipped_when_the_app_shuts_down_mid_private(monkeypatch):
+    # Diana, 2026-09-25: Private Time from 14:35, Mac shut down at 15:43 with
+    # Private still on. shutdown() only cleared the in-memory flag, so the
+    # checkpoints stayed at private-START and no private_time span was sent;
+    # the next launch (Monday 08:04) re-fetched the whole private hour from
+    # AW and billed it as active work. Every exit path (system shutdown,
+    # Quit, self-update exit) converges on SyncEngine.shutdown(), so leaving
+    # private has to happen there -- the same leave path sleep uses.
+    import src.sync.sync_engine as se
+
+    clock = {"t": T0}
+
+    class _DT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["t"]
+
+    monkeypatch.setattr(se, "datetime", _DT)
+
+    eng = _engine(lambda: clock["t"])
+    eng.queue.set_checkpoint(WIN_BUCKET, T0 - timedelta(seconds=30))
+    eng.afk_source.record_sample(T0)
+    eng._build_inproc_afk(T0)
+
+    spans = []
+    real_send = eng._send_status_span
+
+    def _spy(kind, start, *a, **kw):
+        spans.append((kind, start))
+        return real_send(kind, start, *a, **kw)
+
+    monkeypatch.setattr(eng, "_send_status_span", _spy)
+
+    eng.set_private_mode(True)        # enter at T0
+    clock["t"] = T0 + timedelta(hours=1, minutes=8)
+    eng.shutdown()                    # Mac shut down, Private still on
+
+    leave = T0 + timedelta(hours=1, minutes=8)
+    assert eng.queue.get_checkpoint(WIN_BUCKET) >= leave, "private window re-syncs as work after restart"
+    assert eng._afk_inproc_checkpoint >= leave, "in-process AFK private window leaked"
+    assert ("private", T0) in spans, "the private_time span was never sent"
+
+
+def test_shutdown_outside_private_sends_no_private_span(monkeypatch):
+    # The allowance: an ordinary quit must not invent a private span.
+    eng = _engine(lambda: T0)
+    spans = []
+    monkeypatch.setattr(eng, "_send_status_span", lambda kind, start, *a, **kw: spans.append(kind))
+    eng.shutdown()
+    assert "private" not in spans

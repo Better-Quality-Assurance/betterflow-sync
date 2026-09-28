@@ -4715,6 +4715,21 @@ class SyncEngine:
         logout/re-login without stale pause, config, or backoff state
         carrying over from the previous session.
         """
+        # Leave Private Time through the normal leave path BEFORE the flag is
+        # cleared below. Clearing it alone skipped the leave-time checkpoint
+        # advance and the private_time span, so the next launch re-fetched the
+        # whole private window from AW "since checkpoint" and billed it as
+        # active work (Diana, 2026-09-25: Private from 14:35, Mac shut down at
+        # 15:43, the hour uploaded as work on Monday's launch). Every exit --
+        # system shutdown, Quit, self-update exit, logout -- converges here,
+        # which is why this lives in shutdown() and not in one caller. The
+        # span is queued on failure, so it survives an offline shutdown.
+        if self.is_private:
+            try:
+                self.set_private_mode(False)
+            except Exception:
+                logger.warning("ending private mode on shutdown failed", exc_info=True)
+
         with self._state_lock:
             need_end = self._session_active
             self._session_active = False
