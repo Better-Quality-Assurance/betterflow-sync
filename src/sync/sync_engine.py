@@ -35,6 +35,7 @@ try:
     from .os_idle import get_system_idle_seconds
     from .queue import (
         EVENT_RETENTION_DAYS,
+        MAX_EVENT_DURATION_SECONDS,
         _MAX_LAST_ERROR_CHARS,
         is_event_storable,
         normalized_project_id,
@@ -53,6 +54,7 @@ except ImportError:
     from sync.os_idle import get_system_idle_seconds
     from sync.queue import (
         EVENT_RETENTION_DAYS,
+        MAX_EVENT_DURATION_SECONDS,
         _MAX_LAST_ERROR_CHARS,
         is_event_storable,
         normalized_project_id,
@@ -2958,6 +2960,62 @@ class SyncEngine:
                 )
             return
         bucket_type = f"{kind}_time"
+        # The server caps ONE event at MAX_EVENT_DURATION_SECONDS (24h,
+        # internal-tool2 AgentEventController `events.*.duration max:86400`) and
+        # 422s the whole batch otherwise. A weekend lid-close sleep (or idle /
+        # Private Time left on) on a 24/7 schedule has no working-hours clamp,
+        # so it routinely runs ~40-65h. Sent whole, it was rejected, queued,
+        # then evicted as over-long and reported every Monday as "Dropped 1
+        # queued event(s) after max retries ... buckets=bf-status" — and the
+        # dead-letter replay can never resurrect it, so the span was lost.
+        # Split it at the source into contiguous chunks of at most 24h. The
+        # FIRST chunk keeps the span's id, so the per-cycle private_time
+        # refresh keeps patching the row the server already holds; each later
+        # chunk is keyed on its own start, which is stable across cycles.
+        chunks = []
+        offset = 0.0
+        while offset < duration:
+            chunk_start = start + timedelta(seconds=offset)
+            chunk_duration = min(duration - offset, MAX_EVENT_DURATION_SECONDS)
+            chunks.append((chunk_start, chunk_duration))
+            offset += chunk_duration
+        events = [
+            self._status_span_event(kind, chunk_start, chunk_duration)
+            for chunk_start, chunk_duration in chunks
+        ]
+        if len(events) > 1:
+            logger.info(
+                "Split %s span of %.0fs into %d chunks of <=%ds (server per-event cap)",
+                bucket_type, duration, len(events), MAX_EVENT_DURATION_SECONDS,
+            )
+        # bf.send_events() returns SyncResult(success=False) on network errors —
+        # it does NOT raise BetterFlowClientError — so the previous `except`
+        # block was unreachable and break/idle/private events were silently
+        # dropped on the first offline cycle. Inspect the result instead.
+        try:
+            self._note_delivery_attempt()
+            result = self.bf.send_events(events)
+        except BetterFlowAuthError as e:
+            # Auth errors are not retryable without re-login; queueing risks
+            # sending under a different user's session after re-auth. Drop.
+            logger.warning("Auth error sending %s event — not queued: %s", bucket_type, e)
+            return
+        if result.success:
+            logger.info("Sent %s event (%.0fs)", bucket_type, duration)
+        elif queue_on_failure:
+            logger.warning("Failed to send %s event: %s — queueing", bucket_type, result.error or "unknown")
+            self.queue.enqueue(events)
+        else:
+            # In-progress snapshot: superseded by the next cycle's re-send.
+            logger.debug(
+                "Failed to send %s snapshot: %s — not queued (next cycle re-sends)",
+                bucket_type, result.error or "unknown",
+            )
+
+    def _status_span_event(self, kind: str, start: datetime, duration: float) -> dict:
+        """Build one status-span event, keyed on its own start so the id is
+        deterministic (the first chunk's start IS the span's start)."""
+        bucket_type = f"{kind}_time"
         event = {
             "id": f"{kind}_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
@@ -2976,30 +3034,7 @@ class SyncEngine:
             "bucket_type": bucket_type,
             "data": {"status": kind},
         }
-        event = self._stamp_project(event)
-        # bf.send_events() returns SyncResult(success=False) on network errors —
-        # it does NOT raise BetterFlowClientError — so the previous `except`
-        # block was unreachable and break/idle/private events were silently
-        # dropped on the first offline cycle. Inspect the result instead.
-        try:
-            self._note_delivery_attempt()
-            result = self.bf.send_events([event])
-        except BetterFlowAuthError as e:
-            # Auth errors are not retryable without re-login; queueing risks
-            # sending under a different user's session after re-auth. Drop.
-            logger.warning("Auth error sending %s event — not queued: %s", bucket_type, e)
-            return
-        if result.success:
-            logger.info("Sent %s event (%.0fs)", bucket_type, duration)
-        elif queue_on_failure:
-            logger.warning("Failed to send %s event: %s — queueing", bucket_type, result.error or "unknown")
-            self.queue.enqueue([event])
-        else:
-            # In-progress snapshot: superseded by the next cycle's re-send.
-            logger.debug(
-                "Failed to send %s snapshot: %s — not queued (next cycle re-sends)",
-                bucket_type, result.error or "unknown",
-            )
+        return self._stamp_project(event)
 
     def send_break_event(self, start: datetime, end: Optional[datetime] = None) -> None:
         """Send a break_time event covering the break duration."""
