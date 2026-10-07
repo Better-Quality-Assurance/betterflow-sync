@@ -256,6 +256,48 @@ def _is_window_like(bucket_type: str) -> bool:
     return bucket_type in (BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_WEB)
 
 
+def _chunk_span(start: datetime, duration: float) -> list[tuple[datetime, float]]:
+    """Split ``[start, start+duration)`` into contiguous chunks of at most
+    ``MAX_EVENT_DURATION_SECONDS``, the server's per-event cap (internal-tool2
+    AgentEventController ``events.*.duration max:86400``; one event over it 422s
+    the whole batch). One helper for every sender, so the agent's own status
+    spans and ActivityWatch events can never disagree about the cap."""
+    chunks: list[tuple[datetime, float]] = []
+    offset = 0.0
+    while offset < duration:
+        chunk_duration = min(duration - offset, MAX_EVENT_DURATION_SECONDS)
+        chunks.append((start + timedelta(seconds=offset), chunk_duration))
+        offset += chunk_duration
+    return chunks
+
+
+def _split_over_long_event(event: dict) -> list[dict]:
+    """Split one transformed ActivityWatch event that is longer than the
+    server's per-event cap into contiguous <=24h events.
+
+    A machine left on but untouched over a weekend gives aw-watcher-afk ONE afk
+    event of ~40-65h. Sent whole it was 422'd, queued, evicted as over-long and
+    lost (ops board 2026-10-05, ``Dropped 1 queued event(s) ...
+    buckets=aw-watcher-afk``). The first chunk keeps the AW id, because the
+    server already holds that row and patches its duration in place as AW grows
+    the event; each later chunk is ``<id>_<n>``, stable across cycles because
+    chunk n always starts n*24h after the event's start.
+    """
+    duration = event.get("duration")
+    if not isinstance(duration, (int, float)) or duration <= MAX_EVENT_DURATION_SECONDS:
+        return [event]
+    start = datetime.fromisoformat(event["timestamp"])
+    parts = []
+    for n, (chunk_start, chunk_duration) in enumerate(_chunk_span(start, duration)):
+        part = dict(event)
+        part["data"] = dict(event.get("data") or {})
+        part["id"] = event["id"] if n == 0 else f"{event['id']}_{n}"
+        part["timestamp"] = chunk_start.isoformat()
+        part["duration"] = round(chunk_duration, 2)
+        parts.append(part)
+    return parts
+
+
 def _is_afk_like(bucket_type: str) -> bool:
     """AFK/idle buckets that drive the active-vs-idle decision."""
     return bucket_type in (BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT)
@@ -2173,7 +2215,13 @@ class SyncEngine:
                 transformed_event = self._transform_event(
                     event, bucket_id, bucket_type, cycle=cycle
                 )
-                transformed_events = [transformed_event] if transformed_event else []
+                # Window events are NOT split: their activity classification is
+                # computed once for the whole event, so cutting one would need a
+                # re-classification per chunk. Only non-window events (AFK,
+                # input, call) are split; a >24h AFK event is the observed loss.
+                transformed_events = (
+                    _split_over_long_event(transformed_event) if transformed_event else []
+                )
 
             if transformed_events:
                 transformed.extend(transformed_events)
@@ -2972,13 +3020,7 @@ class SyncEngine:
         # FIRST chunk keeps the span's id, so the per-cycle private_time
         # refresh keeps patching the row the server already holds; each later
         # chunk is keyed on its own start, which is stable across cycles.
-        chunks = []
-        offset = 0.0
-        while offset < duration:
-            chunk_start = start + timedelta(seconds=offset)
-            chunk_duration = min(duration - offset, MAX_EVENT_DURATION_SECONDS)
-            chunks.append((chunk_start, chunk_duration))
-            offset += chunk_duration
+        chunks = _chunk_span(start, duration)
         events = [
             self._status_span_event(kind, chunk_start, chunk_duration)
             for chunk_start, chunk_duration in chunks
