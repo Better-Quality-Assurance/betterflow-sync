@@ -189,14 +189,25 @@ def test_lock_notification_racing_just_after_sleep_still_avoids_overlap():
     """The OS can, on some sleep paths, deliver the screenIsLocked
     notification concurrently with or just after NSWorkspaceWillSleep rather
     than before it. Whichever arrives first, the result must still be two
-    non-overlapping spans, never three and never overlapping ones."""
+    non-overlapping spans, never three and never overlapping ones.
+
+    The clock is advanced by hours between the lock notification and the wake
+    notification (simulating a real multi-hour sleep, where nothing in the
+    agent queries the clock again until wake) so that the two candidate start
+    times for the post-wake lock span — "the instant the lock notification
+    arrived" versus "the instant wake fired" — are hours apart and the test
+    can actually tell them apart. Opening the span at the earlier instant
+    would silently re-claim hours of already-reported sleep as "lock" too,
+    which is exactly the double-count this design exists to prevent.
+    """
     handler = _make_handler()
-    patcher, _ = _patch_clock()
+    patcher, clock = _patch_clock()
     with patcher:
         handler.on_system_sleep()      # T0: sleeps first, nothing locked yet
-        handler.on_screen_lock()       # T1: lock notification arrives mid-sleep
-        handler.on_system_wake()       # T2: wakes, still locked
-        handler.on_screen_unlock()     # T3: user returns
+        handler.on_screen_lock()       # T0+1s: lock notification arrives mid-sleep
+        clock._next += timedelta(hours=5)  # the machine sleeps for real hours
+        handler.on_system_wake()       # wakes, hours later, still locked
+        handler.on_screen_unlock()     # user returns
 
     calls = handler.sync_engine.send_sleep_event.call_args_list
     assert len(calls) == 2, (
@@ -205,16 +216,16 @@ def test_lock_notification_racing_just_after_sleep_still_avoids_overlap():
     )
 
     t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    # on_screen_lock consumes no clock tick here: it only sets a flag
-    # (``_locked_while_asleep``) rather than opening a span, since the sleep
-    # span already open covers this exclusion. So the SECOND clock tick is
-    # the one on_system_wake uses to reopen the lock span.
-    t1 = t0 + timedelta(seconds=1)
+    wake_instant = t0 + timedelta(seconds=1) + timedelta(hours=5)
 
     sleep_span, post_wake_lock = calls
     assert sleep_span.args[0] == t0
     assert sleep_span.kwargs == {}
-    assert post_wake_lock.args[0] == t1
+    assert post_wake_lock.args[0] == wake_instant, (
+        "the post-wake lock span must start at WAKE, not at the earlier "
+        "lock-notification instant — anything else re-claims real sleep "
+        "time as lock time too"
+    )
     assert post_wake_lock.kwargs.get("reason") == "lock"
 
 
