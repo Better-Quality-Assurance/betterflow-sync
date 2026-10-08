@@ -48,6 +48,18 @@ class SystemEventHandler:
         # Without this the overnight gap shows as "Break" in the daily
         # activity view (server-side aggregator can't tell idle from sleep).
         self._sleep_start: Optional[datetime] = None
+        # Timestamp set when on_screen_lock fires; consumed on the next
+        # on_screen_unlock to emit a sleep_time event (reason="lock") covering
+        # the span. Before this, a lock called sync_engine.pause() and
+        # uploaded NOTHING — credit already stopped, but the server could not
+        # tell a lock apart from a crashed or quit agent.
+        self._lock_start: Optional[datetime] = None
+        # True while a lock span was open when the system fell asleep (closed
+        # early at the sleep boundary below, to avoid double-reporting the
+        # slept portion once on_system_wake also reports it as sleep_time).
+        # on_system_wake reopens a fresh _lock_start when this is set, since
+        # macOS does not auto-unlock on wake — the screen is still locked.
+        self._locked_while_asleep = False
 
         # Update handler reference (set after construction)
         self.update_handler = None
@@ -59,6 +71,8 @@ class SystemEventHandler:
         except ImportError:
             from ui.tray import TrayState
 
+        lock_start_to_flush = None
+        sleep_boundary = None
         with self._pause_state_lock:
             self._pre_sleep_private = self.sync_engine.is_private
             # Branch on a local, not a re-read of the shared field: the sleep and
@@ -75,12 +89,32 @@ class SystemEventHandler:
             # paths emit two sleeps without a wake between them). Overwriting
             # would silently truncate the front of the sleep span.
             if self._sleep_start is None:
-                self._sleep_start = datetime.now(timezone.utc)
+                sleep_boundary = datetime.now(timezone.utc)
+                self._sleep_start = sleep_boundary
+                # A lock span already open is about to run through the sleep.
+                # Close it HERE, at the sleep boundary, rather than letting it
+                # keep growing — the server SUMS each STATEFUL_EVENT_TYPES
+                # span's duration rather than merging overlapping intervals
+                # (internal-tool2 AgentEventProcessor::updateSessionTiming), so
+                # a lock span spanning the sleep would double-count the slept
+                # portion once on_system_wake also reports it as sleep_time.
+                # Mirrors ending Private Time at this same boundary, just
+                # below, for the same reason: a span must not silently run
+                # through a sleep it was never measuring.
+                if self._lock_start is not None:
+                    lock_start_to_flush = self._lock_start
+                    self._lock_start = None
+                    self._locked_while_asleep = True
             else:
                 logger.debug(
                     "on_system_sleep fired while a prior _sleep_start is still pending "
                     "(no wake yet) — keeping the earlier timestamp"
                 )
+        if lock_start_to_flush is not None:
+            try:
+                self.sync_engine.send_sleep_event(lock_start_to_flush, sleep_boundary, reason="lock")
+            except Exception as e:
+                logger.warning("send_sleep_event (lock, pre-sleep) failed: %s", e)
         # End Private Time at the sleep boundary. Private has no auto-timeout,
         # so a user who enables it and forgets — or whose machine sleeps mid-
         # private — would otherwise stay private across the sleep AND into the
@@ -127,6 +161,14 @@ class SystemEventHandler:
             user_paused = self._user_paused
             sleep_start = self._sleep_start
             self._sleep_start = None
+            if self._locked_while_asleep:
+                # The lock span open when we fell asleep was already closed
+                # and flushed AT the sleep boundary (on_system_sleep). macOS
+                # does not auto-unlock on wake, so the screen is still locked
+                # right now — open a fresh lock span covering the rest of it;
+                # on_screen_unlock flushes it when the user actually returns.
+                self._locked_while_asleep = False
+                self._lock_start = datetime.now(timezone.utc)
         if sleep_start is not None:
             try:
                 self.sync_engine.send_sleep_event(sleep_start)
@@ -174,6 +216,24 @@ class SystemEventHandler:
 
         with self._pause_state_lock:
             self._pre_lock_private = self.sync_engine.is_private
+            # Record the lock span start for later upload as a sleep_time
+            # event (reason="lock"), UNLESS the system is already asleep: an
+            # open sleep span already covers this exclusion, and a lock
+            # notification can arrive concurrently with (or just after) the
+            # sleep notification on some sleep paths. Opening a second,
+            # overlapping span here would double-count that time once
+            # on_system_wake flushes the sleep span too. Just remember we
+            # were locked, so on_system_wake can open a fresh lock span once
+            # the sleep span has been flushed.
+            if self._sleep_start is not None:
+                self._locked_while_asleep = True
+            elif self._lock_start is None:
+                self._lock_start = datetime.now(timezone.utc)
+            else:
+                logger.debug(
+                    "on_screen_lock fired while a prior _lock_start is still pending "
+                    "(no unlock yet) — keeping the earlier timestamp"
+                )
         logger.info("Screen locked - pausing tracking")
         self.coordinator.clear_idle_pause(send_event=True)
         self.sync_engine.pause()
@@ -196,9 +256,20 @@ class SystemEventHandler:
         except ImportError:
             from main import _day_greeting
 
+        # Emit the lock-reason sleep_time event before any early-return paths,
+        # mirroring on_system_wake above — so even an unlock into a still-
+        # paused / still-on-break state records the span. Captured under the
+        # lock to avoid racing a second lock.
         with self._pause_state_lock:
             user_paused = self._user_paused
             pre_lock_private = self._pre_lock_private
+            lock_start = self._lock_start
+            self._lock_start = None
+        if lock_start is not None:
+            try:
+                self.sync_engine.send_sleep_event(lock_start, reason="lock")
+            except Exception as e:
+                logger.warning("send_sleep_event (lock) failed: %s", e)
         if user_paused:
             logger.info("Screen unlocked - staying paused (user-initiated pause active)")
             # Same as the wake path above: "Screen locked" is still stored and

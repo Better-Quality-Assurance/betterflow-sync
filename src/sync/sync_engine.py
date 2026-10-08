@@ -2947,6 +2947,7 @@ class SyncEngine:
         start: datetime,
         end: Optional[datetime] = None,
         queue_on_failure: bool = True,
+        extra_data: Optional[dict] = None,
     ) -> None:
         """Send a duration event for a state-span (break/idle/private).
 
@@ -2961,6 +2962,12 @@ class SyncEngine:
         snapshot would replay a stack of stale intermediate durations after
         an outage. Final spans (sent when the state ends) keep the default
         and are queued for offline retry.
+
+        ``extra_data``, when given, is merged into ``data`` on every chunk
+        (e.g. ``{"reason": "lock"}``) without changing ``kind``/bucket_type/id
+        — purely an observability tag the server does not need to understand.
+        Omitted (None) leaves ``data`` byte-identical to before this param
+        existed; see ``test_status_span_over_24h_split.py``.
         """
         if end is None:
             end = datetime.now(timezone.utc)
@@ -3022,7 +3029,7 @@ class SyncEngine:
         # chunk is keyed on its own start, which is stable across cycles.
         chunks = _chunk_span(start, duration)
         events = [
-            self._status_span_event(kind, chunk_start, chunk_duration)
+            self._status_span_event(kind, chunk_start, chunk_duration, extra_data=extra_data)
             for chunk_start, chunk_duration in chunks
         ]
         if len(events) > 1:
@@ -3054,10 +3061,15 @@ class SyncEngine:
                 bucket_type, result.error or "unknown",
             )
 
-    def _status_span_event(self, kind: str, start: datetime, duration: float) -> dict:
+    def _status_span_event(
+        self, kind: str, start: datetime, duration: float, extra_data: Optional[dict] = None
+    ) -> dict:
         """Build one status-span event, keyed on its own start so the id is
         deterministic (the first chunk's start IS the span's start)."""
         bucket_type = f"{kind}_time"
+        data = {"status": kind}
+        if extra_data:
+            data.update(extra_data)
         event = {
             "id": f"{kind}_{int(start.timestamp())}_{id(self)}",
             "timestamp": start.isoformat(),
@@ -3074,7 +3086,7 @@ class SyncEngine:
             # type "bf-status" rather than "unknown".
             "bucket_id": f"bf-status_{self._hostname}",
             "bucket_type": bucket_type,
-            "data": {"status": kind},
+            "data": data,
         }
         return self._stamp_project(event)
 
@@ -3086,7 +3098,9 @@ class SyncEngine:
         """Send an idle_time event covering the idle duration."""
         self._send_status_span(kind="idle", start=start, end=end)
 
-    def send_sleep_event(self, start: datetime, end: Optional[datetime] = None) -> None:
+    def send_sleep_event(
+        self, start: datetime, end: Optional[datetime] = None, reason: Optional[str] = None
+    ) -> None:
         """Send a sleep_time event covering a system sleep span.
 
         Distinct from idle_time so the server-side aggregator can tell
@@ -3094,8 +3108,20 @@ class SyncEngine:
         walked away from a running machine" (idle). Without this, both
         get rendered as "Break" in the daily activity view, which is
         misleading for overnight sleep cycles.
+
+        ``reason`` is an optional observability tag, e.g. "lock" for a span
+        caused by a screen lock rather than true system/display sleep. Both
+        are uploaded through this same pipeline on purpose: internal-tool2's
+        ``AgentEvent::inferEventType`` keys the exclusion (STATEFUL_EVENT_TYPES
+        -> counted as non-active, never active) on ``bucket_type ==
+        "sleep_time"`` alone and never inspects ``data``, so tagging the
+        reason needs NO server change — it only makes the raw event
+        forensically distinguishable from genuine sleep. Leaving ``reason``
+        unset (the sleep/wake call site) keeps ``data`` byte-identical to
+        before this parameter existed.
         """
-        self._send_status_span(kind="sleep", start=start, end=end)
+        extra = {"reason": reason} if reason else None
+        self._send_status_span(kind="sleep", start=start, end=end, extra_data=extra)
 
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""

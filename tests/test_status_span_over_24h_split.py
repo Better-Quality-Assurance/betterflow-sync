@@ -137,3 +137,32 @@ def test_span_within_24h_is_still_one_event_with_the_original_id():
 
     assert list(server.stored) == [f"idle_{int(start.timestamp())}_{id(engine)}"]
     assert server.stored[f"idle_{int(start.timestamp())}_{id(engine)}"]["duration"] == MAX_EVENT_DURATION_SECONDS
+
+
+def test_sleep_event_reason_is_an_observability_tag_that_survives_24h_chunking():
+    """``reason`` (used for a screen-lock-caused span, system_event_handler.py)
+    rides the exact same pipeline as a plain sleep event, so a long-running
+    lock spanning a day boundary must be split into contiguous <=24h chunks
+    exactly like a long sleep is — every chunk still carries bucket_type
+    "sleep_time" (the server's exclusion keys on that alone) AND the reason,
+    and omitting reason entirely must leave ``data`` byte-identical to a
+    genuine sleep event (see the weekend-sleep test above: exactly
+    ``{"status": "sleep"}``, no "reason" key)."""
+    server = _CapValidatingServer()
+    engine = _engine(Path(tempfile.mkdtemp()), server)
+    start, end = _weekend_sleep()
+
+    engine.send_sleep_event(start, end, reason="lock")
+
+    chunks = sorted(server.stored.values(), key=lambda e: e["timestamp"])
+    assert len(chunks) == 3
+    assert all(c["bucket_type"] == "sleep_time" for c in chunks)
+    assert all(c["data"] == {"status": "sleep", "reason": "lock"} for c in chunks)
+
+    # No reason given -> no "reason" key at all, not reason=None.
+    server2 = _CapValidatingServer()
+    engine2 = _engine(Path(tempfile.mkdtemp()), server2)
+    engine2.send_sleep_event(start, start + timedelta(hours=1))
+    [plain_event] = server2.stored.values()
+    assert plain_event["data"] == {"status": "sleep"}
+    assert "reason" not in plain_event["data"]
