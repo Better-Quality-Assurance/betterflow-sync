@@ -735,3 +735,77 @@ class TestActivityAnalyzerFraudIntegration:
         self.analyzer.update_fraud_config(new_config)
 
         assert self.analyzer._fraud_detector._config.mouse_only_streak_threshold == 10
+
+
+class TestInputSpanProRating:
+    """F1b: an input event's counts are spread over [ts, ts+duration] and only
+    the share overlapping the analysis window is counted. A catch-up event
+    covering a 15-minute span must not land whole in one 5-minute window."""
+
+    T = datetime(2026, 10, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _ev(self, eid, start, duration, presses, clicks=0, scrolls=0):
+        return AWEvent(
+            id=eid,
+            timestamp=start,
+            duration=duration,
+            data={"presses": presses, "clicks": clicks, "scrolls": scrolls},
+        )
+
+    def test_fifteen_minute_catch_up_at_150_per_min_does_not_flag(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        span = 15 * 60
+        # One recovery event spanning the outage, assessed at points across it.
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(seconds=span), span, 2250)])
+        for back in (0, 300, 600):
+            ts = self.T - timedelta(seconds=back)
+            analyzer.add_window_events([AWEvent(id=100 + back, timestamp=ts, duration=1.0,
+                                                data={"app": "Editor", "title": "x"})])
+            result = analyzer.get_fraud_assessment(ts, app="Editor")
+            assert "implausible_input_rate" not in result.signals, back
+
+    def test_window_counts_only_its_overlap_share(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        analyzer.add_input_events([
+            self._ev(1, self.T - timedelta(minutes=15), 900, 2250, clicks=90, scrolls=45)
+        ])
+        m = analyzer.get_raw_metrics(self.T)
+        # 5/15 of the span overlaps [T-5m, T]
+        assert (m.presses, m.clicks, m.scrolls) == (750, 30, 15)
+        assert isinstance(m.presses, int), "the wire shape stays integer"
+
+    def test_window_at_the_start_of_the_span_sees_only_its_share(self):
+        """The pre-fix failure in its sharpest form: a window over the FIRST
+        five minutes of the span counted all 2250 (450/min)."""
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        start = self.T - timedelta(minutes=15)
+        analyzer.add_input_events([self._ev(1, start, 900, 2250)])
+        m = analyzer.get_raw_metrics(start + timedelta(minutes=5))
+        assert m.presses == 750
+
+    def test_sustained_500_per_min_in_real_10s_events_still_flags(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        events = []
+        for i in range(36):  # 6 minutes of 10 s events at ~500/min
+            events.append(self._ev(i, self.T - timedelta(seconds=360 - i * 10), 10, 83))
+        analyzer.add_input_events(events)
+        result = analyzer.get_fraud_assessment(self.T, app="Editor")
+        assert "implausible_input_rate" in result.signals
+
+    def test_zero_duration_event_counts_whole_when_inside_the_window(self):
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=1), 0, 40)])
+        assert analyzer.get_raw_metrics(self.T).presses == 40
+
+    def test_zero_duration_event_outside_the_window_counts_nothing(self):
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=6), 0, 40)])
+        assert analyzer.get_raw_metrics(self.T).presses == 0
+
+    def test_long_event_is_not_pruned_while_its_span_reaches_the_window(self):
+        """Pruning keyed on the START time dropped a long catch-up event as soon
+        as any newer event arrived, losing the share that overlaps the window."""
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=15), 900, 2250)])
+        analyzer.add_input_events([self._ev(2, self.T - timedelta(seconds=10), 10, 20)])
+        assert analyzer.get_raw_metrics(self.T).presses == 750 + 20

@@ -393,11 +393,17 @@ class ActivityAnalyzer:
 
         # Prune old events anchored to the latest event timestamp (not wall
         # clock) so historical replays from the offline queue aren't
-        # immediately discarded as "too old".
+        # immediately discarded as "too old". Keyed on each event's END: a
+        # catch-up event spanning a 15-minute outage starts long before the
+        # cutoff yet still overlaps the current window, and _compute_metrics
+        # counts that overlap.
         if self._input_events:
             ref = max(e.timestamp for e in self._input_events)
             cutoff = ref - timedelta(minutes=self._thresholds.window_minutes * 2)
-            self._input_events = [e for e in self._input_events if e.timestamp >= cutoff]
+            self._input_events = [
+                e for e in self._input_events
+                if e.timestamp + timedelta(seconds=max(e.duration, 0)) >= cutoff
+            ]
 
         # Sort by timestamp for consistent processing
         self._input_events.sort(key=lambda e: e.timestamp)
@@ -509,26 +515,50 @@ class ActivityAnalyzer:
         """
         window_start = timestamp - timedelta(minutes=self._thresholds.window_minutes)
 
-        # Sum input metrics in window
-        total_presses = 0
-        total_clicks = 0
-        total_scrolls = 0
+        # Sum input metrics in window. An input event is a COUNT over the span
+        # [ts, ts + duration], so only the share of that span overlapping the
+        # window is counted. Counting the whole event by its start time let a
+        # catch-up event (15 min of typing posted after an AW outage) land in
+        # one 5-minute window at three times the real rate. Summed as floats,
+        # rounded once at the end so ActivityMetrics (which is sent to the
+        # server) keeps its integer shape.
+        total_presses = 0.0
+        total_clicks = 0.0
+        total_scrolls = 0.0
 
         for event in self._input_events:
-            if window_start <= event.timestamp <= timestamp:
-                total_presses += event.presses
-                total_clicks += event.clicks
-                total_scrolls += event.scrolls
+            share = self._window_share(event, window_start, timestamp)
+            if share <= 0.0:
+                continue
+            total_presses += event.presses * share
+            total_clicks += event.clicks * share
+            total_scrolls += event.scrolls * share
 
         # Count window changes in window
         window_changes = self._count_window_changes(window_start, timestamp)
 
         return ActivityMetrics(
-            presses=total_presses,
-            clicks=total_clicks,
-            scrolls=total_scrolls,
+            presses=int(round(total_presses)),
+            clicks=int(round(total_clicks)),
+            scrolls=int(round(total_scrolls)),
             window_changes=window_changes,
         )
+
+    @staticmethod
+    def _window_share(event: AWEvent, start: datetime, end: datetime) -> float:
+        """Fraction of ``event``'s counts that fall inside [start, end].
+
+        The counts are assumed spread evenly over [ts, ts + duration]. An event
+        with no duration is a point: whole if its ts is in the window (the
+        pre-span behaviour), nothing otherwise."""
+        duration = event.duration
+        if not duration or duration <= 0:
+            return 1.0 if start <= event.timestamp <= end else 0.0
+        ev_end = event.timestamp + timedelta(seconds=duration)
+        overlap = (min(ev_end, end) - max(event.timestamp, start)).total_seconds()
+        if overlap <= 0:
+            return 0.0
+        return min(1.0, overlap / duration)
 
     def _count_window_changes(self, start: datetime, end: datetime) -> int:
         """Count the number of window/app changes in a time range.
