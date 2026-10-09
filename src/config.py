@@ -376,6 +376,12 @@ class FraudDetectionConfig:
     min_app_diversity: int = 2  # Fewer unique apps = suspicious
     app_diversity_min_minutes: int = 60  # Only check after this much active time
     click_keystroke_ratio_threshold: float = 10.0  # Above this = suspicious
+    # Presses per minute, averaged over one analyzer window, above which input
+    # is not plausibly a person typing (fast typists burst at ~400-500/min but a
+    # 5-minute working window averages far below). The 2026-10-08 outlier
+    # averaged ~550/min over 7.9 h. A held key trips it too: intended, the
+    # signal says "implausible input", not "fraud".
+    max_presses_per_minute: int = 400
     # The two fields below are RETIRED 2026-10-09 (input_regularity signal removed:
     # it measured the agent's sync cadence). Read by nothing; kept so an older
     # server /config still parses.
@@ -1346,6 +1352,8 @@ class Config:
                     val = float(fd["click_keystroke_ratio_threshold"])
                     if math.isfinite(val) and val > 0:
                         self.fraud_detection.click_keystroke_ratio_threshold = val
+                if "max_presses_per_minute" in fd:
+                    self.fraud_detection.max_presses_per_minute = max(60, int(fd["max_presses_per_minute"]))
                 if "input_regularity_cv_threshold" in fd:
                     val = float(fd["input_regularity_cv_threshold"])
                     if math.isfinite(val) and val > 0:

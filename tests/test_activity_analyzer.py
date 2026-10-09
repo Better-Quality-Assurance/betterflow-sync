@@ -513,12 +513,16 @@ class TestFraudSignalDetector:
 
     def test_fraud_score_capped_at_100(self):
         """Combined signals should not exceed 100."""
-        # Trigger all remaining signals simultaneously
-        # Uniform keystrokes (6 identical windows)
+        # Trigger all remaining signals simultaneously. min_app_diversity=4 makes a
+        # single app a 3-app deficit, i.e. the full 15 (the default would give 5).
+        self.detector = FraudSignalDetector(config=FraudDetectionConfig(min_app_diversity=4))
+        # Uniform keystrokes (6 identical windows) that are also physically
+        # implausible: 500 presses in a 1-minute window = 500/min > 400.
         for _ in range(6):
             self.detector.record_window_metrics(
-                ActivityMetrics(presses=10, clicks=20, scrolls=0, window_changes=0),
+                ActivityMetrics(presses=500, clicks=20, scrolls=0, window_changes=0),
                 app="OnlyApp",
+                window_minutes=1,
             )
 
         # Enough active time for app diversity
@@ -532,7 +536,53 @@ class TestFraudSignalDetector:
         self.detector._mouse_only_streak = 6
 
         result = self.detector.assess()
-        assert result.score <= 100
+        assert set(result.signals) == {
+            "keystroke_uniformity",
+            "mouse_only_streak",
+            "low_app_diversity",
+            "click_keystroke_ratio",
+            "implausible_input_rate",
+        }
+        # 30 + 20 + 15 + 10 + 30 = 105 uncapped; the cap must actually bite.
+        assert result.score == 100
+
+    # --- implausible_input_rate ---
+
+    def _window(self, presses, clicks=0):
+        return ActivityMetrics(presses=presses, clicks=clicks, scrolls=0, window_changes=1)
+
+    def test_implausible_typing_rate_flagged(self):
+        # 2,750 presses in a 5-minute window = 550/min, the 2026-10-08 outlier's all-day average
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        result = self.detector.assess()
+        assert "implausible_input_rate" in result.signals
+        assert result.score >= 30
+
+    def test_fast_but_human_typing_passes(self):
+        # 300/min sustained for 5 minutes: fast, possible
+        self.detector.record_window_metrics(self._window(1500), app="X", window_minutes=5)
+        assert "implausible_input_rate" not in self.detector.assess().signals
+
+    def test_rate_threshold_is_configurable(self):
+        det = FraudSignalDetector(config=FraudDetectionConfig(max_presses_per_minute=100))
+        det.record_window_metrics(self._window(600), app="X", window_minutes=5)  # 120/min
+        assert "implausible_input_rate" in det.assess().signals
+
+    def test_rate_signal_cleared_by_clear(self):
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        self.detector.clear()
+        assert "implausible_input_rate" not in self.detector.assess().signals
+
+    def test_rate_uses_peak_window_not_session_average(self):
+        # One implausible window among normal ones still flags (max, not mean)
+        for _ in range(3):
+            self.detector.record_window_metrics(self._window(100), app="X", window_minutes=5)
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        assert "implausible_input_rate" in self.detector.assess().signals
+
+    def test_nonpositive_window_minutes_does_not_crash_or_flag(self):
+        self.detector.record_window_metrics(self._window(99999), app="X", window_minutes=0)
+        assert "implausible_input_rate" not in self.detector.assess().signals
 
     # --- Session clear ---
 
@@ -664,6 +714,20 @@ class TestActivityAnalyzerFraudIntegration:
 
         assert self.analyzer._fraud_detector._unique_apps == set()
         assert len(self.analyzer._fraud_detector._input_timestamps) == 0
+
+    def test_analyzer_passes_its_window_minutes_to_rate_signal(self):
+        """End to end: 1,000 presses in the window is 200/min at the default
+        5-minute window (human) but 1000/min at a 1-minute window (implausible)."""
+        for minutes, expected in ((5, False), (1, True)):
+            analyzer = ActivityAnalyzer(
+                thresholds=EngagementThresholds(window_minutes=minutes),
+                fraud_config=FraudDetectionConfig(),
+            )
+            analyzer.add_input_events(
+                [self._make_input_event(self.now - timedelta(seconds=10), event_id=1, presses=1000)]
+            )
+            result = analyzer.get_fraud_assessment(self.now, app="TestApp")
+            assert ("implausible_input_rate" in result.signals) is expected, minutes
 
     def test_fraud_config_update(self):
         """update_fraud_config should propagate to the detector."""

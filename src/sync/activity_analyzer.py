@@ -123,6 +123,8 @@ class FraudSignalDetector:
     - mouse_only_streak: Consecutive windows with clicks but no other input
     - low_app_diversity: Too few unique apps over extended active time
     - click_keystroke_ratio: Abnormally high click-to-keystroke ratio
+    - implausible_input_rate: Any single window averaging more presses/min
+      than a person can plausibly type
 
     Retired 2026-10-09: input_regularity. Input arrives as aggregate count
     events drained on the agent's own ~60s sync cadence, so inter-event gaps
@@ -145,12 +147,20 @@ class FraudSignalDetector:
         self._total_presses: int = 0
         # Active time accumulated in minutes
         self._active_minutes: float = 0.0
+        # Highest presses/min seen in any single window this session.
+        self._max_presses_per_minute: float = 0.0
 
     def update_config(self, config) -> None:
         self._config = config
 
-    def record_window_metrics(self, metrics: "ActivityMetrics", app: Optional[str] = None) -> None:
+    def record_window_metrics(
+        self, metrics: "ActivityMetrics", app: Optional[str] = None, window_minutes: float = 5
+    ) -> None:
         """Record metrics from one analysis window."""
+        if window_minutes > 0:
+            rate = metrics.presses / window_minutes
+            if rate > self._max_presses_per_minute:
+                self._max_presses_per_minute = rate
         self._window_press_counts.append(metrics.presses)
         self._total_clicks += metrics.clicks
         self._total_presses += metrics.presses
@@ -204,6 +214,11 @@ class FraudSignalDetector:
             signals.append("click_keystroke_ratio")
             total_score += ck_score
 
+        # Signal 5: Implausible typing rate in any single window (0 or 30)
+        if self._max_presses_per_minute > self._config.max_presses_per_minute:
+            signals.append("implausible_input_rate")
+            total_score += 30
+
         return FraudAssessment(
             score=min(total_score, 100),
             signals=signals,
@@ -212,6 +227,7 @@ class FraudSignalDetector:
                 "keystroke_variance": round(ks_cv, 4) if ks_cv is not None else None,
                 "mouse_only_streak": self._mouse_only_streak,
                 "click_keystroke_ratio": round(self._total_clicks / max(self._total_presses, 1), 2),
+                "max_presses_per_minute": round(self._max_presses_per_minute, 1),
             },
         )
 
@@ -296,6 +312,7 @@ class FraudSignalDetector:
         self._total_clicks = 0
         self._total_presses = 0
         self._active_minutes = 0.0
+        self._max_presses_per_minute = 0.0
 
 
 class ActivityAnalyzer:
@@ -470,7 +487,9 @@ class ActivityAnalyzer:
         # Record this window's metrics into the fraud detector.
         # Use monotonic sequence counter to avoid recording the same window twice.
         if self._fraud_seq != self._last_fraud_seq:
-            self._fraud_detector.record_window_metrics(metrics, app=app)
+            self._fraud_detector.record_window_metrics(
+                metrics, app=app, window_minutes=self._thresholds.window_minutes
+            )
             # Track active time for app diversity checks (inside guard to avoid double-counting)
             if metrics.is_engaged(self._thresholds):
                 actual = active_seconds if active_seconds > 0 else self._thresholds.window_minutes * 60
