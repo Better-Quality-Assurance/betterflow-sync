@@ -2824,6 +2824,7 @@ class BetterFlowApp:
                 on_network_change=self._on_network_change,
                 on_screen_lock=self._on_screen_lock,
                 on_screen_unlock=self._on_screen_unlock,
+                on_display_sleep=self._on_display_sleep,
                 reachability_host=api_host,
                 reachability_port=api_port,
             )
@@ -3813,6 +3814,11 @@ class BetterFlowApp:
         if self._shutdown_event.is_set():
             return
         self.sys_events.on_screen_unlock()
+
+    def _on_display_sleep(self) -> None:
+        if self._shutdown_event.is_set():
+            return
+        self.sys_events.on_display_sleep()
 
     def _on_network_change(self, is_online: bool) -> None:
         if self._shutdown_event.is_set():
