@@ -20,8 +20,9 @@ except ImportError:
     from src import __version__
 from .retry import RetryConfig, RetryExhausted, log_retry, retry_with_backoff
 
-#: Author-written sentences that open a TRANSIENT failure's message. Each raise
-#: site below builds its message from one of these, and
+#: Author-written sentences that open a TRANSIENT failure's message. Every
+#: _TransientError raise site below, plus the 429 and rate-limit-backoff
+#: BetterFlowClientError sites, builds its message from one of these, and
 #: sync_engine.local_reason_kinds names a failed sync on the cross-tenant ops
 #: ingest by matching these PREFIXES (emitting only its own kind token, never
 #: the text). One spelling, imported by both ends: a reworded message here moves
@@ -34,6 +35,7 @@ REASON_DNS_FAILED = "DNS resolution failed"
 REASON_CONNECT_FAILED = "Cannot connect to BetterFlow API"
 REASON_CONNECTION_DROPPED = "Connection dropped mid-response"
 REASON_TIMEOUT = "Request timed out"
+REASON_DECODING_FAILED = "Response body decoding failed"
 
 __all__ = [
     "BaseApiClient",
@@ -633,7 +635,7 @@ class BaseApiClient:
             except requests.exceptions.ChunkedEncodingError:
                 raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:
-                raise _TransientError("Response body decoding failed")
+                raise _TransientError(REASON_DECODING_FAILED)
             except requests.exceptions.Timeout:
                 raise _TransientError(REASON_TIMEOUT)
             except requests.exceptions.HTTPError as e:

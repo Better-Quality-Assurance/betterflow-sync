@@ -71,7 +71,23 @@ PRODUCERS = {
     "server-error": lambda: _reason_from(status=502),
     "server-unavailable": lambda: _reason_from(status=503),
     "rate-limited": lambda: _reason_from(status=429, headers={"Retry-After": "1"}),
+    "decoding-failed": lambda: _reason_from(body=requests.exceptions.ContentDecodingError("x")),
 }
+
+
+def test_the_rate_limit_backoff_that_follows_a_429_is_also_rate_limited():
+    # The SECOND call after a 429 never reaches the network: it fails fast
+    # with the backoff sentence, a different producer of the same kind.
+    client = _client()
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
+        rsps.add(responses.POST, f"{BASE}/events/batch", status=429,
+                 headers={"Retry-After": "60"})
+        for _ in range(2):
+            with pytest.raises(BetterFlowClientError) as exc:
+                client._request("POST", "events/batch", data={"events": []}, retry=False)
+    reason = str(exc.value)
+    assert reason.startswith("Rate-limit backoff active"), reason
+    assert local_reason_kinds([reason]) == ["rate-limited"], reason
 
 
 @pytest.mark.parametrize("kind", sorted(PRODUCERS))
