@@ -120,10 +120,14 @@ class FraudSignalDetector:
 
     Signals detected:
     - keystroke_uniformity: Suspiciously uniform keystroke counts across windows
-    - input_regularity: Events fired at precise, machine-like intervals
     - mouse_only_streak: Consecutive windows with clicks but no other input
     - low_app_diversity: Too few unique apps over extended active time
     - click_keystroke_ratio: Abnormally high click-to-keystroke ratio
+
+    Retired 2026-10-09: input_regularity. Input arrives as aggregate count
+    events drained on the agent's own ~60s sync cadence, so inter-event gaps
+    carry the sampler's clock, not the human's, and every steady worker scored
+    ~24. Its two config fields stay so an older server /config still parses.
     """
 
     def __init__(self, config=None):
@@ -134,7 +138,7 @@ class FraudSignalDetector:
         self._unique_apps: set[str] = set()
         # Consecutive mouse-only window count
         self._mouse_only_streak: int = 0
-        # Input event timestamps for regularity analysis (bounded: ~60 events/min * 60 min)
+        # Input event timestamps (retired signal; no longer scored; bounded)
         self._input_timestamps: deque[datetime] = deque(maxlen=3600)
         # Session-level cumulative metrics
         self._total_clicks: int = 0
@@ -161,7 +165,7 @@ class FraudSignalDetector:
             self._mouse_only_streak = 0
 
     def record_input_timestamp(self, timestamp: datetime) -> None:
-        """Record an input event timestamp for regularity analysis.
+        """Record an input event timestamp (no longer feeds a score; see class docstring).
 
         Uses a bounded deque (maxlen=3600) for O(1) append with automatic eviction.
         """
@@ -182,25 +186,19 @@ class FraudSignalDetector:
             signals.append("keystroke_uniformity")
             total_score += ks_score
 
-        # Signal 2: Input regularity (0-25)
-        ir_score, ir_cv = self._check_input_regularity()
-        if ir_score > 0:
-            signals.append("input_regularity")
-            total_score += ir_score
-
-        # Signal 3: Mouse-only streak (0-20)
+        # Signal 2: Mouse-only streak (0-20)
         mo_score = self._check_mouse_only_streak()
         if mo_score > 0:
             signals.append("mouse_only_streak")
             total_score += mo_score
 
-        # Signal 4: Low app diversity (0-15)
+        # Signal 3: Low app diversity (0-15)
         ad_score = self._check_app_diversity()
         if ad_score > 0:
             signals.append("low_app_diversity")
             total_score += ad_score
 
-        # Signal 5: Click-to-keystroke ratio (0-10)
+        # Signal 4: Click-to-keystroke ratio (0-10)
         ck_score = self._check_click_keystroke_ratio()
         if ck_score > 0:
             signals.append("click_keystroke_ratio")
@@ -241,41 +239,6 @@ class FraudSignalDetector:
             # At cv=0 -> 30, at cv=threshold -> 0
             score = int(30 * (1 - cv / cfg.keystroke_cv_threshold))
             return min(score, 30), cv
-
-        return 0, cv
-
-    def _check_input_regularity(self) -> tuple[int, Optional[float]]:
-        """Check if input events arrive at suspiciously regular intervals.
-
-        Returns (score 0-25, coefficient_of_variation or None).
-        """
-        cfg = self._config
-        if len(self._input_timestamps) < cfg.min_input_events_for_regularity:
-            return 0, None
-
-        sorted_ts = sorted(self._input_timestamps)
-        gaps = []
-        for i in range(1, len(sorted_ts)):
-            gap = (sorted_ts[i] - sorted_ts[i - 1]).total_seconds()
-            if gap > 0:
-                gaps.append(gap)
-
-        n_gaps = len(gaps)
-        if n_gaps < 2:
-            return 0, None
-
-        mean = sum(gaps) / n_gaps
-        if mean == 0:
-            return 0, None
-
-        # Sample variance (N-1)
-        variance = sum((g - mean) ** 2 for g in gaps) / (n_gaps - 1)
-        std_dev = math.sqrt(variance)
-        cv = std_dev / mean
-
-        if cv < cfg.input_regularity_cv_threshold:
-            score = int(25 * (1 - cv / cfg.input_regularity_cv_threshold))
-            return min(score, 25), cv
 
         return 0, cv
 
@@ -405,7 +368,7 @@ class ActivityAnalyzer:
         new_events = [e for e in events if e.id not in existing_ids]
         self._input_events.extend(new_events)
 
-        # Record timestamps for fraud regularity analysis
+        # Record input timestamps (not scored since input_regularity was retired)
         for e in new_events:
             self._fraud_detector.record_input_timestamp(e.timestamp)
         if new_events:

@@ -368,39 +368,37 @@ class TestFraudSignalDetector:
         result = self.detector.assess()
         assert "keystroke_uniformity" not in result.signals
 
-    # --- Input regularity ---
+    # --- Input regularity (retired 2026-10-09) ---
 
-    def test_regular_intervals_flagged(self):
-        """Events arriving at exactly regular intervals should trigger."""
-        base = self.now - timedelta(minutes=10)
-        for i in range(12):
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
-
-        result = self.detector.assess()
-        assert "input_regularity" in result.signals
-        assert result.score > 0
-
-    def test_random_intervals_pass(self):
-        """Events with natural random intervals should not trigger."""
-        base = self.now - timedelta(minutes=10)
-        # Irregular gaps
-        gaps = [3, 12, 45, 7, 22, 55, 8, 30, 15, 40]
-        t = base
-        for gap in gaps:
-            t += timedelta(seconds=gap)
+    def test_sync_cadence_input_is_not_flagged(self):
+        """One aggregate input event per ~60s sync drain is the AGENT's clock,
+        not the person's. Replayed through the old detector this scored 24
+        (input_regularity) for every steady worker on 2026-10-08."""
+        import random
+        rng = random.Random(1)
+        t = datetime(2026, 10, 8, 9, tzinfo=timezone.utc)
+        for _ in range(300):
+            t += timedelta(seconds=60 + rng.uniform(-0.2, 0.2))
             self.detector.record_input_timestamp(t)
-
         result = self.detector.assess()
         assert "input_regularity" not in result.signals
+        assert result.score == 0
 
-    def test_input_regularity_needs_min_events(self):
-        """Should not flag regularity with fewer than min events."""
-        base = self.now
-        for i in range(3):  # only 3 events, default min is 10
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
+    def test_perfectly_regular_input_is_not_flagged_either(self):
+        """The signal is retired, not retuned: exact 60s spacing is what a
+        healthy agent produces too."""
+        t = datetime(2026, 10, 8, 9, tzinfo=timezone.utc)
+        for _ in range(300):
+            t += timedelta(seconds=60)
+            self.detector.record_input_timestamp(t)
+        assert "input_regularity" not in self.detector.assess().signals
 
-        result = self.detector.assess()
-        assert "input_regularity" not in result.signals
+    def test_retired_regularity_config_still_accepted(self):
+        """An older server /config still carries the two retired fields."""
+        cfg = FraudDetectionConfig(input_regularity_cv_threshold=0.2,
+                                   min_input_events_for_regularity=5)
+        det = FraudSignalDetector(config=cfg)
+        assert det.assess().score == 0
 
     # --- Mouse-only streak ---
 
@@ -515,18 +513,13 @@ class TestFraudSignalDetector:
 
     def test_fraud_score_capped_at_100(self):
         """Combined signals should not exceed 100."""
-        # Trigger all signals simultaneously
+        # Trigger all remaining signals simultaneously
         # Uniform keystrokes (6 identical windows)
         for _ in range(6):
             self.detector.record_window_metrics(
                 ActivityMetrics(presses=10, clicks=20, scrolls=0, window_changes=0),
                 app="OnlyApp",
             )
-
-        # Regular input timestamps
-        base = self.now
-        for i in range(12):
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
 
         # Enough active time for app diversity
         self.detector.add_active_time(65 * 60)

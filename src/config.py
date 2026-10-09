@@ -376,8 +376,11 @@ class FraudDetectionConfig:
     min_app_diversity: int = 2  # Fewer unique apps = suspicious
     app_diversity_min_minutes: int = 60  # Only check after this much active time
     click_keystroke_ratio_threshold: float = 10.0  # Above this = suspicious
-    input_regularity_cv_threshold: float = 0.1  # Below this = suspiciously regular
-    min_input_events_for_regularity: int = 10  # Need this many events for regularity check
+    # The two fields below are RETIRED 2026-10-09 (input_regularity signal removed:
+    # it measured the agent's sync cadence). Read by nothing; kept so an older
+    # server /config still parses.
+    input_regularity_cv_threshold: float = 0.1  # retired
+    min_input_events_for_regularity: int = 10  # retired
 
 
 @dataclass
