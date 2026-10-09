@@ -32,6 +32,7 @@ external watcher and ``MacOSInputWatcher``.
 import logging
 import platform
 import threading
+import time
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -46,6 +47,19 @@ logger = logging.getLogger(__name__)
 # default) from "caller passed None" (explicitly no backend — e.g. a test
 # feeding counts directly, or a platform with no in-process hook).
 _UNSET = object()
+
+# Silent-hook detection (see InputSource.capture_state). Windows silently removes
+# a low-level hook whose callback overruns LowLevelHooksTimeout: the pump thread
+# stays alive, available() stays True, and nothing is counted again. The verdict
+# compares the OS idle clock ("the OS saw input") with our own liveness stamp
+# ("the hook saw anything at all, mouse moves included").
+#: No verdict for this long after an install — a hook needs a moment of input.
+SILENT_GRACE_S = 300
+#: The hook must have seen NOTHING for this long before it is called silent.
+SILENT_NO_EVENT_S = 300
+#: ...while the OS reports input within this many seconds. Above it the user is
+#: simply away and there is nothing for the hook to have seen.
+SILENT_OS_IDLE_MAX_S = 60
 
 
 def _listener_stopped(thread: Optional[threading.Thread]) -> bool:
@@ -89,6 +103,14 @@ class InputSource:
         self._clicks = 0
         self._scrolls = 0
         self._lock = threading.Lock()
+        # Liveness for capture_state(): when the backend last saw ANY input
+        # (mouse moves included, where the backend can see them), and when the
+        # current install began. Monotonic seconds, local only — never sent.
+        # Plain attributes, no lock: note_event() runs inside the OS hook
+        # callback under LowLevelHooksTimeout, and a single float store is
+        # atomic in CPython.
+        self._last_event_mono: Optional[float] = None
+        self._started_mono: Optional[float] = None
 
         # No availability latch here — see available(). The backend owns the
         # verdict, because only the backend knows whether its hook/tap is still
@@ -114,14 +136,56 @@ class InputSource:
     def _on_press(self, n: int = 1) -> None:
         with self._lock:
             self._presses += n
+        self.note_event()
 
     def _on_click(self, n: int = 1) -> None:
         with self._lock:
             self._clicks += n
+        self.note_event()
 
     def _on_scroll(self, n: int = 1) -> None:
         with self._lock:
             self._scrolls += n
+        self.note_event()
+
+    def note_event(self, now: Optional[float] = None) -> None:
+        """Record that the backend saw input. Liveness ONLY: changes no count and
+        never leaves the device. Called from inside the Windows hook callback,
+        which runs under the OS hook timeout — so it is one attribute store and
+        nothing else: no lock, no logging."""
+        self._last_event_mono = time.monotonic() if now is None else now
+
+    def mark_started(self, now: Optional[float] = None) -> None:
+        """Record that a fresh install just succeeded, opening the
+        SILENT_GRACE_S window during which capture_state() gives no verdict."""
+        self._started_mono = time.monotonic() if now is None else now
+
+    def capture_state(
+        self, os_idle_seconds: Optional[float], now: Optional[float] = None
+    ) -> Optional[str]:
+        """The input sensor's own health: None (no backend), "unavailable" (the
+        OS refused the hook / it is stopped), "silent" (the OS saw input in the
+        last minute but our hook has seen nothing for five), or "ok".
+
+        Every unknown answers "ok", never "silent": an unreadable OS idle clock,
+        a backend that cannot see mouse moves (the macOS tap — a reader moving
+        only the mouse would look silent), a hook still inside its grace."""
+        if self._backend is None:
+            return None
+        if not self.available():
+            return "unavailable"
+        if not getattr(self._backend, "observes_all_input", False):
+            return "ok"   # macOS tap / others cannot see mouse moves: no silent verdict
+        now = time.monotonic() if now is None else now
+        started = self._started_mono
+        if started is None or now - started < SILENT_GRACE_S:
+            return "ok"
+        if os_idle_seconds is None or os_idle_seconds > SILENT_OS_IDLE_MAX_S:
+            return "ok"
+        last = self._last_event_mono
+        if last is None or now - last > SILENT_NO_EVENT_S:
+            return "silent"   # the OS saw input in the last minute; our hook saw nothing for 5
+        return "ok"
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -131,11 +195,53 @@ class InputSource:
         ``available()`` then reflects — nothing is cached here."""
         if self._backend is None:
             return False
+        # Sampled BEFORE the backend call. _apply_capture_policy re-runs start()
+        # every 60s, and on a live Windows hook that is the is_alive() fast path:
+        # it returns True and installs nothing. Opening the grace window on that
+        # would restart the 300s grace every minute and "silent" could never be
+        # reported. Only a start that brought a sensor up — never started, or
+        # down beforehand (stopped, crashed, refused) — is a fresh install.
+        fresh = self._started_mono is None or not self.available()
         try:
-            return bool(self._backend.start())
+            ok = bool(self._backend.start())
         except Exception as e:
             logger.warning("InputSource backend start failed: %s", e)
             return False
+        if ok and fresh:
+            self.mark_started()
+        return ok
+
+    def restart(self, timeout: float = 2.0) -> bool:
+        """Reinstall the backend: stop, wait for its listener thread to exit,
+        start again. Returns True only when a new install succeeded.
+
+        stop() then start() is NOT a reinstall on Windows: stop() only posts
+        WM_QUIT, and a start() that runs before the pump thread has exited hits
+        its is_alive() fast path and returns the stale verdict without
+        installing anything. So wait for the old thread first, and if it will
+        not go, refuse rather than pretend. A backend with no join() (macOS
+        tap, whose stop() already joins; test fakes) is treated as stopped."""
+        if self._backend is None:
+            return False
+        self.stop()
+        join = getattr(self._backend, "join", None)
+        if join is not None:
+            try:
+                exited = bool(join(timeout))
+            except Exception as e:
+                logger.warning("InputSource backend join failed: %s", e)
+                exited = False
+            if not exited:
+                logger.warning(
+                    "InputSource restart: listener thread still alive %.1fs after "
+                    "stop — not reinstalling", timeout,
+                )
+                return False
+        ok = self.start()
+        if ok:
+            # Explicit: this IS a fresh install, whatever available() said.
+            self.mark_started()
+        return ok
 
     def stop(self) -> None:
         """Stop the backend listener thread (no-op when there is no backend)."""
@@ -377,6 +483,12 @@ class _WindowsHookBackend:
     _WM_XBUTTONDOWN = 0x020B
     _WM_MOUSEWHEEL = 0x020A
     _WM_MOUSEHWHEEL = 0x020E
+    _WM_MOUSEMOVE = 0x0200
+
+    # LL hooks see every input event, mouse moves included, so a long stretch
+    # with none while the OS reports input is evidence the hook is gone. Read by
+    # InputSource.capture_state(); backends without it get no "silent" verdict.
+    observes_all_input = True
 
     def __init__(self, source: "InputSource") -> None:
         self._source = source
@@ -448,6 +560,15 @@ class _WindowsHookBackend:
         except Exception as e:
             logger.debug("Windows input hook stop failed: %s", e)
 
+    def join(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the hook thread to exit. True when there is
+        no thread or it has exited — i.e. a start() now really installs."""
+        t = self._thread
+        if t is None:
+            return True
+        t.join(timeout)
+        return not t.is_alive()
+
     def _run(self) -> None:
         """Thread target. Any escape from the hook thread is recorded as an
         install failure: a thread that died before (or after) the install left
@@ -501,6 +622,7 @@ class _WindowsHookBackend:
 
         def _kbd_proc(nCode, wParam, lParam):
             if nCode == 0:  # HC_ACTION — a real event to process
+                src.note_event()  # key-ups included: liveness only, no count
                 if wParam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN):
                     src._on_press()
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -516,6 +638,8 @@ class _WindowsHookBackend:
                     src._on_click()
                 elif wParam in (self._WM_MOUSEWHEEL, self._WM_MOUSEHWHEEL):
                     src._on_scroll()
+                elif wParam == self._WM_MOUSEMOVE:
+                    src.note_event()  # liveness only: never a count
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._kbd_cb = HOOKPROC(_kbd_proc)

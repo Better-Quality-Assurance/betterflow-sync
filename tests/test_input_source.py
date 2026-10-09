@@ -805,3 +805,341 @@ def test_discard_is_safe_on_a_backend_with_nothing_buffered():
 
     assert src.discard_counts() == (4, 0, 0)
     assert src.counts == (0, 0, 0)
+
+
+# -- silent-hook detection (Windows LowLevelHooksTimeout eviction) -------------
+#
+# Hypothesis under test (unverified on a real device): Windows silently removes a
+# low-level hook whose callback overruns LowLevelHooksTimeout. The pump thread
+# stays alive, available() stays True, and nothing is counted again. Every
+# health flag reads healthy. capture_state() makes that state visible by
+# comparing the OS idle clock (the OS saw input) with our own liveness stamp
+# (the hook saw nothing).
+
+from src.sync import input_source as _input_source_mod  # noqa: E402
+
+
+class _AllInputBackend:
+    """Sees every input event incl. mouse moves, like the Windows LL hooks."""
+
+    observes_all_input = True
+
+    def __init__(self):
+        self.ok = True
+        self.starts = 0
+        self.stops = 0
+
+    def available(self):
+        return self.ok
+
+    def start(self):
+        self.starts += 1
+        return True
+
+    def stop(self):
+        self.stops += 1
+
+
+class _TapBackend(_AllInputBackend):
+    """Cannot see mouse moves (macOS CGEventTap counts presses/clicks/scrolls)."""
+
+    observes_all_input = False
+
+
+def test_silent_constants_are_the_specified_values():
+    m = _input_source_mod
+    assert (m.SILENT_GRACE_S, m.SILENT_NO_EVENT_S, m.SILENT_OS_IDLE_MAX_S) == (300, 300, 60)
+
+
+def test_silent_when_os_saw_input_but_hook_saw_nothing():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=0.0)
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "silent"
+
+
+def test_silent_when_the_last_event_is_older_than_the_window():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=0.0)
+    s.note_event(now=600.0)  # 400s before `now`, > SILENT_NO_EVENT_S
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "silent"
+
+
+def test_mouse_moves_keep_a_reader_ok():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=0.0)
+    s.note_event(now=990.0)  # a WM_MOUSEMOVE 10s ago, no press/click
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "ok"
+
+
+def test_no_verdict_inside_grace_after_start():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=900.0)
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "ok"
+
+
+def test_unreadable_os_idle_is_never_silent():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=0.0)
+    assert s.capture_state(os_idle_seconds=None, now=1000.0) == "ok"
+
+
+def test_user_away_is_not_silent():
+    s = _src(_AllInputBackend())
+    s.mark_started(now=0.0)
+    assert s.capture_state(os_idle_seconds=900, now=1000.0) == "ok"
+
+
+def test_tap_backend_never_silent():
+    s = _src(_TapBackend())
+    s.mark_started(now=0.0)
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "ok"
+
+
+def test_refused_hook_is_unavailable():
+    b = _AllInputBackend()
+    b.ok = False
+    assert _src(b).capture_state(os_idle_seconds=5, now=1000.0) == "unavailable"
+
+
+def test_no_backend_reports_nothing():
+    assert _src(None).capture_state(os_idle_seconds=5, now=1000.0) is None
+
+
+def test_never_started_is_not_silent():
+    """No install yet: there is no hook to have gone silent."""
+    s = _src(_AllInputBackend())
+    assert s.capture_state(os_idle_seconds=5, now=1000.0) == "ok"
+
+
+def test_windows_mouse_move_notes_liveness_but_counts_nothing():
+    """note_event is liveness only: no press/click/scroll increments.
+    (The brief wrote `s.counts()`; `counts` is a property in this codebase.)"""
+    s = _src(None)
+    s.note_event(now=5.0)
+    assert s.counts == (0, 0, 0)
+    assert s._last_event_mono == 5.0
+
+
+def test_counting_callbacks_also_note_liveness():
+    s = _src(None)
+    for cb in (s._on_press, s._on_click, s._on_scroll):
+        s._last_event_mono = None
+        cb()
+        assert s._last_event_mono is not None, cb.__name__
+
+
+def test_a_successful_start_opens_the_grace_window(monkeypatch):
+    from src.sync import input_source as m
+
+    monkeypatch.setattr(m.time, "monotonic", lambda: 123.0)
+    s = _src(_AllInputBackend())
+    assert s.start() is True
+    assert s._started_mono == 123.0
+
+
+def test_a_refused_start_does_not_open_the_grace_window():
+    b = _AllInputBackend()
+    b.start = lambda: False
+    s = _src(b)
+    assert s.start() is False
+    assert s._started_mono is None
+
+
+def test_the_60s_converge_start_does_not_reset_the_grace_window(monkeypatch):
+    """_apply_capture_policy calls input_source.start() every 60s. On a running
+    Windows hook that hits start()'s is_alive() fast path and returns True
+    WITHOUT installing anything. If that refreshed the grace stamp, the 300s
+    grace would restart every minute and "silent" could never be reported --
+    i.e. the detector would be dead on exactly the devices it exists for."""
+    from src.sync import input_source as m
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock["t"])
+    s = _src(_AllInputBackend())
+    assert s.start() is True
+    clock["t"] = 160.0
+    assert s.start() is True        # converge tick: backend already running
+    assert s._started_mono == 100.0, "a no-op start must not reopen the grace"
+    assert s.capture_state(os_idle_seconds=5, now=100.0 + m.SILENT_GRACE_S + 1) == "silent"
+
+
+def test_a_start_after_the_sensor_went_down_reopens_the_grace(monkeypatch):
+    """Control for the test above: a REAL reinstall (backend was not available
+    -- thread died, hook refused) must open a fresh grace window."""
+    from src.sync import input_source as m
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock["t"])
+    b = _AllInputBackend()
+    s = _src(b)
+    assert s.start() is True
+    b.ok = False                    # sensor went down
+    clock["t"] = 900.0
+
+    def _start():
+        b.ok = True
+        return True
+
+    b.start = _start
+    assert s.start() is True
+    assert s._started_mono == 900.0
+
+
+# -- restart(): a reinstall that actually reinstalls ----------------------------
+
+
+class _JoinableBackend(_AllInputBackend):
+    """Backend whose listener thread may or may not exit on stop()."""
+
+    def __init__(self, exits_on_stop):
+        super().__init__()
+        self.exits_on_stop = exits_on_stop
+        self.alive = True
+        self.join_timeouts = []
+
+    def stop(self):
+        super().stop()
+        if self.exits_on_stop:
+            self.alive = False
+
+    def join(self, timeout):
+        self.join_timeouts.append(timeout)
+        return not self.alive
+
+    def start(self):
+        self.starts += 1
+        self.alive = True
+        return True
+
+
+def test_restart_refuses_to_start_while_the_old_thread_is_still_alive():
+    b = _JoinableBackend(exits_on_stop=False)
+    s = _src(b)
+    s.mark_started(now=0.0)
+
+    assert s.restart(timeout=0.01) is False
+    assert b.stops == 1
+    assert b.join_timeouts == [0.01]
+    assert b.starts == 0, "start() on a live thread hits the fast path and installs nothing"
+    assert s._started_mono == 0.0, "a failed restart must not reopen the grace"
+
+
+def test_restart_reinstalls_once_the_old_thread_exited(monkeypatch):
+    from src.sync import input_source as m
+
+    monkeypatch.setattr(m.time, "monotonic", lambda: 5000.0)
+    b = _JoinableBackend(exits_on_stop=True)
+    s = _src(b)
+    s.mark_started(now=0.0)
+
+    assert s.restart() is True
+    assert b.stops == 1
+    assert b.starts == 1
+    assert s._started_mono == 5000.0, "the 300s grace must apply again after a reinstall"
+
+
+def test_restart_treats_a_backend_without_join_as_stopped(monkeypatch):
+    from src.sync import input_source as m
+
+    monkeypatch.setattr(m.time, "monotonic", lambda: 7.0)
+    b = _AllInputBackend()
+    s = _src(b)
+    assert s.restart() is True
+    assert (b.stops, b.starts) == (1, 1)
+    assert s._started_mono == 7.0
+
+
+def test_restart_without_a_backend_is_false():
+    assert _src(None).restart() is False
+
+
+def test_windows_backend_join(monkeypatch):
+    be = _win_backend(monkeypatch)
+    assert be.join(0.01) is True, "never started: nothing to wait for"
+
+    class _Live:
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    class _Dead(_Live):
+        def is_alive(self):
+            return False
+
+    be._thread = _Live()
+    assert be.join(0.01) is False
+    be._thread = _Dead()
+    assert be.join(0.01) is True
+
+
+def test_windows_backend_declares_it_observes_all_input():
+    from src.sync import input_source as m
+
+    assert m._WindowsHookBackend.observes_all_input is True
+    assert getattr(m._MacOSTapBackend, "observes_all_input", False) is False
+
+
+def _fake_ctypes_for_hooks(callbacks):
+    """A stand-in ctypes whose SetWindowsHookExW records the Python callback and
+    whose pump exits immediately, so the REAL hook callbacks built inside
+    _run_hooks can be invoked on any OS."""
+    user32 = types.SimpleNamespace(
+        CallNextHookEx=lambda *a: 0,
+        SetWindowsHookExW=lambda kind, cb, hmod, tid: callbacks.setdefault(kind, cb) and 1,
+        UnhookWindowsHookEx=lambda h: True,
+        GetMessageW=lambda *a: 0,
+        TranslateMessage=lambda *a: None,
+        DispatchMessageW=lambda *a: None,
+    )
+    kernel32 = types.SimpleNamespace(
+        GetModuleHandleW=lambda *a: 1, GetCurrentThreadId=lambda: 77,
+    )
+    wintypes = types.ModuleType("ctypes.wintypes")
+    wintypes.WPARAM = int
+    wintypes.LPARAM = int
+    wintypes.MSG = lambda: object()
+    fake = types.ModuleType("ctypes")
+    fake.windll = types.SimpleNamespace(user32=user32, kernel32=kernel32)
+    fake.CFUNCTYPE = lambda *types_: (lambda fn: fn)
+    fake.c_long = int
+    fake.c_int = int
+    fake.byref = lambda x: x
+    fake.wintypes = wintypes
+    return fake, wintypes
+
+
+def test_windows_hook_notes_mouse_moves_and_key_ups_without_counting(monkeypatch):
+    """The real hook callbacks: WM_MOUSEMOVE and WM_KEYUP stamp liveness and
+    change NO count; a keydown still counts. Mouse moves are a local timestamp
+    only -- they never reach a count, so they never leave the device."""
+    from src.sync import input_source as m
+
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    src = InputSource(hostname="host", backend=None, frontmost_app_getter=None)
+    be = m._WindowsHookBackend(src)
+    callbacks = {}
+    fake, wt = _fake_ctypes_for_hooks(callbacks)
+    with patch.dict(sys.modules, {"ctypes": fake, "ctypes.wintypes": wt}):
+        be._run_hooks()
+    kbd = callbacks[be._WH_KEYBOARD_LL]
+    mouse = callbacks[be._WH_MOUSE_LL]
+
+    src._last_event_mono = None
+    mouse(0, 0x0200, 0)  # WM_MOUSEMOVE
+    assert src._last_event_mono is not None
+    assert src.counts == (0, 0, 0)
+
+    src._last_event_mono = None
+    kbd(0, 0x0101, 0)  # WM_KEYUP
+    assert src._last_event_mono is not None
+    assert src.counts == (0, 0, 0)
+
+    kbd(0, 0x0100, 0)  # WM_KEYDOWN still counts
+    assert src.counts == (1, 0, 0)
+
+    src._last_event_mono = None
+    mouse(-1, 0x0200, 0)  # nCode < 0: not ours to process
+    kbd(-1, 0x0100, 0)
+    assert src._last_event_mono is None
