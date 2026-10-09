@@ -20,6 +20,23 @@ except ImportError:
     from src import __version__
 from .retry import RetryConfig, RetryExhausted, log_retry, retry_with_backoff
 
+#: Author-written sentences that open a TRANSIENT failure's message. Every
+#: _TransientError raise site below, plus the 429 and rate-limit-backoff
+#: BetterFlowClientError sites, builds its message from one of these, and
+#: sync_engine.local_reason_kinds names a failed sync on the cross-tenant ops
+#: ingest by matching these PREFIXES (emitting only its own kind token, never
+#: the text). One spelling, imported by both ends: a reworded message here moves
+#: the classifier with it instead of silently reverting ops to a bare count.
+REASON_RATE_LIMIT_BACKOFF = "Rate-limit backoff active"
+REASON_RATE_LIMITED = "Server returned 429"
+REASON_SERVER_UNAVAILABLE = "Server returned"
+REASON_SERVER_ERROR = "Server error"
+REASON_DNS_FAILED = "DNS resolution failed"
+REASON_CONNECT_FAILED = "Cannot connect to BetterFlow API"
+REASON_CONNECTION_DROPPED = "Connection dropped mid-response"
+REASON_TIMEOUT = "Request timed out"
+REASON_DECODING_FAILED = "Response body decoding failed"
+
 __all__ = [
     "BaseApiClient",
     "BetterFlowClientError",
@@ -543,7 +560,7 @@ class BaseApiClient:
                 backoff = self._throttle_remaining()
                 if backoff > 0:
                     raise BetterFlowClientError(
-                        f"Rate-limit backoff active, {backoff:.0f}s remaining"
+                        f"{REASON_RATE_LIMIT_BACKOFF}, {backoff:.0f}s remaining"
                     )
 
                 with self._session_lock:
@@ -573,7 +590,7 @@ class BaseApiClient:
                             pass
                     self._enter_throttle(retry_after_secs)
                     raise BetterFlowClientError(
-                        f"Server returned 429 (Retry-After: {retry_after_hdr or 'none'}); "
+                        f"{REASON_RATE_LIMITED} (Retry-After: {retry_after_hdr or 'none'}); "
                         f"backing off {retry_after_secs:.0f}s"
                     )
 
@@ -581,7 +598,7 @@ class BaseApiClient:
                 if response.status_code in (408, 503, 504):
                     retry_after_hdr = response.headers.get("Retry-After")
                     retry_after_secs = None
-                    msg = f"Server returned {response.status_code}"
+                    msg = f"{REASON_SERVER_UNAVAILABLE} {response.status_code}"
                     if retry_after_hdr:
                         msg += f" (Retry-After: {retry_after_hdr}s)"
                         try:
@@ -592,7 +609,7 @@ class BaseApiClient:
 
                 # Other server errors (5xx) are retryable
                 if response.status_code >= 500:
-                    raise _TransientError(f"Server error: {response.status_code}")
+                    raise _TransientError(f"{REASON_SERVER_ERROR}: {response.status_code}")
 
                 response.raise_for_status()
                 if not response.content:
@@ -611,16 +628,16 @@ class BaseApiClient:
                 while cause is not None:
                     if isinstance(cause, socket.gaierror):
                         raise BetterFlowClientError(
-                            f"DNS resolution failed: {cause}"
+                            f"{REASON_DNS_FAILED}: {cause}"
                         ) from e
                     cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
-                raise _TransientError("Cannot connect to BetterFlow API")
+                raise _TransientError(REASON_CONNECT_FAILED)
             except requests.exceptions.ChunkedEncodingError:
-                raise _TransientError("Connection dropped mid-response")
+                raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:
-                raise _TransientError("Response body decoding failed")
+                raise _TransientError(REASON_DECODING_FAILED)
             except requests.exceptions.Timeout:
-                raise _TransientError("Request timed out")
+                raise _TransientError(REASON_TIMEOUT)
             except requests.exceptions.HTTPError as e:
                 error_detail = ""
                 try:
