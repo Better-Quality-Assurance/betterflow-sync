@@ -518,6 +518,19 @@ UNWATCHED_CONFIG_FIELDS: dict[str, str] = {
     "auto_install_updates": "Updater behaviour.",
     "update_channel": "Updater behaviour.",
     "debug_mode": "Local log verbosity.",
+    "capabilities": (
+        "A deploy-order compatibility gate (capabilities.lock_time), not a "
+        "collection toggle. A screen lock already pauses tracking and is "
+        "detected unconditionally (system_event_handler.py's on_screen_lock/"
+        "on_screen_unlock, wired with no Config field at all) -- that is the "
+        "collection decision, already made and not server-flippable. This "
+        "field only decides whether the already-occurring lock/unlock state "
+        "is safe to UPLOAD as its own lock_time event yet, because an "
+        "unpatched server misclassifies an unknown bucket_type as regular "
+        "work (see sync_engine.send_lock_event's docstring). Off, nothing "
+        "about what is monitored changes -- the lock still pauses tracking "
+        "locally, it just isn't reported to the server as a distinct span."
+    ),
 }
 
 

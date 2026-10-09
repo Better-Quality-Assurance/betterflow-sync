@@ -152,6 +152,11 @@ def test_lock_event_is_its_own_bucket_type_and_survives_24h_chunking():
     being treated as proof of presence the way a real sleep is."""
     server = _CapValidatingServer()
     engine = _engine(Path(tempfile.mkdtemp()), server)
+    # send_lock_event is gated on a server-advertised capability (defaults
+    # OFF — see tests/test_lock_time_capability_gate.py); this test is about
+    # the chunking pipeline, not the gate, so switch it on explicitly rather
+    # than have the gate silently swallow the span.
+    engine.config.capabilities.lock_time = True
     start, end = _weekend_sleep()
 
     engine.send_lock_event(start, end)
