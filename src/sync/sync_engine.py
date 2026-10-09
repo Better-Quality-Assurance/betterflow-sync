@@ -25,7 +25,10 @@ try:
     from ..browser_tracker import is_browser_app
     from ..config import Config
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
-    from .bf_client import BetterFlowClientError, BetterFlowAuthError
+    from .bf_client import BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION
+    from .http_client import (
+        REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT,
+    )
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
@@ -44,7 +47,10 @@ except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
     from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
-    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError
+    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION
+    from sync.http_client import (
+        REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT,
+    )
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from sync.daily_time_tracker import DailyTimeTracker
@@ -101,6 +107,23 @@ _LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
     (_REASON_BUCKET_LIST_FAILED, "bucket-list-failed"),
     (_REASON_BUCKET_SYNC_FAILED, "bucket-sync-failed"),
     (_REASON_AUTH_ERROR, "auth-error"),
+    # A TRANSIENT upload failure: `stats.errors.append(result.error)` passes
+    # through a sentence http_client / bf_client wrote, which is why these are
+    # safe to name. Until they were listed here a timed-out upload reached ops
+    # as "1 local reason(s) recorded in local dead-letter" and nothing else
+    # (device 55, 1.5.138, 2026-09-29..10-08). Imported constants, same rule
+    # as above. REASON_RATE_LIMITED must precede REASON_SERVER_UNAVAILABLE:
+    # both open "Server returned", and an item takes the FIRST prefix it
+    # matches, so a 429 is "rate-limited" and not also "server-unavailable".
+    (REASON_TIMEOUT, "timeout"),
+    (REASON_CONNECT_FAILED, "connect-failed"),
+    (REASON_DNS_FAILED, "dns-failed"),
+    (REASON_CONNECTION_DROPPED, "connection-dropped"),
+    (REASON_SERVER_ERROR, "server-error"),
+    (REASON_RATE_LIMITED, "rate-limited"),
+    (REASON_RATE_LIMIT_BACKOFF, "rate-limited"),
+    (REASON_SERVER_UNAVAILABLE, "server-unavailable"),
+    (REASON_NO_CONFIRMATION, "no-confirmation"),
 )
 
 
@@ -115,8 +138,19 @@ def local_reason_kinds(reasons) -> list[str]:
     if isinstance(reasons, str):
         reasons = [reasons]
     items = [str(r) for r in (reasons or []) if r]
-    return [kind for prefix, kind in _LOCAL_REASON_KINDS
-            if any(item.startswith(prefix) for item in items)]
+    # Each item takes the FIRST prefix it matches, so overlapping prefixes
+    # ("Server returned 429" / "Server returned") yield one kind per reason.
+    matched = set()
+    for item in items:
+        for prefix, kind in _LOCAL_REASON_KINDS:
+            if item.startswith(prefix):
+                matched.add(kind)
+                break
+    ordered: list[str] = []
+    for _, kind in _LOCAL_REASON_KINDS:
+        if kind in matched and kind not in ordered:
+            ordered.append(kind)
+    return ordered
 
 
 def server_status_summary(reasons) -> str:

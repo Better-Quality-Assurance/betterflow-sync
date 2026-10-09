@@ -25,6 +25,11 @@ except ImportError:
     from sync.privacy_filter import partition_excluded
     from sync.retry import RetryConfig
 
+#: Opens the transient verdict for a 2xx that confirmed nothing. Named on the
+#: ops ingest by sync_engine.local_reason_kinds, which imports this constant
+#: rather than respelling it (see the REASON_* block in http_client).
+REASON_NO_CONFIRMATION = "server returned no delivery confirmation"
+
 __all__ = [
     "BetterFlowClient",
     "BetterFlowClientError",
@@ -400,7 +405,7 @@ class BetterFlowClient(BaseApiClient):
                     success=False,
                     events_synced=0,
                     events_queued=len(events),
-                    error="server returned no delivery confirmation; re-queuing batch",
+                    error=f"{REASON_NO_CONFIRMATION}; re-queuing batch",
                     transient=True,
                 )
 
