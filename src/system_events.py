@@ -35,18 +35,12 @@ def start_system_event_listener(
     on_network_change: Callable,  # fn(is_online: bool)
     on_screen_lock: Callable = None,   # fn() — screen locked
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
-    on_display_sleep: Callable = None,  # fn() — macOS display sleep (inactivity or as part of a real sleep)
     reachability_host: str = "",  # Host to check for network reachability
     reachability_port: int = 443,  # Port to check for network reachability
 ) -> None:
     """Start platform-specific system event listeners.
 
     All listeners run on daemon threads and die automatically on process exit.
-
-    ``on_display_sleep`` is macOS-only (NSWorkspaceScreensDidSleepNotification
-    has no Windows/Linux equivalent wired here) and optional: a caller that
-    omits it gets exactly today's behaviour (display-off still reported
-    through ``on_sleep``) — see _start_macos_power_listener's docstring.
     """
     host = reachability_host or "app.betterflow.eu"
 
@@ -56,7 +50,7 @@ def start_system_event_listener(
         _safe_call(on_network_change, True)
         # Still start power/screen listeners, just skip network monitoring
         if _system == "Darwin":
-            _start_macos_power_listener(on_sleep, on_wake, on_shutdown, on_display_sleep)
+            _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
             if on_screen_lock or on_screen_unlock:
                 _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
         elif _system == "Windows":
@@ -66,7 +60,7 @@ def start_system_event_listener(
         return
 
     if _system == "Darwin":
-        _start_macos_power_listener(on_sleep, on_wake, on_shutdown, on_display_sleep)
+        _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
         _start_macos_network_listener(on_network_change, host=host)
         if on_screen_lock or on_screen_unlock:
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
@@ -88,44 +82,8 @@ def _start_macos_power_listener(
     on_sleep: Callable,
     on_wake: Callable,
     on_shutdown: Callable,
-    on_display_sleep: Callable = None,
 ) -> None:
-    """Listen for macOS sleep/wake/shutdown via NSWorkspace notifications.
-
-    NSWorkspaceWillSleepNotification (real system/lid sleep) and
-    NSWorkspaceScreensDidSleepNotification (the display turning off — from
-    inactivity, or as a side effect of a real sleep) used to be routed to the
-    SAME handler, deduplicated by a single `sleeping` flag: both fire for a
-    real sleep, but on a desktop that never sleeps (always plugged in) only
-    ScreensDidSleep ever fires, and it was reported as sleep_time — which
-    earns internal-tool2's presence bridge exactly like a real suspend, per
-    Tudor's 2026-10-08 product decision ("if you are not present, you are not
-    working") it must not. ScreensDidSleep now routes to its OWN callback
-    (`on_display_sleep`, optional — omitted callers get byte-identical
-    behaviour to before this split, since nothing then listens for that
-    notification name at all... except we always start it below when the
-    caller provides the lock callbacks; see the docstring on
-    SystemEventHandler.on_display_sleep for what it does with the gate).
-
-    WillSleep is now called UNCONDITIONALLY, with no dedup against
-    ScreensDidSleep — on purpose. The two are independent signals (ordering
-    between them is not guaranteed), and on_system_sleep's own span-flush
-    logic already handles "a display-off span is open when real sleep
-    begins" correctly (closes it at the sleep boundary); suppressing WillSleep
-    because ScreensDidSleep won a race would have meant a real sleep could be
-    classified as mere display-off and never produce a sleep_time event at
-    all. on_system_sleep/on_screen_lock are each idempotent against being
-    called more than once without an intervening wake (see their own
-    docstrings), so a real sleep firing BOTH notifications no longer needs a
-    shared "first one wins" flag to stay correct.
-
-    Wake notifications are deliberately left COMBINED (unlike sleep): both
-    DidWake and ScreensDidWake still share the dedup flag below and call
-    `on_wake` exactly as before this split. on_system_wake's own logic
-    already branches on STATE (was there an open sleep_start / lock span?),
-    not on which notification arrived, so no new wake callback is needed —
-    see SystemEventHandler.on_system_wake.
-    """
+    """Listen for macOS sleep/wake/shutdown via NSWorkspace notifications."""
     try:
         from AppKit import NSWorkspace
         from Foundation import NSObject
@@ -133,22 +91,15 @@ def _start_macos_power_listener(
         logger.warning("pyobjc not available — sleep/wake detection disabled")
         return
 
-    # Wake-side dedup only (see docstring above) — DidWake and ScreensDidWake
-    # still share this. Set by EITHER sleep variant below so a pure
-    # display-off-then-wake (no real sleep ever) still fires on_wake exactly
-    # once, same as before this split.
+    # Deduplication flag — both ScreensDidSleep and WillSleep can fire
     state = {"sleeping": False}
 
     class _PowerObserver(NSObject):
         def handleSleep_(self, notification):
-            state["sleeping"] = True
-            logger.info("System sleep detected on %s - pausing", threading.current_thread().name)
-            _safe_call(on_sleep)
-
-        def handleScreensDidSleep_(self, notification):
-            state["sleeping"] = True
-            logger.info("Display sleep detected on %s", threading.current_thread().name)
-            _safe_call(on_display_sleep if on_display_sleep is not None else on_sleep)
+            if not state["sleeping"]:
+                state["sleeping"] = True
+                logger.info("System sleep detected on %s - pausing", threading.current_thread().name)
+                _safe_call(on_sleep)
 
         def handleWake_(self, notification):
             if state["sleeping"]:
@@ -164,14 +115,13 @@ def _start_macos_power_listener(
         observer = _PowerObserver.alloc().init()
         center = NSWorkspace.sharedWorkspace().notificationCenter()
 
-        # Sleep notifications — kept as two distinct selectors (see docstring
-        # above): real sleep is never deduped against display-off any more.
+        # Sleep notifications
         center.addObserver_selector_name_object_(
             observer, "handleSleep:",
             "NSWorkspaceWillSleepNotification", None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleScreensDidSleep:",
+            observer, "handleSleep:",
             "NSWorkspaceScreensDidSleepNotification", None,
         )
 

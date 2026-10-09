@@ -231,45 +231,6 @@ class SystemEventHandler:
         logger.info("System shutdown detected - shutting down")
         self._shutdown_fn()
 
-    def on_display_sleep(self) -> None:
-        """Handle macOS display sleep (NSWorkspaceScreensDidSleepNotification).
-
-        Fires for a genuine inactivity-triggered display-off AND as a side
-        effect of a real system sleep (both notifications fire for the
-        latter; see system_events.py's docstring on why they are no longer
-        deduped against each other). Which of those this instance is cannot
-        be told from the notification alone, so it is resolved the same way
-        the existing lock/sleep race already is: by LETTING on_system_sleep
-        run its own flush logic rather than trying to guess here.
-
-        Gate OFF (``self.sync_engine.config.capabilities.lock_time`` is
-        False — the server has not advertised lock_time support, or we
-        haven't fetched config yet): delegate straight to on_system_sleep,
-        byte-identical to this agent's behaviour before this split existed
-        (display-off becomes sleep_time, same as a real sleep, and earns the
-        presence bridge the same way — unchanged for old agent builds and
-        for days already recorded).
-
-        Gate ON: delegate to on_screen_lock instead — per Tudor's product
-        rule (2026-10-09), "the display turning off by itself from
-        inactivity is treated the same as a lock". on_screen_lock's existing
-        idempotent span-open logic already does the right thing whether or
-        not a sleep is also in progress or about to start:
-        - if `_sleep_start` is already set (WillSleep got there first), it
-          just records `_locked_while_asleep` — no second span opens.
-        - otherwise it opens `_lock_start` (or, if one is already open,
-          leaves it — the no-overlap rule). If a real sleep follows,
-          on_system_sleep's existing boundary-flush closes this span at the
-          sleep instant and reopens it fresh on wake, exactly as it already
-          does for a literal screen lock that was open when sleep began —
-          the contiguous-split rule this method deliberately does not
-          reimplement.
-        """
-        if not self.sync_engine.config.capabilities.lock_time:
-            self.on_system_sleep()
-            return
-        self.on_screen_lock()
-
     def on_screen_lock(self) -> None:
         """Handle screen lock - treat as AFK."""
         try:
