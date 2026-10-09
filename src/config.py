@@ -422,6 +422,27 @@ class ForegroundActivitySettings:
 
 
 @dataclass
+class AgentCapabilities:
+    """Server-advertised feature gates, keyed by capability name.
+
+    Not a user preference — a mechanical deploy-order gate. The agent must
+    never emit a wire shape the currently-running server doesn't know how to
+    classify (betterflow-sync#271 / internal-tool2#2771: an unpatched server's
+    AgentEvent::inferEventType falls through every check for bucket_type
+    "lock_time" and lands on EVENT_TYPE_APP, which BILLS the locked time as
+    active work — worse than sending nothing). So each gate here defaults OFF
+    and only the server, via AgentConfigController's `capabilities` array,
+    turns it on — by construction, an old/unpatched server cannot send a
+    name it doesn't know, so an agent talking to one sees no capabilities at
+    all and every gate stays closed. See update_from_server for the array ->
+    field mapping, and sync_engine.send_lock_event for the one call site this
+    gates.
+    """
+
+    lock_time: bool = False
+
+
+@dataclass
 class AWSettings:
     """ActivityWatch connection settings."""
 
@@ -851,6 +872,7 @@ class Config:
     fraud_detection: FraudDetectionConfig = field(default_factory=FraudDetectionConfig)
     call_detection: CallDetectionSettings = field(default_factory=CallDetectionSettings)
     foreground_activity: ForegroundActivitySettings = field(default_factory=ForegroundActivitySettings)
+    capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     setup_complete: bool = False
     # Record of the one-time privacy notice (src/privacy_notice.py). The version
     # is a hash of the notice text, so a device holding an OLDER version is
@@ -959,6 +981,7 @@ class Config:
         fraud_detection_data = _block("fraud_detection")
         call_detection_data = _block("call_detection")
         foreground_activity_data = _block("foreground_activity")
+        capabilities_data = _block("capabilities")
         # working_hours was missing from this list until 2026-07-14, so it fell
         # through to the **data splat below and was rebuilt as a plain dict. A
         # dict has no attributes: update_from_server's `self.working_hours.
@@ -996,6 +1019,17 @@ class Config:
                 "platform-defaulted and server-driven",
                 persisted_inproc_input,
             )
+        # Same reasoning as foreground_activity.enabled above: capabilities are
+        # re-confirmed by the SERVER every session (update_from_server), never
+        # trusted from disk. A build that once talked to a patched server and
+        # persisted lock_time=true must not keep emitting lock_time after being
+        # pointed at (or falling back to) a server that has since rolled back —
+        # the on-disk value could outlive the server state it reflected.
+        if capabilities_data.pop("lock_time", None) is True:
+            logger.info(
+                "Ignoring persisted capabilities.lock_time=true on load; it is "
+                "server-confirmed per-session via update_from_server"
+            )
         data.pop("screenshots", None)
 
         # Migrate legacy localhost:8000 URLs to production endpoint.
@@ -1021,6 +1055,7 @@ class Config:
             fraud_detection=_safe(FraudDetectionConfig, fraud_detection_data) if fraud_detection_data else FraudDetectionConfig(),
             call_detection=_safe(CallDetectionSettings, call_detection_data) if call_detection_data else CallDetectionSettings(),
             foreground_activity=_safe(ForegroundActivitySettings, foreground_activity_data) if foreground_activity_data else ForegroundActivitySettings(),
+            capabilities=_safe(AgentCapabilities, capabilities_data) if capabilities_data else AgentCapabilities(),
             working_hours=_safe(WorkingHoursConfig, working_hours_data) if working_hours_data else WorkingHoursConfig(),
             **{k: v for k, v in data.items() if k in cls.__dataclass_fields__},
         )
@@ -1049,6 +1084,12 @@ class Config:
         # overridable, so a value on disk can only ever outrank both and pin a
         # Windows device at zero keystrokes across an upgrade.
         data.get("sync", {}).pop("in_process_input", None)
+        # Never persist capabilities.lock_time — same reason as
+        # foreground_activity.enabled above. It is re-confirmed by the server
+        # every session (update_from_server), and a stale on-disk True must
+        # not survive to a session that talks to a server which has since
+        # rolled the capability back.
+        data.get("capabilities", {}).pop("lock_time", None)
         tmp_file = config_file.with_suffix(".tmp")
         try:
             with open(tmp_file, "w") as f:
@@ -1369,6 +1410,24 @@ class Config:
                     self.foreground_activity.min_session_seconds = max(0, int(fa["min_session_seconds"]))
             except (TypeError, ValueError) as e:
                 logger.warning(f"Invalid foreground_activity config from server: {e}")
+
+        # Mechanical deploy-order gate (betterflow-sync#271 / internal-tool2#2771),
+        # deliberately NOT behind DEFER_UNAPPLIED_SERVER_SETTINGS: that flag defers
+        # a BATCH of settings pending validation of behaviour that is already live;
+        # this one is the validation signal itself — the server advertising a name
+        # IS the confirmation that it knows how to classify the matching bucket_type.
+        # Deferring it would mean no agent could ever turn lock_time on without a
+        # second, unrelated release flipping the batch flag.
+        #
+        # Computed fresh on every successful fetch, never merged with the previous
+        # value: an absent/malformed "capabilities" key or a name missing from the
+        # list means NOT supported, full stop — the safe default — even if an
+        # earlier fetch this session had it on. A server that advertised the
+        # capability and later stops (rollback) must be able to turn an agent's
+        # gate back off without a restart.
+        capabilities = server_config.get("capabilities")
+        advertised = capabilities if isinstance(capabilities, list) else []
+        self.capabilities.lock_time = "lock_time" in advertised
 
         try:
             self.save()

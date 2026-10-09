@@ -2983,11 +2983,23 @@ class SyncEngine:
         end: Optional[datetime] = None,
         queue_on_failure: bool = True,
     ) -> None:
-        """Send a duration event for a state-span (break/idle/private).
+        """Send a duration event for a state-span (break/idle/private/sleep/lock).
 
-        Consolidates three formerly-identical send_*_event helpers. The only
-        variation between them was the ``kind`` string used in the id prefix,
-        bucket_type, and data.status field.
+        Consolidates the formerly-identical send_*_event helpers. The only
+        variation between them is the ``kind`` string used in the id prefix,
+        bucket_type, and data.status field — and bucket_type is what the
+        server classifies ON (``AgentEvent::inferEventType`` keys on
+        ``bucket_type`` alone), so two spans that must be billed differently
+        MUST use different ``kind``s. A screen lock and system sleep are
+        exactly such a pair: internal-tool2's presence-bridge
+        (``AgentAnalyticsService::bridgeActivityToSleepStarts`` /
+        ``clampIdleTailBeforeSleep``) treats every ``sleep_time`` block START
+        as proof of presence and bridges/clamps around it — correct for a
+        genuine suspend, wrong for a lock, which must earn back nothing. A
+        shared bucket_type with a mere ``data`` tag could never be excluded
+        from that bridge (the bridge queries `event_type = sleep_time`, not
+        `data.reason`), which is why ``send_lock_event`` below sends its OWN
+        ``lock_time`` bucket_type rather than reusing this one with a tag.
 
         ``queue_on_failure=False`` is for periodic in-progress snapshots of a
         still-growing span (the per-cycle private_time refresh): a failed
@@ -3129,8 +3141,68 @@ class SyncEngine:
         walked away from a running machine" (idle). Without this, both
         get rendered as "Break" in the daily activity view, which is
         misleading for overnight sleep cycles.
+
+        system/display sleep ONLY — a screen lock must go through
+        ``send_lock_event`` instead, never through this method with a tag.
+        internal-tool2's presence-bridge (bridgeActivityToSleepStarts /
+        clampIdleTailBeforeSleep) treats every sleep_time block START as
+        proof of presence up to that instant, which is correct for a genuine
+        suspend and wrong for a lock (see send_lock_event's docstring).
         """
         self._send_status_span(kind="sleep", start=start, end=end)
+
+    def send_lock_event(self, start: datetime, end: Optional[datetime] = None) -> None:
+        """Send a lock_time event covering a screen-lock span.
+
+        A screen lock already calls sync_engine.pause(), exactly like system
+        sleep does, so credit already stops locally — but unlike sleep,
+        nothing was ever uploaded, so on the server a lock was
+        indistinguishable from a crashed or quit agent.
+
+        This is a DISTINCT bucket_type from sleep_time, not sleep_time with a
+        tag — on purpose, per Tudor's product decision 2026-10-08 ("if you
+        are not present, you are not working"): a lock must NOT earn back any
+        idle time the way a genuine suspend does. internal-tool2's
+        AgentAnalyticsService::bridgeActivityToSleepStarts /
+        clampIdleTailBeforeSleep treat a sleep_time block's START as proof of
+        presence and bridge/clamp the preceding idle gap up to
+        DEFAULT_IDLE_GRACE_MINUTES around it; AgentEvent::inferEventType
+        classifies PURELY on bucket_type, so a reason tag inside ``data``
+        cannot opt a span out of that bridge — only a different event_type
+        can, because the bridge's own query filters on
+        ``event_type = EVENT_TYPE_SLEEP`` specifically. lock_time IS still a
+        declared-non-work exclusion (subtracted from billed time, same as
+        sleep/idle/break/private) — it just never feeds the sleep-specific
+        presence machinery. See internal-tool2's AgentEvent::EVENT_TYPE_LOCK.
+
+        DEPLOY ORDER: the server must classify lock_time (and exclude it from
+        billed time) BEFORE any agent build calling this method ships. An
+        unpatched server's inferEventType falls through every bucket_type AND
+        bucket_id check for "lock_time" (none of the substring matches hit)
+        and lands on EVENT_TYPE_APP — the catch-all "regular work" type. With
+        no app_name and no activity_state in this event's data, that then
+        defaults to active_seconds += duration: an unpatched server would
+        BILL the locked time as active work, which is worse than today's
+        baseline of uploading nothing at all.
+
+        Mechanically enforced, not just documented: gated on
+        ``self.config.capabilities.lock_time``, which defaults OFF and is
+        only switched on per-session by AgentConfigController advertising
+        "lock_time" in its `capabilities` array — i.e. only once the server
+        this agent is actually talking to has internal-tool2's
+        EVENT_TYPE_LOCK change live. With the gate off this call is a no-op:
+        no event is sent at all, byte-identical to a build that never shipped
+        this method. Never bypass this check at a call site — every span
+        source (screen lock, display-off) must flow through this one method.
+        """
+        if not self.config.capabilities.lock_time:
+            logger.debug(
+                "Dropping lock_time span (server has not advertised lock_time "
+                "support): start=%s end=%s", start.isoformat(),
+                (end or datetime.now(timezone.utc)).isoformat(),
+            )
+            return
+        self._send_status_span(kind="lock", start=start, end=end)
 
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
         """Send a private_time event covering the private mode duration."""

@@ -137,3 +137,32 @@ def test_span_within_24h_is_still_one_event_with_the_original_id():
 
     assert list(server.stored) == [f"idle_{int(start.timestamp())}_{id(engine)}"]
     assert server.stored[f"idle_{int(start.timestamp())}_{id(engine)}"]["duration"] == MAX_EVENT_DURATION_SECONDS
+
+
+def test_lock_event_is_its_own_bucket_type_and_survives_24h_chunking():
+    """A screen-lock span (system_event_handler.py's send_lock_event) rides
+    the SAME chunking/dedup pipeline as sleep_time -- a long-running lock
+    spanning a day boundary must be split into contiguous <=24h chunks
+    exactly like a long sleep is -- but every chunk carries bucket_type
+    "lock_time", a DISTINCT type from "sleep_time". This is deliberate, not
+    a shared type with a tag: internal-tool2's presence-bridge
+    (AgentAnalyticsService::bridgeActivityToSleepStarts /
+    clampIdleTailBeforeSleep) keys its query on event_type == EVENT_TYPE_SLEEP
+    specifically, so only a distinct bucket_type can opt a lock span out of
+    being treated as proof of presence the way a real sleep is."""
+    server = _CapValidatingServer()
+    engine = _engine(Path(tempfile.mkdtemp()), server)
+    # send_lock_event is gated on a server-advertised capability (defaults
+    # OFF — see tests/test_lock_time_capability_gate.py); this test is about
+    # the chunking pipeline, not the gate, so switch it on explicitly rather
+    # than have the gate silently swallow the span.
+    engine.config.capabilities.lock_time = True
+    start, end = _weekend_sleep()
+
+    engine.send_lock_event(start, end)
+
+    chunks = sorted(server.stored.values(), key=lambda e: e["timestamp"])
+    assert len(chunks) == 3
+    assert all(c["bucket_type"] == "lock_time" for c in chunks)
+    assert all(c["data"] == {"status": "lock"} for c in chunks)
+    assert all(c["id"].startswith("lock_") for c in chunks)
