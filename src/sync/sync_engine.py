@@ -3148,10 +3148,25 @@ class SyncEngine:
         no app_name and no activity_state in this event's data, that then
         defaults to active_seconds += duration: an unpatched server would
         BILL the locked time as active work, which is worse than today's
-        baseline of uploading nothing at all. Never release/deploy an agent
-        build that calls this method before internal-tool2's EVENT_TYPE_LOCK
-        change is live in production.
+        baseline of uploading nothing at all.
+
+        Mechanically enforced, not just documented: gated on
+        ``self.config.capabilities.lock_time``, which defaults OFF and is
+        only switched on per-session by AgentConfigController advertising
+        "lock_time" in its `capabilities` array — i.e. only once the server
+        this agent is actually talking to has internal-tool2's
+        EVENT_TYPE_LOCK change live. With the gate off this call is a no-op:
+        no event is sent at all, byte-identical to a build that never shipped
+        this method. Never bypass this check at a call site — every span
+        source (screen lock, display-off) must flow through this one method.
         """
+        if not self.config.capabilities.lock_time:
+            logger.debug(
+                "Dropping lock_time span (server has not advertised lock_time "
+                "support): start=%s end=%s", start.isoformat(),
+                (end or datetime.now(timezone.utc)).isoformat(),
+            )
+            return
         self._send_status_span(kind="lock", start=start, end=end)
 
     def _send_private_time_event(self, start: Optional[datetime] = None) -> None:
