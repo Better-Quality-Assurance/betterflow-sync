@@ -14,11 +14,10 @@ The channel: AgentConfigController's existing /api/agent/config response
 Config.update_from_server) gains a `capabilities` array. No new endpoint.
 """
 
-import tempfile
 from pathlib import Path
 from unittest.mock import Mock
 
-from src.config import AgentCapabilities, Config
+from src.config import Config
 from src.sync.queue import OfflineQueue
 from src.sync.sync_engine import SyncEngine
 
