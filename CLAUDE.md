@@ -150,6 +150,19 @@ not the person using it:
   at people who were simply not at their desk and stayed quiet on machines
   losing billable time (#195). Omitted entirely when the probe cannot answer —
   never coerced to `0`, which would read as "at the keyboard this second".
+- `input_capture_state` (`src/sync/input_source.py`, `InputSource.capture_state`)
+  — whether this machine's in-process input COUNTER is working: `ok`, `silent`
+  (the OS idle clock saw input in the last minute while our hook saw nothing,
+  not even a mouse move, for five) or `unavailable` (the OS refused the hook, or
+  it is stopped). Describes the sensor, never the person: it is derived from a
+  local event timestamp that is never sent, and mouse moves feed only that
+  timestamp, never a count. **Why it is sent:** Windows silently evicts a
+  low-level hook that overruns `LowLevelHooksTimeout`, leaving the pump thread
+  alive and every other health flag reading healthy while zero input is
+  counted. Unknowns (unreadable idle clock, the macOS tap which cannot see
+  mouse moves, the first 300 s after an install) report `ok`, never `silent`.
+  On `silent` the agent reinstalls the hook, at most once per 600 s and only
+  inside the capture window. Absent when `sync.in_process_input` is off.
 - `machine_arch` (`src/machine_arch.py`) — the CPU architecture of the hardware,
   seeing through Rosetta 2: an x86_64 build translated on Apple Silicon reports
   `arm64` here, which is the point. A property of the machine, in the same

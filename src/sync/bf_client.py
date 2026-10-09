@@ -582,6 +582,13 @@ class BetterFlowClient(BaseApiClient):
         # preserve-don't-delete design exists for was never actually met.
         # int, always present: 0 is an explicit healthy signal, not an omission.
         "dead_letter_count",
+        # Whether the in-process input COUNTER is working: "ok" / "silent" (the
+        # OS saw input in the last minute, our hook saw nothing for five) /
+        # "unavailable" (the OS refused the hook, or it is stopped). Absent when
+        # in-process input is off or there is no backend. Built from a local
+        # event timestamp that never leaves the machine. See
+        # InputSource.capture_state and main._build_health_telemetry.
+        "input_capture_state",
     )
 
     def heartbeat(

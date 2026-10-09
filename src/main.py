@@ -40,6 +40,7 @@ try:
     from .sync.sync_engine import server_status_summary
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .sync.os_idle import get_system_idle_seconds
+    from .sync.input_source import SILENT_NO_EVENT_S
     from .system_events import start_system_event_listener
     from .ui.permissions import (
         check_accessibility,
@@ -76,6 +77,7 @@ except ImportError:
     from sync.sync_engine import server_status_summary
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from sync.os_idle import get_system_idle_seconds
+    from sync.input_source import SILENT_NO_EVENT_S
     from system_events import start_system_event_listener
     from ui.permissions import (
         check_accessibility,
@@ -282,6 +284,9 @@ class SyncCoordinator:
         # sync-failure counter, which the SyncEngine does not — so the provider
         # lives here and is handed to the engine.
         self.sync_engine.health_provider = self._build_health_telemetry
+        # Rate limit for the silent-input-hook reinstall in
+        # _build_health_telemetry: at most one attempt per 600s.
+        self._last_input_reinstall_mono = float("-inf")
         # So a failed logs_requested upload surfaces to the ops ingest (it can't
         # surface via the log itself — that's the file we couldn't fetch).
         self.sync_engine.error_reporter = self.error_reporter
@@ -2155,12 +2160,43 @@ class SyncCoordinator:
         # desk (#195). Best-effort and OMITTED when unreadable: a null coerced
         # to 0 would read as "at the keyboard this second", turning an unknown
         # into the strongest possible claim of presence.
+        idle_seconds = None
         try:
             idle_seconds = get_system_idle_seconds()
             if idle_seconds is not None:
                 telemetry["os_idle_seconds"] = int(idle_seconds)
         except Exception as e:  # noqa: BLE001
             logger.debug("os-idle telemetry unavailable: %s", e)
+        # Whether the in-process input COUNTER is working: ok / silent (the OS
+        # saw input in the last minute, our hook saw nothing for five) /
+        # unavailable (refused or stopped). Silent is the state every health flag
+        # used to read as healthy — a Windows LL hook evicted for overrunning
+        # LowLevelHooksTimeout leaves the pump thread alive and available() True.
+        # On silent, reinstall at most once per 600s, and only inside the capture
+        # window: a reinstall is a start(), and outside working hours nothing on
+        # this machine may record. Own try/except so it can never cost the rest
+        # of the heartbeat.
+        try:
+            input_source = getattr(self.sync_engine, "input_source", None)
+            if input_source is not None and self.config.sync.in_process_input:
+                state = input_source.capture_state(idle_seconds)
+                if isinstance(state, str):
+                    telemetry["input_capture_state"] = state
+                if state == "silent":
+                    now = time.monotonic()
+                    if (
+                        now - self._last_input_reinstall_mono >= 600
+                        and self.config.working_hours.allows(datetime.now(timezone.utc))
+                    ):
+                        self._last_input_reinstall_mono = now
+                        logger.warning(
+                            "Input hook silent: OS reports input %ss ago but the "
+                            "hook saw nothing for %ss — reinstalling",
+                            idle_seconds, SILENT_NO_EVENT_S,
+                        )
+                        input_source.restart()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("input-capture telemetry unavailable: %s", e)
         # Report the hardware architecture so the fleet can answer "who is on
         # the Intel build?". true_machine_arch() returns "" when its Rosetta
         # probe never resolved; send that as null so the server can tell
@@ -2546,11 +2582,11 @@ class BetterFlowApp:
         )
         self.coordinator.sync_engine.input_source = input_source
         self.input_source = input_source
-        logger.info(
-            "In-process input source: %s",
-            "active" if (self.config.sync.in_process_input and input_source.available())
-            else "inactive",
-        )
+        # The "In-process input source: active/inactive" line is logged from
+        # _start_watchers, after start(), so it reports the install result rather
+        # than a pre-install platform probe (which reads "active" on every
+        # Windows box whether or not the hook ever installs).
+        self._input_source_logged_state: Optional[str] = None
 
         # Reminder manager (created after coordinator for clean callback injection)
         self.reminder_manager = ReminderManager(self.config.reminders)
@@ -2670,6 +2706,12 @@ class BetterFlowApp:
                 self.input_source.start()
             except Exception as e:
                 logger.warning("In-process input source start failed: %s", e)
+            # Logged on CHANGE only: this runs on every 60s converge, and the log
+            # tail is uploadable — one line per minute would bury everything.
+            verdict = "active" if self.input_source.available() else "inactive"
+            if verdict != getattr(self, "_input_source_logged_state", None):
+                self._input_source_logged_state = verdict
+                logger.info("In-process input source: %s", verdict)
 
         # The browser-tab URL reader and the display tracker are started HERE, under
         # the capture policy — not in __init__, where they used to run from process
