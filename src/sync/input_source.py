@@ -502,6 +502,11 @@ class _WindowsHookBackend:
         self._mouse_cb = None
         self._started = threading.Event()
         self._start_ok = False
+        # Serialises start(): restart() on the heartbeat thread and the 60s
+        # capture-policy converge can both call it on a dead hook, and the
+        # is_alive() check-then-spawn below would otherwise install TWO hook
+        # threads, each counting every keystroke.
+        self._start_lock = threading.Lock()
         # Set by _run() when the OS refuses the hooks (UIPI / AV / EDR) or ctypes
         # is unusable. Windows ships NO external input tracker, so this backend is
         # the only input source there — a refused hook that still reported
@@ -529,6 +534,10 @@ class _WindowsHookBackend:
             return False
 
     def start(self) -> bool:
+        with self._start_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         if self._thread is not None and self._thread.is_alive():
             return self._start_ok
         self._started.clear()

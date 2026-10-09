@@ -1143,3 +1143,47 @@ def test_windows_hook_notes_mouse_moves_and_key_ups_without_counting(monkeypatch
     mouse(-1, 0x0200, 0)  # nCode < 0: not ours to process
     kbd(-1, 0x0100, 0)
     assert src._last_event_mono is None
+
+
+def test_concurrent_windows_starts_install_one_hook_thread(monkeypatch):
+    """restart() (heartbeat thread) and the 60s capture-policy converge can both
+    call start() on a dead hook. Two hook threads would each count every
+    keystroke -- double counting. start() must be serialised."""
+    import time as _time
+
+    from src.sync import input_source as m
+
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    be = m._WindowsHookBackend(InputSource(hostname="host", backend=None,
+                                           frontmost_app_getter=None))
+    built = []
+
+    class _SlowThread:
+        def __init__(self, *a, **kw):
+            built.append(self)
+            self._alive = False
+
+        def start(self):
+            _time.sleep(0.05)   # widen the check-then-assign window
+            self._alive = True
+            be._start_ok = True
+            be._started.set()
+
+        def is_alive(self):
+            return self._alive
+
+    real_thread = threading.Thread   # m.threading IS this module: capture first
+    monkeypatch.setattr(m.threading, "Thread", _SlowThread)
+    barrier = threading.Barrier(2)
+
+    def _racing_start():
+        barrier.wait()
+        be.start()
+
+    workers = [real_thread(target=_racing_start) for _ in range(2)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(5)
+    assert not any(w.is_alive() for w in workers)
+    assert len(built) == 1, f"{len(built)} hook threads installed"
