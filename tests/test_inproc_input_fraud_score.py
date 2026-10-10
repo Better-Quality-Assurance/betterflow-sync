@@ -14,7 +14,7 @@ from unittest.mock import Mock
 
 from src.config import Config
 from src.sync.activity_analyzer import ActivityAnalyzer
-from src.sync.aw_client import AWEvent, BUCKET_TYPE_INPUT, BUCKET_TYPE_WINDOW
+from src.sync.aw_client import BUCKET_TYPE_INPUT, BUCKET_TYPE_WINDOW, AWEvent
 from src.sync.daily_time_tracker import DailyTimeTracker
 from src.sync.input_source import InputSource
 from src.sync.sync_engine import SyncEngine
