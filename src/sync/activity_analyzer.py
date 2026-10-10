@@ -126,8 +126,9 @@ class FraudSignalDetector:
     - implausible_input_rate: Any single window averaging more presses/min
       than a person can plausibly type
 
-    Retired 2026-10-09: input_regularity. Input arrives as aggregate count
-    events drained on the agent's own ~60s sync cadence, so inter-event gaps
+    Retired 2026-10-09: input_regularity. The analyzer sees aggregate count
+    events from a periodic emitter (the macOS watcher every 10 s, the AW input
+    bucket, or the in-process drain once per sync cycle), so inter-event gaps
     carry the sampler's clock, not the human's, and every steady worker scored
     ~24. Its two config fields stay so an older server /config still parses.
     """
