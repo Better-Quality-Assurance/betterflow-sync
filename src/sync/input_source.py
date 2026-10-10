@@ -48,9 +48,12 @@ logger = logging.getLogger(__name__)
 # feeding counts directly, or a platform with no in-process hook).
 _UNSET = object()
 
-# Silent-hook detection (see InputSource.capture_state). Windows silently removes
-# a low-level hook whose callback overruns LowLevelHooksTimeout: the pump thread
-# stays alive, available() stays True, and nothing is counted again. The verdict
+# Silent-counter detection (see InputSource.capture_state). "silent" is a
+# SYMPTOM — the OS saw input but our counter received none — not a diagnosis.
+# Possible causes: Windows removing a low-level hook whose callback overran
+# LowLevelHooksTimeout (the pump thread stays alive and available() stays True),
+# an elevated/admin window in the foreground, or the secure desktop (lock
+# screen, UAC). It is a sensor state, not evidence of tampering. The verdict
 # compares the OS idle clock ("the OS saw input") with our own liveness stamp
 # ("the hook saw anything at all, mouse moves included").
 #: No verdict for this long after an install — a hook needs a moment of input.
@@ -165,7 +168,11 @@ class InputSource:
     ) -> Optional[str]:
         """The input sensor's own health: None (no backend), "unavailable" (the
         OS refused the hook / it is stopped), "silent" (the OS saw input in the
-        last minute but our hook has seen nothing for five), or "ok".
+        last minute but our hook has seen nothing for five — a symptom, not a
+        cause; see the module comment), or "ok". The fourth heartbeat value,
+        "off", is not decided here: the caller maps any state to "off" while the
+        working-hours policy disallows capture, because only it knows the
+        policy (main.capture_currently_allowed).
 
         Every unknown answers "ok", never "silent": an unreadable OS idle clock,
         a backend that cannot see mouse moves (the macOS tap — a reader moving
@@ -211,9 +218,21 @@ class InputSource:
             self.mark_started()
         return ok
 
-    def restart(self, timeout: float = 2.0) -> bool:
+    def restart(
+        self,
+        timeout: float = 2.0,
+        may_start: Optional[Callable[[], bool]] = None,
+    ) -> bool:
         """Reinstall the backend: stop, wait for its listener thread to exit,
         start again. Returns True only when a new install succeeded.
+
+        ``may_start`` is asked immediately before the start, AFTER the join:
+        the join can take up to ``timeout`` seconds, and the caller's own
+        capture check is that old by then. Pass the working-hours capture
+        predicate so a reinstall can never install a hook past the window's
+        close. A False answer — or a predicate that raises — leaves the backend
+        stopped and returns False (fail closed: outside the window nothing may
+        record).
 
         stop() then start() is NOT a reinstall on Windows: stop() only posts
         WM_QUIT, and a start() that runs before the pump thread has exited hits
@@ -236,6 +255,15 @@ class InputSource:
                     "InputSource restart: listener thread still alive %.1fs after "
                     "stop — not reinstalling", timeout,
                 )
+                return False
+        if may_start is not None:
+            try:
+                allowed = bool(may_start())
+            except Exception as e:
+                logger.warning("InputSource restart: capture check failed (%s) — not starting", e)
+                allowed = False
+            if not allowed:
+                logger.info("InputSource restart: capture no longer allowed — not starting")
                 return False
         ok = self.start()
         if ok:

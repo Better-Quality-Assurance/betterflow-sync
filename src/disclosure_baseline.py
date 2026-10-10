@@ -674,9 +674,12 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # and update the notice text, not to drop it and go back to blind.
     "dead_letter_count",
     # Whether this machine's input counter is working: ok / silent (the OS saw
-    # input, our counter did not) / unavailable (the OS refused the hook).
-    # Describes the sensor, never the person; derived from a local event
-    # timestamp that is never sent.
+    # input but our counter received none — a symptom with several possible
+    # causes, e.g. the hook removed by Windows, an elevated foreground window,
+    # the secure desktop; a sensor state, not evidence of tampering) /
+    # unavailable (the OS refused the hook) / off (capture is disallowed by the
+    # working-hours policy right now). Describes the sensor, never the person;
+    # derived from a local event timestamp that is never sent.
     "input_capture_state",
 )
 

@@ -225,6 +225,15 @@ def _overrun_fingerprint(elapsed: float, deadline: float) -> str:
     return _OVERRUN_BAND_SEVERE
 
 
+def capture_currently_allowed(config) -> bool:
+    """Whether local capture is permitted right now, per the working-hours
+    schedule. The ONE predicate for "may anything on this machine record now":
+    BetterFlowApp's capture policy (which starts and stops every recorder) and
+    the heartbeat's input-capture telemetry + hook reinstall both ask it, so
+    the reported state and the policy cannot disagree about the window."""
+    return config.working_hours.allows(datetime.now(timezone.utc))
+
+
 class _CyclePhase:
     """The stage _do_sync is currently in, as a per-cycle mutable box.
 
@@ -2167,34 +2176,46 @@ class SyncCoordinator:
                 telemetry["os_idle_seconds"] = int(idle_seconds)
         except Exception as e:  # noqa: BLE001
             logger.debug("os-idle telemetry unavailable: %s", e)
-        # Whether the in-process input COUNTER is working: ok / silent (the OS
-        # saw input in the last minute, our hook saw nothing for five) /
-        # unavailable (refused or stopped). Silent is the state every health flag
-        # used to read as healthy — a Windows LL hook evicted for overrunning
-        # LowLevelHooksTimeout leaves the pump thread alive and available() True.
-        # On silent, reinstall at most once per 600s, and only inside the capture
-        # window: a reinstall is a start(), and outside working hours nothing on
-        # this machine may record. Own try/except so it can never cost the rest
-        # of the heartbeat.
+        # Whether the in-process input COUNTER is working: ok / silent / unavailable
+        # / off. "silent" is a SYMPTOM: the OS idle clock saw input in the last
+        # minute while our counter received nothing, not even a mouse move, for
+        # five. Possible causes include Windows removing the hook (e.g. for
+        # overrunning LowLevelHooksTimeout), an elevated/admin window in the
+        # foreground, or the secure desktop (lock screen, UAC prompt) — it is a
+        # sensor state, not evidence of tampering. "unavailable" = the OS refused
+        # the hook or it stopped inside the capture window; "off" = capture is
+        # disallowed by the working-hours policy right now, so the hook is
+        # deliberately down (never reported as a refusal).
+        # The capture predicate is evaluated ONCE and drives both the reported
+        # value and the reinstall gate. On silent, reinstall at most once per
+        # 600s; restart() re-asks the predicate right before its start(), since
+        # its join can outlast the window's close. Own try/except so it can never
+        # cost the rest of the heartbeat.
         try:
             input_source = getattr(self.sync_engine, "input_source", None)
             if input_source is not None and self.config.sync.in_process_input:
+                capture_allowed = capture_currently_allowed(self.config)
                 state = input_source.capture_state(idle_seconds)
+                if isinstance(state, str) and not capture_allowed:
+                    state = "off"
                 if isinstance(state, str):
                     telemetry["input_capture_state"] = state
                 if state == "silent":
                     now = time.monotonic()
-                    if (
-                        now - self._last_input_reinstall_mono >= 600
-                        and self.config.working_hours.allows(datetime.now(timezone.utc))
-                    ):
+                    if now - self._last_input_reinstall_mono >= 600:
                         self._last_input_reinstall_mono = now
                         logger.warning(
-                            "Input hook silent: OS reports input %ss ago but the "
-                            "hook saw nothing for %ss — reinstalling",
+                            "Input counter silent: the OS reports input %ss ago but "
+                            "the counter received none for %ss (possible causes: "
+                            "hook removed by Windows, an elevated foreground window, "
+                            "the secure desktop; a sensor state, not evidence of "
+                            "tampering) — reinstalling",
                             idle_seconds, SILENT_NO_EVENT_S,
                         )
-                        input_source.restart()
+                        config = self.config
+                        input_source.restart(
+                            may_start=lambda: capture_currently_allowed(config)
+                        )
         except Exception as e:  # noqa: BLE001
             logger.debug("input-capture telemetry unavailable: %s", e)
         # Report the hardware architecture so the fleet can answer "who is on
@@ -2782,7 +2803,7 @@ class BetterFlowApp:
 
     def _capture_currently_allowed(self) -> bool:
         """Whether capture is permitted right now, per the working-hours schedule."""
-        return self.config.working_hours.allows(datetime.now(timezone.utc))
+        return capture_currently_allowed(self.config)
 
     def _apply_capture_policy(self, reason: str = "tick") -> None:
         """Start or stop ALL local capture according to the working-hours schedule.

@@ -1187,3 +1187,47 @@ def test_concurrent_windows_starts_install_one_hook_thread(monkeypatch):
         w.join(5)
     assert not any(w.is_alive() for w in workers)
     assert len(built) == 1, f"{len(built)} hook threads installed"
+
+
+# -- F4: the capture window is re-checked right before the reinstall's start --
+
+
+def test_restart_does_not_start_when_the_window_closed_during_the_join():
+    """restart() joins for up to 2 s; working hours can close inside that
+    join. The start must re-ask the capture predicate, not trust the caller's
+    answer from before the join."""
+    b = _JoinableBackend(exits_on_stop=True)
+    s = _src(b)
+    s.mark_started(now=0.0)
+    allowed = {"now": True}
+
+    real_join = b.join
+
+    def join_then_close(timeout):
+        allowed["now"] = False  # 18:00:00 strikes mid-join
+        return real_join(timeout)
+
+    b.join = join_then_close
+
+    assert s.restart(may_start=lambda: allowed["now"]) is False
+    assert b.stops == 1
+    assert b.starts == 0, "a hook was installed after the capture window closed"
+    assert s._started_mono == 0.0
+
+
+def test_restart_starts_when_the_predicate_still_allows():
+    b = _JoinableBackend(exits_on_stop=True)
+    s = _src(b)
+    assert s.restart(may_start=lambda: True) is True
+    assert b.starts == 1
+
+
+def test_restart_fails_closed_when_the_predicate_raises():
+    b = _JoinableBackend(exits_on_stop=True)
+    s = _src(b)
+
+    def boom():
+        raise RuntimeError("schedule unreadable")
+
+    assert s.restart(may_start=boom) is False
+    assert b.starts == 0
