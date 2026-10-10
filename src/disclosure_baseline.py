@@ -673,6 +673,14 @@ HEARTBEAT_HEALTH_KEYS: tuple[str, ...] = (
     # if the category is ever contested, the safe answer is to keep the field
     # and update the notice text, not to drop it and go back to blind.
     "dead_letter_count",
+    # Whether this machine's input counter is working: ok / silent (the OS saw
+    # input but our counter received none — a symptom with several possible
+    # causes, e.g. the hook removed by Windows, an elevated foreground window,
+    # the secure desktop; a sensor state, not evidence of tampering) /
+    # unavailable (the OS refused the hook) / off (capture is disallowed by the
+    # working-hours policy right now). Describes the sensor, never the person;
+    # derived from a local event timestamp that is never sent.
+    "input_capture_state",
 )
 
 #: The machine's hostname is read once and embedded in every `bucket_id`, so

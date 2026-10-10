@@ -376,8 +376,19 @@ class FraudDetectionConfig:
     min_app_diversity: int = 2  # Fewer unique apps = suspicious
     app_diversity_min_minutes: int = 60  # Only check after this much active time
     click_keystroke_ratio_threshold: float = 10.0  # Above this = suspicious
-    input_regularity_cv_threshold: float = 0.1  # Below this = suspiciously regular
-    min_input_events_for_regularity: int = 10  # Need this many events for regularity check
+    # Presses per minute, averaged over one analyzer window, above which input
+    # is not plausibly a person typing (fast typists burst at ~400-500/min but a
+    # 5-minute working window averages far below). The 2026-10-08 outlier
+    # averaged ~550/min over 7.9 h. A held key trips it too: intended, the
+    # signal says "implausible input", not "fraud".
+    max_presses_per_minute: int = 400
+    # The two fields below are RETIRED 2026-10-09 (input_regularity signal removed:
+    # the analyzer sees aggregate count events from a periodic emitter — the
+    # macOS watcher every 10 s, or the AW input bucket — so the gaps it measured
+    # were the sampler's clock, not the person). Read by nothing; kept so an
+    # older server /config still parses.
+    input_regularity_cv_threshold: float = 0.1  # retired
+    min_input_events_for_regularity: int = 10  # retired
 
 
 @dataclass
@@ -1343,13 +1354,21 @@ class Config:
                     val = float(fd["click_keystroke_ratio_threshold"])
                     if math.isfinite(val) and val > 0:
                         self.fraud_detection.click_keystroke_ratio_threshold = val
+                if "max_presses_per_minute" in fd:
+                    # Non-finite rejected like the float siblings: int(inf)
+                    # raises OverflowError and int(nan) ValueError.
+                    val = float(fd["max_presses_per_minute"])
+                    if math.isfinite(val):
+                        self.fraud_detection.max_presses_per_minute = max(60, int(val))
+                # Retired 2026-10-09 (input_regularity signal removed), read by
+                # nothing: still parsed so an older server /config round-trips.
                 if "input_regularity_cv_threshold" in fd:
                     val = float(fd["input_regularity_cv_threshold"])
                     if math.isfinite(val) and val > 0:
                         self.fraud_detection.input_regularity_cv_threshold = val
                 if "min_input_events_for_regularity" in fd:
                     self.fraud_detection.min_input_events_for_regularity = max(2, int(fd["min_input_events_for_regularity"]))
-            except (TypeError, ValueError) as e:
+            except (TypeError, ValueError, OverflowError) as e:
                 logger.warning(f"Invalid fraud_detection config from server: {e}")
 
         if "call_detection" in server_config and DEFER_UNAPPLIED_SERVER_SETTINGS:

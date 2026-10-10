@@ -368,39 +368,37 @@ class TestFraudSignalDetector:
         result = self.detector.assess()
         assert "keystroke_uniformity" not in result.signals
 
-    # --- Input regularity ---
+    # --- Input regularity (retired 2026-10-09) ---
 
-    def test_regular_intervals_flagged(self):
-        """Events arriving at exactly regular intervals should trigger."""
-        base = self.now - timedelta(minutes=10)
-        for i in range(12):
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
-
-        result = self.detector.assess()
-        assert "input_regularity" in result.signals
-        assert result.score > 0
-
-    def test_random_intervals_pass(self):
-        """Events with natural random intervals should not trigger."""
-        base = self.now - timedelta(minutes=10)
-        # Irregular gaps
-        gaps = [3, 12, 45, 7, 22, 55, 8, 30, 15, 40]
-        t = base
-        for gap in gaps:
-            t += timedelta(seconds=gap)
+    def test_sync_cadence_input_is_not_flagged(self):
+        """One aggregate input event per ~60s sync drain is the AGENT's clock,
+        not the person's. Replayed through the old detector this scored 24
+        (input_regularity) for every steady worker on 2026-10-08."""
+        import random
+        rng = random.Random(1)
+        t = datetime(2026, 10, 8, 9, tzinfo=timezone.utc)
+        for _ in range(300):
+            t += timedelta(seconds=60 + rng.uniform(-0.2, 0.2))
             self.detector.record_input_timestamp(t)
-
         result = self.detector.assess()
         assert "input_regularity" not in result.signals
+        assert result.score == 0
 
-    def test_input_regularity_needs_min_events(self):
-        """Should not flag regularity with fewer than min events."""
-        base = self.now
-        for i in range(3):  # only 3 events, default min is 10
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
+    def test_perfectly_regular_input_is_not_flagged_either(self):
+        """The signal is retired, not retuned: exact 60s spacing is what a
+        healthy agent produces too."""
+        t = datetime(2026, 10, 8, 9, tzinfo=timezone.utc)
+        for _ in range(300):
+            t += timedelta(seconds=60)
+            self.detector.record_input_timestamp(t)
+        assert "input_regularity" not in self.detector.assess().signals
 
-        result = self.detector.assess()
-        assert "input_regularity" not in result.signals
+    def test_retired_regularity_config_still_accepted(self):
+        """An older server /config still carries the two retired fields."""
+        cfg = FraudDetectionConfig(input_regularity_cv_threshold=0.2,
+                                   min_input_events_for_regularity=5)
+        det = FraudSignalDetector(config=cfg)
+        assert det.assess().score == 0
 
     # --- Mouse-only streak ---
 
@@ -515,18 +513,17 @@ class TestFraudSignalDetector:
 
     def test_fraud_score_capped_at_100(self):
         """Combined signals should not exceed 100."""
-        # Trigger all signals simultaneously
-        # Uniform keystrokes (6 identical windows)
+        # Trigger all remaining signals simultaneously. min_app_diversity=4 makes a
+        # single app a 3-app deficit, i.e. the full 15 (the default would give 5).
+        self.detector = FraudSignalDetector(config=FraudDetectionConfig(min_app_diversity=4))
+        # Uniform keystrokes (6 identical windows) that are also physically
+        # implausible: 500 presses in a 1-minute window = 500/min > 400.
         for _ in range(6):
             self.detector.record_window_metrics(
-                ActivityMetrics(presses=10, clicks=20, scrolls=0, window_changes=0),
+                ActivityMetrics(presses=500, clicks=20, scrolls=0, window_changes=0),
                 app="OnlyApp",
+                window_minutes=1,
             )
-
-        # Regular input timestamps
-        base = self.now
-        for i in range(12):
-            self.detector.record_input_timestamp(base + timedelta(seconds=i * 60))
 
         # Enough active time for app diversity
         self.detector.add_active_time(65 * 60)
@@ -539,7 +536,53 @@ class TestFraudSignalDetector:
         self.detector._mouse_only_streak = 6
 
         result = self.detector.assess()
-        assert result.score <= 100
+        assert set(result.signals) == {
+            "keystroke_uniformity",
+            "mouse_only_streak",
+            "low_app_diversity",
+            "click_keystroke_ratio",
+            "implausible_input_rate",
+        }
+        # 30 + 20 + 15 + 10 + 30 = 105 uncapped; the cap must actually bite.
+        assert result.score == 100
+
+    # --- implausible_input_rate ---
+
+    def _window(self, presses, clicks=0):
+        return ActivityMetrics(presses=presses, clicks=clicks, scrolls=0, window_changes=1)
+
+    def test_implausible_typing_rate_flagged(self):
+        # 2,750 presses in a 5-minute window = 550/min, the 2026-10-08 outlier's all-day average
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        result = self.detector.assess()
+        assert "implausible_input_rate" in result.signals
+        assert result.score >= 30
+
+    def test_fast_but_human_typing_passes(self):
+        # 300/min sustained for 5 minutes: fast, possible
+        self.detector.record_window_metrics(self._window(1500), app="X", window_minutes=5)
+        assert "implausible_input_rate" not in self.detector.assess().signals
+
+    def test_rate_threshold_is_configurable(self):
+        det = FraudSignalDetector(config=FraudDetectionConfig(max_presses_per_minute=100))
+        det.record_window_metrics(self._window(600), app="X", window_minutes=5)  # 120/min
+        assert "implausible_input_rate" in det.assess().signals
+
+    def test_rate_signal_cleared_by_clear(self):
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        self.detector.clear()
+        assert "implausible_input_rate" not in self.detector.assess().signals
+
+    def test_rate_uses_peak_window_not_session_average(self):
+        # One implausible window among normal ones still flags (max, not mean)
+        for _ in range(3):
+            self.detector.record_window_metrics(self._window(100), app="X", window_minutes=5)
+        self.detector.record_window_metrics(self._window(2750), app="X", window_minutes=5)
+        assert "implausible_input_rate" in self.detector.assess().signals
+
+    def test_nonpositive_window_minutes_does_not_crash_or_flag(self):
+        self.detector.record_window_metrics(self._window(99999), app="X", window_minutes=0)
+        assert "implausible_input_rate" not in self.detector.assess().signals
 
     # --- Session clear ---
 
@@ -672,9 +715,97 @@ class TestActivityAnalyzerFraudIntegration:
         assert self.analyzer._fraud_detector._unique_apps == set()
         assert len(self.analyzer._fraud_detector._input_timestamps) == 0
 
+    def test_analyzer_passes_its_window_minutes_to_rate_signal(self):
+        """End to end: 1,000 presses in the window is 200/min at the default
+        5-minute window (human) but 1000/min at a 1-minute window (implausible)."""
+        for minutes, expected in ((5, False), (1, True)):
+            analyzer = ActivityAnalyzer(
+                thresholds=EngagementThresholds(window_minutes=minutes),
+                fraud_config=FraudDetectionConfig(),
+            )
+            analyzer.add_input_events(
+                [self._make_input_event(self.now - timedelta(seconds=10), event_id=1, presses=1000)]
+            )
+            result = analyzer.get_fraud_assessment(self.now, app="TestApp")
+            assert ("implausible_input_rate" in result.signals) is expected, minutes
+
     def test_fraud_config_update(self):
         """update_fraud_config should propagate to the detector."""
         new_config = FraudDetectionConfig(mouse_only_streak_threshold=10)
         self.analyzer.update_fraud_config(new_config)
 
         assert self.analyzer._fraud_detector._config.mouse_only_streak_threshold == 10
+
+
+class TestInputSpanProRating:
+    """F1b: an input event's counts are spread over [ts, ts+duration] and only
+    the share overlapping the analysis window is counted. A catch-up event
+    covering a 15-minute span must not land whole in one 5-minute window."""
+
+    T = datetime(2026, 10, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _ev(self, eid, start, duration, presses, clicks=0, scrolls=0):
+        return AWEvent(
+            id=eid,
+            timestamp=start,
+            duration=duration,
+            data={"presses": presses, "clicks": clicks, "scrolls": scrolls},
+        )
+
+    def test_fifteen_minute_catch_up_at_150_per_min_does_not_flag(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        span = 15 * 60
+        # One recovery event spanning the outage, assessed at points across it.
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(seconds=span), span, 2250)])
+        for back in (0, 300, 600):
+            ts = self.T - timedelta(seconds=back)
+            analyzer.add_window_events([AWEvent(id=100 + back, timestamp=ts, duration=1.0,
+                                                data={"app": "Editor", "title": "x"})])
+            result = analyzer.get_fraud_assessment(ts, app="Editor")
+            assert "implausible_input_rate" not in result.signals, back
+
+    def test_window_counts_only_its_overlap_share(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        analyzer.add_input_events([
+            self._ev(1, self.T - timedelta(minutes=15), 900, 2250, clicks=90, scrolls=45)
+        ])
+        m = analyzer.get_raw_metrics(self.T)
+        # 5/15 of the span overlaps [T-5m, T]
+        assert (m.presses, m.clicks, m.scrolls) == (750, 30, 15)
+        assert isinstance(m.presses, int), "the wire shape stays integer"
+
+    def test_window_at_the_start_of_the_span_sees_only_its_share(self):
+        """The pre-fix failure in its sharpest form: a window over the FIRST
+        five minutes of the span counted all 2250 (450/min)."""
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        start = self.T - timedelta(minutes=15)
+        analyzer.add_input_events([self._ev(1, start, 900, 2250)])
+        m = analyzer.get_raw_metrics(start + timedelta(minutes=5))
+        assert m.presses == 750
+
+    def test_sustained_500_per_min_in_real_10s_events_still_flags(self):
+        analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
+        events = []
+        for i in range(36):  # 6 minutes of 10 s events at ~500/min
+            events.append(self._ev(i, self.T - timedelta(seconds=360 - i * 10), 10, 83))
+        analyzer.add_input_events(events)
+        result = analyzer.get_fraud_assessment(self.T, app="Editor")
+        assert "implausible_input_rate" in result.signals
+
+    def test_zero_duration_event_counts_whole_when_inside_the_window(self):
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=1), 0, 40)])
+        assert analyzer.get_raw_metrics(self.T).presses == 40
+
+    def test_zero_duration_event_outside_the_window_counts_nothing(self):
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=6), 0, 40)])
+        assert analyzer.get_raw_metrics(self.T).presses == 0
+
+    def test_long_event_is_not_pruned_while_its_span_reaches_the_window(self):
+        """Pruning keyed on the START time dropped a long catch-up event as soon
+        as any newer event arrived, losing the share that overlaps the window."""
+        analyzer = ActivityAnalyzer()
+        analyzer.add_input_events([self._ev(1, self.T - timedelta(minutes=15), 900, 2250)])
+        analyzer.add_input_events([self._ev(2, self.T - timedelta(seconds=10), 10, 20)])
+        assert analyzer.get_raw_metrics(self.T).presses == 750 + 20
