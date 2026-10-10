@@ -120,6 +120,9 @@ def test_windows_cycle_with_inproc_input_attaches_fraud_score():
     for ev in windows:
         assert "fraud_score" in ev, ev
         assert "activity_metrics" in ev
+        # The metrics come from the drained in-process counts (the window event's
+        # share of the 60 s span), not from an empty analyzer.
+        assert ev["activity_metrics"]["presses"] > 0, ev["activity_metrics"]
     # ...and the drained input event still uploads exactly as before.
     inputs = [e for e in sent if e.get("bucket_type") == BUCKET_TYPE_INPUT]
     assert len(inputs) == 1 and inputs[0]["data"]["presses"] == 40

@@ -175,3 +175,37 @@ def test_outage_catch_up_does_not_trip_the_rate_signal(monkeypatch):
     # 5-minute share of the 15-minute span (~150/min x 5).
     metrics = analyzer.get_raw_metrics(clock.now)
     assert 700 <= metrics.presses <= 800
+
+
+def test_counts_arriving_during_a_post_keep_their_span_start(monkeypatch):
+    """Keys pressed while a post is in flight are left in the counters by the
+    subtract. If AW then goes down, their eventual post must still start at
+    that post, not at [now - 10 s]."""
+    clock = _Clock(T0)
+    _install_clock(monkeypatch, clock)
+    aw = _ScriptedAW()
+    w = _watcher(aw)
+
+    real_post = aw.post_events
+
+    def post_while_typing(bucket_id, events):
+        real_post(bucket_id, events)
+        if len(aw.posted) == 1:
+            _press(w, 3)  # landed between the snapshot and the subtract
+
+    aw.post_events = post_while_typing
+
+    def go_down():
+        aw.fail = True
+
+    def come_back():
+        aw.fail = False
+
+    script = [lambda: _press(w, 25), go_down] + [lambda: None] * 29 + [come_back]
+    _run(monkeypatch, w, clock, script)
+
+    assert len(aw.posted) == 2
+    second = aw.posted[1]
+    assert second["data"]["presses"] == 3
+    assert datetime.fromisoformat(second["timestamp"]) == T0 + timedelta(seconds=10)
+    assert second["duration"] == 310.0  # 31 ticks after the first post
