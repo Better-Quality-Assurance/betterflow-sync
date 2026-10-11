@@ -1106,6 +1106,7 @@ def _fake_ctypes_for_hooks(callbacks):
     fake.c_long = int
     fake.c_int = int
     fake.byref = lambda x: x
+    fake.get_last_error = lambda: 0
     fake.wintypes = wintypes
     return fake, wintypes
 
@@ -1121,6 +1122,7 @@ def test_windows_hook_notes_mouse_moves_and_key_ups_without_counting(monkeypatch
     be = m._WindowsHookBackend(src)
     callbacks = {}
     fake, wt = _fake_ctypes_for_hooks(callbacks)
+    be._api_loader = lambda: (fake.windll.user32, fake.windll.kernel32, lambda fn: fn)
     with patch.dict(sys.modules, {"ctypes": fake, "ctypes.wintypes": wt}):
         be._run_hooks()
     kbd = callbacks[be._WH_KEYBOARD_LL]

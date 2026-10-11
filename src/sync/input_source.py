@@ -473,6 +473,72 @@ def _default_frontmost_app_getter() -> Optional[Callable[[], Optional[str]]]:
     return getter
 
 
+def _declare_win32_hook_signatures(user32, kernel32, functype):
+    """Declare argtypes/restype for every Win32 call _WindowsHookBackend makes,
+    on the given DLL objects, and return the HOOKPROC callback type.
+
+    Undeclared, ctypes treats every return as a 32-bit ``c_int`` and every
+    Python-int argument as ``c_int``. On 64-bit Windows that truncated the
+    HMODULE from GetModuleHandleW, so SetWindowsHookExW refused both hooks on
+    every device in the fleet (``kbd=0 mouse=0`` once a minute, zero input
+    counted); the HHOOK return and the pointer-sized lParam chained through
+    CallNextHookEx were truncated/overflowed the same way. ``functype`` is
+    ``ctypes.WINFUNCTYPE`` in production; injectable so the declarations are
+    checkable on any OS."""
+    import ctypes
+    from ctypes import wintypes
+
+    LRESULT = wintypes.LPARAM  # noqa: N806 — Win32 name; pointer-sized signed (LONG_PTR)
+    HOOKPROC = functype(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)  # noqa: N806
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+    user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    user32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    # BOOL is signed, so GetMessageW's -1 error return survives for the pump.
+    user32.GetMessageW.argtypes = [
+        wintypes.LPMSG, wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [wintypes.LPMSG]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [wintypes.LPMSG]
+    user32.DispatchMessageW.restype = LRESULT
+    user32.PostThreadMessageW.argtypes = [
+        wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.PostThreadMessageW.restype = wintypes.BOOL
+    return HOOKPROC
+
+
+def _load_win32_hook_api():
+    """Backend-local user32/kernel32 with declared signatures, plus HOOKPROC.
+
+    Private ``WinDLL`` instances, NOT the shared ``ctypes.windll.*``: setting
+    argtypes on the global objects would silently change every other module's
+    calls to the same functions (system_events.py calls GetModuleHandleW too).
+    ``use_last_error=True`` so a refused install can log the real Windows error
+    via ``ctypes.get_last_error()``. Imported lazily: this module loads on every
+    platform."""
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    hookproc = _declare_win32_hook_signatures(user32, kernel32, ctypes.WINFUNCTYPE)
+    return user32, kernel32, hookproc
+
+
 def _default_input_backend(source: "InputSource"):
     """Build the platform's in-process input-counting backend, or None when the
     platform has no in-process hook.
@@ -547,6 +613,11 @@ class _WindowsHookBackend:
         # a window every tick where a refused hook reads as a working sensor and
         # _should_skip_external_input drops the external bucket.
         self._install_failed = False
+        # Seam for tests; production loads private, signature-declared DLLs.
+        self._api_loader = _load_win32_hook_api
+        # The typed user32 the hook thread loaded; stop() posts WM_QUIT through
+        # it. Assigned before _thread_id, so a non-None id implies it is set.
+        self._user32 = None
 
     def available(self) -> bool:
         """ctypes + user32 are always present on Windows, so this is a platform
@@ -588,12 +659,12 @@ class _WindowsHookBackend:
 
     def stop(self) -> None:
         tid = self._thread_id
-        if tid is None:
+        user32 = self._user32
+        if tid is None or user32 is None:
             return
         try:
-            import ctypes
             # WM_QUIT == 0x0012 — breaks the message loop so the thread exits.
-            ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)
+            user32.PostThreadMessageW(tid, 0x0012, 0, 0)
         except Exception as e:
             logger.debug("Windows input hook stop failed: %s", e)
 
@@ -641,19 +712,17 @@ class _WindowsHookBackend:
         try:
             import ctypes
             from ctypes import wintypes
+
+            # LowLevelKeyboardProc / LowLevelMouseProc signature is HOOKPROC.
+            user32, kernel32, HOOKPROC = self._api_loader()  # noqa: N806
         except Exception as e:
-            logger.warning("ctypes unavailable — Windows input hook disabled: %s", e)
+            logger.warning(
+                "ctypes/Win32 hook API unavailable — Windows input hook disabled: %s", e
+            )
             self._install_failed = True
             self._started.set()
             return
-
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        # LowLevelKeyboardProc / LowLevelMouseProc signature.
-        HOOKPROC = ctypes.CFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
-        )
+        self._user32 = user32
 
         src = self._source
 
@@ -682,19 +751,26 @@ class _WindowsHookBackend:
         self._kbd_cb = HOOKPROC(_kbd_proc)
         self._mouse_cb = HOOKPROC(_mouse_proc)
 
-        # A NULL hMod with dwThreadId 0 requires the callback to live in this
-        # module (it does). Pass the module handle for robustness.
+        # Low-level hooks are never injected, so with dwThreadId 0 Windows takes
+        # either a NULL hMod or any valid module handle. Older Windows versions
+        # are reported to refuse NULL (ERROR_MOD_NOT_FOUND), so pass this
+        # process's own (correctly typed, full 64-bit) module handle.
         h_mod = kernel32.GetModuleHandleW(None)
+        # Read each error immediately: the saved last-error is per thread and
+        # the next call overwrites it.
         self._kbd_hook = user32.SetWindowsHookExW(
             self._WH_KEYBOARD_LL, self._kbd_cb, h_mod, 0
         )
+        kbd_err = 0 if self._kbd_hook else ctypes.get_last_error()
         self._mouse_hook = user32.SetWindowsHookExW(
             self._WH_MOUSE_LL, self._mouse_cb, h_mod, 0
         )
+        mouse_err = 0 if self._mouse_hook else ctypes.get_last_error()
         if not self._kbd_hook or not self._mouse_hook:
             logger.warning(
-                "SetWindowsHookEx failed (kbd=%s mouse=%s) — in-process input "
-                "counting disabled", self._kbd_hook, self._mouse_hook,
+                "SetWindowsHookEx failed (kbd=%s err=%s mouse=%s err=%s) — "
+                "in-process input counting disabled",
+                self._kbd_hook, kbd_err, self._mouse_hook, mouse_err,
             )
             self._unhook(user32)
             self._install_failed = True
