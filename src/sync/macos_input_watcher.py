@@ -34,6 +34,8 @@ _kCGEventLeftMouseDown = 1
 _kCGEventRightMouseDown = 3
 _kCGEventOtherMouseDown = 25
 _kCGEventScrollWheel = 22
+# CGEventField kCGKeyboardEventAutorepeat: non-zero on a held key's repeats.
+_kCGKeyboardEventAutorepeat = 8  # noqa: N816 — Quartz name
 _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
 # macOS disables a tap for two reasons, not one. Handling only the timeout case
 # left a tap disabled by user input dead forever: counters frozen at 0 while
@@ -51,6 +53,18 @@ _EVENT_MASK = (
     | (1 << _kCGEventOtherMouseDown)
     | (1 << _kCGEventScrollWheel)
 )
+
+
+def _is_autorepeat(event) -> bool:
+    """True when a keyDown is a held key's auto-repeat, which is real input but
+    not a new key press. Reads only the autorepeat flag, never the key. Any
+    failure answers False, so the press is counted (the behaviour before this
+    filter existed) rather than silently dropped."""
+    try:
+        from Quartz import CGEventGetIntegerValueField
+        return CGEventGetIntegerValueField(event, _kCGKeyboardEventAutorepeat) != 0
+    except Exception:
+        return False
 
 
 class MacOSInputWatcher:
@@ -293,7 +307,9 @@ class MacOSInputWatcher:
             return (None, None)
 
     def _event_callback(self, proxy, event_type, event, refcon):
-        """CGEventTap callback — increment counters. Never reads key values."""
+        """CGEventTap callback — increment counters. Never reads key values;
+        on a keyDown it reads only the autorepeat flag, so a held key counts
+        as one press."""
         if event_type in _TAP_DISABLED_EVENT_TYPES:
             # Re-enable the tap if macOS disabled it. A tap that stays disabled
             # never increments a counter again, so the agent silently reports
@@ -315,10 +331,15 @@ class MacOSInputWatcher:
                 logger.warning("CGEventTap disabled by %s but no tap ref to re-enable", reason)
             return event
 
+        # Read outside the lock: it calls into Quartz.
+        repeat = event_type == _kCGEventKeyDown and _is_autorepeat(event)
         with self._lock:
             recognized = True
             if event_type == _kCGEventKeyDown:
-                self._presses += 1
+                # A repeat stays "recognized": it is real input, so it still
+                # moves the input-observed timestamp below; it is not a press.
+                if not repeat:
+                    self._presses += 1
             elif event_type in (
                 _kCGEventLeftMouseDown,
                 _kCGEventRightMouseDown,

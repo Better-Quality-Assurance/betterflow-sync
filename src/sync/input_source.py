@@ -539,6 +539,39 @@ def _load_win32_hook_api():
     return user32, kernel32, hookproc
 
 
+_KBDLLHOOKSTRUCT = None
+
+
+def _read_kbd_vkcode(lparam) -> Optional[int]:
+    """The vkCode of the KBDLLHOOKSTRUCT a WH_KEYBOARD_LL callback's lParam
+    points at, or None when it cannot be read. Never raises: it runs inside
+    the hook callback, where an exception would skip CallNextHookEx.
+
+    The key identity is used ONLY by _WindowsHookBackend to recognise an
+    auto-repeat. Callers must never log it, store it beyond the held-key set,
+    or put it in any event or payload (CLAUDE.md: input is counts only)."""
+    global _KBDLLHOOKSTRUCT
+    try:
+        if not isinstance(lparam, int) or lparam <= 0:
+            return None  # NULL / not a pointer: from_address would crash
+        import ctypes
+        from ctypes import wintypes
+
+        if _KBDLLHOOKSTRUCT is None:
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
+                ]
+            _KBDLLHOOKSTRUCT = KBDLLHOOKSTRUCT
+        return int(_KBDLLHOOKSTRUCT.from_address(lparam).vkCode)
+    except Exception:
+        return None
+
+
 def _default_input_backend(source: "InputSource"):
     """Build the platform's in-process input-counting backend, or None when the
     platform has no in-process hook.
@@ -561,8 +594,16 @@ class _WindowsHookBackend:
 
     Runs its own thread with a Windows message loop (``GetMessage``) — the OS
     only delivers low-level hook callbacks to a thread that pumps messages. The
-    callback reads ONLY the event type (WM_KEYDOWN / WM_*BUTTONDOWN / WM_*WHEEL),
-    never key values, then chains to the next hook.
+    callbacks read the event type (WM_KEYDOWN / WM_*BUTTONDOWN / WM_*WHEEL), then
+    chain to the next hook.
+
+    The keyboard callback also reads the key's ``vkCode``, for ONE purpose: a
+    held key makes Windows repeat WM_KEYDOWN ~30x/s with no repeat flag on an
+    LL hook, so a KEYDOWN for a key with no KEYUP since its last DOWN is an
+    auto-repeat and is not counted. The vkCode lives only in ``_held_keys``
+    (in memory, hook thread only, at most ``_MAX_HELD_KEYS`` entries, cleared on
+    every install and unhook). It is never logged, never stored anywhere else,
+    and never put in any event or payload — only the press COUNT leaves.
     """
 
     # Windows message / hook constants (defined here to avoid importing win32 at
@@ -571,6 +612,12 @@ class _WindowsHookBackend:
     _WH_MOUSE_LL = 14
     _WM_KEYDOWN = 0x0100
     _WM_SYSKEYDOWN = 0x0104
+    _WM_KEYUP = 0x0101
+    _WM_SYSKEYUP = 0x0105
+    # More keys "held" than a keyboard plausibly holds means KEYUPs were lost
+    # (another hook ate them, a timeout evicted ours): clear rather than let a
+    # stuck entry suppress that key's real presses forever.
+    _MAX_HELD_KEYS = 32
     _WM_LBUTTONDOWN = 0x0201
     _WM_RBUTTONDOWN = 0x0204
     _WM_MBUTTONDOWN = 0x0207
@@ -618,6 +665,34 @@ class _WindowsHookBackend:
         # The typed user32 the hook thread loaded; stop() posts WM_QUIT through
         # it. Assigned before _thread_id, so a non-None id implies it is set.
         self._user32 = None
+        # vkCodes with a KEYDOWN and no KEYUP yet: the auto-repeat filter. Hook
+        # thread only. See the class docstring for what may (not) be done with it.
+        self._held_keys: set = set()
+
+    def _is_new_key_press(self, wparam, lparam) -> bool:
+        """True when this keyboard message is a press to COUNT: a KEYDOWN /
+        SYSKEYDOWN for a key not already held. Updates the held set on downs
+        and ups. Runs inside the hook callback, so it never raises; an
+        unreadable lparam counts the KEYDOWN (today's behaviour)."""
+        try:
+            is_down = wparam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN)
+            is_up = wparam in (self._WM_KEYUP, self._WM_SYSKEYUP)
+            if not (is_down or is_up):
+                return False
+            vk = _read_kbd_vkcode(lparam)
+            if vk is None:
+                return is_down
+            if is_up:
+                self._held_keys.discard(vk)
+                return False
+            if vk in self._held_keys:
+                return False  # auto-repeat of a key still held
+            if len(self._held_keys) >= self._MAX_HELD_KEYS:
+                self._held_keys.clear()
+            self._held_keys.add(vk)
+            return True
+        except Exception:
+            return wparam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN)
 
     def available(self) -> bool:
         """ctypes + user32 are always present on Windows, so this is a platform
@@ -728,8 +803,8 @@ class _WindowsHookBackend:
 
         def _kbd_proc(nCode, wParam, lParam):
             if nCode == 0:  # HC_ACTION — a real event to process
-                src.note_event()  # key-ups included: liveness only, no count
-                if wParam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN):
+                src.note_event()  # key-ups and repeats: liveness only, no count
+                if self._is_new_key_press(wParam, lParam):
                     src._on_press()
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
@@ -748,6 +823,8 @@ class _WindowsHookBackend:
                     src.note_event()  # liveness only: never a count
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+        # Fresh install: any KEYUP sent while we were unhooked was never seen.
+        self._held_keys.clear()
         self._kbd_cb = HOOKPROC(_kbd_proc)
         self._mouse_cb = HOOKPROC(_mouse_proc)
 
@@ -838,6 +915,8 @@ class _WindowsHookBackend:
                     logger.debug("UnhookWindowsHookEx failed", exc_info=True)
         self._kbd_hook = None
         self._mouse_hook = None
+        # Unhooked: KEYUPs from here on are invisible, so forget held keys.
+        self._held_keys.clear()
 
 
 class _MacOSTapBackend:
