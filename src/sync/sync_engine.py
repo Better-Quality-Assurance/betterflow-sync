@@ -2035,18 +2035,7 @@ class SyncEngine:
                 events.sort(key=lambda e: e.timestamp)  # AW is newest-first
                 batch: list[dict] = []
                 for event in events:
-                    if _is_window_like(bucket.type):
-                        batch.extend(
-                            self._transform_window_event_with_timeout(
-                                event, bucket.id, bucket.type, cycle
-                            )
-                        )
-                    else:
-                        transformed = self._transform_event(
-                            event, bucket.id, bucket.type, skip_time_tracking=True, cycle=cycle
-                        )
-                        if transformed:
-                            batch.append(transformed)
+                    batch.extend(self._transform_for_replay(event, bucket, cycle))
                 if batch:
                     enqueued += self.queue.enqueue(batch)
         if enqueued:
@@ -2055,6 +2044,37 @@ class SyncEngine:
                 enqueued,
                 day_start.isoformat(),
             )
+
+    def _transform_for_replay(
+        self, event: AWEvent, bucket, cycle: "_SyncCycleContext"
+    ) -> list[dict]:
+        """Transform one AW event for the paths that ENQUEUE instead of sending:
+        ``_reconcile_backlog`` and ``_flush_pre_window_tail``.
+
+        One implementation for both, because they had drifted from live sync:
+        #269 split a >24h non-window event inside ``_transform_and_checkpoint``
+        only, so these two still queued it whole. The pause tail flush is the
+        likely one: it fetches from the bucket's checkpoint, which for an ongoing
+        AFK event is that event's start, so after a day idle it returns the whole
+        >24h event. ``evict_unstorable`` then dead-lettered it as over-long real
+        loss (ops board 2026-10-09, device 10, agent 1.5.138:
+        "Dropped 1 queued event(s) ... buckets=aw-watcher-afk"). Splitting with
+        the same ``_split_over_long_event`` gives the same chunk ids the live
+        path sends, so the server upserts rather than storing a second copy.
+
+        Non-window events pass ``skip_time_tracking`` so a replay never touches
+        the daily total; window events dedup through the counted-time cache in
+        ``_transform_window_event_with_timeout`` and are not split (their
+        classification is per event, same as live sync).
+        """
+        if _is_window_like(bucket.type):
+            return self._transform_window_event_with_timeout(
+                event, bucket.id, bucket.type, cycle
+            )
+        transformed = self._transform_event(
+            event, bucket.id, bucket.type, skip_time_tracking=True, cycle=cycle
+        )
+        return _split_over_long_event(transformed) if transformed else []
 
     def _within_working_hours(self, event: AWEvent) -> bool:
         """True if the event's start may be uploaded — i.e. it falls inside the
@@ -5008,19 +5028,7 @@ class SyncEngine:
                 events.sort(key=lambda e: e.timestamp)  # AW is newest-first
                 batch: list[dict] = []
                 for event in events:
-                    if _is_window_like(bucket.type):
-                        batch.extend(
-                            self._transform_window_event_with_timeout(
-                                event, bucket.id, bucket.type, cycle
-                            )
-                        )
-                    else:
-                        transformed = self._transform_event(
-                            event, bucket.id, bucket.type,
-                            skip_time_tracking=True, cycle=cycle,
-                        )
-                        if transformed:
-                            batch.append(transformed)
+                    batch.extend(self._transform_for_replay(event, bucket, cycle))
                 if batch:
                     enqueued += self.queue.enqueue(batch)
             except Exception as e:
