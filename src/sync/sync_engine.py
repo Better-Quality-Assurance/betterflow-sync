@@ -629,6 +629,11 @@ class SyncEngine:
         # confirmed send, mirroring AFK/window. Mutated only on the sync thread.
         self.input_source = None
         self._input_inproc_checkpoint: Optional[datetime] = None
+        # End of the newest in-process input event fed to the analyzer. Lets
+        # has_input_data mean "input observed within the lookback" on the
+        # in-process path, as it does for the external bucket, instead of
+        # "something was typed THIS cycle". Local only.
+        self._inproc_input_analyzed_until: Optional[datetime] = None
 
         # Monotonic timestamp of the current sync() cycle's start, stamped at the
         # top of sync(). Gates the per-bucket send loop's in-cycle network budget
@@ -1542,10 +1547,36 @@ class SyncEngine:
             )
             self._backlog_reconciled = True
 
+        # When the agent counts input in-process (the sole input source), drop the
+        # external aw-watcher-input bucket(s) so its (possibly hook-blocked, zero)
+        # events never reach the server and can't double-count. No-op when the
+        # flag is off (default): the external input bucket syncs exactly as today.
+        # Decided ONCE here and used for upload AND analysis, so the analyzer
+        # sees exactly the input stream that is uploaded — never both.
+        skip_external_input = self._should_skip_external_input()
+
+        # Pending in-process input checkpoint for this cycle, kept as a LOCAL for
+        # the same wedge-recovery reason window_pending is (see _build_inproc_window).
+        # Drained BEFORE the input analysis so the analyzer sees it: on Windows
+        # this is the only input stream there is, and without it no window event
+        # ever carried a client fraud_score.
+        input_pending: Optional[datetime] = None
+        input_event: Optional[dict] = None
+        if skip_external_input:
+            # Sole-source path: drain the accumulated keystroke/click/scroll
+            # counts into one event for the slice since the last covered instant.
+            input_event, input_pending = self._build_inproc_input(
+                datetime.now(timezone.utc)
+            )
+
         # Fetch input events for activity analysis before processing window
         # events. The returned context is threaded explicitly through the
         # transform path — no per-cycle state lives on the instance.
-        cycle = self._prepare_input_analysis(input_buckets)
+        cycle = self._prepare_input_analysis(
+            input_buckets,
+            analyze_external=not skip_external_input,
+            inproc_input_event=input_event,
+        )
 
         # When the agent is the sole per-app window source (in-process), drop the
         # external bf-window-tracker bucket(s) entirely — we upload our own stream
@@ -1595,11 +1626,6 @@ class SyncEngine:
         # with the engine every active cycle — one source of truth, not a cache a
         # separate timer keeps in sync (and silently failed to: Bug A, #76/#78).
         self._publish_inproc_afk_flag(skip_external_afk)
-        # When the agent counts input in-process (the sole input source), drop the
-        # external aw-watcher-input bucket(s) so its (possibly hook-blocked, zero)
-        # events never reach the server and can't double-count. No-op when the
-        # flag is off (default): the external input bucket syncs exactly as today.
-        skip_external_input = self._should_skip_external_input()
         for bucket in web_buckets + afk_buckets + input_buckets:
             if skip_external_afk and _is_afk_like(bucket.type):
                 continue
@@ -1639,17 +1665,9 @@ class SyncEngine:
             )
             all_events.extend(window_events)
 
-        # Pending in-process input checkpoint for this cycle, kept as a LOCAL for
-        # the same wedge-recovery reason window_pending is (see _build_inproc_window).
-        input_pending: Optional[datetime] = None
-        if skip_external_input:
-            # Sole-source path: drain the accumulated keystroke/click/scroll
-            # counts into one event for the slice since the last covered instant.
-            input_event, input_pending = self._build_inproc_input(
-                datetime.now(timezone.utc)
-            )
-            if input_event is not None:
-                all_events.append(input_event)
+        # The in-process input event drained above (before the analysis).
+        if input_event is not None:
+            all_events.append(input_event)
 
         # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
         # from (app, start), so the server upserts one growing row per meeting.
@@ -1762,12 +1780,25 @@ class SyncEngine:
             self._window_filter_streak, cause,
         )
 
-    def _prepare_input_analysis(self, input_buckets: list) -> _SyncCycleContext:
+    def _prepare_input_analysis(
+        self,
+        input_buckets: list,
+        *,
+        analyze_external: bool = True,
+        inproc_input_event: Optional[dict] = None,
+    ) -> _SyncCycleContext:
         """Fetch recent input events, feed the activity analyzer, and return a
         fresh cycle context recording whether input data exists.
 
         The lookback covers the engagement window and the AFK grace period so
         the analyzer sees enough history to classify engagement.
+
+        ``analyze_external`` is False when the in-process source has replaced
+        the external input bucket for upload; the analyzer then reads only
+        ``inproc_input_event`` (this cycle's drain, with its real
+        [range_start, range_end] span, which the analyzer pro-rates). The
+        external buckets are still read for ``last_input_at`` exactly as
+        before, so the foreground-activity anchor does not change.
         """
         input_lookback_minutes = max(
             self.config.engagement.window_minutes * 2,
@@ -1784,7 +1815,32 @@ class SyncEngine:
                 input_events_for_analysis.extend(events)
             except AWClientError as e:
                 logger.debug("input bucket %s fetch failed: %s", bucket.id, e)
-        self._activity_analyzer.add_input_events(input_events_for_analysis)
+        analyzed: list[AWEvent] = (
+            list(input_events_for_analysis) if analyze_external else []
+        )
+        if inproc_input_event is not None:
+            try:
+                inproc = AWEvent.from_dict(inproc_input_event)
+            except ValueError as e:
+                # Analysis only: the event itself still uploads unchanged.
+                logger.debug("in-process input event not analysable: %s", e)
+            else:
+                analyzed.append(inproc)
+                self._inproc_input_analyzed_until = (
+                    inproc.timestamp + timedelta(seconds=inproc.duration)
+                )
+        self._activity_analyzer.add_input_events(analyzed)
+        has_input_data = len(analyzed) > 0
+        if not has_input_data and not analyze_external:
+            # A quiet cycle on the in-process path: the external bucket would
+            # still report input data while any event sits in the lookback, so
+            # do the same rather than flipping this cycle's windows to an
+            # unclassified, unscored "active".
+            seen = self._inproc_input_analyzed_until
+            has_input_data = seen is not None and (
+                datetime.now(timezone.utc) - seen
+                <= timedelta(minutes=input_lookback_minutes)
+            )
         # Latest real-input instant (end-time of the newest input event) as the
         # cross-platform human-presence anchor for foreground-activity credit.
         last_input_at: Optional[datetime] = None
@@ -1793,7 +1849,7 @@ class SyncEngine:
             if last_input_at is None or end > last_input_at:
                 last_input_at = end
         return _SyncCycleContext(
-            has_input_data=len(input_events_for_analysis) > 0,
+            has_input_data=has_input_data,
             last_input_at=last_input_at,
         )
 

@@ -120,10 +120,17 @@ class FraudSignalDetector:
 
     Signals detected:
     - keystroke_uniformity: Suspiciously uniform keystroke counts across windows
-    - input_regularity: Events fired at precise, machine-like intervals
     - mouse_only_streak: Consecutive windows with clicks but no other input
     - low_app_diversity: Too few unique apps over extended active time
     - click_keystroke_ratio: Abnormally high click-to-keystroke ratio
+    - implausible_input_rate: Any single window averaging more presses/min
+      than a person can plausibly type
+
+    Retired 2026-10-09: input_regularity. The analyzer sees aggregate count
+    events from a periodic emitter (the macOS watcher every 10 s, the AW input
+    bucket, or the in-process drain once per sync cycle), so inter-event gaps
+    carry the sampler's clock, not the human's, and every steady worker scored
+    ~24. Its two config fields stay so an older server /config still parses.
     """
 
     def __init__(self, config=None):
@@ -134,19 +141,27 @@ class FraudSignalDetector:
         self._unique_apps: set[str] = set()
         # Consecutive mouse-only window count
         self._mouse_only_streak: int = 0
-        # Input event timestamps for regularity analysis (bounded: ~60 events/min * 60 min)
+        # Input event timestamps (retired signal; no longer scored; bounded)
         self._input_timestamps: deque[datetime] = deque(maxlen=3600)
         # Session-level cumulative metrics
         self._total_clicks: int = 0
         self._total_presses: int = 0
         # Active time accumulated in minutes
         self._active_minutes: float = 0.0
+        # Highest presses/min seen in any single window this session.
+        self._max_presses_per_minute: float = 0.0
 
     def update_config(self, config) -> None:
         self._config = config
 
-    def record_window_metrics(self, metrics: "ActivityMetrics", app: Optional[str] = None) -> None:
+    def record_window_metrics(
+        self, metrics: "ActivityMetrics", app: Optional[str] = None, window_minutes: float = 5
+    ) -> None:
         """Record metrics from one analysis window."""
+        if window_minutes > 0:
+            rate = metrics.presses / window_minutes
+            if rate > self._max_presses_per_minute:
+                self._max_presses_per_minute = rate
         self._window_press_counts.append(metrics.presses)
         self._total_clicks += metrics.clicks
         self._total_presses += metrics.presses
@@ -161,7 +176,7 @@ class FraudSignalDetector:
             self._mouse_only_streak = 0
 
     def record_input_timestamp(self, timestamp: datetime) -> None:
-        """Record an input event timestamp for regularity analysis.
+        """Record an input event timestamp (no longer feeds a score; see class docstring).
 
         Uses a bounded deque (maxlen=3600) for O(1) append with automatic eviction.
         """
@@ -182,29 +197,28 @@ class FraudSignalDetector:
             signals.append("keystroke_uniformity")
             total_score += ks_score
 
-        # Signal 2: Input regularity (0-25)
-        ir_score, ir_cv = self._check_input_regularity()
-        if ir_score > 0:
-            signals.append("input_regularity")
-            total_score += ir_score
-
-        # Signal 3: Mouse-only streak (0-20)
+        # Signal 2: Mouse-only streak (0-20)
         mo_score = self._check_mouse_only_streak()
         if mo_score > 0:
             signals.append("mouse_only_streak")
             total_score += mo_score
 
-        # Signal 4: Low app diversity (0-15)
+        # Signal 3: Low app diversity (0-15)
         ad_score = self._check_app_diversity()
         if ad_score > 0:
             signals.append("low_app_diversity")
             total_score += ad_score
 
-        # Signal 5: Click-to-keystroke ratio (0-10)
+        # Signal 4: Click-to-keystroke ratio (0-10)
         ck_score = self._check_click_keystroke_ratio()
         if ck_score > 0:
             signals.append("click_keystroke_ratio")
             total_score += ck_score
+
+        # Signal 5: Implausible typing rate in any single window (0 or 30)
+        if self._max_presses_per_minute > self._config.max_presses_per_minute:
+            signals.append("implausible_input_rate")
+            total_score += 30
 
         return FraudAssessment(
             score=min(total_score, 100),
@@ -214,6 +228,7 @@ class FraudSignalDetector:
                 "keystroke_variance": round(ks_cv, 4) if ks_cv is not None else None,
                 "mouse_only_streak": self._mouse_only_streak,
                 "click_keystroke_ratio": round(self._total_clicks / max(self._total_presses, 1), 2),
+                "max_presses_per_minute": round(self._max_presses_per_minute, 1),
             },
         )
 
@@ -241,41 +256,6 @@ class FraudSignalDetector:
             # At cv=0 -> 30, at cv=threshold -> 0
             score = int(30 * (1 - cv / cfg.keystroke_cv_threshold))
             return min(score, 30), cv
-
-        return 0, cv
-
-    def _check_input_regularity(self) -> tuple[int, Optional[float]]:
-        """Check if input events arrive at suspiciously regular intervals.
-
-        Returns (score 0-25, coefficient_of_variation or None).
-        """
-        cfg = self._config
-        if len(self._input_timestamps) < cfg.min_input_events_for_regularity:
-            return 0, None
-
-        sorted_ts = sorted(self._input_timestamps)
-        gaps = []
-        for i in range(1, len(sorted_ts)):
-            gap = (sorted_ts[i] - sorted_ts[i - 1]).total_seconds()
-            if gap > 0:
-                gaps.append(gap)
-
-        n_gaps = len(gaps)
-        if n_gaps < 2:
-            return 0, None
-
-        mean = sum(gaps) / n_gaps
-        if mean == 0:
-            return 0, None
-
-        # Sample variance (N-1)
-        variance = sum((g - mean) ** 2 for g in gaps) / (n_gaps - 1)
-        std_dev = math.sqrt(variance)
-        cv = std_dev / mean
-
-        if cv < cfg.input_regularity_cv_threshold:
-            score = int(25 * (1 - cv / cfg.input_regularity_cv_threshold))
-            return min(score, 25), cv
 
         return 0, cv
 
@@ -333,6 +313,7 @@ class FraudSignalDetector:
         self._total_clicks = 0
         self._total_presses = 0
         self._active_minutes = 0.0
+        self._max_presses_per_minute = 0.0
 
 
 class ActivityAnalyzer:
@@ -405,7 +386,7 @@ class ActivityAnalyzer:
         new_events = [e for e in events if e.id not in existing_ids]
         self._input_events.extend(new_events)
 
-        # Record timestamps for fraud regularity analysis
+        # Record input timestamps (not scored since input_regularity was retired)
         for e in new_events:
             self._fraud_detector.record_input_timestamp(e.timestamp)
         if new_events:
@@ -413,11 +394,17 @@ class ActivityAnalyzer:
 
         # Prune old events anchored to the latest event timestamp (not wall
         # clock) so historical replays from the offline queue aren't
-        # immediately discarded as "too old".
+        # immediately discarded as "too old". Keyed on each event's END: a
+        # catch-up event spanning a 15-minute outage starts long before the
+        # cutoff yet still overlaps the current window, and _compute_metrics
+        # counts that overlap.
         if self._input_events:
             ref = max(e.timestamp for e in self._input_events)
             cutoff = ref - timedelta(minutes=self._thresholds.window_minutes * 2)
-            self._input_events = [e for e in self._input_events if e.timestamp >= cutoff]
+            self._input_events = [
+                e for e in self._input_events
+                if e.timestamp + timedelta(seconds=max(e.duration, 0)) >= cutoff
+            ]
 
         # Sort by timestamp for consistent processing
         self._input_events.sort(key=lambda e: e.timestamp)
@@ -507,7 +494,9 @@ class ActivityAnalyzer:
         # Record this window's metrics into the fraud detector.
         # Use monotonic sequence counter to avoid recording the same window twice.
         if self._fraud_seq != self._last_fraud_seq:
-            self._fraud_detector.record_window_metrics(metrics, app=app)
+            self._fraud_detector.record_window_metrics(
+                metrics, app=app, window_minutes=self._thresholds.window_minutes
+            )
             # Track active time for app diversity checks (inside guard to avoid double-counting)
             if metrics.is_engaged(self._thresholds):
                 actual = active_seconds if active_seconds > 0 else self._thresholds.window_minutes * 60
@@ -527,26 +516,50 @@ class ActivityAnalyzer:
         """
         window_start = timestamp - timedelta(minutes=self._thresholds.window_minutes)
 
-        # Sum input metrics in window
-        total_presses = 0
-        total_clicks = 0
-        total_scrolls = 0
+        # Sum input metrics in window. An input event is a COUNT over the span
+        # [ts, ts + duration], so only the share of that span overlapping the
+        # window is counted. Counting the whole event by its start time let a
+        # catch-up event (15 min of typing posted after an AW outage) land in
+        # one 5-minute window at three times the real rate. Summed as floats,
+        # rounded once at the end so ActivityMetrics (which is sent to the
+        # server) keeps its integer shape.
+        total_presses = 0.0
+        total_clicks = 0.0
+        total_scrolls = 0.0
 
         for event in self._input_events:
-            if window_start <= event.timestamp <= timestamp:
-                total_presses += event.presses
-                total_clicks += event.clicks
-                total_scrolls += event.scrolls
+            share = self._window_share(event, window_start, timestamp)
+            if share <= 0.0:
+                continue
+            total_presses += event.presses * share
+            total_clicks += event.clicks * share
+            total_scrolls += event.scrolls * share
 
         # Count window changes in window
         window_changes = self._count_window_changes(window_start, timestamp)
 
         return ActivityMetrics(
-            presses=total_presses,
-            clicks=total_clicks,
-            scrolls=total_scrolls,
+            presses=int(round(total_presses)),
+            clicks=int(round(total_clicks)),
+            scrolls=int(round(total_scrolls)),
             window_changes=window_changes,
         )
+
+    @staticmethod
+    def _window_share(event: AWEvent, start: datetime, end: datetime) -> float:
+        """Fraction of ``event``'s counts that fall inside [start, end].
+
+        The counts are assumed spread evenly over [ts, ts + duration]. An event
+        with no duration is a point: whole if its ts is in the window (the
+        pre-span behaviour), nothing otherwise."""
+        duration = event.duration
+        if not duration or duration <= 0:
+            return 1.0 if start <= event.timestamp <= end else 0.0
+        ev_end = event.timestamp + timedelta(seconds=duration)
+        overlap = (min(ev_end, end) - max(event.timestamp, start)).total_seconds()
+        if overlap <= 0:
+            return 0.0
+        return min(1.0, overlap / duration)
 
     def _count_window_changes(self, start: datetime, end: datetime) -> int:
         """Count the number of window/app changes in a time range.

@@ -582,6 +582,17 @@ class BetterFlowClient(BaseApiClient):
         # preserve-don't-delete design exists for was never actually met.
         # int, always present: 0 is an explicit healthy signal, not an omission.
         "dead_letter_count",
+        # Whether the in-process input COUNTER is working: "ok" / "silent" (a
+        # symptom: the OS saw input in the last minute but our counter received
+        # none for five — possibly the hook removed by Windows, an elevated
+        # foreground window, or the secure desktop; a sensor state, not evidence
+        # of tampering) / "unavailable" (the OS refused the hook, or it stopped
+        # inside the capture window) / "off" (capture disallowed by the
+        # working-hours policy right now). Absent when in-process input is off or
+        # there is no backend. Built from a local event timestamp that never
+        # leaves the machine. See InputSource.capture_state and
+        # main._build_health_telemetry.
+        "input_capture_state",
     )
 
     def heartbeat(
