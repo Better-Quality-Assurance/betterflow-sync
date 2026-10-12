@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _WM_KEYDOWN = 0x0100
+_WM_KEYUP = 0x0101
 _WM_LBUTTONDOWN = 0x0201
 
 
@@ -110,3 +111,46 @@ def test_real_callbacks_chain_a_64bit_lparam_and_count(monkeypatch):
         f"{u.exc_type.__name__}: {u.exc_value}" for u in unraisable
     ]
     assert src.counts == (1, 1, 0)
+
+
+def test_real_callback_counts_a_held_key_once(monkeypatch):
+    """A held key repeats WM_KEYDOWN for the same vkCode with no KEYUP. Through
+    the REAL callback thunk and a real KBDLLHOOKSTRUCT pointer, the repeat must
+    not be counted and a release must re-arm the key (device 34: every row
+    scored implausible_input_rate once the hook started counting repeats)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda u: unraisable.append(u))
+
+    key_a = KBDLLHOOKSTRUCT(vkCode=0x41)
+    addr = ctypes.addressof(key_a)
+
+    src, be = _backend()
+    try:
+        be.start()
+        assert be._kbd_cb is not None, "callback was never built"
+        be._kbd_cb(0, _WM_KEYDOWN, addr)
+        be._kbd_cb(0, _WM_KEYDOWN, addr)   # auto-repeat: same key, no KEYUP
+        be._kbd_cb(0, _WM_KEYDOWN, addr)
+        held = src.counts
+        be._kbd_cb(0, _WM_KEYUP, addr)
+        be._kbd_cb(0, _WM_KEYDOWN, addr)   # a real second press
+    finally:
+        _stop(be)
+
+    assert unraisable == [], [
+        f"{u.exc_type.__name__}: {u.exc_value}" for u in unraisable
+    ]
+    assert held == (1, 0, 0)
+    assert src.counts == (2, 0, 0)
