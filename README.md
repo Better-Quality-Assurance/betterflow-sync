@@ -133,6 +133,9 @@ BETTERFLOW_WEB_BASE_URL=https://app.betterflow.eu
 # Install dev dependencies (includes pytest, ruff, pyinstaller)
 pip install -r requirements-dev.txt
 
+# Or, to run only the tests (no tray stack, so no C compiler needed on Linux):
+# pip install -r requirements-test.txt
+
 # Run tests
 make test
 

@@ -1,0 +1,27 @@
+# What the test suite needs, and nothing that has to be compiled (#262).
+#
+#   pip install -r requirements-test.txt && pytest tests/
+#
+# Runtime pins come from requirements-core.txt, i.e. requirements.txt minus the
+# tray/desktop backends (pystray, PyGObject, python-xlib). PyGObject has no
+# Linux wheel and needs a C toolchain plus libgirepository/cairo headers, so
+# including it made the suite uninstallable in a clean container. No test
+# imports gi, pystray or Xlib: src/ imports them lazily inside functions, and
+# the tray tests patch src.ui.tray.pystray. tests/test_requirements_split.py
+# fails if any of the three comes back into this set.
+#
+# Desktop development (running the tray, building with PyInstaller) still uses
+# requirements-dev.txt, which carries the full runtime set.
+-r requirements-core.txt
+
+pytest>=7.0
+pytest-mock>=3.0
+pytest-cov>=4.0
+responses>=0.23
+
+# Clock travel for tests. Moves time.time(), time.gmtime(), time.localtime()
+# and datetime together at the C level — a hand-rolled patch that freezes only
+# datetime leaves time.time() on the real clock, and the resulting hours-wide
+# skew reads as a day-boundary bug (#190). Used by tests/freeze_clock_plugin.py,
+# which is opt-in via -p and does not affect a normal run.
+time-machine>=2.13
