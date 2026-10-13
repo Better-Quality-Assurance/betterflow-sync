@@ -147,15 +147,24 @@ def local_reason_kinds(reasons) -> list[str]:
     # Each item takes the FIRST prefix it matches, so overlapping prefixes
     # ("Server returned 429" / "Server returned") yield one kind per reason.
     matched = set()
+    any_unmatched = False
     for item in items:
         for prefix, kind in _LOCAL_REASON_KINDS:
             if item.startswith(prefix):
                 matched.add(kind)
                 break
+        else:
+            any_unmatched = True
     ordered: list[str] = []
     for _, kind in _LOCAL_REASON_KINDS:
         if kind in matched and kind not in ordered:
             ordered.append(kind)
+    # An item that matched no prefix is a fact, not an absence. Dropping it made
+    # one bucket failure plus an unknown reason read exactly like two bucket
+    # failures, and with nothing matched, like a pre-#254 agent (#255). Last,
+    # so the order stays fixed; a token we wrote, never the item's text.
+    if any_unmatched:
+        ordered.append(_UNCLASSIFIED_KIND)
     return ordered
 
 
@@ -188,11 +197,11 @@ def server_status_summary(reasons) -> str:
     if codes and not uncoded:
         return f"; server status {','.join(codes)}, full reason in local dead-letter"
     kinds = local_reason_kinds(uncoded)
-    # No kind matched is a FACT to report, not an absence: without the literal,
-    # this branch emitted the exact bytes a pre-#254 agent sends, so ops could
-    # not tell "unrecognised reason" from "agent predates the fix" (#255). The
-    # token is ours, chosen from no input, so nothing new leaves the device.
-    named = f" [{','.join(kinds) if kinds else _UNCLASSIFIED_KIND}]"
+    # Never empty here: `uncoded` is non-empty on every path that reaches this
+    # line, and local_reason_kinds names an unmatched item `unclassified` rather
+    # than dropping it (#255). The bare-count bytes a pre-#254 agent sends are
+    # therefore unreachable. The `if kinds` keeps that true if a caller changes.
+    named = f" [{','.join(kinds)}]" if kinds else f" [{_UNCLASSIFIED_KIND}]"
     if codes:
         return (f"; server status {','.join(codes)} plus "
                 f"{len(uncoded)} local reason(s){named}, "

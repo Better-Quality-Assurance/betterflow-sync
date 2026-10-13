@@ -51,3 +51,43 @@ def test_CONTROL_status_only_reasons_are_unchanged():
 
 def test_CONTROL_no_reasons_is_still_empty():
     assert server_status_summary([]) == ""
+
+
+# ── Review of #280: a PARTIAL match hid the unknown reason ───────────────────
+# [unclassified] was emitted only when NO reason matched, and
+# local_reason_kinds drops an item that matches no prefix. So one bucket
+# failure plus one unknown reason produced the same bytes as two bucket
+# failures, and the unknown one vanished from the alert.
+
+TWO_BUCKET_FAILURES = [
+    "Failed to sync bucket aw-watcher-window_H: boom",
+    "Failed to sync bucket aw-watcher-afk_H: boom",
+]
+ONE_BUCKET_ONE_UNKNOWN = [
+    "Failed to sync bucket aw-watcher-window_H: boom",
+    "Bank details 1234 rejected",
+]
+
+
+def test_a_known_and_an_unknown_reason_is_not_byte_identical_to_two_known():
+    mixed = server_status_summary(ONE_BUCKET_ONE_UNKNOWN)
+    assert mixed != server_status_summary(TWO_BUCKET_FAILURES), mixed
+    assert mixed == ("; 2 local reason(s) [bucket-sync-failed,unclassified] "
+                     "recorded in local dead-letter"), mixed
+
+
+def test_a_partial_match_beside_a_server_status_still_names_the_unknown():
+    out = server_status_summary(["API error (500): x", *ONE_BUCKET_ONE_UNKNOWN])
+    assert out == ("; server status 500 plus 2 local reason(s) "
+                   "[bucket-sync-failed,unclassified], full detail in local dead-letter"), out
+
+
+def test_CONTROL_two_bucket_failures_still_give_only_their_kind():
+    out = server_status_summary(TWO_BUCKET_FAILURES)
+    assert out == "; 2 local reason(s) [bucket-sync-failed] recorded in local dead-letter", out
+
+
+def test_CONTROL_the_partial_match_ships_no_reason_text():
+    out = server_status_summary(ONE_BUCKET_ONE_UNKNOWN)
+    for leaked in ("Bank details", "1234", "aw-watcher", "boom"):
+        assert leaked not in out, f"{leaked!r} leaked: {out}"
