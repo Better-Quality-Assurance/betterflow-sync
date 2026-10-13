@@ -128,6 +128,11 @@ _LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Emitted in place of a kind when a local reason matched none of the prefixes
+#: above. Never derived from the reason text.
+_UNCLASSIFIED_KIND = "unclassified"
+
+
 def local_reason_kinds(reasons) -> list[str]:
     """Bounded kinds for reasons that carry no server status.
 
@@ -183,7 +188,11 @@ def server_status_summary(reasons) -> str:
     if codes and not uncoded:
         return f"; server status {','.join(codes)}, full reason in local dead-letter"
     kinds = local_reason_kinds(uncoded)
-    named = f" [{','.join(kinds)}]" if kinds else ""
+    # No kind matched is a FACT to report, not an absence: without the literal,
+    # this branch emitted the exact bytes a pre-#254 agent sends, so ops could
+    # not tell "unrecognised reason" from "agent predates the fix" (#255). The
+    # token is ours, chosen from no input, so nothing new leaves the device.
+    named = f" [{','.join(kinds) if kinds else _UNCLASSIFIED_KIND}]"
     if codes:
         return (f"; server status {','.join(codes)} plus "
                 f"{len(uncoded)} local reason(s){named}, "

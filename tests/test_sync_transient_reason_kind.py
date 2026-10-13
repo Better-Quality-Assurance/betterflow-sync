@@ -126,7 +126,9 @@ def test_CONTROL_the_interpolated_text_still_never_leaves_the_device():
 
 def test_CONTROL_an_unrecognised_reason_is_still_counted_not_named():
     out = server_status_summary(["Bank details 1234-5678 rejected by upstream"])
-    assert out == "; 1 local reason(s) recorded in local dead-letter", out
+    # Named as unclassified, never by its text (#255): the bare count was
+    # byte-identical to a pre-#254 agent's message.
+    assert out == "; 1 local reason(s) [unclassified] recorded in local dead-letter", out
 
 
 def test_CONTROL_a_definitive_rejection_still_reports_its_status():

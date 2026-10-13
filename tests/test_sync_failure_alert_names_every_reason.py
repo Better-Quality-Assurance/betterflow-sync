@@ -120,4 +120,5 @@ def test_NEGATIVE_CONTROL_no_errors_still_reports_the_fallback():
 
     (msg,) = _repeated_failure_messages(coord)
     assert "1 local reason(s)" in msg, msg
-    assert "[" not in msg, msg
+    # The fallback names no kind; since #255 it says so explicitly.
+    assert "[unclassified]" in msg, msg
