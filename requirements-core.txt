@@ -1,0 +1,36 @@
+# Runtime dependencies WITHOUT the Linux tray/desktop backends.
+#
+# Not an install target on its own: a real install is `requirements.txt`, which
+# includes this file and adds the tray stack. This file exists so that
+# `requirements-test.txt` can share these pins instead of copying them, and so a
+# bump here reaches both at once (#262).
+#
+# Upper bounds cap the next major to avoid a surprise breaking upstream release
+# (no lockfile, and the deps span 3 platforms). APScheduler<4 is the important
+# one — 4.0 is a breaking rewrite of the scheduler API this app relies on.
+requests>=2.31,<3
+keyring>=24.0,<26
+apscheduler>=3.10,<4
+platformdirs>=3.0,<5
+Pillow>=10.0,<13
+# psutil -> foreground-process CPU sampling for activity detection (credits
+# engaged no-input work like an active Claude Code/build session). Cross-platform.
+psutil>=7.2.2,<8
+pyobjc-framework-SystemConfiguration>=10.0,<13; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0,<13; sys_platform == "darwin"
+
+# Windows-only dependencies
+# uiautomation -> read the foreground browser's omnibox URL via UI Automation
+# (opt-in active-tab tracking, privacy.track_browser_urls). Fail-closed if absent.
+uiautomation>=2.0,<3; sys_platform == "win32"
+# Windows ships no IANA timezone database, so zoneinfo.ZoneInfo("Europe/Bucharest")
+# raises ZoneInfoNotFoundError there. WorkingHoursConfig.allows() would catch it and
+# fall back to the MACHINE's local timezone — i.e. evaluate an enforced working-hours
+# window in a timezone the employee themselves controls. Ship the tz database.
+tzdata>=2026.3; sys_platform == "win32"
+
+# Linux-only dependencies that need no compiler.
+# jeepney -> systemd-logind sleep/wake D-Bus signals; SecretStorage -> keyring
+# Secret Service backend (also pulled in transitively by keyring on Linux).
+jeepney>=0.8,<1; sys_platform == "linux"
+SecretStorage>=3.3,<4; sys_platform == "linux"
