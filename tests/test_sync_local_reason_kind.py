@@ -67,7 +67,10 @@ def test_kinds_come_from_a_closed_set():
         "Authentication error: z",
         "something nobody wrote",
     ])
-    assert everything == ["activitywatch-down", "bucket-list-failed", "bucket-sync-failed", "auth-error"]
+    # "something nobody wrote" is named `unclassified`, not dropped (#255):
+    # still a token from our closed set, never the item's text.
+    assert everything == ["activitywatch-down", "bucket-list-failed", "bucket-sync-failed", "auth-error",
+                          "unclassified"]
     for kind in everything:
         assert re.fullmatch(r"[a-z-]+", kind), kind
 
