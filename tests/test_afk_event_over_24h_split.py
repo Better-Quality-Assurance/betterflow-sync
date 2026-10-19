@@ -42,7 +42,10 @@ class _CapValidatingServer:
         self.stored: dict[str, dict] = {}
         self.rejected_batches = 0
 
-    def send_events(self, events):
+    def credential_generation(self):
+        return 0
+
+    def send_events(self, events, *, expected_generation=None):
         if any(not (0 <= e["duration"] <= 86400) for e in events):
             self.rejected_batches += 1
             return SyncResult(

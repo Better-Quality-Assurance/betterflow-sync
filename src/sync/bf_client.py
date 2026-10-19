@@ -14,14 +14,20 @@ try:
     from .. import __version__
     from .. import config as config_mod
     from ..config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
-    from .http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from .http_client import (
+        BaseApiClient, BetterFlowClientError, BetterFlowAuthError,
+        CredentialsChangedError,
+    )
     from .privacy_filter import partition_excluded
     from .retry import RetryConfig
 except ImportError:
     from src import __version__
     import config as config_mod
     from config import DEFAULT_API_URL, PrivacySettings, get_machine_uuid
-    from sync.http_client import BaseApiClient, BetterFlowClientError, BetterFlowAuthError
+    from sync.http_client import (
+        BaseApiClient, BetterFlowClientError, BetterFlowAuthError,
+        CredentialsChangedError,
+    )
     from sync.privacy_filter import partition_excluded
     from sync.retry import RetryConfig
 
@@ -29,6 +35,9 @@ except ImportError:
 #: ops ingest by sync_engine.local_reason_kinds, which imports this constant
 #: rather than respelling it (see the REASON_* block in http_client).
 REASON_NO_CONFIRMATION = "server returned no delivery confirmation"
+#: A batch prepared under one set of credentials, refused before egress because
+#: a sign-in / sign-out / account switch replaced them (CredentialsChangedError).
+REASON_CREDENTIALS_CHANGED = "credentials changed since the batch was prepared"
 
 __all__ = [
     "BetterFlowClient",
@@ -301,11 +310,17 @@ class BetterFlowClient(BaseApiClient):
     # Event Sync
     # =========================================================================
 
-    def send_events(self, events: list[dict]) -> SyncResult:
+    def send_events(
+        self, events: list[dict], *, expected_generation: Optional[int] = None
+    ) -> SyncResult:
         """Send a batch of events to BetterFlow.
 
         Args:
             events: List of event dictionaries with timestamp, duration, bucket_id, data
+            expected_generation: credential_generation() the batch was prepared
+                under. If the credentials have changed since, nothing is sent
+                and a transient failure is returned (REASON_CREDENTIALS_CHANGED):
+                the batch must never go out under another account's token.
 
         Returns:
             SyncResult with success status and count
@@ -358,6 +373,7 @@ class BetterFlowClient(BaseApiClient):
                 data={"events": events},
                 compress=True,
                 extra_headers={"X-Idempotency-Key": idempotency_key},
+                expected_generation=expected_generation,
             )
             # Trust ONLY an explicit delivery confirmation from the server.
             #
@@ -437,6 +453,13 @@ class BetterFlowClient(BaseApiClient):
             )
         except BetterFlowAuthError:
             raise  # Callers must handle token refresh / re-login
+        except CredentialsChangedError:
+            # Nothing went on the wire. Transient: the caller holds or
+            # re-queues the batch, and the queue's owner check decides whether
+            # it is still deliverable at all.
+            return SyncResult(
+                success=False, error=REASON_CREDENTIALS_CHANGED, transient=True
+            )
         except BetterFlowClientError as e:
             # Transient unless the server gave a definitive 4xx rejection. The
             # error classifies itself (5xx / timeout / connection / DNS / 429 =>

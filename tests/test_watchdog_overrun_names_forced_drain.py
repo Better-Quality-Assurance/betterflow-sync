@@ -150,7 +150,7 @@ class TestARealForcedDrainNamesItself:
         bf = Mock()
         bf.is_reachable.return_value = True
         bf.start_session.side_effect = self.outage.start_session
-        bf.send_events.side_effect = lambda batch: SyncResult(
+        bf.send_events.side_effect = lambda batch, **_kw: SyncResult(
             success=True, events_synced=len(batch)
         )
         self.bf = bf
