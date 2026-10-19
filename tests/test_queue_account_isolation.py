@@ -30,7 +30,7 @@ import pytest
 
 from src.auth.login import LoginManager
 from src.config import Config
-from src.sync.bf_client import AuthResult, SyncResult
+from src.sync.bf_client import AuthResult, REASON_CREDENTIALS_CHANGED, SyncResult
 from src.sync.http_client import BetterFlowAuthError
 from src.sync.queue import OfflineQueue
 from src.sync.sync_engine import SyncEngine, SyncStats
@@ -52,13 +52,19 @@ class FakeBF:
         self.delivered: list[tuple[str, str]] = []  # (token, event id)
         self.next_auth: AuthResult | None = None
         self.send_hook = None
+        self.generation = 0
 
     def set_credentials(self, token, device_id):
         self.token = token
         self.device_id = device_id
+        self.generation += 1
 
     def clear_credentials(self):
         self.token = None
+        self.generation += 1
+
+    def credential_generation(self):
+        return self.generation
 
     def get_status(self):
         if self.token is None or self.token in self.rejected:
@@ -68,11 +74,17 @@ class FakeBF:
     def exchange_code(self, code, device_name, code_verifier, device_info=None):
         return self.next_auth
 
-    def send_events(self, events):
+    def send_events(self, events, *, expected_generation=None):
         if self.send_hook is not None:
             self.send_hook()
         # Read the token at "request time", AFTER any hook: that is when the
-        # real client builds its Authorization header.
+        # real client builds its Authorization header — and, like the real
+        # client (http_client._get_headers), refuses a batch pinned to
+        # credentials that have since been replaced.
+        if expected_generation is not None and expected_generation != self.generation:
+            return SyncResult(
+                success=False, transient=True, error=REASON_CREDENTIALS_CHANGED
+            )
         token = self.token
         if token is None or token in self.rejected:
             raise BetterFlowAuthError("401 Unauthenticated")
@@ -308,8 +320,9 @@ class TestInFlightDelivery:
         self, tmp_path
     ):
         """The sync thread can be mid-drain when the next person signs in on
-        the login thread. The new token must not go live while a batch the
-        previous account owns is still on its way out."""
+        the login thread. The sign-in must not wait for the in-flight send
+        (no lock across network I/O), and the batch, prepared under the
+        previous account's credentials, must never go out with the new token."""
         bf = FakeBF()
         queue = OfflineQueue(db_path=tmp_path / "q.db")
         engine = _engine(bf, queue)
@@ -347,17 +360,18 @@ class TestInFlightDelivery:
             daemon=True,
         )
         login.start()
-        time.sleep(0.3)  # give the login thread every chance to race ahead
+        login.join(2)
+        # The sign-in completed while the send was still hung.
+        assert not login.is_alive(), "sign-in blocked behind an in-flight send"
         release.set()
         drain.join(10)
-        login.join(10)
 
-        assert not drain.is_alive() and not login.is_alive(), "drain/login deadlocked"
+        assert not drain.is_alive(), "drain never finished"
         assert errors == {}, errors
-        assert sorted(_owned_by(bf, "alice")) == [
-            ("tok-alice", "alice-0"), ("tok-alice", "alice-1"),
-        ]
         assert bf.token == "tok-bob"
+        assert [d for d in bf.delivered if d[0] == "tok-bob"] == []
+        assert _owned_by(bf, "alice") == []
+        assert queue.size() == 0
 
 
 # The pre-upgrade schema, verbatim from origin/main at 152fb0e: no account
@@ -516,3 +530,360 @@ def test_app_wires_the_queue_into_the_login_manager():
                 if kw.arg == "account_binder" and ast.unparse(kw.value) == "self.queue.bind_account":
                     wired = True
     assert wired
+
+
+# ---- Fix round 1 (PR #282 review): one egress rule ---------------------------
+
+
+def _future_events(prefix: str, n: int, minutes: int = 1) -> list[dict]:
+    """Events timestamped AFTER any switch made now, so the owner_since clip
+    cannot be what stops them: isolates the credential/owner checks."""
+    ts = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+    evs = _events(prefix, n)
+    for e in evs:
+        e["timestamp"] = ts
+    return evs
+
+
+class TestOneEgressRule:
+    def test_events_fetched_before_a_switch_are_not_sent_after_it(self, tmp_path):
+        """sync() fetches without any lock; the next person can finish signing
+        in between the fetch and the send."""
+        bf = FakeBF()
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        eng = _engine(bf, q)
+        mgr = _login_manager(bf, q)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        fetched = _events("alice", 2)
+        for e in fetched:
+            e["timestamp"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        _browser_login(mgr, bf, "bob@corp.test", "tok-bob")
+        eng._send_and_advance_checkpoints(fetched, [], SyncStats())
+        assert _owned_by(bf, "alice") == []
+        assert q.size() == 0
+
+    def test_a_cycle_pinned_to_one_account_cannot_send_or_queue_as_the_next(
+        self, tmp_path, caplog
+    ):
+        """Even data timestamped after the switch: a cycle that started as
+        Alice is refused at egress (credentials changed) and its rows are
+        refused by the queue (owner no longer bound) — never re-tagged Bob."""
+        bf = FakeBF()
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        eng = _engine(bf, q)
+        mgr = _login_manager(bf, q)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        caplog.set_level(logging.WARNING)
+        with eng._egress_cycle():
+            _browser_login(mgr, bf, "bob@corp.test", "tok-bob")
+            eng._send_events(_future_events("alice", 2), SyncStats())
+        assert bf.delivered == []
+        assert q.size() == 0
+        assert any("Refused 2 event(s)" in r.getMessage() for r in caplog.records)
+
+    def test_a_401_batch_is_not_requeued_as_the_account_bound_since(self, tmp_path):
+        bf = FakeBF()
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        eng = _engine(bf, q)
+        mgr = _login_manager(bf, q)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        bf.rejected.add("tok-alice")
+        with eng._egress_cycle():
+            # Bound to Bob, Bob's token not live yet: the bind-then-activate gap.
+            q.bind_account("bob@corp.test", restored_session=False)
+            with pytest.raises(BetterFlowAuthError):
+                eng._send_and_advance_checkpoints(_future_events("alice", 2), [], SyncStats())
+        assert q.size() == 0
+
+    def test_inproc_afk_spans_from_before_a_switch_never_upload(self, tmp_path):
+        """Reviewer repro: Alice's held in-process AFK checkpoint after auth
+        failures rebuilt ~40 not-afk spans and delivered them under Bob."""
+        from src.sync.afk_source import AfkSource
+
+        bf = FakeBF()
+        queue = OfflineQueue(db_path=tmp_path / "q.db")
+        mgr = _login_manager(bf, queue)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        cfg = Config()
+        cfg.sync.in_process_afk = True
+        eng = SyncEngine(aw=Mock(), bf=bf, queue=queue, config=cfg, time_tracker=Mock())
+        eng.afk_source = AfkSource(600, "host", idle_clock=lambda: 5.0, retention_seconds=7200.0)
+        now = datetime.now(timezone.utc)
+        t_a = now - timedelta(minutes=40)
+        eng._afk_inproc_checkpoint = t_a
+        for m in range(40):
+            eng.afk_source.record_sample(t_a + timedelta(minutes=m), protect_since=t_a)
+        _browser_login(mgr, bf, "bob@corp.test", "tok-bob")
+        with eng._egress_cycle():
+            # The switch was noticed at the cycle's snapshot: Alice's held
+            # checkpoint no longer reaches back before Bob took over.
+            assert eng._afk_inproc_checkpoint >= queue.owner_since
+            eng.afk_source.record_sample(now, protect_since=eng._afk_inproc_checkpoint)
+            events = eng._build_inproc_afk(now)
+            eng._send_events(events, SyncStats())
+        delivered_bob = {eid for tok, eid in bf.delivered if tok == "tok-bob"}
+        leaked = [
+            e for e in events
+            if e["id"] in delivered_bob
+            and datetime.fromisoformat(e["timestamp"]) < queue.owner_since
+        ]
+        assert leaked == []
+
+
+class TestNoLockAcrossNetworkIO:
+    def test_a_hung_send_blocks_neither_another_send_nor_pause_nor_sign_in(self, tmp_path):
+        bf = FakeBF()
+        queue = OfflineQueue(db_path=tmp_path / "q.db")
+        mgr = _login_manager(bf, queue)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        eng = _engine(bf, queue)
+        hang = threading.Event()
+        entered = threading.Event()
+
+        def hung():
+            bf.send_hook = None
+            entered.set()
+            hang.wait(30)
+
+        bf.send_hook = hung
+        threading.Thread(
+            target=lambda: eng._send_events(_events("zombie", 1), SyncStats()),
+            daemon=True,
+        ).start()
+        assert entered.wait(5)
+        try:
+            def timed(fn):
+                done = threading.Event()
+
+                def run():
+                    fn()
+                    done.set()
+
+                threading.Thread(target=run, daemon=True).start()
+                return done.wait(1.0)
+
+            assert timed(lambda: eng._send_events(_events("fresh", 1), SyncStats())), \
+                "a second send blocked behind the hung one"
+            assert timed(eng.pause), "pause() blocked behind the hung send"
+            assert timed(lambda: queue.bind_account("alice@corp.test", restored_session=True)), \
+                "sign-in binding blocked behind the hung send"
+        finally:
+            hang.set()
+
+
+class TestSamePersonSigningInAgain:
+    def test_keychain_loss_re_sign_in_is_not_a_switch(self, tmp_path):
+        """macOS re-signing the bundle makes the keychain unreadable and forces
+        a browser sign-in (restored_session=False). Same person: nothing is
+        dropped and nothing is moved."""
+        bf = FakeBF()
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        eng = _engine(bf, q)
+        mgr = _login_manager(bf, q)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        _queue_under_rejected_token(eng, bf, _events("alice", 2))
+        cp = datetime.now(timezone.utc) - timedelta(hours=3)
+        q.set_checkpoint("aw-watcher-window_host", cp)
+        since = q.owner_since
+
+        r = q.bind_account("Alice@Corp.test", restored_session=False)
+        assert r["switched"] is False
+        assert q.size() == 2
+        assert q.owner_since == since
+        assert q.get_checkpoint("aw-watcher-window_host") == cp
+
+
+class TestSignInWithoutAnAccount:
+    def test_no_email_from_the_server_refuses_sign_in(self, tmp_path):
+        bf = FakeBF()
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        keychain = MagicMock()
+        keychain.store.return_value = True
+        mgr = _login_manager(bf, q, keychain)
+        bf.next_auth = AuthResult(
+            success=True, device_id="42", api_token="tok-x", user_email=None,
+            user_name="x", user_role="user",
+        )
+        flow = Mock()
+        flow.start.return_value = SimpleNamespace(
+            success=True, code="c", code_verifier="v", error=None
+        )
+        with patch("src.auth.login.BrowserAuthFlow", return_value=flow), patch(
+            "src.auth.login.DeviceInfo.collect",
+            return_value=SimpleNamespace(machine_id="m" * 16),
+        ):
+            state = mgr.login_via_browser()
+        assert state.logged_in is False
+        assert "which account" in state.error
+        assert bf.token is None
+        keychain.store.assert_not_called()
+
+
+def _insert_row(q: OfflineQueue, table: str, account: str, event: dict, **extra):
+    import json
+
+    now = datetime.now(timezone.utc)
+    conn = q._get_connection()
+    if table == "queued_events":
+        conn.execute(
+            "INSERT INTO queued_events (event_data, created_at, account) VALUES (?, ?, ?)",
+            (json.dumps(event), now.isoformat(), account),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO dead_letter_events (event_data, bucket_id, created_at, "
+            "retry_count, dropped_at, account) VALUES (?, ?, ?, 5, ?, ?)",
+            (json.dumps(event), event["bucket_id"], now.isoformat(),
+             (now - timedelta(hours=2)).isoformat(), account),
+        )
+    conn.commit()
+
+
+class TestQueueOwnerWalls:
+    """Each wall on its own, so removing one is seen (the purge in
+    bind_account otherwise hides the read filters)."""
+
+    def test_dequeue_never_hands_out_another_accounts_row(self, tmp_path):
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        q.bind_account("alice@corp.test", restored_session=False)
+        _insert_row(q, "queued_events", "bob@corp.test", _events("bob", 1)[0])
+        assert q.dequeue(100) == []
+        assert q.dequeue(100, account="alice@corp.test") == []
+
+    def test_replay_never_resurrects_another_accounts_dead_letter(self, tmp_path):
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        q.bind_account("alice@corp.test", restored_session=False)
+        _insert_row(q, "dead_letter_events", "bob@corp.test", _events("bob", 1)[0])
+        r = q.requeue_storable_dead_letter(min_dead_age_seconds=0)
+        assert r["requeued"] == 0 and q.size() == 0
+
+    def test_eviction_keeps_the_owner_tag(self, tmp_path):
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        q.bind_account("alice@corp.test", restored_session=False)
+        ev = _events("alice", 1)[0]
+        ev.pop("bucket_id")  # bucketless: unstorable, evicted to dead letter
+        q.enqueue([ev])
+        assert q.evict_unstorable()["count"] == 1
+        rows = q._get_connection().execute(
+            "SELECT account FROM dead_letter_events").fetchall()
+        assert [r[0] for r in rows] == ["alice@corp.test"]
+
+    def test_dequeue_refuses_a_snapshot_account_no_longer_bound(self, tmp_path):
+        """Same owner rule as enqueue/replay: Alice's snapshot draining after
+        Bob is bound gets nothing, even rows the switch did not purge."""
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        q.bind_account("bob@corp.test", restored_session=False)
+        _insert_row(q, "queued_events", "alice@corp.test", _events("alice", 1)[0])
+        assert q.dequeue(100, account="alice@corp.test") == []
+
+    def test_enqueue_refuses_rows_of_an_account_no_longer_bound(self, tmp_path):
+        q = OfflineQueue(db_path=tmp_path / "q.db")
+        q.bind_account("bob@corp.test", restored_session=False)
+        assert q.enqueue(_future_events("alice", 2), account="alice@corp.test") == 0
+        assert q.size() == 0
+
+
+_SINCE = datetime(2026, 10, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _ev(offset_s: float, duration=None, **extra) -> dict:
+    ev = {"id": "e", "timestamp": (_SINCE + timedelta(seconds=offset_s)).isoformat()}
+    if duration is not None:
+        ev["duration"] = duration
+    ev.update(extra)
+    return ev
+
+
+class TestClipToOwner:
+    """The owner_since boundary decides whose billed time each second is."""
+
+    clip = staticmethod(SyncEngine._clip_to_owner)
+
+    def test_straddling_event_is_clipped_to_start_at_owner_since(self):
+        kept, dropped = self.clip([_ev(-60, 300)], _SINCE)
+        assert dropped == 0
+        assert kept[0]["timestamp"] == _SINCE.isoformat()
+        assert kept[0]["duration"] == 240.0
+
+    def test_clipping_does_not_mutate_the_callers_event(self):
+        ev = _ev(-60, 300)
+        self.clip([ev], _SINCE)
+        assert ev["duration"] == 300
+
+    def test_event_ending_exactly_at_owner_since_is_dropped(self):
+        assert self.clip([_ev(-60, 60)], _SINCE) == ([], 1)
+
+    def test_event_wholly_before_owner_since_is_dropped(self):
+        assert self.clip([_ev(-600, 60)], _SINCE) == ([], 1)
+
+    def test_event_starting_at_or_after_owner_since_is_kept_untouched(self):
+        at, after = _ev(0, 30), _ev(5, 30)
+        assert self.clip([at, after], _SINCE) == ([at, after], 0)
+
+    def test_pre_switch_event_without_a_duration_is_dropped(self):
+        assert self.clip([_ev(-1)], _SINCE) == ([], 1)
+
+    def test_pre_switch_event_with_a_bool_duration_is_dropped(self):
+        assert self.clip([_ev(-60, True)], _SINCE) == ([], 1)
+
+    def test_unparseable_or_missing_timestamp_is_dropped(self):
+        events = [{"timestamp": "not-a-date", "duration": 10},
+                  {"duration": 10}, {"timestamp": 1234, "duration": 10}]
+        assert self.clip(events, _SINCE) == ([], 3)
+
+    def test_naive_timestamp_is_read_as_utc(self):
+        naive = (_SINCE - timedelta(seconds=10)).replace(tzinfo=None).isoformat()
+        kept, dropped = self.clip([{"timestamp": naive, "duration": 20}], _SINCE)
+        assert dropped == 0 and kept[0]["duration"] == 10.0
+
+    def test_no_owner_since_passes_everything_through(self):
+        events = [_ev(-600, 1), {"timestamp": "junk"}]
+        assert self.clip(events, None) == (events, 0)
+
+
+class TestRealClientPinsCredentials:
+    def test_a_pinned_send_is_refused_before_the_wire_once_credentials_change(self):
+        from src.sync.bf_client import BetterFlowClient
+
+        client = BetterFlowClient(api_url="https://betterflow.test/api/agent")
+        client._session = MagicMock()
+        client.set_credentials("tok-alice", "42")
+        pinned = client.credential_generation()
+        client.set_credentials("tok-bob", "42")
+        result = client.send_events(_future_events("alice", 1), expected_generation=pinned)
+        assert result.success is False and result.transient is True
+        assert result.error == REASON_CREDENTIALS_CHANGED
+        client._session.request.assert_not_called()
+
+
+def test_every_send_and_enqueue_goes_through_the_one_egress_rule():
+    """Structure guard: the account rule holds only if nothing bypasses it.
+    `.send_events(` may be called only inside SyncEngine._egress_send,
+    `.enqueue(` only inside _egress_enqueue, and every `.dequeue(` /
+    `.requeue_storable_dead_letter(` in src/ must name the snapshot account."""
+    allowed = {"send_events": "_egress_send", "enqueue": "_egress_enqueue"}
+    violations = []
+    seen = {"send_events": 0, "enqueue": 0, "dequeue": 0,
+            "requeue_storable_dead_letter": 0}
+    for path in (REPO_ROOT / "src").rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                name = node.func.attr
+                where = f"{path.relative_to(REPO_ROOT)}:{node.lineno} in {fn.name}"
+                if name in allowed:
+                    seen[name] += 1
+                    if fn.name != allowed[name]:
+                        violations.append(where)
+                elif name in ("dequeue", "requeue_storable_dead_letter"):
+                    seen[name] += 1
+                    if not any(kw.arg == "account" for kw in node.keywords):
+                        violations.append(where)
+    # Positive control: the scan saw the one legitimate call of each kind.
+    assert seen == {"send_events": 1, "enqueue": 1, "dequeue": 1,
+                    "requeue_storable_dead_letter": 1}, seen
+    assert violations == []

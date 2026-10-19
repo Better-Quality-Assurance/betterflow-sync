@@ -80,7 +80,7 @@ def test_legacy_bucketless_status_span_is_backfilled_and_delivered():
     # never reached delivery).
     delivered: set[str] = set()
 
-    def _accept(events):
+    def _accept(events, **_kw):
         delivered.update(e["id"] for e in events)
         return SyncResult(success=True, events_synced=len(events))
 
@@ -179,7 +179,7 @@ def test_startup_sanitizes_invalid_project_id_before_status_span_drain():
 
     delivered: list[dict] = []
 
-    def _accept(events):
+    def _accept(events, **_kw):
         delivered.extend(events)
         return SyncResult(success=True, events_synced=len(events))
 
@@ -251,7 +251,7 @@ class _DurationStrictServer:
     def __init__(self) -> None:
         self.delivered: set[str] = set()
 
-    def __call__(self, events: list[dict]) -> SyncResult:
+    def __call__(self, events: list[dict], **_kw) -> SyncResult:
         if any(not (0 <= e.get("duration", 0) <= MAX_EVENT_DURATION_SECONDS) for e in events):
             return SyncResult(success=False, events_queued=len(events), transient=False)
         for e in events:

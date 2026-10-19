@@ -150,16 +150,19 @@ class LoginManager:
 
         # Bind local data to this account BEFORE its token goes live. A
         # restored session is the one that was signed in before this launch.
-        if not self._bind_account(credentials.user_email, restored_session=True):
+        if not self._bind_account(
+            credentials.user_email,
+            restored_session=True,
+            activate=lambda: self.bf.set_credentials(
+                credentials.api_token, credentials.device_id
+            ),
+        ):
             # Not a verdict on the session: retry like any other transient.
             return LoginState(
                 logged_in=False,
                 transient=True,
                 error="Could not prepare local data for this account",
             )
-
-        # Set credentials on client
-        self.bf.set_credentials(credentials.api_token, credentials.device_id)
 
         # Verify credentials are still valid. A single 401 is often transient
         # (the agent started mid-deploy, or a momentary backend token-lookup
@@ -309,13 +312,30 @@ class LoginManager:
         if not result.success:
             return LoginState(logged_in=False, error=result.error)
 
-        user_email = result.user_email or device_name
+        # Refuse a sign-in the server did not attach an account to. Every piece
+        # of locally-held activity is keyed by this email; the old fallback to
+        # the MACHINE name gave everyone who ever signed in on this laptop the
+        # same key, which is the cross-person leak this binding exists to stop.
+        user_email = (result.user_email or "").strip()
+        if not user_email:
+            logger.error("Sign-in refused: the server returned no account email")
+            return LoginState(
+                logged_in=False,
+                error=(
+                    "Sign-in failed: BetterFlow did not say which account this "
+                    "is. Please try again, or contact your administrator."
+                ),
+            )
 
         # Bind local data to this account BEFORE its token is stored or goes
         # live: if this is a different person on the machine, the previous
         # person's queued activity is dropped here, not delivered as theirs.
         # A failure refuses the sign-in rather than risk exactly that.
-        if not self._bind_account(user_email, restored_session=False):
+        if not self._bind_account(
+            user_email,
+            restored_session=False,
+            activate=lambda: self.bf.set_credentials(result.api_token, result.device_id),
+        ):
             return LoginState(
                 logged_in=False,
                 error="Could not prepare local data for this account. Please try again.",
@@ -334,9 +354,6 @@ class LoginManager:
 
         if not self.keychain.store(credentials):
             logger.warning("Failed to store credentials in keychain")
-
-        # Set credentials on client
-        self.bf.set_credentials(result.api_token, result.device_id)
 
         # A fresh session ends any restore-failure streak. Leaving a stale
         # first-failure timestamp here would make the NEXT single 401 look
@@ -358,13 +375,23 @@ class LoginManager:
 
         return state
 
-    def _bind_account(self, user_email: Optional[str], *, restored_session: bool) -> bool:
-        """Run the account binder. False when it failed; the caller must then
-        NOT hand the new token to the client."""
+    def _bind_account(
+        self,
+        user_email: Optional[str],
+        *,
+        restored_session: bool,
+        activate: Callable[[], None],
+    ) -> bool:
+        """Bind local data to the signing-in account and put its token live
+        (``activate``) as ONE step under the queue's state lock. False when it
+        failed; the token is then not live."""
         if self._account_binder is None:
+            activate()
             return True
         try:
-            self._account_binder(user_email, restored_session=restored_session)
+            self._account_binder(
+                user_email, restored_session=restored_session, activate=activate
+            )
             return True
         except Exception as e:
             logger.error(

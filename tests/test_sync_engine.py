@@ -23,7 +23,7 @@ class TestSyncEngine:
         """Set up test fixtures."""
         self.aw = Mock()
         self.bf = Mock()
-        self.queue = MagicMock()  # account_lock() is a context manager
+        self.queue = MagicMock()  # state_lock() is a context manager
         # Mock the exclude_apps as a list so "in" checks work
         self.queue.get_checkpoint.return_value = None
         # Default: nothing unstorable to evict (real queue returns this shape).
@@ -439,7 +439,7 @@ class TestSyncEngine:
         self.aw.get_events.side_effect = _get_events
         self.queue.size.return_value = 0
         enqueued: list[dict] = []
-        self.queue.enqueue.side_effect = lambda batch: (enqueued.extend(batch), len(batch))[1]
+        self.queue.enqueue.side_effect = lambda batch, **_kw: (enqueued.extend(batch), len(batch))[1]
 
         bucket = Mock(id="win-bucket", type=BUCKET_TYPE_WINDOW)
         with patch("src.sync.sync_engine.datetime", _FrozenClock):
@@ -1376,7 +1376,7 @@ class TestSendEventsDecoupleBuckets:
     def setup_method(self):
         self.aw = Mock()
         self.bf = Mock()
-        self.queue = MagicMock()  # account_lock() is a context manager
+        self.queue = MagicMock()  # state_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see
@@ -1402,7 +1402,7 @@ class TestSendEventsDecoupleBuckets:
         from src.sync.bf_client import SyncResult
         from src.sync.sync_engine import SyncStats
 
-        def fake_send(batch):
+        def fake_send(batch, **_kw):
             if any("afk" in e.get("bucket_id", "") for e in batch):
                 return SyncResult(success=False, error="transient failure")
             return SyncResult(success=True, events_synced=len(batch))
@@ -1465,7 +1465,7 @@ class TestSendEventsDecoupleBuckets:
         from src.sync.bf_client import SyncResult
         from src.sync.sync_engine import SyncStats
 
-        def fake_send(batch):
+        def fake_send(batch, **_kw):
             if any("afk" in e.get("bucket_id", "") for e in batch):
                 return SyncResult(success=False, error="transient failure")
             return SyncResult(success=True, events_synced=len(batch))
@@ -1500,7 +1500,7 @@ class TestStatusSpanEvents:
         self.aw = Mock()
         self.bf = Mock()
         self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
-        self.queue = MagicMock()  # account_lock() is a context manager
+        self.queue = MagicMock()  # state_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see
@@ -1702,7 +1702,7 @@ class TestPrivateOngoingSpanRefresh:
         self.aw = Mock()
         self.bf = Mock()
         self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
-        self.queue = MagicMock()  # account_lock() is a context manager
+        self.queue = MagicMock()  # state_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see

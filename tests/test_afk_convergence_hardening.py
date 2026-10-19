@@ -19,7 +19,7 @@ Two independent failure modes from the in-process-AFK rollout:
 """
 
 from datetime import timedelta
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 from src.config import Config
 from src.main import SyncCoordinator
@@ -51,7 +51,7 @@ def _runnable_engine(in_process_afk: bool) -> SyncEngine:
     bf = Mock()
     bf.is_reachable.return_value = True
 
-    queue = Mock()
+    queue = MagicMock()  # state_lock() is a context manager
     queue.get_checkpoint.return_value = None
     queue.is_empty.return_value = True
 

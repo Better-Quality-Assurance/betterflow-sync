@@ -99,7 +99,7 @@ def _engine(config: Config, client: BetterFlowClient) -> SyncEngine:
     return SyncEngine(
         aw=Mock(),
         bf=client,
-        queue=MagicMock(),  # account_lock() is a context manager
+        queue=MagicMock(),  # state_lock() is a context manager
         config=config,
         activity_analyzer=Mock(spec=ActivityAnalyzer),
         time_tracker=Mock(spec=DailyTimeTracker),

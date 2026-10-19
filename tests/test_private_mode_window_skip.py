@@ -35,11 +35,12 @@ class _Bucket:
 class _FakeQueue:
     """Dict-backed checkpoint store — enough to assert what gets skipped."""
 
-    # SyncEngine's send/enqueue paths hold the queue's account lock and clamp
-    # ActivityWatch reads to owner_since (see OfflineQueue.bind_account).
+    # SyncEngine's egress snapshot reads these under the queue's state lock
+    # (see OfflineQueue.bind_account / SyncEngine._egress_send).
+    account = None
     owner_since = None
 
-    def account_lock(self):
+    def state_lock(self):
         return contextlib.nullcontext()
 
     def __init__(self):

@@ -16,7 +16,7 @@ time on upgrade. Three gaps that follows from that, closed here:
 
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 from src.config import Config
 import src.config as config_module
@@ -262,7 +262,7 @@ def test_sync_gates_config_fetch_on_config_refetch_due():
     # the drain loop's monotonic-based deadline.
     from unittest.mock import patch as _patch
 
-    aw, bf, queue = Mock(), Mock(), Mock()
+    aw, bf, queue = Mock(), Mock(), MagicMock()  # state_lock() is a context manager
     bf.is_reachable.return_value = True
     queue.is_empty.return_value = True
     aw.get_buckets.return_value = {}

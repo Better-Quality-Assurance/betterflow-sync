@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 try:
     from ..config import Config, MAX_QUEUE_SIZE
@@ -50,9 +50,9 @@ _MAX_LAST_ERROR_CHARS = 500
 # terminates it. Same reasoning that gave MAX_EVENT_DURATION_SECONDS its name.
 EVENT_RETENTION_DAYS = 7
 
-# How long bind_account waits for an in-flight delivery (one request chain,
-# ~94s against a hung server) to finish before switching accounts anyway.
-_ACCOUNT_LOCK_TIMEOUT_S = 180.0
+
+#: Default for enqueue/dequeue's ``account``: "whatever account is bound".
+_BOUND = object()
 
 
 def normalize_account(value: object) -> Optional[str]:
@@ -251,11 +251,11 @@ class OfflineQueue:
         # for delivery while that same account is bound. The queue used to be
         # one per MACHINE: a laptop handed to a new person drained the previous
         # person's backlog under the new person's token, as their hours.
-        # _account_lock serialises "produce rows for / send under the bound
-        # account" (SyncEngine holds it per send) against bind_account, so the
-        # next person's token never goes live while a batch the previous
-        # person owns is still on its way out. Reentrant: sends nest.
-        self._account_lock = threading.RLock()
+        # _state_lock makes "rebind + put the new token live" (bind_account's
+        # `activate`) one step as seen by SyncEngine's egress snapshot, which
+        # reads (account, owner_since, credential generation) under it. Held
+        # only for that step and the snapshot — NEVER across network I/O.
+        self._state_lock = threading.Lock()
         self._account: Optional[str] = None
         self._owner_since: Optional[datetime] = None
         self._init_db()
@@ -551,12 +551,12 @@ class OfflineQueue:
         return self._owner_since
 
     @contextmanager
-    def account_lock(self) -> Iterator[None]:
-        """Held while producing rows for, or sending under, the bound account.
-
-        bind_account takes the same lock, so an account switch waits for the
-        send in flight to finish under the token it started with."""
-        with self._account_lock:
+    def state_lock(self) -> Iterator[None]:
+        """Held by SyncEngine only while taking its egress snapshot (account,
+        owner_since and the HTTP client's credential generation), so the
+        snapshot can never pair one account with another account's token.
+        Never hold it across network I/O."""
+        with self._state_lock:
             yield
 
     def bind_account(
@@ -564,6 +564,7 @@ class OfflineQueue:
         account: Optional[str],
         *,
         restored_session: bool,
+        activate: Optional[Callable[[], None]] = None,
         now: Optional[datetime] = None,
     ) -> dict:
         """Bind the queue to the account that is about to sign in.
@@ -585,28 +586,29 @@ class OfflineQueue:
         - otherwise (a fresh sign-in with no session to restore): whoever
           recorded the backlog is unknowable, so it is dropped with a count.
 
-        Switching to a different account also moves every ActivityWatch
-        checkpoint up to ``now`` and records ``owner_since``, so neither the
-        live fetch nor the start-of-day reconcile re-reads the previous
-        person's part of the day from this machine's ActivityWatch.
+        A SWITCH is "the signing-in account differs from the one bound here"
+        (or, on the first bind after the upgrade, a sign-in with no session to
+        restore). The same person signing in again, however they got there (a
+        keychain macOS stopped letting us read, an expired token), is not a
+        switch: nothing is dropped and nothing is moved. A switch moves every
+        ActivityWatch checkpoint up to ``now`` and records ``owner_since``;
+        SyncEngine drops or clips anything that starts before it, at egress.
+
+        ``activate`` (LoginManager: put the new token live) runs under the
+        same state lock as the rebinding, after it commits, so no egress
+        snapshot can pair the new account with the old token or vice versa.
+        No in-flight send is waited for: a batch prepared under the previous
+        credentials is refused before egress (expected_generation), and its
+        rows are refused re-entry by enqueue's owner check.
         """
         account = normalize_account(account)
         now = now or datetime.now(timezone.utc)
-        acquired = self._account_lock.acquire(timeout=_ACCOUNT_LOCK_TIMEOUT_S)
-        if not acquired:
-            # A wedged send held the lock past the timeout. Switching anyway is
-            # the lesser harm: refusing would strand the new person's sign-in
-            # forever behind a hung socket. The rows themselves are still
-            # dropped below; only that one in-flight batch is unaccounted for.
-            logger.error(
-                "[queue] account switch could not wait for the in-flight "
-                "delivery (%.0fs) — switching anyway", _ACCOUNT_LOCK_TIMEOUT_S,
-            )
-        try:
-            return self._bind_account_locked(account, restored_session, now)
-        finally:
-            if acquired:
-                self._account_lock.release()
+        with self._state_lock:
+            result = self._bind_account_locked(account, restored_session, now)
+            if activate is not None:
+                activate()
+        self._log_bind(result, now)
+        return result
 
     def _bind_account_locked(
         self, account: Optional[str], restored_session: bool, now: datetime
@@ -675,7 +677,9 @@ class OfflineQueue:
             self._account = account
             self._owner_since = owner_since
             result["switched"] = switched
+        return result
 
+    def _log_bind(self, result: dict, now: datetime) -> None:
         if result["claimed_legacy"]:
             logger.info(
                 "[queue] %d untagged pre-upgrade event(s) assigned to the "
@@ -701,13 +705,31 @@ class OfflineQueue:
                 "[queue] Account changed on this machine; ActivityWatch data "
                 "before %s will not be uploaded", now.isoformat(),
             )
-        return result
 
-    def enqueue(self, events: list[dict]) -> int:
+    def _owner_check(self, account: object, what: str) -> tuple[bool, Optional[str]]:
+        """THE owner rule for enqueue, dequeue and dead-letter replay: a caller
+        naming an account (SyncEngine's egress snapshot) is served only while
+        that account is still the bound one. Returns (owned, bound account);
+        a refusal is logged. Call it inside the operation's transaction, so the
+        binding cannot change before the rows are touched."""
+        bound = self._account
+        if account is _BOUND or normalize_account(account) == bound:
+            return True, bound
+        logger.warning(
+            "[queue] Refused %s: recorded under another account than the one "
+            "now signed in on this machine", what,
+        )
+        return False, bound
+
+    def enqueue(self, events: list[dict], *, account: object = _BOUND) -> int:
         """Add events to the queue.
 
         Args:
             events: List of event dictionaries
+            account: The account the events were recorded under (SyncEngine
+                passes its egress snapshot's). If that is no longer the bound
+                account, the events are REFUSED — dropped with a logged count —
+                never re-tagged as the account that is signed in now.
 
         Returns:
             Number of events added
@@ -722,6 +744,13 @@ class OfflineQueue:
 
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor(immediate=True) as cursor:
+            # Owner check FIRST, before eviction can make room for rows that
+            # are about to be refused.
+            # Read inside the BEGIN IMMEDIATE transaction: bind_account swaps
+            # the binding inside its own, so this tag is never stale.
+            owned, account = self._owner_check(account, f"{len(events)} event(s)")
+            if not owned:
+                return 0
             # Atomic: check size + evict + insert in a single transaction.
             # immediate=True is what makes that claim TRUE — the COUNT decides
             # how many rows to evict, so it has to be inside the transaction the
@@ -746,9 +775,6 @@ class OfflineQueue:
                 logger.warning(f"Queue full, removed {to_remove} oldest events")
 
             count = len(events)
-            # Read inside the BEGIN IMMEDIATE transaction: bind_account swaps
-            # the binding inside its own, so this tag is never stale.
-            account = self._account
             cursor.executemany(
                 """
                 INSERT INTO queued_events (event_data, created_at, account)
@@ -758,7 +784,9 @@ class OfflineQueue:
             )
             return count
 
-    def dequeue(self, batch_size: int = 100, max_retries: int = 5) -> list[QueuedEvent]:
+    def dequeue(
+        self, batch_size: int = 100, max_retries: int = 5, *, account: object = _BOUND
+    ) -> list[QueuedEvent]:
         """Get a batch of events from the queue (oldest first).
 
         Skips events that have exceeded max_retries (N7).
@@ -775,6 +803,9 @@ class OfflineQueue:
             logger.error("[queue] Skipping dequeue due to integrity failure")
             return []
         with self._cursor() as cursor:
+            owned, account = self._owner_check(account, "dequeue")
+            if not owned:
+                return []
             cursor.execute(
                 """
                 SELECT id, event_data, created_at, retry_count
@@ -786,7 +817,7 @@ class OfflineQueue:
                 # Only the bound account's rows are ever handed out for
                 # delivery (bind_account drops the rest; this is the second
                 # wall, at the read every send starts from).
-                (max_retries, self._account, batch_size),
+                (max_retries, account, batch_size),
             )
             rows = cursor.fetchall()
             result: list[QueuedEvent] = []
@@ -1424,6 +1455,7 @@ class OfflineQueue:
         now: Optional[datetime] = None,
         stale_after_days: int = EVENT_RETENTION_DAYS,
         min_dead_age_seconds: Optional[float] = None,
+        account: object = _BOUND,
     ) -> dict:
         """Resurrect dead-lettered rows that are STORABLE again — move them back
         into the live queue for another delivery attempt.
@@ -1504,8 +1536,12 @@ class OfflineQueue:
         # on, so it must be inside the write transaction, not ahead of it.
         with self._cursor(immediate=True) as cursor:
             # Only the bound account's dead letters are resurrected (read
-            # inside the transaction, like enqueue's tag).
-            account = self._account
+            # inside the transaction, like enqueue's tag) — or the caller's
+            # snapshot account, which then must still be the bound one.
+            owned, account = self._owner_check(account, "dead-letter replay")
+            if not owned:
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0,
+                        "marked_terminal": 0}
             # Capacity first, and read INSIDE this transaction so it can't go
             # stale before the INSERT below acts on it. ``enqueue`` enforces
             # max_size by evicting the OLDEST queued events; this raw-INSERT

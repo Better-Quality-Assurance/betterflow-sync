@@ -41,6 +41,7 @@ __all__ = [
     "BaseApiClient",
     "BetterFlowClientError",
     "BetterFlowAuthError",
+    "CredentialsChangedError",
     "resolve_ca_bundle",
     "transient_failure_count",
     "transient_failure_counter",
@@ -303,6 +304,17 @@ class BetterFlowAuthError(BetterFlowClientError):
     _COUNTS_AS_NETWORK_FAILURE = False
 
 
+class CredentialsChangedError(Exception):
+    """The credentials changed between preparing a request and sending it.
+
+    Raised BEFORE anything goes on the wire, when a caller pinned the
+    credential generation it prepared a batch under (``expected_generation``)
+    and a sign-in, sign-out or account switch has since replaced the token.
+    The batch belongs to whoever was signed in when it was prepared and must
+    never go out with someone else's token. Not a BetterFlowClientError: no
+    network was involved, so it must not count toward the watchdog tally."""
+
+
 def _note_transient_attempt(attempt: int, error: Exception, delay: float) -> None:
     """``on_retry`` hook for the in-cycle retry chain: count the failed attempt
     toward this thread's transient tally, then log exactly as the default does.
@@ -420,6 +432,11 @@ class BaseApiClient:
         self._session = session or _new_verified_session()
         self._owns_session = session is None  # Track if we created the session
         self._session_lock = threading.Lock()
+        # Bumped on every set/clear of credentials, under _session_lock. A
+        # request pinned to a generation is refused once it moves (see
+        # CredentialsChangedError) - checked and turned into the Authorization
+        # header under the same lock, so there is no gap between the two.
+        self._credential_generation = 0
         # Global rate-limit backoff. When the server returns 429, ALL outbound
         # calls (sync, hours, trends, heartbeat) pause until this monotonic
         # deadline — one coordinated pause instead of each endpoint independently
@@ -470,9 +487,25 @@ class BaseApiClient:
         parsed = urlparse(self.api_url)
         return f"{parsed.scheme}://{parsed.netloc}"
 
-    def _get_headers(self) -> dict:
-        """Get request headers with authentication (thread-safe)."""
+    def credential_generation(self) -> int:
+        """Opaque counter identifying the credentials currently in use."""
         with self._session_lock:
+            return self._credential_generation
+
+    def _get_headers(self, expected_generation: Optional[int] = None) -> dict:
+        """Get request headers with authentication (thread-safe).
+
+        ``expected_generation``: refuse (CredentialsChangedError) unless the
+        credentials are still the ones the caller prepared its request under.
+        """
+        with self._session_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self._credential_generation
+            ):
+                raise CredentialsChangedError(
+                    "credentials changed since this request was prepared"
+                )
             token = self.token
             device_id = self.device_id
         headers = {
@@ -496,6 +529,7 @@ class BaseApiClient:
         extra_headers: Optional[dict] = None,
         timeout_override: Optional[int] = None,
         retry_config_override: Optional[RetryConfig] = None,
+        expected_generation: Optional[int] = None,
     ) -> dict:
         """Make request to BetterFlow API.
 
@@ -509,6 +543,8 @@ class BaseApiClient:
             extra_headers: Additional headers to include in the request
             timeout_override: Override default timeout for this request
             retry_config_override: Override default retry config for this request
+            expected_generation: See _get_headers. The header is built ONCE,
+                before the retry loop, so a retried batch never changes token.
 
         Returns:
             Response data as dict
@@ -518,7 +554,7 @@ class BaseApiClient:
             BetterFlowClientError: For other errors
         """
         url = f"{self.api_url}/{endpoint.lstrip('/')}"
-        headers = self._get_headers()
+        headers = self._get_headers(expected_generation)
         if extra_headers:
             headers.update(extra_headers)
         read_timeout = timeout_override if timeout_override is not None else self.timeout
@@ -697,12 +733,14 @@ class BaseApiClient:
         with self._session_lock:
             self.token = token
             self.device_id = device_id
+            self._credential_generation += 1
 
     def clear_credentials(self) -> None:
         """Clear authentication credentials (thread-safe)."""
         with self._session_lock:
             self.token = None
             self.device_id = None
+            self._credential_generation += 1
 
     def is_reachable(self) -> bool:
         """Check if BetterFlow API is reachable."""

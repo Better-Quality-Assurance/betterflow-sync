@@ -9,7 +9,7 @@ bring the trackers back up.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -130,7 +130,7 @@ class TestSyncLoopHonoursSuppression:
     def _engine(self, cfg):
         from src.sync.sync_engine import SyncEngine
 
-        aw, bf, queue = Mock(), Mock(), Mock()
+        aw, bf, queue = Mock(), Mock(), MagicMock()  # state_lock() is a context manager
         bf.is_reachable.return_value = True
         queue.is_empty.return_value = True
         aw.get_buckets.return_value = {}  # no buckets: an in-hours cycle runs to a clean no-op
