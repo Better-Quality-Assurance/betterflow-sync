@@ -14,7 +14,7 @@ can bypass".
 import gzip
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -99,7 +99,7 @@ def _engine(config: Config, client: BetterFlowClient) -> SyncEngine:
     return SyncEngine(
         aw=Mock(),
         bf=client,
-        queue=Mock(),
+        queue=MagicMock(),  # account_lock() is a context manager
         config=config,
         activity_analyzer=Mock(spec=ActivityAnalyzer),
         time_tracker=Mock(spec=DailyTimeTracker),

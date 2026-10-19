@@ -23,7 +23,7 @@ class TestSyncEngine:
         """Set up test fixtures."""
         self.aw = Mock()
         self.bf = Mock()
-        self.queue = Mock()
+        self.queue = MagicMock()  # account_lock() is a context manager
         # Mock the exclude_apps as a list so "in" checks work
         self.queue.get_checkpoint.return_value = None
         # Default: nothing unstorable to evict (real queue returns this shape).
@@ -1376,7 +1376,7 @@ class TestSendEventsDecoupleBuckets:
     def setup_method(self):
         self.aw = Mock()
         self.bf = Mock()
-        self.queue = Mock()
+        self.queue = MagicMock()  # account_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see
@@ -1500,7 +1500,7 @@ class TestStatusSpanEvents:
         self.aw = Mock()
         self.bf = Mock()
         self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
-        self.queue = Mock()
+        self.queue = MagicMock()  # account_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see
@@ -1702,7 +1702,7 @@ class TestPrivateOngoingSpanRefresh:
         self.aw = Mock()
         self.bf = Mock()
         self.bf.send_events.return_value = SyncResult(success=True, events_synced=1)
-        self.queue = Mock()
+        self.queue = MagicMock()  # account_lock() is a context manager
         self.queue.get_checkpoint.return_value = None
         self.config = Config()
         # Capture is fail-closed on an unknown schedule (see

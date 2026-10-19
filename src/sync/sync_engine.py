@@ -8,6 +8,7 @@ import threading
 import time
 from collections import Counter, OrderedDict
 import dataclasses
+import functools
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -349,6 +350,24 @@ def _split_over_long_event(event: dict) -> list[dict]:
         part["duration"] = round(chunk_duration, 2)
         parts.append(part)
     return parts
+
+
+def _holds_account_lock(method):
+    """Run a SyncEngine method holding the queue's account lock.
+
+    For every method that sends under the current token or produces rows
+    tagged with the bound account. OfflineQueue.bind_account takes the same
+    lock, so a sign-in by a different person waits for the send in flight to
+    finish under the token it started with, and no row recorded for the
+    previous person can be tagged as the next one's. One wrapper, applied at
+    each such method, so a new send path cannot quietly skip it."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.queue.account_lock():
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _is_afk_like(bucket_type: str) -> bool:
@@ -1089,6 +1108,7 @@ class SyncEngine:
             event["project_id"] = pid
         return event
 
+    @_holds_account_lock
     def _enqueue_events_best_effort(self, events: list, context: str) -> None:
         """Queue events for later delivery when they can't be sent now (fully
         offline paths that bypass _send_events' own queue-on-failure). Best
@@ -1100,6 +1120,7 @@ class SyncEngine:
                 "Failed to queue %d event(s) (%s): %s", len(events), context, e
             )
 
+    @_holds_account_lock
     def _deliver_final_event(self, event: dict, context: str) -> None:
         """Deliver a final detector event at shutdown: one immediate direct
         send, queueing on any non-auth failure (a definitive rejection ages
@@ -1972,6 +1993,17 @@ class SyncEngine:
         except Exception as e:
             logger.debug("Counted-time persist failed for %s/%s: %s", bucket_id, event_id, e)
 
+    def _not_before_owner(self, start: datetime) -> datetime:
+        """Never reach back into ActivityWatch data recorded before the
+        signed-in account took over this machine: AW's buckets are per
+        machine, so that span is the previous person's (OfflineQueue
+        .owner_since; None when there was no switch)."""
+        since = self.queue.owner_since
+        if isinstance(since, datetime) and since > start:
+            return since
+        return start
+
+    @_holds_account_lock
     def _reconcile_backlog(self, buckets: list) -> None:
         """Enqueue the whole current work day's AW events into the offline queue
         so they drain in the background.
@@ -2021,7 +2053,7 @@ class SyncEngine:
             )
             return
 
-        day_start = (
+        day_start = self._not_before_owner(
             datetime.now()
             .astimezone()
             .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2130,6 +2162,7 @@ class SyncEngine:
             lookback_start = checkpoint
         else:
             lookback_start = checkpoint - timedelta(minutes=2)
+        lookback_start = self._not_before_owner(lookback_start)
 
         # Page OLDEST-first through a bounded forward window.
         #
@@ -3013,6 +3046,7 @@ class SyncEngine:
                 return category
         return "other"
 
+    @_holds_account_lock
     def _send_status_span(
         self,
         *,
@@ -3779,6 +3813,7 @@ class SyncEngine:
         except Exception:
             logger.debug("inproc-afk-blind report failed", exc_info=True)
 
+    @_holds_account_lock
     def _send_events(self, events: list[dict], stats: SyncStats) -> None:
         """Send events to BetterFlow, grouped by bucket (#4 decouple buckets).
 
@@ -3851,6 +3886,7 @@ class SyncEngine:
                     )
                 raise
 
+    @_holds_account_lock
     def _send_bucket_events(self, events: list[dict], stats: SyncStats) -> None:
         """Batch and send a single bucket's events (or queue on failure)."""
         # Batch events
@@ -4058,6 +4094,7 @@ class SyncEngine:
         stats.forced_drain = True
         return True
 
+    @_holds_account_lock
     def _process_queue(self, stats: SyncStats) -> None:
         """Process offline queue with exponential backoff.
 
@@ -5010,6 +5047,7 @@ class SyncEngine:
             f"Advanced checkpoints for {len(bucket_ids)} buckets due to {reason}"
         )
 
+    @_holds_account_lock
     def _flush_pre_window_tail(self, buckets: list, boundary: datetime, reason: str) -> None:
         """Queue whatever AW recorded between each bucket's checkpoint and
         ``boundary``, so the checkpoint advance that follows discards only the

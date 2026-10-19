@@ -17,6 +17,7 @@ skip_time_tracking) so it cannot double-count.
 """
 
 from datetime import datetime, timedelta, timezone
+import contextlib
 from unittest.mock import Mock
 
 import pytest
@@ -40,6 +41,13 @@ class _Bucket:
 
 
 class _FakeQueue:
+    # SyncEngine's send/enqueue paths hold the queue's account lock and clamp
+    # ActivityWatch reads to owner_since (see OfflineQueue.bind_account).
+    owner_since = None
+
+    def account_lock(self):
+        return contextlib.nullcontext()
+
     def __init__(self):
         self._cp = {}
         self.enqueued = []

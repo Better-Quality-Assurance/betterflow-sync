@@ -2413,7 +2413,9 @@ class BetterFlowApp:
         )
 
         logger.info("Sync engine created")
-        self.login_manager = LoginManager(self.bf, self.keychain)
+        self.login_manager = LoginManager(
+            self.bf, self.keychain, account_binder=self.queue.bind_account
+        )
 
         # Tray icon
         self.tray = TrayIcon(

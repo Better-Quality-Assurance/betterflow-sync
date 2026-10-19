@@ -77,15 +77,21 @@ class LoginManager:
         self,
         bf_client: BetterFlowClient,
         keychain: Optional[KeychainManager] = None,
+        account_binder: Optional[Callable[..., object]] = None,
     ):
         """Initialize login manager.
 
         Args:
             bf_client: BetterFlow API client
             keychain: Keychain manager (creates default if None)
+            account_binder: ``OfflineQueue.bind_account`` in the app. Called
+                with the signing-in account BEFORE its token is handed to the
+                client, so locally-held activity recorded under a different
+                account can never be delivered with this account's token.
         """
         self.bf = bf_client
         self.keychain = keychain or KeychainManager()
+        self._account_binder = account_binder
         self._on_login_callback: Optional[Callable[[LoginState], None]] = None
         self._on_logout_callback: Optional[Callable[[], None]] = None
         self._active_flow: Optional[BrowserAuthFlow] = None
@@ -141,6 +147,16 @@ class LoginManager:
             # failure starts its own window.
             self._first_restore_failure = None
             return LoginState(logged_in=False)
+
+        # Bind local data to this account BEFORE its token goes live. A
+        # restored session is the one that was signed in before this launch.
+        if not self._bind_account(credentials.user_email, restored_session=True):
+            # Not a verdict on the session: retry like any other transient.
+            return LoginState(
+                logged_in=False,
+                transient=True,
+                error="Could not prepare local data for this account",
+            )
 
         # Set credentials on client
         self.bf.set_credentials(credentials.api_token, credentials.device_id)
@@ -293,8 +309,19 @@ class LoginManager:
         if not result.success:
             return LoginState(logged_in=False, error=result.error)
 
-        # Store credentials in keychain
         user_email = result.user_email or device_name
+
+        # Bind local data to this account BEFORE its token is stored or goes
+        # live: if this is a different person on the machine, the previous
+        # person's queued activity is dropped here, not delivered as theirs.
+        # A failure refuses the sign-in rather than risk exactly that.
+        if not self._bind_account(user_email, restored_session=False):
+            return LoginState(
+                logged_in=False,
+                error="Could not prepare local data for this account. Please try again.",
+            )
+
+        # Store credentials in keychain
         user_name = result.user_name or user_email
         user_role = result.user_role or "user"
         credentials = StoredCredentials(
@@ -330,6 +357,21 @@ class LoginManager:
             self._on_login_callback(state)
 
         return state
+
+    def _bind_account(self, user_email: Optional[str], *, restored_session: bool) -> bool:
+        """Run the account binder. False when it failed; the caller must then
+        NOT hand the new token to the client."""
+        if self._account_binder is None:
+            return True
+        try:
+            self._account_binder(user_email, restored_session=restored_session)
+            return True
+        except Exception as e:
+            logger.error(
+                "Could not bind local data to the signing-in account (%s: %s) "
+                "— sign-in not completed", type(e).__name__, e,
+            )
+            return False
 
     def logout(self) -> bool:
         """Log out and revoke device token.
