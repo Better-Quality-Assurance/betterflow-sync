@@ -10,7 +10,7 @@ These drive a full ``SyncEngine.sync()`` cycle with a REAL ActivityAnalyzer.
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 from src.config import Config
 from src.sync.activity_analyzer import ActivityAnalyzer
@@ -78,7 +78,7 @@ def _engine(*, external_input_events=None):
     bf = Mock()
     bf.is_reachable.return_value = True
 
-    queue = Mock()
+    queue = MagicMock()  # state_lock() is a context manager
     queue.get_checkpoint.return_value = now - timedelta(minutes=5)
     queue.is_empty.return_value = True
 
