@@ -522,7 +522,7 @@ class TestActivityWatchBacklogAfterSwitch:
 def test_app_wires_the_queue_into_the_login_manager():
     """Callsite guard: the binding only protects anyone if the app passes the
     queue's binder to the LoginManager it actually uses."""
-    tree = ast.parse((REPO_ROOT / "src" / "main.py").read_text())
+    tree = ast.parse((REPO_ROOT / "src" / "main.py").read_text(encoding="utf-8"))
     wired = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "LoginManager":
@@ -866,7 +866,7 @@ def test_every_send_and_enqueue_goes_through_the_one_egress_rule():
     seen = {"send_events": 0, "enqueue": 0, "dequeue": 0,
             "requeue_storable_dead_letter": 0}
     for path in (REPO_ROOT / "src").rglob("*.py"):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
