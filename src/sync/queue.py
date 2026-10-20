@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 try:
     from ..config import Config, MAX_QUEUE_SIZE
@@ -49,6 +49,19 @@ _MAX_LAST_ERROR_CHARS = 500
 # every cooldown, with `dropped_at` restamped on each pass so the cooldown never
 # terminates it. Same reasoning that gave MAX_EVENT_DURATION_SECONDS its name.
 EVENT_RETENTION_DAYS = 7
+
+
+#: Default for enqueue/dequeue's ``account``: "whatever account is bound".
+_BOUND = object()
+
+
+def normalize_account(value: object) -> Optional[str]:
+    """The account key rows are tagged with: the signed-in email, trimmed and
+    lowercased so 'Alice@Corp' and 'alice@corp' are one person. None when
+    there is no usable value."""
+    if not isinstance(value, str):
+        return None
+    return value.strip().lower() or None
 
 
 def _parse_timestamp(ts: object) -> Optional[datetime]:
@@ -233,7 +246,20 @@ class OfflineQueue:
         self._last_integrity_check: float = time.monotonic()
         self._integrity_check_interval: float = 3600.0  # 1 hour
         self._integrity_lock = threading.Lock()
+        # Account binding. Every queued / dead-lettered row is tagged with the
+        # account signed in when it was recorded and is only ever handed out
+        # for delivery while that same account is bound. The queue used to be
+        # one per MACHINE: a laptop handed to a new person drained the previous
+        # person's backlog under the new person's token, as their hours.
+        # _state_lock makes "rebind + put the new token live" (bind_account's
+        # `activate`) one step as seen by SyncEngine's egress snapshot, which
+        # reads (account, owner_since, credential generation) under it. Held
+        # only for that step and the snapshot — NEVER across network I/O.
+        self._state_lock = threading.Lock()
+        self._account: Optional[str] = None
+        self._owner_since: Optional[datetime] = None
         self._init_db()
+        self._load_owner()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection.
@@ -400,6 +426,24 @@ class OfflineQueue:
                 """
             )
 
+            # Additive migration: the account that recorded each row (see
+            # bind_account). Rows written before this column existed stay NULL
+            # ("legacy") and are settled exactly once, by the first bind after
+            # the upgrade. Nullable, so a downgraded agent still works.
+            if "account" not in cols:
+                cursor.execute("ALTER TABLE queued_events ADD COLUMN account TEXT")
+            if "account" not in dl_cols:
+                cursor.execute(
+                    "ALTER TABLE dead_letter_events ADD COLUMN account TEXT")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS queue_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
+
             # Also track sync checkpoints
             cursor.execute(
                 """
@@ -477,11 +521,215 @@ class OfflineQueue:
                 self._last_integrity_check = 0.0  # reset so next call retries
             return False
 
-    def enqueue(self, events: list[dict]) -> int:
+    # Account binding ------------------------------------------------------
+
+    _META_OWNER = "owner_account"
+    _META_OWNER_SINCE = "owner_since"
+    _META_LEGACY_RESOLVED = "legacy_resolved"
+
+    def _load_owner(self) -> None:
+        """Restore the bound account across a restart, so rows recorded before
+        the session is restored are still tagged with their owner."""
+        with self._cursor() as cursor:
+            cursor.execute("SELECT key, value FROM queue_meta")
+            meta = {row[0]: row[1] for row in cursor.fetchall()}
+        self._account = normalize_account(meta.get(self._META_OWNER))
+        since = meta.get(self._META_OWNER_SINCE)
+        self._owner_since = _parse_timestamp(since) if since else None
+
+    @property
+    def account(self) -> Optional[str]:
+        """The account rows are currently recorded for and delivered under."""
+        return self._account
+
+    @property
+    def owner_since(self) -> Optional[datetime]:
+        """When the bound account took over this machine, or None when it has
+        no predecessor here (or it predates this field). ActivityWatch data
+        older than this was recorded by someone else and must not be fetched
+        for upload (SyncEngine reads it)."""
+        return self._owner_since
+
+    @contextmanager
+    def state_lock(self) -> Iterator[None]:
+        """Held by SyncEngine only while taking its egress snapshot (account,
+        owner_since and the HTTP client's credential generation), so the
+        snapshot can never pair one account with another account's token.
+        Never hold it across network I/O."""
+        with self._state_lock:
+            yield
+
+    def bind_account(
+        self,
+        account: Optional[str],
+        *,
+        restored_session: bool,
+        activate: Optional[Callable[[], None]] = None,
+        now: Optional[datetime] = None,
+    ) -> dict:
+        """Bind the queue to the account that is about to sign in.
+
+        MUST run before that account's token is handed to the HTTP client:
+        from the moment it returns, the queue hands out only this account's
+        rows. Every row recorded under any other account is DROPPED, from the
+        live queue and the dead-letter table alike, and the count is logged.
+        Dropped rather than quarantined: the rows can never be delivered under
+        their owner's token from here (the device has changed hands), and
+        keeping them would leave the previous person's window titles on the
+        next person's laptop.
+
+        Legacy rows (written before rows carried an account) are settled once,
+        on the first bind after the upgrade:
+        - ``restored_session=True``: the session restored from the keychain is
+          the one that was signed in when the agent upgraded, so the legacy
+          backlog is its own. Claimed and delivered.
+        - otherwise (a fresh sign-in with no session to restore): whoever
+          recorded the backlog is unknowable, so it is dropped with a count.
+
+        A SWITCH is "the signing-in account differs from the one bound here"
+        (or, on the first bind after the upgrade, a sign-in with no session to
+        restore). The same person signing in again, however they got there (a
+        keychain macOS stopped letting us read, an expired token), is not a
+        switch: nothing is dropped and nothing is moved. A switch moves every
+        ActivityWatch checkpoint up to ``now`` and records ``owner_since``;
+        SyncEngine drops or clips anything that starts before it, at egress.
+
+        ``activate`` (LoginManager: put the new token live) runs under the
+        same state lock as the rebinding, after it commits, so no egress
+        snapshot can pair the new account with the old token or vice versa.
+        No in-flight send is waited for: a batch prepared under the previous
+        credentials is refused before egress (expected_generation), and its
+        rows are refused re-entry by enqueue's owner check.
+        """
+        account = normalize_account(account)
+        now = now or datetime.now(timezone.utc)
+        with self._state_lock:
+            result = self._bind_account_locked(account, restored_session, now)
+            if activate is not None:
+                activate()
+        self._log_bind(result, now)
+        return result
+
+    def _bind_account_locked(
+        self, account: Optional[str], restored_session: bool, now: datetime
+    ) -> dict:
+        result = {
+            "dropped_queued": 0, "dropped_dead_letter": 0,
+            "claimed_legacy": 0, "dropped_legacy_queued": 0,
+            "dropped_legacy_dead_letter": 0, "switched": False,
+        }
+        with self._cursor(immediate=True) as cursor:
+            cursor.execute("SELECT key, value FROM queue_meta")
+            meta = {row[0]: row[1] for row in cursor.fetchall()}
+            first_bind = meta.get(self._META_LEGACY_RESOLVED) != "1"
+            previous = normalize_account(meta.get(self._META_OWNER))
+
+            if first_bind:
+                if restored_session:
+                    for table in ("queued_events", "dead_letter_events"):
+                        cursor.execute(
+                            f"UPDATE {table} SET account = ? WHERE account IS NULL",
+                            (account,),
+                        )
+                        result["claimed_legacy"] += max(cursor.rowcount, 0)
+                else:
+                    cursor.execute("DELETE FROM queued_events WHERE account IS NULL")
+                    result["dropped_legacy_queued"] = max(cursor.rowcount, 0)
+                    cursor.execute(
+                        "DELETE FROM dead_letter_events WHERE account IS NULL")
+                    result["dropped_legacy_dead_letter"] = max(cursor.rowcount, 0)
+                # An upgrade with a session to restore keeps today's backlog
+                # (it is that session's); a fresh sign-in cannot vouch for it.
+                switched = not restored_session
+            else:
+                switched = previous != account
+
+            # `IS NOT` so NULL compares as a value: an untagged row is never
+            # delivered under a named account once the legacy rule has run.
+            cursor.execute(
+                "DELETE FROM queued_events WHERE account IS NOT ?", (account,))
+            result["dropped_queued"] = max(cursor.rowcount, 0)
+            cursor.execute(
+                "DELETE FROM dead_letter_events WHERE account IS NOT ?", (account,))
+            result["dropped_dead_letter"] = max(cursor.rowcount, 0)
+
+            owner_since = self._owner_since
+            if switched:
+                owner_since = now
+                cursor.execute(
+                    "UPDATE sync_checkpoints SET last_timestamp = ?, updated_at = ? "
+                    "WHERE last_timestamp < ?",
+                    (now.isoformat(), now.isoformat(), now.isoformat()),
+                )
+            cursor.executemany(
+                "INSERT INTO queue_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [
+                    (self._META_OWNER, account),
+                    (self._META_OWNER_SINCE,
+                     owner_since.isoformat() if owner_since else None),
+                    (self._META_LEGACY_RESOLVED, "1"),
+                ],
+            )
+            # Set INSIDE the write transaction: enqueue reads the tag inside
+            # its own BEGIN IMMEDIATE, so it sees either the old binding (and
+            # its rows were just deleted) or the new one, never a mix.
+            self._account = account
+            self._owner_since = owner_since
+            result["switched"] = switched
+        return result
+
+    def _log_bind(self, result: dict, now: datetime) -> None:
+        if result["claimed_legacy"]:
+            logger.info(
+                "[queue] %d untagged pre-upgrade event(s) assigned to the "
+                "restored session's account", result["claimed_legacy"],
+            )
+        if result["dropped_legacy_queued"] or result["dropped_legacy_dead_letter"]:
+            logger.warning(
+                "[queue] Dropped %d queued and %d dead-lettered untagged "
+                "pre-upgrade event(s): no session was restored, so whoever "
+                "recorded them is unknown and they must not upload as this "
+                "account's time",
+                result["dropped_legacy_queued"], result["dropped_legacy_dead_letter"],
+            )
+        if result["dropped_queued"] or result["dropped_dead_letter"]:
+            logger.warning(
+                "[queue] Dropped %d queued and %d dead-lettered event(s) recorded "
+                "under another account on this machine — they must never upload "
+                "under the account now signing in",
+                result["dropped_queued"], result["dropped_dead_letter"],
+            )
+        if result["switched"]:
+            logger.info(
+                "[queue] Account changed on this machine; ActivityWatch data "
+                "before %s will not be uploaded", now.isoformat(),
+            )
+
+    def _owner_check(self, account: object, what: str) -> tuple[bool, Optional[str]]:
+        """THE owner rule for enqueue, dequeue and dead-letter replay: a caller
+        naming an account (SyncEngine's egress snapshot) is served only while
+        that account is still the bound one. Returns (owned, bound account);
+        a refusal is logged. Call it inside the operation's transaction, so the
+        binding cannot change before the rows are touched."""
+        bound = self._account
+        if account is _BOUND or normalize_account(account) == bound:
+            return True, bound
+        logger.warning(
+            "[queue] Refused %s: recorded under another account than the one "
+            "now signed in on this machine", what,
+        )
+        return False, bound
+
+    def enqueue(self, events: list[dict], *, account: object = _BOUND) -> int:
         """Add events to the queue.
 
         Args:
             events: List of event dictionaries
+            account: The account the events were recorded under (SyncEngine
+                passes its egress snapshot's). If that is no longer the bound
+                account, the events are REFUSED — dropped with a logged count —
+                never re-tagged as the account that is signed in now.
 
         Returns:
             Number of events added
@@ -496,6 +744,13 @@ class OfflineQueue:
 
         now = datetime.now(timezone.utc).isoformat()
         with self._cursor(immediate=True) as cursor:
+            # Owner check FIRST, before eviction can make room for rows that
+            # are about to be refused.
+            # Read inside the BEGIN IMMEDIATE transaction: bind_account swaps
+            # the binding inside its own, so this tag is never stale.
+            owned, account = self._owner_check(account, f"{len(events)} event(s)")
+            if not owned:
+                return 0
             # Atomic: check size + evict + insert in a single transaction.
             # immediate=True is what makes that claim TRUE — the COUNT decides
             # how many rows to evict, so it has to be inside the transaction the
@@ -522,14 +777,16 @@ class OfflineQueue:
             count = len(events)
             cursor.executemany(
                 """
-                INSERT INTO queued_events (event_data, created_at)
-                VALUES (?, ?)
+                INSERT INTO queued_events (event_data, created_at, account)
+                VALUES (?, ?, ?)
                 """,
-                [(json.dumps(e), now) for e in events],
+                [(json.dumps(e), now, account) for e in events],
             )
             return count
 
-    def dequeue(self, batch_size: int = 100, max_retries: int = 5) -> list[QueuedEvent]:
+    def dequeue(
+        self, batch_size: int = 100, max_retries: int = 5, *, account: object = _BOUND
+    ) -> list[QueuedEvent]:
         """Get a batch of events from the queue (oldest first).
 
         Skips events that have exceeded max_retries (N7).
@@ -546,15 +803,21 @@ class OfflineQueue:
             logger.error("[queue] Skipping dequeue due to integrity failure")
             return []
         with self._cursor() as cursor:
+            owned, account = self._owner_check(account, "dequeue")
+            if not owned:
+                return []
             cursor.execute(
                 """
                 SELECT id, event_data, created_at, retry_count
                 FROM queued_events
-                WHERE retry_count < ?
+                WHERE retry_count < ? AND account IS ?
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
-                (max_retries, batch_size),
+                # Only the bound account's rows are ever handed out for
+                # delivery (bind_account drops the rest; this is the second
+                # wall, at the read every send starts from).
+                (max_retries, account, batch_size),
             )
             rows = cursor.fetchall()
             result: list[QueuedEvent] = []
@@ -792,7 +1055,8 @@ class OfflineQueue:
         with self._cursor(immediate=True) as cursor:
             cursor.execute(
                 """
-                SELECT id, event_data, created_at, retry_count, last_error
+                SELECT id, event_data, created_at, retry_count, last_error,
+                       account
                 FROM queued_events
                 WHERE retry_count >= ?
                 """,
@@ -820,15 +1084,16 @@ class OfflineQueue:
                 # receiving-side change, which have opposite fixes.
                 reason = row[4] or last_error
                 dead_rows.append(
-                    (row[0], row[1], bucket_id, row[2], row[3], reason, now)
+                    (row[0], row[1], bucket_id, row[2], row[3], reason, now,
+                     row[5])
                 )
 
             cursor.executemany(
                 """
                 INSERT INTO dead_letter_events
                     (original_id, event_data, bucket_id, created_at,
-                     retry_count, last_error, dropped_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     retry_count, last_error, dropped_at, account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 dead_rows,
             )
@@ -911,8 +1176,8 @@ class OfflineQueue:
         # write it to dead_letter twice.
         with self._cursor(immediate=True) as cursor:
             cursor.execute(
-                "SELECT id, event_data, created_at, retry_count, last_error "
-                "FROM queued_events"
+                "SELECT id, event_data, created_at, retry_count, last_error, "
+                "account FROM queued_events"
             )
             rows = cursor.fetchall()
             if not rows:
@@ -961,7 +1226,7 @@ class OfflineQueue:
                     unstorable += 1
                 dead_rows.append(
                     (rid, raw, bucket_id, created_at, retry_count,
-                     row_error or last_error, dropped_at)
+                     row_error or last_error, dropped_at, row[5])
                 )
 
             if not evict_ids:
@@ -971,8 +1236,8 @@ class OfflineQueue:
                 """
                 INSERT INTO dead_letter_events
                     (original_id, event_data, bucket_id, created_at,
-                     retry_count, last_error, dropped_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     retry_count, last_error, dropped_at, account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 dead_rows,
             )
@@ -1190,6 +1455,7 @@ class OfflineQueue:
         now: Optional[datetime] = None,
         stale_after_days: int = EVENT_RETENTION_DAYS,
         min_dead_age_seconds: Optional[float] = None,
+        account: object = _BOUND,
     ) -> dict:
         """Resurrect dead-lettered rows that are STORABLE again — move them back
         into the live queue for another delivery attempt.
@@ -1269,6 +1535,13 @@ class OfflineQueue:
         # immediate=True: the SELECT below CHOOSES the rows the INSERT/DELETE act
         # on, so it must be inside the write transaction, not ahead of it.
         with self._cursor(immediate=True) as cursor:
+            # Only the bound account's dead letters are resurrected (read
+            # inside the transaction, like enqueue's tag) — or the caller's
+            # snapshot account, which then must still be the bound one.
+            owned, account = self._owner_check(account, "dead-letter replay")
+            if not owned:
+                return {"examined": 0, "requeued": 0, "skipped_unstorable": 0,
+                        "marked_terminal": 0}
             # Capacity first, and read INSIDE this transaction so it can't go
             # stale before the INSERT below acts on it. ``enqueue`` enforces
             # max_size by evicting the OLDEST queued events; this raw-INSERT
@@ -1336,23 +1609,26 @@ class OfflineQueue:
                 if cursor_key is None:
                     cursor.execute(
                         """
-                        SELECT id, event_data, dropped_at FROM dead_letter_events
-                        WHERE dropped_at <= ? AND terminal = 0
+                        SELECT id, event_data, dropped_at, account
+                        FROM dead_letter_events
+                        WHERE dropped_at <= ? AND terminal = 0 AND account IS ?
                         ORDER BY dropped_at ASC, id ASC
                         LIMIT ?
                         """,
-                        (cooldown_cutoff, page),
+                        (cooldown_cutoff, account, page),
                     )
                 else:
                     cursor.execute(
                         """
-                        SELECT id, event_data, dropped_at FROM dead_letter_events
-                        WHERE dropped_at <= ? AND terminal = 0
+                        SELECT id, event_data, dropped_at, account
+                        FROM dead_letter_events
+                        WHERE dropped_at <= ? AND terminal = 0 AND account IS ?
                           AND (dropped_at, id) > (?, ?)
                         ORDER BY dropped_at ASC, id ASC
                         LIMIT ?
                         """,
-                        (cooldown_cutoff, cursor_key[0], cursor_key[1], page),
+                        (cooldown_cutoff, account, cursor_key[0], cursor_key[1],
+                         page),
                     )
                 rows = cursor.fetchall()
                 if not rows:
@@ -1411,8 +1687,9 @@ class OfflineQueue:
                             terminal_ids.append(dead_id)
                         continue
                     move_ids.append(dead_id)
-                    # Re-enter with a fresh created_at and retry_count 0.
-                    new_rows.append((raw, requeued_at))
+                    # Re-enter with a fresh created_at and retry_count 0,
+                    # still owned by the account that recorded it.
+                    new_rows.append((raw, requeued_at, row[3]))
 
             if examined == 0:
                 return {"examined": 0, "requeued": 0, "skipped_unstorable": 0,
@@ -1429,7 +1706,8 @@ class OfflineQueue:
                 }
 
             cursor.executemany(
-                "INSERT INTO queued_events (event_data, created_at) VALUES (?, ?)",
+                "INSERT INTO queued_events (event_data, created_at, account) "
+                "VALUES (?, ?, ?)",
                 new_rows,
             )
             placeholders = ",".join("?" * len(move_ids))

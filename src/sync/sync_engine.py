@@ -8,8 +8,14 @@ import threading
 import time
 from collections import Counter, OrderedDict
 import dataclasses
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+# Unpatchable aliases for the account-isolation code: several suites patch
+# this module's `datetime` to freeze the clock, and an isinstance()/parse
+# against a Mock would fail closed on every event.
+_DateTime = datetime
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
@@ -25,7 +31,10 @@ try:
     from ..browser_tracker import is_browser_app
     from ..config import Config
     from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
-    from .bf_client import BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION
+    from .bf_client import (
+        BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION,
+        REASON_CREDENTIALS_CHANGED, SyncResult,
+    )
     from .http_client import (
         REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
@@ -47,7 +56,10 @@ except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
     from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
-    from sync.bf_client import BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION
+    from sync.bf_client import (
+        BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION,
+        REASON_CREDENTIALS_CHANGED, SyncResult,
+    )
     from sync.http_client import (
         REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
@@ -125,7 +137,13 @@ _LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
     (REASON_RATE_LIMIT_BACKOFF, "rate-limited"),
     (REASON_SERVER_UNAVAILABLE, "server-unavailable"),
     (REASON_NO_CONFIRMATION, "no-confirmation"),
+    (REASON_CREDENTIALS_CHANGED, "credentials-changed"),
 )
+
+
+#: Emitted in place of a kind when a local reason matched none of the prefixes
+#: above. Never derived from the reason text.
+_UNCLASSIFIED_KIND = "unclassified"
 
 
 def local_reason_kinds(reasons) -> list[str]:
@@ -142,15 +160,24 @@ def local_reason_kinds(reasons) -> list[str]:
     # Each item takes the FIRST prefix it matches, so overlapping prefixes
     # ("Server returned 429" / "Server returned") yield one kind per reason.
     matched = set()
+    any_unmatched = False
     for item in items:
         for prefix, kind in _LOCAL_REASON_KINDS:
             if item.startswith(prefix):
                 matched.add(kind)
                 break
+        else:
+            any_unmatched = True
     ordered: list[str] = []
     for _, kind in _LOCAL_REASON_KINDS:
         if kind in matched and kind not in ordered:
             ordered.append(kind)
+    # An item that matched no prefix is a fact, not an absence. Dropping it made
+    # one bucket failure plus an unknown reason read exactly like two bucket
+    # failures, and with nothing matched, like a pre-#254 agent (#255). Last,
+    # so the order stays fixed; a token we wrote, never the item's text.
+    if any_unmatched:
+        ordered.append(_UNCLASSIFIED_KIND)
     return ordered
 
 
@@ -183,7 +210,11 @@ def server_status_summary(reasons) -> str:
     if codes and not uncoded:
         return f"; server status {','.join(codes)}, full reason in local dead-letter"
     kinds = local_reason_kinds(uncoded)
-    named = f" [{','.join(kinds)}]" if kinds else ""
+    # Never empty here: `uncoded` is non-empty on every path that reaches this
+    # line, and local_reason_kinds names an unmatched item `unclassified` rather
+    # than dropping it (#255). The bare-count bytes a pre-#254 agent sends are
+    # therefore unreachable. The `if kinds` keeps that true if a caller changes.
+    named = f" [{','.join(kinds)}]" if kinds else f" [{_UNCLASSIFIED_KIND}]"
     if codes:
         return (f"; server status {','.join(codes)} plus "
                 f"{len(uncoded)} local reason(s){named}, "
@@ -331,6 +362,19 @@ def _split_over_long_event(event: dict) -> list[dict]:
         part["duration"] = round(chunk_duration, 2)
         parts.append(part)
     return parts
+
+
+@dataclass(frozen=True)
+class EgressSnapshot:
+    """Who locally-held activity belongs to, captured ONCE before it is
+    produced: the bound account, when that account took over this machine,
+    and the HTTP client's credential generation. Taken atomically under the
+    queue's state lock (OfflineQueue.bind_account rebinds and puts the new
+    token live under the same lock). See SyncEngine._egress_send."""
+
+    account: Optional[str]
+    owner_since: Optional[datetime]
+    generation: object
 
 
 def _is_afk_like(bucket_type: str) -> bool:
@@ -694,6 +738,11 @@ class SyncEngine:
 
         # Thread safety: protects cross-thread mutable state
         self._state_lock = threading.Lock()
+        # Egress snapshot pinned for the current sync cycle (per thread: the
+        # tray thread sends status spans concurrently). See _egress_cycle.
+        self._egress_local = threading.local()
+        self._egress_switch_lock = threading.Lock()
+        self._egress_owner_since_seen = self._queue_owner_since()
         # Dedicated lock for all BoundedLRU caches (ops are multi-step and
         # touched from the sync thread plus heartbeat thread).
         self._cache_lock = threading.Lock()
@@ -1076,12 +1125,174 @@ class SyncEngine:
             event["project_id"] = pid
         return event
 
+    # ---- The one egress rule ---------------------------------------------
+    #
+    # Locally-held activity (the offline queue, in-memory buffers, in-process
+    # checkpoints, open detector sessions) belongs to whoever was signed in
+    # when it was RECORDED. A laptop handed to another person used to deliver
+    # the previous person's backlog under the next person's token, as their
+    # hours. Every send and every enqueue in this module goes through exactly
+    # two methods, _egress_send and _egress_enqueue
+    # (tests/test_queue_account_isolation.py has a structure guard), and both
+    # apply the same rule against ONE EgressSnapshot:
+    #   - anything starting before the snapshot's owner_since is dropped, or
+    #     clipped to start at it (logged count);
+    #   - a send is pinned to the snapshot's credential generation, so a batch
+    #     prepared under one account is refused before egress once the token
+    #     has changed, never sent with the new one;
+    #   - an enqueue is refused unless the snapshot's account is still the
+    #     bound one — never re-tagged as the account signed in now.
+    # No lock is held across network I/O: the checks are atomic where the
+    # state lives (the HTTP client's session lock, the queue's transaction).
+
+    def _queue_owner_since(self) -> Optional[datetime]:
+        since = getattr(self.queue, "owner_since", None)
+        return since if isinstance(since, _DateTime) else None
+
+    def _take_egress_snapshot(self) -> EgressSnapshot:
+        with self.queue.state_lock():
+            snap = EgressSnapshot(
+                account=getattr(self.queue, "account", None),
+                owner_since=self._queue_owner_since(),
+                generation=self.bf.credential_generation(),
+            )
+        return snap
+
+    def _egress_snapshot(self) -> EgressSnapshot:
+        """The current sync cycle's pinned snapshot, else a fresh one (a
+        tray-thread status span or detector flush is produced and sent in one
+        step, so a fresh snapshot covers it)."""
+        pinned = getattr(self._egress_local, "snapshot", None)
+        return pinned if pinned is not None else self._take_egress_snapshot()
+
+    @contextmanager
+    def _egress_cycle(self):
+        """Pin one snapshot for everything a sync cycle fetches, builds, sends
+        and queues. Taken BEFORE anything is fetched, so data fetched under
+        one account can never be sent or queued as another."""
+        if getattr(self._egress_local, "snapshot", None) is not None:
+            yield  # nested: keep the outer cycle's snapshot
+            return
+        snap = self._take_egress_snapshot()
+        # Producer reset on an account switch runs HERE, on the sync cycle's
+        # own thread, never from a getter a tray-thread send can reach: the
+        # checkpoints and detectors it resets belong to the sync thread. A
+        # tray send that sees the switch first is covered by egress clipping;
+        # the reset then happens at the next cycle (owner_since_seen is only
+        # advanced by _on_owner_since).
+        self._on_owner_since(snap.owner_since)
+        self._egress_local.snapshot = snap
+        try:
+            yield
+        finally:
+            self._egress_local.snapshot = None
+
+    def _on_owner_since(self, since: Optional[datetime]) -> None:
+        """A new owner_since means a different person signed in on this
+        machine. In-memory state recorded before it is theirs-before: pull the
+        in-process checkpoints up to it and discard open detector sessions, so
+        they are not rebuilt into spans at all (egress would clip them anyway).
+        """
+        if since is None:
+            return
+        with self._egress_switch_lock:
+            if since == self._egress_owner_since_seen:
+                return
+            self._egress_owner_since_seen = since
+        for attr in (
+            "_afk_inproc_checkpoint",
+            "_window_inproc_checkpoint",
+            "_input_inproc_checkpoint",
+        ):
+            cp = getattr(self, attr, None)
+            if isinstance(cp, _DateTime) and cp < since:
+                setattr(self, attr, since)
+        discarded = 0
+        for detector in (
+            getattr(self, "_call_detector", None),
+            getattr(self, "_mic_detector", None),
+            getattr(self, "_foreground_detector", None),
+        ):
+            if detector is None:
+                continue
+            try:
+                if detector.flush():
+                    discarded += 1
+            except Exception as e:
+                logger.warning("detector reset on account switch failed: %s", e)
+        logger.info(
+            "Account changed on this machine: in-process checkpoints moved to "
+            "%s, %d open detector session(s) discarded", since.isoformat(), discarded,
+        )
+
+    @staticmethod
+    def _clip_to_owner(events: list, owner_since: Optional[datetime]) -> tuple[list, int]:
+        """Drop events that end before ``owner_since`` and clip those that
+        straddle it to start at it. An unreadable timestamp is dropped: it
+        cannot be shown to belong to the signed-in account."""
+        if owner_since is None or not events:
+            return events, 0
+        kept: list = []
+        dropped = 0
+        for ev in events:
+            ts = None
+            if isinstance(ev, dict) and isinstance(ev.get("timestamp"), str):
+                try:
+                    ts = _DateTime.fromisoformat(ev["timestamp"])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    ts = None
+            if ts is None:
+                dropped += 1
+                continue
+            if ts >= owner_since:
+                kept.append(ev)
+                continue
+            duration = ev.get("duration")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                end = ts + timedelta(seconds=float(duration))
+                if end > owner_since:
+                    clipped = dict(ev)
+                    clipped["timestamp"] = owner_since.isoformat()
+                    clipped["duration"] = (end - owner_since).total_seconds()
+                    kept.append(clipped)
+                    continue
+            dropped += 1
+        return kept, dropped
+
+    def _egress_send(self, events: list) -> SyncResult:
+        """THE send path. See the block comment above."""
+        snap = self._egress_snapshot()
+        events, dropped = self._clip_to_owner(events, snap.owner_since)
+        if dropped:
+            logger.warning(
+                "Dropped %d event(s) recorded before the current account took "
+                "over this machine — not sent", dropped,
+            )
+        if not events:
+            return SyncResult(success=True, events_synced=0)
+        return self.bf.send_events(events, expected_generation=snap.generation)
+
+    def _egress_enqueue(self, events: list) -> int:
+        """THE enqueue path. See the block comment above."""
+        snap = self._egress_snapshot()
+        events, dropped = self._clip_to_owner(events, snap.owner_since)
+        if dropped:
+            logger.warning(
+                "Dropped %d event(s) recorded before the current account took "
+                "over this machine — not queued", dropped,
+            )
+        if not events:
+            return 0
+        return self.queue.enqueue(events, account=snap.account)
+
     def _enqueue_events_best_effort(self, events: list, context: str) -> None:
         """Queue events for later delivery when they can't be sent now (fully
         offline paths that bypass _send_events' own queue-on-failure). Best
         effort: a queue error is logged, never raised into the sync cycle."""
         try:
-            self.queue.enqueue(events)
+            self._egress_enqueue(events)
         except Exception as e:
             logger.warning(
                 "Failed to queue %d event(s) (%s): %s", len(events), context, e
@@ -1102,7 +1313,7 @@ class SyncEngine:
         """
         try:
             self._note_delivery_attempt()
-            result = self.bf.send_events([event])
+            result = self._egress_send([event])
             if getattr(result, "success", False):
                 return
             self._enqueue_events_best_effort([event], context)
@@ -1283,6 +1494,13 @@ class SyncEngine:
             self._last_config_fetch_monotonic = time.monotonic()
 
     def sync(self) -> SyncStats:
+        """Perform a sync cycle under ONE egress snapshot (see _egress_cycle):
+        everything this cycle fetches is sent or queued as the account that
+        was signed in when it started, or not at all."""
+        with self._egress_cycle():
+            return self._sync_cycle()
+
+    def _sync_cycle(self) -> SyncStats:
         """Perform a sync cycle.
 
         1. Fetch server config (first time only)
@@ -2010,6 +2228,16 @@ class SyncEngine:
         except Exception as e:
             logger.debug("Counted-time persist failed for %s/%s: %s", bucket_id, event_id, e)
 
+    def _not_before_owner(self, start: datetime) -> datetime:
+        """Never reach back into ActivityWatch data recorded before the
+        signed-in account took over this machine: AW's buckets are per
+        machine, so that span is the previous person's (OfflineQueue
+        .owner_since; None when there was no switch)."""
+        since = self.queue.owner_since
+        if isinstance(since, _DateTime) and since > start:
+            return since
+        return start
+
     def _reconcile_backlog(self, buckets: list) -> None:
         """Enqueue the whole current work day's AW events into the offline queue
         so they drain in the background.
@@ -2059,7 +2287,7 @@ class SyncEngine:
             )
             return
 
-        day_start = (
+        day_start = self._not_before_owner(
             datetime.now()
             .astimezone()
             .replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2091,26 +2319,46 @@ class SyncEngine:
                 events.sort(key=lambda e: e.timestamp)  # AW is newest-first
                 batch: list[dict] = []
                 for event in events:
-                    if _is_window_like(bucket.type):
-                        batch.extend(
-                            self._transform_window_event_with_timeout(
-                                event, bucket.id, bucket.type, cycle
-                            )
-                        )
-                    else:
-                        transformed = self._transform_event(
-                            event, bucket.id, bucket.type, skip_time_tracking=True, cycle=cycle
-                        )
-                        if transformed:
-                            batch.append(transformed)
+                    batch.extend(self._transform_for_replay(event, bucket, cycle))
                 if batch:
-                    enqueued += self.queue.enqueue(batch)
+                    enqueued += self._egress_enqueue(batch)
         if enqueued:
             logger.info(
                 "Backlog reconcile: enqueued %d work-day events (since %s) to drain via the queue",
                 enqueued,
                 day_start.isoformat(),
             )
+
+    def _transform_for_replay(
+        self, event: AWEvent, bucket, cycle: "_SyncCycleContext"
+    ) -> list[dict]:
+        """Transform one AW event for the paths that ENQUEUE instead of sending:
+        ``_reconcile_backlog`` and ``_flush_pre_window_tail``.
+
+        One implementation for both, because they had drifted from live sync:
+        #269 split a >24h non-window event inside ``_transform_and_checkpoint``
+        only, so these two still queued it whole. The pause tail flush is the
+        likely one: it fetches from the bucket's checkpoint, which for an ongoing
+        AFK event is that event's start, so after a day idle it returns the whole
+        >24h event. ``evict_unstorable`` then dead-lettered it as over-long real
+        loss (ops board 2026-10-09, device 10, agent 1.5.138:
+        "Dropped 1 queued event(s) ... buckets=aw-watcher-afk"). Splitting with
+        the same ``_split_over_long_event`` gives the same chunk ids the live
+        path sends, so the server upserts rather than storing a second copy.
+
+        Non-window events pass ``skip_time_tracking`` so a replay never touches
+        the daily total; window events dedup through the counted-time cache in
+        ``_transform_window_event_with_timeout`` and are not split (their
+        classification is per event, same as live sync).
+        """
+        if _is_window_like(bucket.type):
+            return self._transform_window_event_with_timeout(
+                event, bucket.id, bucket.type, cycle
+            )
+        transformed = self._transform_event(
+            event, bucket.id, bucket.type, skip_time_tracking=True, cycle=cycle
+        )
+        return _split_over_long_event(transformed) if transformed else []
 
     def _within_working_hours(self, event: AWEvent) -> bool:
         """True if the event's start may be uploaded — i.e. it falls inside the
@@ -2148,6 +2396,7 @@ class SyncEngine:
             lookback_start = checkpoint
         else:
             lookback_start = checkpoint - timedelta(minutes=2)
+        lookback_start = self._not_before_owner(lookback_start)
 
         # Page OLDEST-first through a bounded forward window.
         #
@@ -3139,7 +3388,7 @@ class SyncEngine:
         # dropped on the first offline cycle. Inspect the result instead.
         try:
             self._note_delivery_attempt()
-            result = self.bf.send_events(events)
+            result = self._egress_send(events)
         except BetterFlowAuthError as e:
             # Auth errors are not retryable without re-login; queueing risks
             # sending under a different user's session after re-auth. Drop.
@@ -3149,7 +3398,7 @@ class SyncEngine:
             logger.info("Sent %s event (%.0fs)", bucket_type, duration)
         elif queue_on_failure:
             logger.warning("Failed to send %s event: %s — queueing", bucket_type, result.error or "unknown")
-            self.queue.enqueue(events)
+            self._egress_enqueue(events)
         else:
             # In-progress snapshot: superseded by the next cycle's re-send.
             logger.debug(
@@ -3848,7 +4097,7 @@ class SyncEngine:
                     self._SEND_SKIP_IF_CYCLE_ELAPSED, len(bucket_groups) - idx,
                 )
                 for remaining in bucket_groups[idx:]:
-                    self.queue.enqueue(remaining)
+                    self._egress_enqueue(remaining)
                     stats.events_queued += len(remaining)
                     stats.queued_bucket_ids.update(
                         e.get("bucket_id", "") for e in remaining
@@ -3862,7 +4111,7 @@ class SyncEngine:
                 # propagating so nothing is silently dropped (the per-bucket
                 # handler already queued this bucket's remaining batches).
                 for remaining in bucket_groups[idx + 1:]:
-                    self.queue.enqueue(remaining)
+                    self._egress_enqueue(remaining)
                     stats.events_queued += len(remaining)
                     stats.queued_bucket_ids.update(
                         e.get("bucket_id", "") for e in remaining
@@ -3878,7 +4127,7 @@ class SyncEngine:
         for i, batch in enumerate(batches):
             try:
                 self._note_delivery_attempt()
-                result = self.bf.send_events(batch)
+                result = self._egress_send(batch)
                 if result.success:
                     stats.events_sent += result.events_synced
                     self._clear_queue_backoff("live batch accepted")
@@ -3891,7 +4140,7 @@ class SyncEngine:
                         stats.events_sent += len(batch) - len(failed)
                         self._clear_queue_backoff("live batch partially accepted")
                         if failed:
-                            self.queue.enqueue(failed)
+                            self._egress_enqueue(failed)
                             stats.events_queued += len(failed)
                             stats.queued_bucket_ids.update(
                                 e.get("bucket_id", "") for e in failed
@@ -3910,7 +4159,7 @@ class SyncEngine:
                             result.error or "unknown",
                             len(batch),
                         )
-                        self.queue.enqueue(batch)
+                        self._egress_enqueue(batch)
                         stats.events_queued += len(batch)
                         stats.queued_bucket_ids.update(
                             e.get("bucket_id", "") for e in batch
@@ -3923,7 +4172,7 @@ class SyncEngine:
                 # request, so batch i was NOT processed.  Re-sending is safe
                 # because the server uses idempotency keys.
                 for remaining in batches[i:]:
-                    self.queue.enqueue(remaining)
+                    self._egress_enqueue(remaining)
                     stats.events_queued += len(remaining)
                     stats.queued_bucket_ids.update(
                         e.get("bucket_id", "") for e in remaining
@@ -4081,6 +4330,9 @@ class SyncEngine:
 
         Capped at 30s wall-clock time to prevent tying up the sync thread.
         """
+        # Only the snapshot account's rows are drained, and every batch is
+        # sent pinned to the snapshot's credentials (_egress_send).
+        egress = self._egress_snapshot()
         # Evict genuinely-unstorable events (no bucket to route to, or already
         # past the server's retention window) from the active queue BEFORE
         # batching. dequeue() is oldest-first, so an unstorable event sits at the
@@ -4137,7 +4389,7 @@ class SyncEngine:
         # that are genuinely unstorable or have aged past retention are left
         # behind). Resurrected rows fall into the same drain loop below.
         try:
-            self.queue.requeue_storable_dead_letter()
+            self.queue.requeue_storable_dead_letter(account=egress.account)
         except Exception as e:  # noqa: BLE001
             # WARNING, not debug. This is the only signal the replay ever emits
             # on failure, and debug is off in the shipped build — a replay that
@@ -4158,7 +4410,7 @@ class SyncEngine:
         max_per_cycle = batch_size * 10  # Max 10 batches per cycle
 
         while processed < max_per_cycle and time.monotonic() < deadline:
-            queued = self.queue.dequeue(batch_size)
+            queued = self.queue.dequeue(batch_size, account=egress.account)
             if not queued:
                 break
 
@@ -4194,7 +4446,7 @@ class SyncEngine:
 
             try:
                 self._note_delivery_attempt()
-                result = self.bf.send_events(events)
+                result = self._egress_send(events)
                 if result.success:
                     self.queue.remove(event_ids)
                     stats.events_sent += result.events_synced
@@ -5064,21 +5316,9 @@ class SyncEngine:
                 events.sort(key=lambda e: e.timestamp)  # AW is newest-first
                 batch: list[dict] = []
                 for event in events:
-                    if _is_window_like(bucket.type):
-                        batch.extend(
-                            self._transform_window_event_with_timeout(
-                                event, bucket.id, bucket.type, cycle
-                            )
-                        )
-                    else:
-                        transformed = self._transform_event(
-                            event, bucket.id, bucket.type,
-                            skip_time_tracking=True, cycle=cycle,
-                        )
-                        if transformed:
-                            batch.append(transformed)
+                    batch.extend(self._transform_for_replay(event, bucket, cycle))
                 if batch:
-                    enqueued += self.queue.enqueue(batch)
+                    enqueued += self._egress_enqueue(batch)
             except Exception as e:
                 logger.debug("pre-%s tail flush failed for %s: %s", reason, bucket.id, e)
         if enqueued:

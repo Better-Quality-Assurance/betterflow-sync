@@ -102,7 +102,10 @@ class _FakeBF:
     def get_trends(self):
         return {}
 
-    def send_events(self, events):
+    def credential_generation(self):
+        return 0
+
+    def send_events(self, events, *, expected_generation=None):
         is_afk = any("afk" in e.get("bucket_id", "") for e in events)
         if is_afk and not self.afk_ok:
             return SyncResult(success=False, error="transient failure")

@@ -77,7 +77,7 @@ class _StrictServer:
     def __init__(self) -> None:
         self.delivered: set[str] = set()
 
-    def __call__(self, events: list[dict]) -> SyncResult:
+    def __call__(self, events: list[dict], **_kw) -> SyncResult:
         if any(not e.get("bucket_id") for e in events):
             # Definitive 4xx on the whole batch — no accepted_ids, not transient.
             return SyncResult(
