@@ -10,7 +10,7 @@ Requires the same Accessibility permission as the window watcher.
 import logging
 import platform
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -34,6 +34,8 @@ _kCGEventLeftMouseDown = 1
 _kCGEventRightMouseDown = 3
 _kCGEventOtherMouseDown = 25
 _kCGEventScrollWheel = 22
+# CGEventField kCGKeyboardEventAutorepeat: non-zero on a held key's repeats.
+_kCGKeyboardEventAutorepeat = 8  # noqa: N816 — Quartz name
 _kCGEventTapDisabledByTimeout = 0xFFFFFFFE
 # macOS disables a tap for two reasons, not one. Handling only the timeout case
 # left a tap disabled by user input dead forever: counters frozen at 0 while
@@ -51,6 +53,18 @@ _EVENT_MASK = (
     | (1 << _kCGEventOtherMouseDown)
     | (1 << _kCGEventScrollWheel)
 )
+
+
+def _is_autorepeat(event) -> bool:
+    """True when a keyDown is a held key's auto-repeat, which is real input but
+    not a new key press. Reads only the autorepeat flag, never the key. Any
+    failure answers False, so the press is counted (the behaviour before this
+    filter existed) rather than silently dropped."""
+    try:
+        from Quartz import CGEventGetIntegerValueField
+        return CGEventGetIntegerValueField(event, _kCGKeyboardEventAutorepeat) != 0
+    except Exception:
+        return False
 
 
 class MacOSInputWatcher:
@@ -87,6 +101,12 @@ class MacOSInputWatcher:
         # input recently" probe works regardless of where in the emit cycle
         # we land.
         self._last_input_at: Optional[datetime] = None
+        # When the first count still held in the counters was recorded — the
+        # start of the span the next post covers. None while the counters are
+        # empty. Without it a post that follows failed posts carried the whole
+        # outage's counts stamped as the last 10 s, which reads as superhuman
+        # typing to the fraud analyzer (implausible_input_rate). Local only.
+        self._span_start: Optional[datetime] = None
         self._lock = threading.Lock()
 
         # Store CFRunLoop ref so stop() can break out of it
@@ -173,6 +193,7 @@ class MacOSInputWatcher:
             self._presses = 0
             self._clicks = 0
             self._scrolls = 0
+            self._span_start = None
         self._run_loop = None
         self._tap_ref = None
 
@@ -286,7 +307,9 @@ class MacOSInputWatcher:
             return (None, None)
 
     def _event_callback(self, proxy, event_type, event, refcon):
-        """CGEventTap callback — increment counters. Never reads key values."""
+        """CGEventTap callback — increment counters. Never reads key values;
+        on a keyDown it reads only the autorepeat flag, so a held key counts
+        as one press."""
         if event_type in _TAP_DISABLED_EVENT_TYPES:
             # Re-enable the tap if macOS disabled it. A tap that stays disabled
             # never increments a counter again, so the agent silently reports
@@ -308,10 +331,15 @@ class MacOSInputWatcher:
                 logger.warning("CGEventTap disabled by %s but no tap ref to re-enable", reason)
             return event
 
+        # Read outside the lock: it calls into Quartz.
+        repeat = event_type == _kCGEventKeyDown and _is_autorepeat(event)
         with self._lock:
             recognized = True
             if event_type == _kCGEventKeyDown:
-                self._presses += 1
+                # A repeat stays "recognized": it is real input, so it still
+                # moves the input-observed timestamp below; it is not a press.
+                if not repeat:
+                    self._presses += 1
             elif event_type in (
                 _kCGEventLeftMouseDown,
                 _kCGEventRightMouseDown,
@@ -328,6 +356,8 @@ class MacOSInputWatcher:
                 # We update under the same lock that guards the counters so a
                 # concurrent reader gets a coherent (count, ts) pair.
                 self._last_input_at = datetime.now(timezone.utc)
+                if self._span_start is None:
+                    self._span_start = self._last_input_at
 
         return event
 
@@ -392,6 +422,7 @@ class MacOSInputWatcher:
                 presses = self._presses
                 clicks = self._clicks
                 scrolls = self._scrolls
+                span_start = self._span_start
 
             # Skip zero-count events to avoid 8,640 idle events/day.
             # AFK bucket already handles idle detection.
@@ -406,8 +437,17 @@ class MacOSInputWatcher:
             # time, which is a small, acceptable approximation.
             app_name, app_bundle = self._current_frontmost_app()
 
+            # Stamp the span the counts actually cover. After failed posts the
+            # counters hold the whole outage, so [now - interval, now] would
+            # compress it into 10 s; start at the first held count instead.
+            # Never shorter than one interval: in steady state that is exactly
+            # the old [now - 10 s, now] stamp, and a sub-interval span would
+            # only inflate any rate computed as count / duration.
+            emit_now = datetime.now(timezone.utc)
+            start = emit_now - timedelta(seconds=self._emit_interval)
+            if span_start is not None and span_start < start:
+                start = span_start
             try:
-                now = datetime.now(timezone.utc).isoformat()
                 data = {
                     "presses": presses,
                     "clicks": clicks,
@@ -418,8 +458,8 @@ class MacOSInputWatcher:
                 if app_bundle:
                     data["bundle"] = app_bundle
                 self._aw.post_events(self._bucket_id, [{
-                    "timestamp": now,
-                    "duration": self._emit_interval,
+                    "timestamp": start.isoformat(),
+                    "duration": (emit_now - start).total_seconds(),
                     "data": data,
                 }])
             except Exception as e:
@@ -438,3 +478,9 @@ class MacOSInputWatcher:
                 self._presses = max(0, self._presses - presses)
                 self._clicks = max(0, self._clicks - clicks)
                 self._scrolls = max(0, self._scrolls - scrolls)
+                # Whatever is left arrived after the snapshot, so its span
+                # starts no earlier than this post.
+                if self._presses or self._clicks or self._scrolls:
+                    self._span_start = emit_now
+                else:
+                    self._span_start = None

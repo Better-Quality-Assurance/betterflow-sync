@@ -324,3 +324,37 @@ class TestCallDetectionCreditCap:
         cfg = Config()
         cfg.update_from_server({"call_detection": {"min_call_duration": 999999}})
         assert cfg.call_detection.min_call_duration == 600
+
+
+class TestMaxPressesPerMinuteParse:
+    """F7: the server value for max_presses_per_minute is clamped like its
+    siblings — non-finite is rejected and an infinity cannot crash the whole
+    server-config update (int(inf) raises OverflowError, which the block did
+    not catch)."""
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_is_rejected_and_does_not_raise(self, monkeypatch, bad):
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+        cfg.update_from_server({"fraud_detection": {"max_presses_per_minute": bad}})
+        assert cfg.fraud_detection.max_presses_per_minute == 400
+
+    def test_non_finite_does_not_cost_the_sibling_fields(self, monkeypatch):
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+        cfg.update_from_server({"fraud_detection": {
+            "max_presses_per_minute": float("inf"),
+            "min_app_diversity": 5,
+        }})
+        assert cfg.fraud_detection.min_app_diversity == 5
+
+    def test_finite_value_still_clamped_to_floor(self, monkeypatch):
+        from src.config import Config
+        monkeypatch.setattr(config_module, "DEFER_UNAPPLIED_SERVER_SETTINGS", False)
+        cfg = Config()
+        cfg.update_from_server({"fraud_detection": {"max_presses_per_minute": 10}})
+        assert cfg.fraud_detection.max_presses_per_minute == 60
+        cfg.update_from_server({"fraud_detection": {"max_presses_per_minute": 520.7}})
+        assert cfg.fraud_detection.max_presses_per_minute == 520
