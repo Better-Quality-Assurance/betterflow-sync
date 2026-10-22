@@ -165,7 +165,10 @@ class TestSanitizerIsActuallyCalled:
 
         class FakeReporter:
             def capture(self, message, **kw):
-                captured["msg"] = message
+                # Everything that leaves the device: the message AND the
+                # context the values moved into (#266).
+                captured["msg"] = message + " " + repr(kw.get("context"))
+                captured["reason"] = (kw.get("context") or {}).get("reason", "")
 
         engine = SyncEngine.__new__(SyncEngine)
         engine.error_reporter = FakeReporter()
@@ -180,7 +183,7 @@ class TestSanitizerIsActuallyCalled:
             ],
         })
         msg = captured.get("msg", "")
-        assert "server status 422" in msg, msg
+        assert "server status 422" in captured.get("reason", ""), msg
         assert "CONFIDENTIAL" not in msg, f"payload reached the ops ingest: {msg}"
         assert "layoffs" not in msg
         assert "title" not in msg

@@ -173,7 +173,10 @@ class TestWatchdogOffline(_CoordinatorHarness):
         assert self.recorder.by_level("error") == []
         message = offline[0]["message"]
         assert str(_TEST_DEADLINE) in message
-        assert "1 transient failure" in message
+        # The count rides in context, never the message (#266): "1 transient
+        # failure" vs "2 transient failures" were two ingest rows.
+        assert "transient failure" not in message, message
+        assert offline[0]["context"]["transient_failures"] == 1
 
     def test_offline_branch_still_resets_both_sessions(self):
         # Unchanged by design: discarding pooled connections after a network

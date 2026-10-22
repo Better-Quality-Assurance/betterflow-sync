@@ -1646,8 +1646,10 @@ class SyncCoordinator:
                     and not self._restart_loop_escalated
                     and self.error_reporter is not None
                 ):
+                    # Constant message, count in context (#266): a count in the
+                    # message splits the ingest row per device.
                     self.error_reporter.capture(
-                        f"Idle-tracker restart loop not converging ({restarts} restarts this session)",
+                        "Idle-tracker restart loop not converging this session",
                         level="warning",
                         tags={"component": "idle-tracker"},
                         context={"stale_restarts": restarts},
@@ -1780,14 +1782,16 @@ class SyncCoordinator:
                     transient_this_cycle,
                 )
                 if self.error_reporter is not None:
+                    # Transient count in context, not the message (#266).
                     self.error_reporter.capture(
                         f"Sync slow — exceeded {self._DO_SYNC_DEADLINE}s while the "
-                        "BetterFlow API was unreachable "
-                        f"({transient_this_cycle} transient "
-                        f"failure{'' if transient_this_cycle == 1 else 's'} this cycle)",
+                        "BetterFlow API was unreachable",
                         level="warning",
                         tags={"component": "sync-watchdog"},
-                        context={"phase": phase.at_deadline},
+                        context={
+                            "phase": phase.at_deadline,
+                            "transient_failures": transient_this_cycle,
+                        },
                         fingerprint="sync-watchdog-timeout-offline",
                     )
             else:
@@ -2244,8 +2248,12 @@ class SyncCoordinator:
             and self._consecutive_sync_failures >= self._SYNC_FAILURE_ALERT_THRESHOLD
         ):
             safe = server_status_summary(reason).lstrip("; ") or "no server status"
+            # The consecutive count is in `context`, never the message (#266):
+            # the ingest splits rows by message, so "(3×)" and "(4×)" were two
+            # rows for one condition. `safe` stays: it names the CAUSE, which
+            # the digest reads from the message.
             self.error_reporter.capture(
-                f"Sync failing repeatedly ({self._consecutive_sync_failures}×): {safe}",
+                f"Sync failing repeatedly: {safe}",
                 level="error",
                 exc=exc,
                 tags={"component": "sync"},

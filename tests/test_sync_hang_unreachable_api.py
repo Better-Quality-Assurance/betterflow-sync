@@ -271,7 +271,7 @@ class TestFailedAttemptsReachTheWatchdog(_CoordinatorHarness):
         )
         offline = self.recorder.by_fingerprint("sync-watchdog-timeout-offline")
         assert len(offline) == 1, self.recorder.captures
-        assert "1 transient failure" in offline[0]["message"]
+        assert offline[0]["context"]["transient_failures"] == 1  # not the message (#266)
         assert str(_TEST_DEADLINE) in offline[0]["message"]
 
     def test_success_with_no_failed_attempt_still_pages_as_hung(self):

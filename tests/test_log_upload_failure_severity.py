@@ -100,7 +100,7 @@ class TestLogUploadFailureSeverity:
         reports = self.recorder.by_fingerprint(_FINGERPRINT)
         assert len(reports) == 1, self.recorder.captures
         assert reports[0]["level"] == "warning"
-        assert _OFFLINE in reports[0]["message"]
+        assert _OFFLINE in reports[0]["context"]["reason"]  # not the message (#266)
 
     def test_unreachable_api_emits_no_error_level_report_at_all(self):
         """The noise property stated end-to-end: a handled transient must not
