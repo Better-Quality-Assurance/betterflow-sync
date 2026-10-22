@@ -519,7 +519,7 @@ class TestSyncEngine:
             self.engine._send_heartbeat()
         self.bf.upload_logs.assert_not_called()
         self.engine.error_reporter.capture.assert_called_once()
-        assert "unreadable" in self.engine.error_reporter.capture.call_args[0][0]
+        assert "unreadable" in self.engine.error_reporter.capture.call_args.kwargs["context"]["reason"]
 
     def test_failed_upload_post_reports_to_ops(self):
         """A POST failure on the upload is likewise surfaced to ops, not just
@@ -531,7 +531,7 @@ class TestSyncEngine:
         with patch.object(SyncEngine, "_read_log_tail", return_value=b"log-bytes"):
             self.engine._send_heartbeat()
         self.engine.error_reporter.capture.assert_called_once()
-        assert "POST failed" in self.engine.error_reporter.capture.call_args[0][0]
+        assert "POST failed" in self.engine.error_reporter.capture.call_args.kwargs["context"]["reason"]
 
     def test_successful_upload_does_not_report_failure(self):
         """The happy path must NOT fire a failure report."""
@@ -684,7 +684,8 @@ class TestSyncEngine:
 
         self.engine.error_reporter.capture.assert_called_once()
         msg = self.engine.error_reporter.capture.call_args[0][0]
-        assert "Dropped 3 queued event" in msg
+        assert msg.startswith("Dropped queued event")
+        assert self.engine.error_reporter.capture.call_args.kwargs["context"]["dropped_count"] == 3
         assert self.engine.error_reporter.capture.call_args.kwargs["fingerprint"] == (
             "offline-queue-events-dropped"
         )
@@ -1158,10 +1159,12 @@ class TestSyncEngine:
         })
         self.engine.error_reporter.capture.assert_called_once()
         call = self.engine.error_reporter.capture.call_args
-        msg = call.args[0]
+        # Message AND context: the values moved into context (#266), and the
+        # privacy properties below hold for everything that leaves the device.
+        msg = call.args[0] + " " + repr(call.kwargs.get("context"))
         assert call.kwargs["level"] == "warning"
         # F4: hostname (often a person's name) must be stripped to the bucket type.
-        assert "aw-watcher-window" in msg
+        assert call.kwargs["context"]["buckets"] == "aw-watcher-window"
         assert "Razvan-MacBook-Pro" not in msg
         # F3: no raw wall-clock activity timestamps in the ops report.
         assert "2026-06-24T07:30:00" not in msg and "2026-06-24T07:31:00" not in msg

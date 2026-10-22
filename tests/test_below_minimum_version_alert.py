@@ -48,7 +48,10 @@ def test_below_minimum_is_reported_to_ops():
         "the condition is invisible to ops until someone pulls the log"
     )
     message, kw = reporter.captures[0]
-    assert "1.5.124" in message, message
+    # Versions ride in context, never the message (#266: a version in the
+    # message splits the ingest row per version pair).
+    assert kw["context"]["min_version"] == "1.5.124", kw
+    assert "1.5.124" not in message, message
     assert kw["level"] == "warning"
     assert kw["fingerprint"] == "agent-below-minimum-version", (
         "a stable fingerprint is what lets the ingest age this into "
@@ -62,9 +65,10 @@ def test_the_report_carries_both_versions():
     reporter = _Reporter()
     SyncEngine._report_below_minimum(_engine(reporter), "1.5.124")
 
-    message = reporter.captures[0][0]
+    context = reporter.captures[0][1]["context"]
     from src.sync.bf_client import AGENT_VERSION
-    assert AGENT_VERSION in message, f"running version missing: {message}"
+    assert context["agent_version"] == AGENT_VERSION, f"running version missing: {context}"
+    assert context["min_version"] == "1.5.124", context
 
 
 def test_no_reporter_is_survivable():
