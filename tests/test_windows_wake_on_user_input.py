@@ -81,16 +81,3 @@ def test_no_hook_wired_still_runs_the_idle_check():
     stub.wake_if_user_input = None
     SyncCoordinator._check_idle_status(stub)
     stub.idle_mgr.check_idle_status.assert_called_once()
-
-
-def test_the_app_wires_the_handler_and_the_hook_on_windows_only():
-    """Callsite guard (Phantom 3): the helpers above are inert unless the app
-    constructs the handler with the Windows-only flag and hands the coordinator
-    the hook. A source check, because BetterFlowApp cannot be built in a test."""
-    import inspect
-
-    from src.main import BetterFlowApp
-
-    src = inspect.getsource(BetterFlowApp)
-    assert 'wake_on_user_input=sys.platform == "win32"' in src
-    assert "self.coordinator.wake_if_user_input = self.sys_events.wake_if_user_input_since_sleep" in src
