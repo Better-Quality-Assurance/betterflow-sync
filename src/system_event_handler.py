@@ -29,6 +29,7 @@ class SystemEventHandler:
         aw,
         pause_state_lock: threading.RLock,
         shutdown_fn,
+        wake_on_user_input: bool = False,
     ) -> None:
         self.sync_engine = sync_engine
         self.tray = tray
@@ -38,6 +39,10 @@ class SystemEventHandler:
         self.aw = aw
         self._pause_state_lock = pause_state_lock
         self._shutdown_fn = shutdown_fn
+        # Windows only: its listener no longer treats an unattended wake as
+        # the user being back, so real input must be able to end the asleep
+        # state itself. macOS always delivers a wake, so it stays off there.
+        self._wake_on_user_input = wake_on_user_input
 
         # Shared state protected by _pause_state_lock
         self._user_paused = False
@@ -225,6 +230,22 @@ class SystemEventHandler:
         self.reminder_manager.on_tracking_started()
         logger.info("Tracking resumed (system wake)")
         self.coordinator.trigger_sync("wake_sync")
+
+    def wake_if_user_input_since_sleep(self, last_input_at: Optional[datetime]) -> None:
+        """End the asleep state if a person has used the machine since it slept.
+
+        While asleep the engine is paused and the idle check returns early for
+        a paused engine, so input alone never resumed tracking. Input older than
+        the sleep (the keystroke before the lid closed) proves nothing.
+        """
+        if not self._wake_on_user_input or last_input_at is None:
+            return
+        with self._pause_state_lock:
+            sleep_start = self._sleep_start
+        if sleep_start is None or last_input_at <= sleep_start:
+            return
+        logger.info("User input after sleep with no resume-by-user signal - resuming")
+        self.on_system_wake()
 
     def on_system_shutdown(self) -> None:
         """Handle system shutdown / restart."""
