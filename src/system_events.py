@@ -474,9 +474,9 @@ def _start_windows_listener(
         # receive broadcast messages". WS_EX_TOOLWINDOW keeps it out of Alt+Tab;
         # with no WS_VISIBLE and no ShowWindow it has no taskbar button either.
         hwnd = user32.CreateWindowExW(
-            _WS_EX_TOOLWINDOW, class_name, "BetterFlow Events", 0,
+            0, class_name, "BetterFlow Events", 0,
             0, 0, 0, 0,
-            None, None, wc.hInstance, None,
+            -3, None, wc.hInstance, None,
         )
         if not hwnd:
             logger.warning(
