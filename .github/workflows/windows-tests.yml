@@ -1,0 +1,35 @@
+name: Windows tests
+
+# The real-Win32 tests (tests/test_windows_system_events_real.py) only run on a
+# Windows process, and build.yml's windows-latest leg only runs on tags and
+# workflow_dispatch (it packages and signs). This runs ONLY pytest on
+# windows-latest for pull requests: no packaging, no secrets, no artifacts, and
+# no release step, so it cannot publish anything.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [fix/windows-power-events]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
