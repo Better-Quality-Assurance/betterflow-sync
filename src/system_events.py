@@ -478,8 +478,8 @@ def _start_windows_listener(
             return
 
         # A TOP-LEVEL window that is never shown, NOT HWND_MESSAGE: Windows
-        # broadcasts WM_POWERBROADCAST (sleep/wake) and WM_QUERYENDSESSION
-        # (shutdown) to top-level windows, and a message-only window "does not
+        # broadcasts WM_POWERBROADCAST (sleep/wake) and WM_QUERYENDSESSION /
+        # WM_ENDSESSION (shutdown; we act on the latter) to top-level windows, and a message-only window "does not
         # receive broadcast messages". WS_EX_TOOLWINDOW keeps it out of Alt+Tab;
         # with no WS_VISIBLE and no ShowWindow it has no taskbar button either.
         hwnd = user32.CreateWindowExW(
