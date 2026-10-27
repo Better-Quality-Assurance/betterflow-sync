@@ -153,3 +153,16 @@ def test_getmessage_keeps_its_negative_error_return():
     assert ctypes.sizeof(wndproc._restype_) == ctypes.sizeof(ctypes.c_void_p)
     assert ctypes.sizeof(k.GetModuleHandleW.restype) == ctypes.sizeof(ctypes.c_void_p)
     assert u.DefWindowProcW.argtypes[3] is wintypes.LPARAM
+
+
+def test_no_32bit_long_types_in_the_declarations():
+    """``c_long`` is 8 bytes on macOS/Linux but 4 on Windows, so on this CI a
+    ``c_long`` LRESULT/LPARAM is indistinguishable by size from the right type
+    and the #277 truncation would come back unseen (the pre-fix WNDPROC used
+    ``c_long``). Pointer-sized slots must be spelled with ``wintypes``."""
+    import inspect
+    import re
+
+    src = inspect.getsource(se._declare_win32_listener_signatures)
+    code = "\n".join(line.split("#")[0] for line in src.splitlines() if '"""' not in line)
+    assert not re.search(r"\bc_u?long\b", code)
