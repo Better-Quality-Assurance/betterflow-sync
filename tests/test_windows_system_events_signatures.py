@@ -240,3 +240,55 @@ def test_resume_automatic_broadcast_reaches_on_wake_exactly_once(win):
     win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
     assert sleeps == [1]
     assert wakes == [1]
+
+
+ENDSESSION_CLOSEAPP = 0x1
+
+
+def _app_wired_to_listener(win, order):
+    """The REAL BetterFlowApp shutdown handler behind the fake-DLL listener.
+
+    ``__new__`` skips the heavy ``__init__``; only what the handler touches is
+    set. ``order`` records teardown and tray.stop in call order.
+    """
+    import src.main as m
+
+    app = m.BetterFlowApp.__new__(m.BetterFlowApp)
+    app._shutdown_event = threading.Event()
+    app.sys_events = types.SimpleNamespace(
+        on_system_shutdown=lambda: order.append("teardown"),
+    )
+    app.tray = types.SimpleNamespace(stop=lambda: order.append("tray.stop"))
+    _start(win, on_shutdown=app._on_system_shutdown)
+    return app
+
+
+def test_restart_manager_close_ends_the_process_after_teardown(win):
+    """Restart Manager (installer CloseApplications) sends WM_ENDSESSION(TRUE,
+    ENDSESSION_CLOSEAPP) and then does NOT kill the process; pystray's window
+    ignores the message. Teardown alone leaves a tray icon that records
+    nothing, so the tray must be stopped (main thread's run_blocking returns,
+    the process exits) AFTER teardown."""
+    order = []
+    app = _app_wired_to_listener(win, order)
+    assert win.wndproc(HWND, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP) == 0
+    assert order == ["teardown", "tray.stop"]
+    assert app._shutdown_event.is_set()
+
+
+def test_real_logoff_shutdown_follows_the_same_single_rule(win):
+    """lParam 0 (a real logoff/shutdown): exiting after teardown is harmless,
+    Windows kills the process anyway. One rule, no lParam branching."""
+    order = []
+    _app_wired_to_listener(win, order)
+    assert win.wndproc(HWND, WM_ENDSESSION, 1, 0) == 0
+    assert order == ["teardown", "tray.stop"]
+
+
+@pytest.mark.parametrize("lparam", [0, ENDSESSION_CLOSEAPP])
+def test_cancelled_end_session_neither_tears_down_nor_stops_the_tray(win, lparam):
+    order = []
+    app = _app_wired_to_listener(win, order)
+    assert win.wndproc(HWND, WM_ENDSESSION, 0, lparam) == 0
+    assert order == []
+    assert not app._shutdown_event.is_set()
