@@ -237,9 +237,9 @@ def test_resume_automatic_broadcast_reaches_on_wake_exactly_once(win):
     sleeps, wakes = [], []
     _start(win, on_sleep=lambda: sleeps.append(1), on_wake=lambda: wakes.append(1))
     win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    assert (sleeps, wakes) == ([1], [])  # a swapped dispatch goes red here
     win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
-    assert sleeps == [1]
-    assert wakes == [1]
+    assert (sleeps, wakes) == ([1], [1])
 
 
 ENDSESSION_CLOSEAPP = 0x1
