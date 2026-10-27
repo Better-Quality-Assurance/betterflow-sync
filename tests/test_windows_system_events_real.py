@@ -11,20 +11,32 @@ documents that a message-only window "does not receive broadcast messages". So
 the power tests send through HWND_BROADCAST. Handing the message straight to our
 own hwnd would pass for any window type and prove nothing.
 
-Runs on windows-latest (.github/workflows/windows-tests.yml, and the build leg
-of build.yml on tags and workflow_dispatch). Never broadcast these on a
+Runs only where BETTERFLOW_REAL_WIN32_TESTS=1 is set, which is
+.github/workflows/windows-tests.yml alone (build.yml's Windows leg skips them).
+Never broadcast these on a
 developer machine: HWND_BROADCAST reaches every program in the session.
 """
 
 import logging
+import os
 import sys
 import threading
 import time
 
 import pytest
 
+# These BROADCAST PBT_APMSUSPEND/RESUME to every top-level window in the
+# session. On a developer machine with the real agent installed that records a
+# fake sleep. So they need an explicit opt-in, set only by
+# .github/workflows/windows-tests.yml, never by a plain `pytest tests/`.
+_OPT_IN_ENV = "BETTERFLOW_REAL_WIN32_TESTS"
+
 pytestmark = pytest.mark.skipif(
-    sys.platform != "win32", reason="real Win32 API: only a Windows process can exercise it"
+    sys.platform != "win32" or os.environ.get(_OPT_IN_ENV) != "1",
+    reason=(
+        "real Win32 API: needs Windows AND " + _OPT_IN_ENV + "=1 "
+        "(it broadcasts fake sleep/wake to every program on the desktop)"
+    ),
 )
 
 _WM_POWERBROADCAST = 0x0218

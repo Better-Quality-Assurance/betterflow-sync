@@ -321,6 +321,7 @@ def _start_macos_network_listener(
 # Win32 message constants used by the listener's window procedure.
 _WM_POWERBROADCAST = 0x0218
 _WM_QUERYENDSESSION = 0x0011
+_WM_ENDSESSION = 0x0016
 _WM_WTSSESSION_CHANGE = 0x02B1
 _PBT_APMSUSPEND = 0x0004
 _PBT_APMRESUMEAUTOMATIC = 0x0012
@@ -445,9 +446,17 @@ def _start_windows_listener(
                 logger.info("Screen unlocked — user returned")
                 _safe_call(on_screen_unlock)
         elif msg == _WM_QUERYENDSESSION:
-            logger.info("System shutdown detected")
-            _safe_call(on_shutdown)
-            return 1  # Allow shutdown to proceed
+            # Only a QUESTION: the user can still cancel (unsaved document,
+            # Restart Manager). Tearing down here would leave a running agent
+            # that records nothing. Answer yes, never veto, do nothing else.
+            return 1
+        elif msg == _WM_ENDSESSION:
+            # wParam is TRUE only when the session really is ending. FALSE
+            # means it was cancelled after QUERYENDSESSION: keep running.
+            if wparam:
+                logger.info("System shutdown detected")
+                _safe_call(on_shutdown)
+            return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def run_message_pump():

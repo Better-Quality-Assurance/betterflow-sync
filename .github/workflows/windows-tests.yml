@@ -8,8 +8,6 @@ name: Windows tests
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [fix/windows-power-events]
   workflow_dispatch:
 
 permissions:
@@ -32,4 +30,8 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests
+        env:
+          # Opt in to tests/test_windows_system_events_real.py, which
+          # broadcasts fake sleep/wake to the whole desktop (safe on a CI VM).
+          BETTERFLOW_REAL_WIN32_TESTS: '1'
         run: pytest tests/ -v --tb=short
