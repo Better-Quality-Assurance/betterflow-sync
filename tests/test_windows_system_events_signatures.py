@@ -30,6 +30,9 @@ WM_WTSSESSION_CHANGE = 0x02B1
 WTS_SESSION_LOCK = 0x7
 WM_QUERYENDSESSION = 0x0011
 WM_ENDSESSION = 0x0016
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMEAUTOMATIC = 0x0012
 NOTIFY_FOR_THIS_SESSION = 0
 BIG_HMODULE = 0x7FF6_1234_0000      # a typical 64-bit image base
 BIG_LPARAM = 0x0000_00D1_2345_6780  # a 64-bit CREATESTRUCT pointer
@@ -226,3 +229,14 @@ def test_confirmed_shutdown_tears_down_exactly_once(win):
 def test_query_end_session_never_vetoes_shutdown(win, lparam):
     _start(win)
     assert win.wndproc(HWND, WM_QUERYENDSESSION, 0, lparam) == 1
+
+
+def test_resume_automatic_broadcast_reaches_on_wake_exactly_once(win):
+    """Regression guard (passes at the base too): the real-Windows test covers
+    this only on Windows, so pin the dispatch where Linux CI can see it."""
+    sleeps, wakes = [], []
+    _start(win, on_sleep=lambda: sleeps.append(1), on_wake=lambda: wakes.append(1))
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    assert sleeps == [1]
+    assert wakes == [1]
