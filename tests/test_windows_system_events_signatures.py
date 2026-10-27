@@ -38,7 +38,7 @@ class _FakeFn:
 
     def __call__(self, *args):
         if hasattr(self, "argtypes"):
-            for a, t in zip(args, self.argtypes):
+            for a, t in zip(args, self.argtypes, strict=False):
                 if isinstance(a, int) and ctypes.sizeof(t) < 8 and not -(2**31) <= a < 2**31:
                     raise ctypes.ArgumentError("int too long to convert")
         else:
@@ -89,7 +89,7 @@ class _Win:
     def dlls(self):
         return {
             "user32": _FakeDLL({
-                "DefWindowProcW": lambda h, m, w, l: 1 if m == WM_NCCREATE else 0,
+                "DefWindowProcW": lambda h, m, w, lp: 1 if m == WM_NCCREATE else 0,
                 "RegisterClassW": self.register,
                 "CreateWindowExW": self.create,
                 "GetMessageW": self.get_message,
