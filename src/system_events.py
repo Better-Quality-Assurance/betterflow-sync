@@ -2,7 +2,7 @@
 
 Platform-specific implementations:
 - macOS: pyobjc NSWorkspace notifications + SCNetworkReachability
-- Windows: ctypes hidden window message pump
+- Windows: ctypes hidden top-level window message pump
 - Linux: systemd-logind PrepareForSleep D-Bus signal (via jeepney)
 - Fallback: socket-based network poller
 """
@@ -315,7 +315,7 @@ def _start_macos_network_listener(
 
 
 # ---------------------------------------------------------------------------
-# Windows: hidden message-only window for power/session events
+# Windows: hidden top-level window for power/session events
 # ---------------------------------------------------------------------------
 
 # Win32 message constants used by the listener's window procedure.
@@ -327,7 +327,7 @@ _PBT_APMRESUMEAUTOMATIC = 0x0012
 _WTS_SESSION_LOCK = 0x7
 _WTS_SESSION_UNLOCK = 0x8
 _NOTIFY_FOR_THIS_SESSION = 0
-_HWND_MESSAGE = -3
+_WS_EX_TOOLWINDOW = 0x00000080
 
 
 def _declare_win32_listener_signatures(user32, kernel32, wtsapi32, functype):
@@ -468,14 +468,19 @@ def _start_windows_listener(
             )
             return
 
+        # A TOP-LEVEL window that is never shown, NOT HWND_MESSAGE: Windows
+        # broadcasts WM_POWERBROADCAST (sleep/wake) and WM_QUERYENDSESSION
+        # (shutdown) to top-level windows, and a message-only window "does not
+        # receive broadcast messages". WS_EX_TOOLWINDOW keeps it out of Alt+Tab;
+        # with no WS_VISIBLE and no ShowWindow it has no taskbar button either.
         hwnd = user32.CreateWindowExW(
-            0, class_name, "BetterFlow Events", 0,
+            _WS_EX_TOOLWINDOW, class_name, "BetterFlow Events", 0,
             0, 0, 0, 0,
-            _HWND_MESSAGE, None, wc.hInstance, None,
+            None, None, wc.hInstance, None,
         )
         if not hwnd:
             logger.warning(
-                "Failed to create message window for system events (error %s)",
+                "Failed to create hidden window for system events (error %s)",
                 ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?",
             )
             return
