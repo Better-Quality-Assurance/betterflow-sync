@@ -3812,7 +3812,17 @@ class BetterFlowApp:
         self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
-        self.sys_events.on_system_shutdown()
+        # Teardown stops the recorders but not the process. A real logoff or
+        # shutdown kills us afterwards, but Restart Manager (installer
+        # CloseApplications) does not, and pystray's window ignores
+        # WM_ENDSESSION: without the quit below the tray icon would outlive a
+        # cancelled install while recording nothing. _on_quit is the one quit
+        # path (tray.stop() returns run_blocking, then the finally runs the
+        # idempotent _shutdown and the process exits normally).
+        try:
+            self.sys_events.on_system_shutdown()
+        finally:
+            self._on_quit()
 
     def _on_screen_lock(self) -> None:
         if self._shutdown_event.is_set():
