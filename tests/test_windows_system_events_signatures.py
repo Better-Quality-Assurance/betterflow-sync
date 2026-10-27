@@ -285,6 +285,22 @@ def test_real_logoff_shutdown_follows_the_same_single_rule(win):
     assert order == ["teardown", "tray.stop"]
 
 
+def test_a_teardown_that_raises_still_quits(win):
+    """If teardown throws part-way, the tray must still stop: otherwise the
+    Restart Manager case leaves the same icon that records nothing."""
+    order = []
+    app = _app_wired_to_listener(win, order)
+
+    def boom():
+        order.append("teardown")
+        raise RuntimeError("teardown failed")
+
+    app.sys_events.on_system_shutdown = boom
+    win.wndproc(HWND, WM_ENDSESSION, 1, ENDSESSION_CLOSEAPP)
+    assert order == ["teardown", "tray.stop"]
+    assert app._shutdown_event.is_set()
+
+
 @pytest.mark.parametrize("lparam", [0, ENDSESSION_CLOSEAPP])
 def test_cancelled_end_session_neither_tears_down_nor_stops_the_tray(win, lparam):
     order = []
