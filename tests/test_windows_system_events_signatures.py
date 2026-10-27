@@ -1,7 +1,7 @@
 """The Windows sleep/wake/lock listener must survive 64-bit handles (#277).
 
-There is no Windows box in PR CI, so these drive ``_start_windows_listener``
-against fake DLLs that model the two ctypes behaviours that broke it, at the
+These run on every platform (including Linux CI): they drive
+``_start_windows_listener`` against fake DLLs that model the two ctypes behaviours that broke it, at the
 DLL boundary only (the listener's own code runs unmodified):
 
 * a call to a function with no ``argtypes`` converts every int to a 32-bit
@@ -11,8 +11,9 @@ DLL boundary only (the listener's own code runs unmodified):
 
 Windows sends WM_NCCREATE through the window procedure, with a pointer-sized
 lParam, before CreateWindowExW returns; if the procedure answers 0 the window is
-not created. The fake CreateWindowExW does the same. Whether real Windows
-behaves this way for THIS listener is unverified until a windows-latest run.
+not created. The fake CreateWindowExW does the same. The real Win32
+behaviour is covered separately by tests/test_windows_system_events_real.py on
+windows-latest (.github/workflows/windows-tests.yml).
 """
 
 import ctypes
@@ -27,6 +28,9 @@ from src import system_events as se
 WM_NCCREATE = 0x0081
 WM_WTSSESSION_CHANGE = 0x02B1
 WTS_SESSION_LOCK = 0x7
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+NOTIFY_FOR_THIS_SESSION = 0
 BIG_HMODULE = 0x7FF6_1234_0000      # a typical 64-bit image base
 BIG_LPARAM = 0x0000_00D1_2345_6780  # a 64-bit CREATESTRUCT pointer
 HWND = 0x1234
@@ -70,6 +74,8 @@ class _Win:
         self.pump_entered = threading.Event()
         self.release = threading.Event()
         self.created_with_hinstance = None
+        self.created_parent = "unset"
+        self.wts_calls = []
 
     def register(self, pwc):
         self.wndproc = pwc._obj.lpfnWndProc
@@ -77,9 +83,17 @@ class _Win:
 
     def create(self, *args):
         self.created_with_hinstance = args[10]
+        # args[8] is hWndParent. HWND_MESSAGE (-3) would make a message-only
+        # window, which never receives the sleep/wake/shutdown broadcasts.
+        self.created_parent = args[8]
+        assert args[8] is None, "hidden window must be top-level (parent None), not HWND_MESSAGE"
         if not self.wndproc(HWND, WM_NCCREATE, 0, BIG_LPARAM):
             return 0
         return HWND
+
+    def wts_register(self, hwnd, flags):
+        self.wts_calls.append((hwnd, flags))
+        return 1
 
     def get_message(self, *args):
         self.pump_entered.set()
@@ -97,7 +111,7 @@ class _Win:
                 "DispatchMessageW": lambda *a: 0,
             }),
             "kernel32": _FakeDLL({"GetModuleHandleW": lambda name: BIG_HMODULE}),
-            "wtsapi32": _FakeDLL({"WTSRegisterSessionNotification": lambda h, f: 1}),
+            "wtsapi32": _FakeDLL({"WTSRegisterSessionNotification": self.wts_register}),
         }
 
 
@@ -166,3 +180,49 @@ def test_no_32bit_long_types_in_the_declarations():
     src = inspect.getsource(se._declare_win32_listener_signatures)
     code = "\n".join(line.split("#")[0] for line in src.splitlines() if '"""' not in line)
     assert not re.search(r"\bc_u?long\b", code)
+
+
+def _start(win, **callbacks):
+    cbs = {
+        "on_sleep": lambda: None, "on_wake": lambda: None, "on_shutdown": lambda: None,
+        "on_screen_lock": lambda: None, "on_screen_unlock": lambda: None,
+    }
+    cbs.update(callbacks)
+    se._start_windows_listener(**cbs)
+    assert win.pump_entered.wait(5), "message pump never reached"
+
+
+def test_real_lock_delivery_is_registered_for_this_session_on_the_created_window(win):
+    """Real lock/unlock reach the window ONLY via WTSRegisterSessionNotification;
+    sending the message straight to the hwnd (as the real test does) cannot tell."""
+    _start(win)
+    assert win.wts_calls == [(HWND, NOTIFY_FOR_THIS_SESSION)]
+
+
+def test_window_is_top_level_not_message_only(win):
+    _start(win)
+    assert win.created_parent is None
+
+
+def test_cancelled_shutdown_does_not_tear_down_the_agent(win):
+    """WM_QUERYENDSESSION is a question, not the shutdown: the user can still
+    click Cancel, after which WM_ENDSESSION(FALSE) arrives."""
+    calls = []
+    _start(win, on_shutdown=lambda: calls.append(1))
+    assert win.wndproc(HWND, WM_QUERYENDSESSION, 0, 0) == 1
+    assert win.wndproc(HWND, WM_ENDSESSION, 0, 0) == 0
+    assert calls == []
+
+
+def test_confirmed_shutdown_tears_down_exactly_once(win):
+    calls = []
+    _start(win, on_shutdown=lambda: calls.append(1))
+    assert win.wndproc(HWND, WM_QUERYENDSESSION, 0, 0) == 1
+    assert win.wndproc(HWND, WM_ENDSESSION, 1, 0) == 0
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("lparam", [0, 0x1, 0x80000000, 0x40000000])
+def test_query_end_session_never_vetoes_shutdown(win, lparam):
+    _start(win)
+    assert win.wndproc(HWND, WM_QUERYENDSESSION, 0, lparam) == 1
