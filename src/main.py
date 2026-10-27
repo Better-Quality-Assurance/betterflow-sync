@@ -399,8 +399,6 @@ class SyncCoordinator:
         # Sub-managers (own their locks)
         self.break_mgr = BreakManager(sync_engine, tray, self.scheduler, config, reminder_manager)
         self.idle_mgr = IdleManager(sync_engine, tray, aw, config)
-        # Set by the app once the system event handler exists (Windows only).
-        self.wake_if_user_input = None
         self.hours = HoursTracker(bf, sync_engine, tray)
 
         # Optional callback wired by the app for auth-error re-login
@@ -1458,14 +1456,6 @@ class SyncCoordinator:
         self.aw_manager.set_inproc_afk_active(eng.inproc_afk_active)
 
     def _check_idle_status(self) -> None:
-        # Before the idle check: it returns early for a paused (asleep) engine.
-        wake = self.wake_if_user_input
-        watcher = self.idle_mgr.input_watcher
-        if wake is not None and watcher is not None:
-            try:
-                wake(watcher.get_last_input_at())
-            except Exception as e:
-                logger.warning("wake-on-input check failed: %s", e)
         self.idle_mgr.check_idle_status(
             logged_in=self.logged_in,
             is_on_break=self.is_on_break,
@@ -2614,9 +2604,7 @@ class BetterFlowApp:
             aw=self.aw,
             pause_state_lock=self._pause_state_lock,
             shutdown_fn=self._shutdown,
-            wake_on_user_input=sys.platform == "win32",
         )
-        self.coordinator.wake_if_user_input = self.sys_events.wake_if_user_input_since_sleep
         self.sys_events.update_handler = self.update_handler
 
     def _set_startup_status(self, message: str) -> None:

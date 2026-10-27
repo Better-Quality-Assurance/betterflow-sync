@@ -325,7 +325,6 @@ _WM_ENDSESSION = 0x0016
 _WM_WTSSESSION_CHANGE = 0x02B1
 _PBT_APMSUSPEND = 0x0004
 _PBT_APMRESUMEAUTOMATIC = 0x0012
-_PBT_APMRESUMESUSPEND = 0x0007
 _WTS_SESSION_LOCK = 0x7
 _WTS_SESSION_UNLOCK = 0x8
 _NOTIFY_FOR_THIS_SESSION = 0
@@ -431,36 +430,19 @@ def _start_windows_listener(
         logger.warning("Win32 API not available (%s) — sleep/wake detection disabled", e)
         return
 
-    # Only the window-proc thread touches this, so no lock.
-    asleep = False
-
-    def wake_up(why):
-        nonlocal asleep
-        if asleep:
-            asleep = False
-            logger.info("System wake detected (%s) — resuming", why)
-            _safe_call(on_wake)
-
     def wnd_proc(hwnd, msg, wparam, lparam):
-        nonlocal asleep
         if msg == _WM_POWERBROADCAST:
             if wparam == _PBT_APMSUSPEND:
                 logger.info("System sleep detected — pausing")
-                asleep = True
                 _safe_call(on_sleep)
-            elif wparam == _PBT_APMRESUMESUSPEND:
-                # Sent after RESUMEAUTOMATIC only when a person used the
-                # machine. RESUMEAUTOMATIC alone also fires for a timer wake
-                # (Windows Update) with nobody there; that is not work.
-                wake_up("user input")
+            elif wparam == _PBT_APMRESUMEAUTOMATIC:
+                logger.info("System wake detected — resuming")
+                _safe_call(on_wake)
         elif msg == _WM_WTSSESSION_CHANGE:
             if wparam == _WTS_SESSION_LOCK and on_screen_lock:
                 logger.info("Screen locked — treating as AFK")
                 _safe_call(on_screen_lock)
             elif wparam == _WTS_SESSION_UNLOCK and on_screen_unlock:
-                # Whoever unlocked is present, whether or not Windows ever
-                # sent RESUMESUSPEND: never leave them in the asleep state.
-                wake_up("unlock")
                 logger.info("Screen unlocked — user returned")
                 _safe_call(on_screen_unlock)
         elif msg == _WM_QUERYENDSESSION:
