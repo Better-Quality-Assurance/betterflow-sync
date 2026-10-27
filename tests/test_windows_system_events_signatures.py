@@ -26,6 +26,11 @@ import pytest
 from src import system_events as se
 
 WM_NCCREATE = 0x0081
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_APMRESUMEAUTOMATIC = 0x0012
+WTS_SESSION_UNLOCK = 0x8
 WM_WTSSESSION_CHANGE = 0x02B1
 WTS_SESSION_LOCK = 0x7
 WM_QUERYENDSESSION = 0x0011
@@ -226,3 +231,41 @@ def test_confirmed_shutdown_tears_down_exactly_once(win):
 def test_query_end_session_never_vetoes_shutdown(win, lparam):
     _start(win)
     assert win.wndproc(HWND, WM_QUERYENDSESSION, 0, lparam) == 1
+
+
+# --- an unattended wake is not work (product decision, #288) ----------------
+# Microsoft: PBT_APMRESUMEAUTOMATIC "is delivered every time the system resumes
+# and does not indicate whether a user is present"; PBT_APMRESUMESUSPEND is sent
+# after it when the system "detects user interaction at the physical console ...
+# after waking unattended". So only RESUMESUSPEND means "the user is back".
+
+
+def test_a_timer_wake_alone_does_not_resume_tracking(win):
+    wakes = []
+    _start(win, on_wake=lambda: wakes.append(1))
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    assert wakes == []
+
+
+def test_automatic_resume_then_user_input_resumes_exactly_once(win):
+    wakes = []
+    _start(win, on_wake=lambda: wakes.append(1))
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0)  # a repeat
+    assert wakes == [1]
+
+
+def test_unlock_while_still_asleep_ends_the_asleep_state_before_the_unlock(win):
+    """A person who unlocks is present, whatever Windows did or did not send."""
+    order = []
+    _start(win, on_wake=lambda: order.append("wake"),
+           on_screen_unlock=lambda: order.append("unlock"))
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    win.wndproc(HWND, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    win.wndproc(HWND, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0)
+    assert order == ["wake", "unlock"]
+    win.wndproc(HWND, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0)
+    assert order == ["wake", "unlock", "unlock"]  # awake already: no second wake

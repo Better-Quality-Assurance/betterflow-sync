@@ -43,6 +43,7 @@ _WM_POWERBROADCAST = 0x0218
 _WM_WTSSESSION_CHANGE = 0x02B1
 _PBT_APMSUSPEND = 0x0004
 _PBT_APMRESUMEAUTOMATIC = 0x0012
+_PBT_APMRESUMESUSPEND = 0x0007
 _WTS_SESSION_LOCK = 0x7
 _WTS_SESSION_UNLOCK = 0x8
 _HWND_MESSAGE = -3
@@ -160,8 +161,15 @@ def test_real_listener_receives_a_broadcast_sleep_and_wake(listener):
         "WM_POWERBROADCAST/PBT_APMSUSPEND broadcast to top-level windows did not "
         f"reach on_sleep (a message-only window cannot receive it). Log: {listener.log}"
     )
+    # A timer wake: RESUMEAUTOMATIC alone is "the system resumed", not "a
+    # person is here". SendMessageTimeout is synchronous, so by now the window
+    # proc has handled it and a wrongly-fired wake would already be set.
     _broadcast(user32, _WM_POWERBROADCAST, _PBT_APMRESUMEAUTOMATIC)
+    assert not listener.wake.is_set(), (
+        f"an unattended RESUMEAUTOMATIC must not resume tracking. Log: {listener.log}"
+    )
+    _broadcast(user32, _WM_POWERBROADCAST, _PBT_APMRESUMESUSPEND)
     assert listener.wake.wait(5), (
-        "WM_POWERBROADCAST/PBT_APMRESUMEAUTOMATIC broadcast did not reach on_wake. "
+        "WM_POWERBROADCAST/PBT_APMRESUMESUSPEND broadcast did not reach on_wake. "
         f"Log: {listener.log}"
     )
