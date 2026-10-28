@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   verify-pins:
-    runs-on: [self-hosted, railway]
+    runs-on: ubuntu-latest
     # The per-read socket timeout in the script does not bound total runtime: a
     # slow-drip upstream can keep three ~100 MB fetches alive for hours on the
     # default 6h job limit. Cap the whole job instead.

@@ -24,7 +24,8 @@ jobs:
   # on every commit. This job keeps real test coverage on every change;
   # `build` below is now gated to tags/workflow_dispatch only.
   test:
-    if: "!startsWith(github.ref, 'refs/tags/v')"
+    # Fork PRs must never reach the persistent self-hosted fleet (public repo).
+    if: "!startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
     runs-on: [self-hosted, railway]
     steps:
       - uses: actions/checkout@v7
