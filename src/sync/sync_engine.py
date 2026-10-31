@@ -1936,6 +1936,17 @@ class SyncEngine:
                 datetime.now(timezone.utc)
             )
             if sent_input_event is not None:
+                # The top-of-cycle peek covered [cp, t_peek]; this drain covers
+                # [cp, t_drain] under the SAME id, so whatever was typed in
+                # between is uploaded but unseen by the analyzer. Feed the
+                # unsplit drained event (the peek was unsplit too): the analyzer
+                # REPLACES the peek's entry by id, never sums. Windows scored
+                # this cycle already ran; this serves the next cycle's windows,
+                # whose peek starts at the new checkpoint (a disjoint span, so
+                # no double count).
+                drained = self._parse_inproc_input_for_analysis(sent_input_event)
+                if drained is not None:
+                    self._activity_analyzer.add_input_events([drained])
                 # Same >24h cap as every ActivityWatch event, same splitter: a
                 # machine that slept past a day and was typed on at wake drains its
                 # counts into one over-cap span.
@@ -2090,16 +2101,9 @@ class SyncEngine:
             list(input_events_for_analysis) if analyze_external else []
         )
         if inproc_input_event is not None:
-            try:
-                inproc = AWEvent.from_dict(inproc_input_event)
-            except ValueError as e:
-                # Analysis only: the event itself still uploads unchanged.
-                logger.debug("in-process input event not analysable: %s", e)
-            else:
+            inproc = self._parse_inproc_input_for_analysis(inproc_input_event)
+            if inproc is not None:
                 analyzed.append(inproc)
-                self._inproc_input_analyzed_until = (
-                    inproc.timestamp + timedelta(seconds=inproc.duration)
-                )
         self._activity_analyzer.add_input_events(analyzed)
         has_input_data = len(analyzed) > 0
         if not has_input_data and not analyze_external:
@@ -2123,6 +2127,20 @@ class SyncEngine:
             has_input_data=has_input_data,
             last_input_at=last_input_at,
         )
+
+    def _parse_inproc_input_for_analysis(self, event: dict) -> Optional[AWEvent]:
+        """Turn an in-process input event into the analyzer's shape and record
+        how far input has been seen (the quiet-cycle ``has_input_data`` anchor).
+        None when it cannot be parsed: analysis only, the event still uploads."""
+        try:
+            parsed = AWEvent.from_dict(event)
+        except ValueError as e:
+            logger.debug("in-process input event not analysable: %s", e)
+            return None
+        self._inproc_input_analyzed_until = (
+            parsed.timestamp + timedelta(seconds=parsed.duration)
+        )
+        return parsed
 
     def _sync_window_buckets(
         self, window_buckets: list, stats: "SyncStats", cycle: "_SyncCycleContext"

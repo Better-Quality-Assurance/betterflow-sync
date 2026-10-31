@@ -381,15 +381,31 @@ class ActivityAnalyzer:
         if not events:
             return
 
-        # Deduplicate by event ID
-        existing_ids = {e.id for e in self._input_events}
-        new_events = [e for e in events if e.id not in existing_ids]
-        self._input_events.extend(new_events)
+        # Deduplicate by event ID, but a later copy of a known id SUPERSEDES the
+        # stored one when it covers more: the same id means the same span start,
+        # and a producer re-emitting it (an in-process input peek that is later
+        # drained with more counts, a failed cycle recovered over a longer span,
+        # an ActivityWatch event that grew) sends a superset. Replaced, never
+        # summed. Dropping it left the analyzer on the stale, smaller counts.
+        by_id = {e.id: i for i, e in enumerate(self._input_events)}
+        new_events = []
+        changed = False
+        for e in events:
+            idx = by_id.get(e.id)
+            if idx is None:
+                by_id[e.id] = len(self._input_events)
+                self._input_events.append(e)
+                new_events.append(e)
+                changed = True
+                continue
+            if self._supersedes(e, self._input_events[idx]):
+                self._input_events[idx] = e
+                changed = True
 
         # Record input timestamps (not scored since input_regularity was retired)
         for e in new_events:
             self._fraud_detector.record_input_timestamp(e.timestamp)
-        if new_events:
+        if changed:
             self._fraud_seq += 1
 
         # Prune old events anchored to the latest event timestamp (not wall
@@ -408,6 +424,19 @@ class ActivityAnalyzer:
 
         # Sort by timestamp for consistent processing
         self._input_events.sort(key=lambda e: e.timestamp)
+
+    @staticmethod
+    def _supersedes(new: AWEvent, old: AWEvent) -> bool:
+        """True when ``new`` (same id as ``old``) covers strictly more: a later
+        end, or the same end with larger counts. Equal or smaller never
+        replaces, so a redelivered stale copy cannot shrink the stored one."""
+        new_end = new.timestamp + timedelta(seconds=max(new.duration, 0))
+        old_end = old.timestamp + timedelta(seconds=max(old.duration, 0))
+        if new_end != old_end:
+            return new_end > old_end
+        return (new.presses + new.clicks + new.scrolls) > (
+            old.presses + old.clicks + old.scrolls
+        )
 
     def add_window_events(self, events: list[AWEvent]) -> None:
         """Add window events for switch detection.
