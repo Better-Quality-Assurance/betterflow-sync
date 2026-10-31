@@ -337,6 +337,41 @@ def _chunk_span(start: datetime, duration: float) -> list[tuple[datetime, float]
     return chunks
 
 
+#: Counters on an input event that ADD UP over time (unlike an AFK ``status``,
+#: which is true of every chunk of its span).
+_INPUT_COUNT_KEYS = ("presses", "clicks", "scrolls")
+
+
+def _prorate_input_counts(
+    event: dict, chunks: list[tuple[datetime, float]]
+) -> list[dict]:
+    """Per-chunk ``{counter: share}`` overrides for an input event being split.
+
+    Copying ``data`` into every chunk is right for state (AFK ``status``) and
+    wrong for counts: 1000 presses over 25 h became 2 x 1000 server-side. Each
+    counter is cut in proportion to the chunk's share of the span, using
+    cumulative rounding so the shares always sum to exactly the original and the
+    rate (count / duration) stays uniform across chunks. Non-input events and
+    non-integer counters get no override, so they are copied as before."""
+    shares: list[dict] = [{} for _ in chunks]
+    if event.get("bucket_type") != BUCKET_TYPE_INPUT:
+        return shares
+    data = event.get("data") or {}
+    total_duration = sum(d for _, d in chunks)
+    for key in _INPUT_COUNT_KEYS:
+        total = data.get(key)
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            continue
+        elapsed = 0.0
+        allocated = 0
+        for n, (_, chunk_duration) in enumerate(chunks):
+            elapsed += chunk_duration
+            upto = total if n == len(chunks) - 1 else int(total * elapsed / total_duration)
+            shares[n][key] = upto - allocated
+            allocated = upto
+    return shares
+
+
 def _split_over_long_event(event: dict) -> list[dict]:
     """Split one transformed ActivityWatch event that is longer than the
     server's per-event cap into contiguous <=24h events.
@@ -353,10 +388,13 @@ def _split_over_long_event(event: dict) -> list[dict]:
     if not isinstance(duration, (int, float)) or duration <= MAX_EVENT_DURATION_SECONDS:
         return [event]
     start = datetime.fromisoformat(event["timestamp"])
+    chunks = _chunk_span(start, duration)
+    shares = _prorate_input_counts(event, chunks)
     parts = []
-    for n, (chunk_start, chunk_duration) in enumerate(_chunk_span(start, duration)):
+    for n, (chunk_start, chunk_duration) in enumerate(chunks):
         part = dict(event)
         part["data"] = dict(event.get("data") or {})
+        part["data"].update(shares[n])
         part["id"] = event["id"] if n == 0 else f"{event['id']}_{n}"
         part["timestamp"] = chunk_start.isoformat()
         part["duration"] = round(chunk_duration, 2)
@@ -1885,7 +1923,10 @@ class SyncEngine:
 
         # The in-process input event drained above (before the analysis).
         if input_event is not None:
-            all_events.append(input_event)
+            # Same >24h cap as every ActivityWatch event, same splitter: a
+            # machine that slept past a day and was typed on at wake drains its
+            # counts into one over-cap span.
+            all_events.extend(_split_over_long_event(input_event))
 
         # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
         # from (app, start), so the server upserts one growing row per meeting.
