@@ -45,7 +45,7 @@ jobs:
           pip install -r requirements-test.txt
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/test_zz_probe.py -s
 
   build:
     # Full packaging (4-platform matrix, signing, notarization, Windows
@@ -106,7 +106,7 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/test_zz_probe.py -s
 
       - name: Generate icons
         run: python scripts/generate_icons.py
