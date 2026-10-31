@@ -24,6 +24,12 @@ from src.sync.macos_window_watcher import MacOSWindowWatcher
 
 NOTIFY = "src.notifications.send_notification"
 
+# "The re-check throttle has long since elapsed." The throttle compares against
+# time.monotonic(), which on Linux is time since BOOT. A fresh CI runner reaches
+# pytest 20-46s after boot (measured), under the 30s interval, so a literal 0.0
+# read as "checked just now" and the transition handler skipped the check.
+_NEVER_CHECKED = float("-inf")
+
 
 def _watcher():
     return MacOSWindowWatcher(MagicMock(), poll_interval=0.1)
@@ -103,7 +109,7 @@ def test_a_second_revocation_notifies_again():
         assert notify.call_count == 1
 
         # The user grants it: the transition handler must re-arm.
-        w._last_accessibility_check_ts = 0.0
+        w._last_accessibility_check_ts = _NEVER_CHECKED
         with patch.dict(sys.modules, {"ApplicationServices": _fake_ax(True)}):
             w._maybe_log_accessibility_transition()
         assert w._accessibility_notified is False, "grant did not re-arm the latch"
@@ -117,7 +123,7 @@ def test_a_revocation_while_running_prompts():
     """Not only the start-up path. A grant can be withdrawn mid-session."""
     w = _watcher()
     w._last_accessibility = True
-    w._last_accessibility_check_ts = 0.0
+    w._last_accessibility_check_ts = _NEVER_CHECKED
 
     with patch(NOTIFY) as notify, patch.dict(
         sys.modules, {"ApplicationServices": _fake_ax(False)}
