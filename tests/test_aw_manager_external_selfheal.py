@@ -69,17 +69,21 @@ def test_reaper_kills_orphans_only(monkeypatch):
     mgr = AWManager()
     managed = MagicMock()
     managed.poll.return_value = None
-    managed.pid = 1111
+    # Derived from our own PID, never literals: a fresh CI runner hands pytest a
+    # PID around 2220, and a literal 2222 equal to os.getpid() was (correctly)
+    # spared by the reaper, so the orphan was never killed.
+    managed_pid, orphan_pid = os.getpid() + 1, os.getpid() + 2
+    managed.pid = managed_pid
     mgr._processes = {"bf-idle-tracker": managed}
 
     monkeypatch.setattr(awm, "_resolve_binary_path", lambda d, n: "/x/bf-idle-tracker")
-    monkeypatch.setattr(awm, "_find_pids_by_path", lambda p: [1111, 2222, os.getpid()])
+    monkeypatch.setattr(awm, "_find_pids_by_path", lambda p: [managed_pid, orphan_pid, os.getpid()])
     killed = []
     monkeypatch.setattr(awm, "_terminate_pid", lambda pid, **k: killed.append(pid))
 
     mgr._reap_orphan_processes("bf-idle-tracker", "/x")
 
-    assert killed == [2222], "kills the orphan only — not our managed PID, not ourselves"
+    assert killed == [orphan_pid], "kills the orphan only — not our managed PID, not ourselves"
 
 
 def test_force_restart_reaps_hung_server_then_starts_fresh(monkeypatch):
