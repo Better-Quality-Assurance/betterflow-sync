@@ -22,6 +22,11 @@ BUCKET_TYPE_AFK = "afkstatus"
 BUCKET_TYPE_AFK_ALT = "aw-watcher-afk"
 BUCKET_TYPE_WEB = "aw-watcher-web"
 BUCKET_TYPE_INPUT = "aw-watcher-input"  # Keystroke/click tracking for fraud detection
+#: The counters on an input event, in the order InputSource snapshots them. They ADD UP
+#: over time (unlike an AFK ``status``), so the over-24h splitter pro-rates them. The ONE
+#: spelling: the event builder, the egress transform and the splitter all read this, and
+#: tests/test_input_over_24h_no_double_count.py fails on any numeric field this misses.
+INPUT_COUNT_KEYS = ("presses", "clicks", "scrolls")
 BUCKET_TYPE_CALL = "call"
 BUCKET_TYPE_DEV_SESSION = "dev-session"  # Foreground-CPU activity (engaged, no input)
 

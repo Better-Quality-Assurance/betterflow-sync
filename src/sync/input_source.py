@@ -32,13 +32,14 @@ external watcher and ``MacOSInputWatcher``.
 import logging
 import platform
 import threading
+import time
 from datetime import datetime
 from typing import Callable, Optional
 
 try:
-    from .aw_client import BUCKET_TYPE_INPUT
+    from .aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
 except ImportError:  # PyInstaller bundle (src/ is import root)
-    from sync.aw_client import BUCKET_TYPE_INPUT
+    from sync.aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,22 @@ logger = logging.getLogger(__name__)
 # default) from "caller passed None" (explicitly no backend — e.g. a test
 # feeding counts directly, or a platform with no in-process hook).
 _UNSET = object()
+
+# Silent-counter detection (see InputSource.capture_state). "silent" is a
+# SYMPTOM — the OS saw input but our counter received none — not a diagnosis.
+# Possible causes: Windows removing a low-level hook whose callback overran
+# LowLevelHooksTimeout (the pump thread stays alive and available() stays True),
+# an elevated/admin window in the foreground, or the secure desktop (lock
+# screen, UAC). It is a sensor state, not evidence of tampering. The verdict
+# compares the OS idle clock ("the OS saw input") with our own liveness stamp
+# ("the hook saw anything at all, mouse moves included").
+#: No verdict for this long after an install — a hook needs a moment of input.
+SILENT_GRACE_S = 300
+#: The hook must have seen NOTHING for this long before it is called silent.
+SILENT_NO_EVENT_S = 300
+#: ...while the OS reports input within this many seconds. Above it the user is
+#: simply away and there is nothing for the hook to have seen.
+SILENT_OS_IDLE_MAX_S = 60
 
 
 def _listener_stopped(thread: Optional[threading.Thread]) -> bool:
@@ -89,6 +106,14 @@ class InputSource:
         self._clicks = 0
         self._scrolls = 0
         self._lock = threading.Lock()
+        # Liveness for capture_state(): when the backend last saw ANY input
+        # (mouse moves included, where the backend can see them), and when the
+        # current install began. Monotonic seconds, local only — never sent.
+        # Plain attributes, no lock: note_event() runs inside the OS hook
+        # callback under LowLevelHooksTimeout, and a single float store is
+        # atomic in CPython.
+        self._last_event_mono: Optional[float] = None
+        self._started_mono: Optional[float] = None
 
         # No availability latch here — see available(). The backend owns the
         # verdict, because only the backend knows whether its hook/tap is still
@@ -114,14 +139,60 @@ class InputSource:
     def _on_press(self, n: int = 1) -> None:
         with self._lock:
             self._presses += n
+        self.note_event()
 
     def _on_click(self, n: int = 1) -> None:
         with self._lock:
             self._clicks += n
+        self.note_event()
 
     def _on_scroll(self, n: int = 1) -> None:
         with self._lock:
             self._scrolls += n
+        self.note_event()
+
+    def note_event(self, now: Optional[float] = None) -> None:
+        """Record that the backend saw input. Liveness ONLY: changes no count and
+        never leaves the device. Called from inside the Windows hook callback,
+        which runs under the OS hook timeout — so it is one attribute store and
+        nothing else: no lock, no logging."""
+        self._last_event_mono = time.monotonic() if now is None else now
+
+    def mark_started(self, now: Optional[float] = None) -> None:
+        """Record that a fresh install just succeeded, opening the
+        SILENT_GRACE_S window during which capture_state() gives no verdict."""
+        self._started_mono = time.monotonic() if now is None else now
+
+    def capture_state(
+        self, os_idle_seconds: Optional[float], now: Optional[float] = None
+    ) -> Optional[str]:
+        """The input sensor's own health: None (no backend), "unavailable" (the
+        OS refused the hook / it is stopped), "silent" (the OS saw input in the
+        last minute but our hook has seen nothing for five — a symptom, not a
+        cause; see the module comment), or "ok". The fourth heartbeat value,
+        "off", is not decided here: the caller maps any state to "off" while the
+        working-hours policy disallows capture, because only it knows the
+        policy (main.capture_currently_allowed).
+
+        Every unknown answers "ok", never "silent": an unreadable OS idle clock,
+        a backend that cannot see mouse moves (the macOS tap — a reader moving
+        only the mouse would look silent), a hook still inside its grace."""
+        if self._backend is None:
+            return None
+        if not self.available():
+            return "unavailable"
+        if not getattr(self._backend, "observes_all_input", False):
+            return "ok"   # macOS tap / others cannot see mouse moves: no silent verdict
+        now = time.monotonic() if now is None else now
+        started = self._started_mono
+        if started is None or now - started < SILENT_GRACE_S:
+            return "ok"
+        if os_idle_seconds is None or os_idle_seconds > SILENT_OS_IDLE_MAX_S:
+            return "ok"
+        last = self._last_event_mono
+        if last is None or now - last > SILENT_NO_EVENT_S:
+            return "silent"   # the OS saw input in the last minute; our hook saw nothing for 5
+        return "ok"
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -131,11 +202,74 @@ class InputSource:
         ``available()`` then reflects — nothing is cached here."""
         if self._backend is None:
             return False
+        # Sampled BEFORE the backend call. _apply_capture_policy re-runs start()
+        # every 60s, and on a live Windows hook that is the is_alive() fast path:
+        # it returns True and installs nothing. Opening the grace window on that
+        # would restart the 300s grace every minute and "silent" could never be
+        # reported. Only a start that brought a sensor up — never started, or
+        # down beforehand (stopped, crashed, refused) — is a fresh install.
+        fresh = self._started_mono is None or not self.available()
         try:
-            return bool(self._backend.start())
+            ok = bool(self._backend.start())
         except Exception as e:
             logger.warning("InputSource backend start failed: %s", e)
             return False
+        if ok and fresh:
+            self.mark_started()
+        return ok
+
+    def restart(
+        self,
+        timeout: float = 2.0,
+        may_start: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """Reinstall the backend: stop, wait for its listener thread to exit,
+        start again. Returns True only when a new install succeeded.
+
+        ``may_start`` is asked immediately before the start, AFTER the join:
+        the join can take up to ``timeout`` seconds, and the caller's own
+        capture check is that old by then. Pass the working-hours capture
+        predicate so a reinstall can never install a hook past the window's
+        close. A False answer — or a predicate that raises — leaves the backend
+        stopped and returns False (fail closed: outside the window nothing may
+        record).
+
+        stop() then start() is NOT a reinstall on Windows: stop() only posts
+        WM_QUIT, and a start() that runs before the pump thread has exited hits
+        its is_alive() fast path and returns the stale verdict without
+        installing anything. So wait for the old thread first, and if it will
+        not go, refuse rather than pretend. A backend with no join() (macOS
+        tap, whose stop() already joins; test fakes) is treated as stopped."""
+        if self._backend is None:
+            return False
+        self.stop()
+        join = getattr(self._backend, "join", None)
+        if join is not None:
+            try:
+                exited = bool(join(timeout))
+            except Exception as e:
+                logger.warning("InputSource backend join failed: %s", e)
+                exited = False
+            if not exited:
+                logger.warning(
+                    "InputSource restart: listener thread still alive %.1fs after "
+                    "stop — not reinstalling", timeout,
+                )
+                return False
+        if may_start is not None:
+            try:
+                allowed = bool(may_start())
+            except Exception as e:
+                logger.warning("InputSource restart: capture check failed (%s) — not starting", e)
+                allowed = False
+            if not allowed:
+                logger.info("InputSource restart: capture no longer allowed — not starting")
+                return False
+        ok = self.start()
+        if ok:
+            # Explicit: this IS a fresh install, whatever available() said.
+            self.mark_started()
+        return ok
 
     def stop(self) -> None:
         """Stop the backend listener thread (no-op when there is no backend)."""
@@ -270,17 +404,34 @@ class InputSource:
             return None
         # Snapshot-and-reset in one step — the next range accrues fresh. Shared
         # with discard_counts() so both paths clear exactly the same state.
-        presses, clicks, scrolls = self._take_counts()
-        if presses == 0 and clicks == 0 and scrolls == 0:
+        counts = self._take_counts()
+        if not any(counts):
             return None
-        return self._event(range_start, range_end, presses, clicks, scrolls)
+        return self._event(range_start, range_end, counts)
+
+    def peek_input_event(
+        self, range_start: datetime, range_end: datetime
+    ) -> Optional[dict]:
+        """The event ``drain_input_event`` would build over the same range,
+        WITHOUT resetting anything. For the fraud analyzer, which needs to see
+        the counts at the top of a cycle; the destructive drain stays next to
+        the send, so a cycle that dies (or is taken over) in between loses
+        nothing and cannot re-send a stale snapshot under the id a replacement
+        cycle already used. Same None cases as the drain."""
+        if not self.available():
+            return None
+        if range_end <= range_start:
+            return None
+        counts = self.counts
+        if not any(counts):
+            return None
+        return self._event(range_start, range_end, counts)
 
     def _event(
-        self, start: datetime, end: datetime,
-        presses: int, clicks: int, scrolls: int,
+        self, start: datetime, end: datetime, counts: tuple[int, ...],
     ) -> dict:
         duration = (end - start).total_seconds()
-        data = {"presses": presses, "clicks": clicks, "scrolls": scrolls}
+        data = dict(zip(INPUT_COUNT_KEYS, counts))
         app = self._frontmost_app()
         if app:
             data["app"] = app
@@ -339,6 +490,105 @@ def _default_frontmost_app_getter() -> Optional[Callable[[], Optional[str]]]:
     return getter
 
 
+def _declare_win32_hook_signatures(user32, kernel32, functype):
+    """Declare argtypes/restype for every Win32 call _WindowsHookBackend makes,
+    on the given DLL objects, and return the HOOKPROC callback type.
+
+    Undeclared, ctypes treats every return as a 32-bit ``c_int`` and every
+    Python-int argument as ``c_int``. On 64-bit Windows that truncated the
+    HMODULE from GetModuleHandleW, so SetWindowsHookExW refused both hooks on
+    every device in the fleet (``kbd=0 mouse=0`` once a minute, zero input
+    counted); the HHOOK return and the pointer-sized lParam chained through
+    CallNextHookEx were truncated/overflowed the same way. ``functype`` is
+    ``ctypes.WINFUNCTYPE`` in production; injectable so the declarations are
+    checkable on any OS."""
+    import ctypes
+    from ctypes import wintypes
+
+    LRESULT = wintypes.LPARAM  # noqa: N806 — Win32 name; pointer-sized signed (LONG_PTR)
+    HOOKPROC = functype(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)  # noqa: N806
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+    user32.SetWindowsHookExW.restype = wintypes.HHOOK
+    user32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    # BOOL is signed, so GetMessageW's -1 error return survives for the pump.
+    user32.GetMessageW.argtypes = [
+        wintypes.LPMSG, wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [wintypes.LPMSG]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [wintypes.LPMSG]
+    user32.DispatchMessageW.restype = LRESULT
+    user32.PostThreadMessageW.argtypes = [
+        wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.PostThreadMessageW.restype = wintypes.BOOL
+    return HOOKPROC
+
+
+def _load_win32_hook_api():
+    """Backend-local user32/kernel32 with declared signatures, plus HOOKPROC.
+
+    Private ``WinDLL`` instances, NOT the shared ``ctypes.windll.*``: setting
+    argtypes on the global objects would silently change every other module's
+    calls to the same functions (system_events.py calls GetModuleHandleW too).
+    ``use_last_error=True`` so a refused install can log the real Windows error
+    via ``ctypes.get_last_error()``. Imported lazily: this module loads on every
+    platform."""
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    hookproc = _declare_win32_hook_signatures(user32, kernel32, ctypes.WINFUNCTYPE)
+    return user32, kernel32, hookproc
+
+
+_KBDLLHOOKSTRUCT = None
+
+
+def _read_kbd_vkcode(lparam) -> Optional[int]:
+    """The vkCode of the KBDLLHOOKSTRUCT a WH_KEYBOARD_LL callback's lParam
+    points at, or None when it cannot be read. Never raises: it runs inside
+    the hook callback, where an exception would skip CallNextHookEx.
+
+    The key identity is used ONLY by _WindowsHookBackend to recognise an
+    auto-repeat. Callers must never log it, store it beyond the held-key set,
+    or put it in any event or payload (CLAUDE.md: input is counts only)."""
+    global _KBDLLHOOKSTRUCT
+    try:
+        if not isinstance(lparam, int) or lparam <= 0:
+            return None  # NULL / not a pointer: from_address would crash
+        import ctypes
+        from ctypes import wintypes
+
+        if _KBDLLHOOKSTRUCT is None:
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
+                ]
+            _KBDLLHOOKSTRUCT = KBDLLHOOKSTRUCT
+        return int(_KBDLLHOOKSTRUCT.from_address(lparam).vkCode)
+    except Exception:
+        return None
+
+
 def _default_input_backend(source: "InputSource"):
     """Build the platform's in-process input-counting backend, or None when the
     platform has no in-process hook.
@@ -361,8 +611,16 @@ class _WindowsHookBackend:
 
     Runs its own thread with a Windows message loop (``GetMessage``) — the OS
     only delivers low-level hook callbacks to a thread that pumps messages. The
-    callback reads ONLY the event type (WM_KEYDOWN / WM_*BUTTONDOWN / WM_*WHEEL),
-    never key values, then chains to the next hook.
+    callbacks read the event type (WM_KEYDOWN / WM_*BUTTONDOWN / WM_*WHEEL), then
+    chain to the next hook.
+
+    The keyboard callback also reads the key's ``vkCode``, for ONE purpose: a
+    held key makes Windows repeat WM_KEYDOWN ~30x/s with no repeat flag on an
+    LL hook, so a KEYDOWN for a key with no KEYUP since its last DOWN is an
+    auto-repeat and is not counted. The vkCode lives only in ``_held_keys``
+    (in memory, hook thread only, at most ``_MAX_HELD_KEYS`` entries, cleared on
+    every install and unhook). It is never logged, never stored anywhere else,
+    and never put in any event or payload — only the press COUNT leaves.
     """
 
     # Windows message / hook constants (defined here to avoid importing win32 at
@@ -371,12 +629,24 @@ class _WindowsHookBackend:
     _WH_MOUSE_LL = 14
     _WM_KEYDOWN = 0x0100
     _WM_SYSKEYDOWN = 0x0104
+    _WM_KEYUP = 0x0101
+    _WM_SYSKEYUP = 0x0105
+    # More keys "held" than a keyboard plausibly holds means KEYUPs were lost
+    # (another hook ate them, a timeout evicted ours): clear rather than let a
+    # stuck entry suppress that key's real presses forever.
+    _MAX_HELD_KEYS = 32
     _WM_LBUTTONDOWN = 0x0201
     _WM_RBUTTONDOWN = 0x0204
     _WM_MBUTTONDOWN = 0x0207
     _WM_XBUTTONDOWN = 0x020B
     _WM_MOUSEWHEEL = 0x020A
     _WM_MOUSEHWHEEL = 0x020E
+    _WM_MOUSEMOVE = 0x0200
+
+    # LL hooks see every input event, mouse moves included, so a long stretch
+    # with none while the OS reports input is evidence the hook is gone. Read by
+    # InputSource.capture_state(); backends without it get no "silent" verdict.
+    observes_all_input = True
 
     def __init__(self, source: "InputSource") -> None:
         self._source = source
@@ -390,6 +660,11 @@ class _WindowsHookBackend:
         self._mouse_cb = None
         self._started = threading.Event()
         self._start_ok = False
+        # Serialises start(): restart() on the heartbeat thread and the 60s
+        # capture-policy converge can both call it on a dead hook, and the
+        # is_alive() check-then-spawn below would otherwise install TWO hook
+        # threads, each counting every keystroke.
+        self._start_lock = threading.Lock()
         # Set by _run() when the OS refuses the hooks (UIPI / AV / EDR) or ctypes
         # is unusable. Windows ships NO external input tracker, so this backend is
         # the only input source there — a refused hook that still reported
@@ -402,6 +677,39 @@ class _WindowsHookBackend:
         # a window every tick where a refused hook reads as a working sensor and
         # _should_skip_external_input drops the external bucket.
         self._install_failed = False
+        # Seam for tests; production loads private, signature-declared DLLs.
+        self._api_loader = _load_win32_hook_api
+        # The typed user32 the hook thread loaded; stop() posts WM_QUIT through
+        # it. Assigned before _thread_id, so a non-None id implies it is set.
+        self._user32 = None
+        # vkCodes with a KEYDOWN and no KEYUP yet: the auto-repeat filter. Hook
+        # thread only. See the class docstring for what may (not) be done with it.
+        self._held_keys: set = set()
+
+    def _is_new_key_press(self, wparam, lparam) -> bool:
+        """True when this keyboard message is a press to COUNT: a KEYDOWN /
+        SYSKEYDOWN for a key not already held. Updates the held set on downs
+        and ups. Runs inside the hook callback, so it never raises; an
+        unreadable lparam counts the KEYDOWN (today's behaviour)."""
+        try:
+            is_down = wparam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN)
+            is_up = wparam in (self._WM_KEYUP, self._WM_SYSKEYUP)
+            if not (is_down or is_up):
+                return False
+            vk = _read_kbd_vkcode(lparam)
+            if vk is None:
+                return is_down
+            if is_up:
+                self._held_keys.discard(vk)
+                return False
+            if vk in self._held_keys:
+                return False  # auto-repeat of a key still held
+            if len(self._held_keys) >= self._MAX_HELD_KEYS:
+                self._held_keys.clear()
+            self._held_keys.add(vk)
+            return True
+        except Exception:
+            return wparam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN)
 
     def available(self) -> bool:
         """ctypes + user32 are always present on Windows, so this is a platform
@@ -417,6 +725,10 @@ class _WindowsHookBackend:
             return False
 
     def start(self) -> bool:
+        with self._start_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> bool:
         if self._thread is not None and self._thread.is_alive():
             return self._start_ok
         self._started.clear()
@@ -439,14 +751,23 @@ class _WindowsHookBackend:
 
     def stop(self) -> None:
         tid = self._thread_id
-        if tid is None:
+        user32 = self._user32
+        if tid is None or user32 is None:
             return
         try:
-            import ctypes
             # WM_QUIT == 0x0012 — breaks the message loop so the thread exits.
-            ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)
+            user32.PostThreadMessageW(tid, 0x0012, 0, 0)
         except Exception as e:
             logger.debug("Windows input hook stop failed: %s", e)
+
+    def join(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` for the hook thread to exit. True when there is
+        no thread or it has exited — i.e. a start() now really installs."""
+        t = self._thread
+        if t is None:
+            return True
+        t.join(timeout)
+        return not t.is_alive()
 
     def _run(self) -> None:
         """Thread target. Any escape from the hook thread is recorded as an
@@ -483,25 +804,24 @@ class _WindowsHookBackend:
         try:
             import ctypes
             from ctypes import wintypes
+
+            # LowLevelKeyboardProc / LowLevelMouseProc signature is HOOKPROC.
+            user32, kernel32, HOOKPROC = self._api_loader()  # noqa: N806
         except Exception as e:
-            logger.warning("ctypes unavailable — Windows input hook disabled: %s", e)
+            logger.warning(
+                "ctypes/Win32 hook API unavailable — Windows input hook disabled: %s", e
+            )
             self._install_failed = True
             self._started.set()
             return
-
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-
-        # LowLevelKeyboardProc / LowLevelMouseProc signature.
-        HOOKPROC = ctypes.CFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
-        )
+        self._user32 = user32
 
         src = self._source
 
         def _kbd_proc(nCode, wParam, lParam):
             if nCode == 0:  # HC_ACTION — a real event to process
-                if wParam in (self._WM_KEYDOWN, self._WM_SYSKEYDOWN):
+                src.note_event()  # key-ups and repeats: liveness only, no count
+                if self._is_new_key_press(wParam, lParam):
                     src._on_press()
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
@@ -516,24 +836,35 @@ class _WindowsHookBackend:
                     src._on_click()
                 elif wParam in (self._WM_MOUSEWHEEL, self._WM_MOUSEHWHEEL):
                     src._on_scroll()
+                elif wParam == self._WM_MOUSEMOVE:
+                    src.note_event()  # liveness only: never a count
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+        # Fresh install: any KEYUP sent while we were unhooked was never seen.
+        self._held_keys.clear()
         self._kbd_cb = HOOKPROC(_kbd_proc)
         self._mouse_cb = HOOKPROC(_mouse_proc)
 
-        # A NULL hMod with dwThreadId 0 requires the callback to live in this
-        # module (it does). Pass the module handle for robustness.
+        # Low-level hooks are never injected, so with dwThreadId 0 Windows takes
+        # either a NULL hMod or any valid module handle. Older Windows versions
+        # are reported to refuse NULL (ERROR_MOD_NOT_FOUND), so pass this
+        # process's own (correctly typed, full 64-bit) module handle.
         h_mod = kernel32.GetModuleHandleW(None)
+        # Read each error immediately: the saved last-error is per thread and
+        # the next call overwrites it.
         self._kbd_hook = user32.SetWindowsHookExW(
             self._WH_KEYBOARD_LL, self._kbd_cb, h_mod, 0
         )
+        kbd_err = 0 if self._kbd_hook else ctypes.get_last_error()
         self._mouse_hook = user32.SetWindowsHookExW(
             self._WH_MOUSE_LL, self._mouse_cb, h_mod, 0
         )
+        mouse_err = 0 if self._mouse_hook else ctypes.get_last_error()
         if not self._kbd_hook or not self._mouse_hook:
             logger.warning(
-                "SetWindowsHookEx failed (kbd=%s mouse=%s) — in-process input "
-                "counting disabled", self._kbd_hook, self._mouse_hook,
+                "SetWindowsHookEx failed (kbd=%s err=%s mouse=%s err=%s) — "
+                "in-process input counting disabled",
+                self._kbd_hook, kbd_err, self._mouse_hook, mouse_err,
             )
             self._unhook(user32)
             self._install_failed = True
@@ -601,6 +932,8 @@ class _WindowsHookBackend:
                     logger.debug("UnhookWindowsHookEx failed", exc_info=True)
         self._kbd_hook = None
         self._mouse_hook = None
+        # Unhooked: KEYUPs from here on are invisible, so forget held keys.
+        self._held_keys.clear()
 
 
 class _MacOSTapBackend:
