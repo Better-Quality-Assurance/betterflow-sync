@@ -293,6 +293,18 @@ class InputSource:
             self._scrolls = 0
         return counts
 
+    def restore_counts(self, presses: int, clicks: int, scrolls: int) -> None:
+        """Add counts back after a drain whose event never left the process.
+
+        The inverse of ``_take_counts`` for a cycle that raised between the
+        drain and the send: the counters were zeroed into an event that is now
+        gone, so the keystrokes are returned and ride the next span. Adds rather
+        than assigns, because input keeps arriving while the cycle is down."""
+        with self._lock:
+            self._presses += max(0, int(presses))
+            self._clicks += max(0, int(clicks))
+            self._scrolls += max(0, int(scrolls))
+
     def discard_counts(self) -> tuple[int, int, int]:
         """Throw away everything counted so far, returning what was dropped.
 
