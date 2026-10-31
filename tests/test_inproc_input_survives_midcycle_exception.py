@@ -49,12 +49,12 @@ def test_keystrokes_typed_after_the_failure_add_to_the_restored_ones(monkeypatch
     real = eng._sync_window_buckets
 
     def boom(*a, **k):
+        eng.input_source._on_press(5)  # typed after the drain, before the failure
         raise RuntimeError("unexpected")
 
     monkeypatch.setattr(eng, "_sync_window_buckets", boom)
     with pytest.raises(RuntimeError):
         eng.sync()
-    eng.input_source._on_press(5)  # typed while the cycle was down
 
     monkeypatch.setattr(eng, "_sync_window_buckets", real)
     eng.sync()
