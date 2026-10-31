@@ -30,7 +30,7 @@ except ImportError:
 try:
     from ..browser_tracker import is_browser_app
     from ..config import Config
-    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
+    from .aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
     from .bf_client import (
         BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION,
         REASON_CREDENTIALS_CHANGED, SyncResult,
@@ -55,7 +55,7 @@ try:
 except ImportError:
     from browser_tracker import is_browser_app
     from config import Config
-    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
+    from sync.aw_client import AWClientError, AWEvent, BUCKET_TYPE_WINDOW, BUCKET_TYPE_WINDOW_ALT, BUCKET_TYPE_AFK, BUCKET_TYPE_AFK_ALT, BUCKET_TYPE_WEB, BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS, BUCKET_TYPE_CALL, CALL_STATUS_ONGOING, CALL_STATUS_COMPLETED
     from sync.bf_client import (
         BetterFlowClientError, BetterFlowAuthError, REASON_NO_CONFIRMATION,
         REASON_CREDENTIALS_CHANGED, SyncResult,
@@ -337,11 +337,6 @@ def _chunk_span(start: datetime, duration: float) -> list[tuple[datetime, float]
     return chunks
 
 
-#: Counters on an input event that ADD UP over time (unlike an AFK ``status``,
-#: which is true of every chunk of its span).
-_INPUT_COUNT_KEYS = ("presses", "clicks", "scrolls")
-
-
 def _prorate_input_counts(
     event: dict, chunks: list[tuple[datetime, float]]
 ) -> list[dict]:
@@ -351,22 +346,37 @@ def _prorate_input_counts(
     wrong for counts: 1000 presses over 25 h became 2 x 1000 server-side. Each
     counter is cut in proportion to the chunk's share of the span, using
     cumulative rounding so the shares always sum to exactly the original and the
-    rate (count / duration) stays uniform across chunks. Non-input events and
-    non-integer counters get no override, so they are copied as before."""
+    rate (count / duration) stays uniform across chunks. An integer count is cut
+    in whole numbers; a float count is cut proportionally (the last chunk takes
+    the remainder). A count that is not a finite non-negative number cannot be
+    divided, so it stays on the first chunk and the rest get 0: copying it would
+    multiply it, which is the bug this exists to prevent. Non-input events get
+    no override, so they are copied as before."""
     shares: list[dict] = [{} for _ in chunks]
     if event.get("bucket_type") != BUCKET_TYPE_INPUT:
         return shares
     data = event.get("data") or {}
     total_duration = sum(d for _, d in chunks)
-    for key in _INPUT_COUNT_KEYS:
-        total = data.get(key)
-        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+    last = len(chunks) - 1
+    for key in INPUT_COUNT_KEYS:
+        if key not in data:
+            continue
+        total = data[key]
+        is_number = isinstance(total, (int, float)) and not isinstance(total, bool)
+        if not is_number or not math.isfinite(total) or total < 0:
+            for n in range(len(chunks)):
+                shares[n][key] = total if n == 0 else 0
             continue
         elapsed = 0.0
-        allocated = 0
+        allocated = 0 if isinstance(total, int) else 0.0
         for n, (_, chunk_duration) in enumerate(chunks):
             elapsed += chunk_duration
-            upto = total if n == len(chunks) - 1 else int(total * elapsed / total_duration)
+            if n == last:
+                upto = total
+            elif isinstance(total, int):
+                upto = int(total * elapsed / total_duration)
+            else:
+                upto = total * elapsed / total_duration
             shares[n][key] = upto - allocated
             allocated = upto
     return shares
@@ -1811,150 +1821,144 @@ class SyncEngine:
         # sees exactly the input stream that is uploaded — never both.
         skip_external_input = self._should_skip_external_input()
 
+        # The analyzer needs this cycle's in-process input, but the counters are
+        # only READ here: the destructive drain sits next to the send (below), so a
+        # cycle that raises, or is abandoned by a wedge takeover, has taken nothing.
+        # Draining here instead let an abandoned cycle later send its stale snapshot
+        # under the id the replacement cycle had already used (same checkpoint, same
+        # id), overwriting the replacement's larger count.
+        input_event: Optional[dict] = None
+        if skip_external_input:
+            input_event = self._peek_inproc_input(datetime.now(timezone.utc))
+        # Fetch input events for activity analysis before processing window
+        # events. The returned context is threaded explicitly through the
+        # transform path — no per-cycle state lives on the instance.
+        cycle = self._prepare_input_analysis(
+            input_buckets,
+            analyze_external=not skip_external_input,
+            inproc_input_event=input_event,
+        )
+
+        # When the agent is the sole per-app window source (in-process), drop the
+        # external bf-window-tracker bucket(s) entirely — we upload our own stream
+        # below instead, so its (possibly blind) events never reach the server and
+        # can't double-count. No-op when the flag is off (default): the external
+        # window bucket syncs exactly as today.
+        # Escalate a blind in-process window probe once per episode (and, via
+        # _should_skip_external_window below, fall back to the external tracker).
+        self._check_window_source_health()
+        skip_external_window = self._should_skip_external_window()
+        window_buckets_to_sync = (
+            [b for b in window_buckets if not _is_window_like(b.type)]
+            if skip_external_window else window_buckets
+        )
+
+        # Sync window buckets with gap-filling
+        all_events, call_events, pending_checkpoints = self._sync_window_buckets(
+            window_buckets_to_sync, stats, cycle
+        )
+
+        # Foreground-CPU activity: sample the focused process and credit engaged
+        # no-input work (an active Claude Code / build / render). Anchored to the
+        # most recent real input so credit only ever extends near genuine human
+        # presence. Updates is_active_dev_session() for the idle guard, advances
+        # the AFK activity-source credit (folded by next cycle's record_sample),
+        # and emits an auditable dev-session span when a session ends.
+        self._observe_foreground_activity(all_events, stats, cycle)
+
+        # Microphone-in-use meeting detection: the system-level companion to the
+        # window-title call detector — sees a meeting even when the call window
+        # isn't frontmost. Keeps is_mic_meeting_active() current for the idle
+        # guard, advances the AFK activity-source credit, and uploads a live
+        # snapshot / final span (call_type "mic") for server-side audit.
+        self._observe_mic_activity(all_events, stats)
+
+        # Clear window-specific AFK context before processing non-window buckets
+        # so AFK events from one window bucket don't leak into unrelated buckets.
+        cycle.afk_events = []
+
+        # Sync non-window buckets normally. When the agent is the sole AFK source
+        # (in-process), drop the external bf-idle-tracker bucket entirely — we
+        # upload our own stream below instead, so its (possibly frozen/blind)
+        # events never reach the server.
+        skip_external_afk = self._should_skip_external_afk()
+        # Publish the decision to the flag sink on the path where it's made, so
+        # aw_manager's flag (idle-tracker watchdog + AFK telemetry) stays in step
+        # with the engine every active cycle — one source of truth, not a cache a
+        # separate timer keeps in sync (and silently failed to: Bug A, #76/#78).
+        self._publish_inproc_afk_flag(skip_external_afk)
+        for bucket in web_buckets + afk_buckets + input_buckets:
+            if skip_external_afk and _is_afk_like(bucket.type):
+                continue
+            if skip_external_input and _is_input_like(bucket.type):
+                continue
+            try:
+                events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats, cycle)
+                all_events.extend(events)
+                if checkpoint:
+                    pending_checkpoints.append(checkpoint)
+                stats.buckets_synced += 1
+            except AWClientError as e:
+                stats.errors.append(f"{_REASON_BUCKET_SYNC_FAILED} {bucket.id}: {e}")
+
+        if skip_external_afk:
+            # Sole-source path: upload the in-process AFK stream for the slice
+            # since the last covered instant. Subsumes _synthesize_for_stale_afk.
+            all_events.extend(self._build_inproc_afk(datetime.now(timezone.utc)))
+        else:
+            # External-bucket path: if bf-idle-tracker has frozen but the OS idle
+            # clock shows the user kept working, upload a synthetic not-afk span so
+            # the frozen tracker's worked span isn't billed idle ("Active time not
+            # advancing" alert) — the gap #53/#56 left open on the upload side.
+            synth_afk = self._synthesize_for_stale_afk(afk_buckets)
+            if synth_afk:
+                all_events.append(synth_afk)
+
+        # Pending in-process window checkpoint for this cycle, kept as a LOCAL
+        # (not an instance field) so a concurrent wedge-recovery cycle can't
+        # clobber the value this cycle will commit after its own confirmed send.
+        window_pending: Optional[datetime] = None
+        if skip_external_window:
+            # Sole-source path: upload the in-process per-app window stream for
+            # the slice since the last covered instant.
+            window_events, window_pending = self._build_inproc_window(
+                datetime.now(timezone.utc)
+            )
+            all_events.extend(window_events)
+
         # Pending in-process input checkpoint for this cycle, kept as a LOCAL for
         # the same wedge-recovery reason window_pending is (see _build_inproc_window).
-        # Drained BEFORE the input analysis so the analyzer sees it: on Windows
-        # this is the only input stream there is, and without it no window event
-        # ever carried a client fraud_score.
         input_pending: Optional[datetime] = None
-        input_event: Optional[dict] = None
         if skip_external_input:
             # Sole-source path: drain the accumulated keystroke/click/scroll
             # counts into one event for the slice since the last covered instant.
-            input_event, input_pending = self._build_inproc_input(
+            sent_input_event, input_pending = self._build_inproc_input(
                 datetime.now(timezone.utc)
             )
-        # The drain above is destructive: from here until the send takes
-        # ownership of the event, anything that raises would drop the user's
-        # keystrokes (the drain used to sit next to the send, so nothing could
-        # fall in between). Hand the counts back and re-raise; the checkpoint
-        # was not advanced, so the retry stamps them over the span they cover.
-        try:
-            # Fetch input events for activity analysis before processing window
-            # events. The returned context is threaded explicitly through the
-            # transform path — no per-cycle state lives on the instance.
-            cycle = self._prepare_input_analysis(
-                input_buckets,
-                analyze_external=not skip_external_input,
-                inproc_input_event=input_event,
-            )
-
-            # When the agent is the sole per-app window source (in-process), drop the
-            # external bf-window-tracker bucket(s) entirely — we upload our own stream
-            # below instead, so its (possibly blind) events never reach the server and
-            # can't double-count. No-op when the flag is off (default): the external
-            # window bucket syncs exactly as today.
-            # Escalate a blind in-process window probe once per episode (and, via
-            # _should_skip_external_window below, fall back to the external tracker).
-            self._check_window_source_health()
-            skip_external_window = self._should_skip_external_window()
-            window_buckets_to_sync = (
-                [b for b in window_buckets if not _is_window_like(b.type)]
-                if skip_external_window else window_buckets
-            )
-
-            # Sync window buckets with gap-filling
-            all_events, call_events, pending_checkpoints = self._sync_window_buckets(
-                window_buckets_to_sync, stats, cycle
-            )
-
-            # Foreground-CPU activity: sample the focused process and credit engaged
-            # no-input work (an active Claude Code / build / render). Anchored to the
-            # most recent real input so credit only ever extends near genuine human
-            # presence. Updates is_active_dev_session() for the idle guard, advances
-            # the AFK activity-source credit (folded by next cycle's record_sample),
-            # and emits an auditable dev-session span when a session ends.
-            self._observe_foreground_activity(all_events, stats, cycle)
-
-            # Microphone-in-use meeting detection: the system-level companion to the
-            # window-title call detector — sees a meeting even when the call window
-            # isn't frontmost. Keeps is_mic_meeting_active() current for the idle
-            # guard, advances the AFK activity-source credit, and uploads a live
-            # snapshot / final span (call_type "mic") for server-side audit.
-            self._observe_mic_activity(all_events, stats)
-
-            # Clear window-specific AFK context before processing non-window buckets
-            # so AFK events from one window bucket don't leak into unrelated buckets.
-            cycle.afk_events = []
-
-            # Sync non-window buckets normally. When the agent is the sole AFK source
-            # (in-process), drop the external bf-idle-tracker bucket entirely — we
-            # upload our own stream below instead, so its (possibly frozen/blind)
-            # events never reach the server.
-            skip_external_afk = self._should_skip_external_afk()
-            # Publish the decision to the flag sink on the path where it's made, so
-            # aw_manager's flag (idle-tracker watchdog + AFK telemetry) stays in step
-            # with the engine every active cycle — one source of truth, not a cache a
-            # separate timer keeps in sync (and silently failed to: Bug A, #76/#78).
-            self._publish_inproc_afk_flag(skip_external_afk)
-            for bucket in web_buckets + afk_buckets + input_buckets:
-                if skip_external_afk and _is_afk_like(bucket.type):
-                    continue
-                if skip_external_input and _is_input_like(bucket.type):
-                    continue
-                try:
-                    events, checkpoint = self._sync_bucket(bucket.id, bucket.type, stats, cycle)
-                    all_events.extend(events)
-                    if checkpoint:
-                        pending_checkpoints.append(checkpoint)
-                    stats.buckets_synced += 1
-                except AWClientError as e:
-                    stats.errors.append(f"{_REASON_BUCKET_SYNC_FAILED} {bucket.id}: {e}")
-
-            if skip_external_afk:
-                # Sole-source path: upload the in-process AFK stream for the slice
-                # since the last covered instant. Subsumes _synthesize_for_stale_afk.
-                all_events.extend(self._build_inproc_afk(datetime.now(timezone.utc)))
-            else:
-                # External-bucket path: if bf-idle-tracker has frozen but the OS idle
-                # clock shows the user kept working, upload a synthetic not-afk span so
-                # the frozen tracker's worked span isn't billed idle ("Active time not
-                # advancing" alert) — the gap #53/#56 left open on the upload side.
-                synth_afk = self._synthesize_for_stale_afk(afk_buckets)
-                if synth_afk:
-                    all_events.append(synth_afk)
-
-            # Pending in-process window checkpoint for this cycle, kept as a LOCAL
-            # (not an instance field) so a concurrent wedge-recovery cycle can't
-            # clobber the value this cycle will commit after its own confirmed send.
-            window_pending: Optional[datetime] = None
-            if skip_external_window:
-                # Sole-source path: upload the in-process per-app window stream for
-                # the slice since the last covered instant.
-                window_events, window_pending = self._build_inproc_window(
-                    datetime.now(timezone.utc)
-                )
-                all_events.extend(window_events)
-
-            # The in-process input event drained above (before the analysis).
-            if input_event is not None:
+            if sent_input_event is not None:
                 # Same >24h cap as every ActivityWatch event, same splitter: a
                 # machine that slept past a day and was typed on at wake drains its
                 # counts into one over-cap span.
-                all_events.extend(_split_over_long_event(input_event))
+                all_events.extend(_split_over_long_event(sent_input_event))
 
-            # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
-            # from (app, start), so the server upserts one growing row per meeting.
-            # The old per-cycle flush() here ended the call at every sync boundary:
-            # one meeting fragmented into per-cycle call rows, is_in_call() dropped
-            # to False between cycles (IdleManager's in-call idle suppression raced
-            # a sub-second window and mostly never engaged — Ecaterina's huddle
-            # billed Idle, 2026-07-15), and the AFK activity source found flushed
-            # state at record_sample time. The call now stays open until its real
-            # end (grace expiry), an AW outage, or shutdown.
-            if self._call_detector:
-                snap = self._call_detector.snapshot()
-                if snap:
-                    all_events.append(
-                        self._make_call_bf_event(snap, status=CALL_STATUS_ONGOING)
-                    )
-            if call_events:
-                stats.calls_detected += len(call_events)
-                all_events.extend(call_events)
-        except BaseException:
-            self._restore_drained_input(input_event)
-            raise
-
+        # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
+        # from (app, start), so the server upserts one growing row per meeting.
+        # The old per-cycle flush() here ended the call at every sync boundary:
+        # one meeting fragmented into per-cycle call rows, is_in_call() dropped
+        # to False between cycles (IdleManager's in-call idle suppression raced
+        # a sub-second window and mostly never engaged — Ecaterina's huddle
+        # billed Idle, 2026-07-15), and the AFK activity source found flushed
+        # state at record_sample time. The call now stays open until its real
+        # end (grace expiry), an AW outage, or shutdown.
+        if self._call_detector:
+            snap = self._call_detector.snapshot()
+            if snap:
+                all_events.append(
+                    self._make_call_bf_event(snap, status=CALL_STATUS_ONGOING)
+                )
+        if call_events:
+            stats.calls_detected += len(call_events)
+            all_events.extend(call_events)
         # Send events, then advance checkpoints per-bucket.
         self._send_and_advance_checkpoints(all_events, pending_checkpoints, stats)
         # Commit the in-process AFK checkpoint only if its bucket wasn't queued
@@ -3087,9 +3091,8 @@ class SyncEngine:
             # Input events track keystrokes, clicks, scrolls for fraud detection.
             # The MacOSInputWatcher tags each batch with the frontmost app so the
             # server can attribute counts to the correct per-app aggregate.
-            data["presses"] = event.presses
-            data["clicks"] = event.clicks
-            data["scrolls"] = event.scrolls
+            for key in INPUT_COUNT_KEYS:
+                data[key] = event.data.get(key, 0)
             if event.app:
                 data["app"] = event.app
             bundle = event.data.get("bundle")
@@ -4055,22 +4058,18 @@ class SyncEngine:
             return None, None
         return event, now
 
-    def _restore_drained_input(self, event: Optional[dict]) -> None:
-        """Hand a drained-but-unsent input event's counts back to the source.
-
-        Only for a cycle that failed BEFORE the send took ownership of ``event``
-        (see sync()); once it is sent or queued the offline queue redelivers it
-        and restoring would count it twice. Never raises: it runs while another
-        exception is propagating and must not replace it."""
-        if event is None:
-            return
-        data = event.get("data") or {}
-        try:
-            self.input_source.restore_counts(
-                data.get("presses", 0), data.get("clicks", 0), data.get("scrolls", 0)
-            )
-        except Exception:
-            logger.warning("Could not restore drained input counts", exc_info=True)
+    def _peek_inproc_input(self, now: datetime) -> Optional[dict]:
+        """The input event ``_build_inproc_input`` would drain for [checkpoint, now],
+        built WITHOUT touching the counters or the checkpoint. Feeds the fraud
+        analyzer at the top of a cycle; the send site drains for real. None when
+        there is nothing to analyse (flag off, checkpoint not seeded, clock stepped
+        back, nothing counted)."""
+        if not self._should_use_inproc_input():
+            return None
+        cp = self._input_inproc_checkpoint
+        if cp is None or now <= cp:
+            return None
+        return self.input_source.peek_input_event(cp, now)
 
     def _commit_inproc_input_checkpoint(
         self, stats: SyncStats, pending: Optional[datetime]

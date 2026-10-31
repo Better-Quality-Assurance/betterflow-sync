@@ -37,9 +37,9 @@ from datetime import datetime
 from typing import Callable, Optional
 
 try:
-    from .aw_client import BUCKET_TYPE_INPUT
+    from .aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
 except ImportError:  # PyInstaller bundle (src/ is import root)
-    from sync.aw_client import BUCKET_TYPE_INPUT
+    from sync.aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -293,18 +293,6 @@ class InputSource:
             self._scrolls = 0
         return counts
 
-    def restore_counts(self, presses: int, clicks: int, scrolls: int) -> None:
-        """Add counts back after a drain whose event never left the process.
-
-        The inverse of ``_take_counts`` for a cycle that raised between the
-        drain and the send: the counters were zeroed into an event that is now
-        gone, so the keystrokes are returned and ride the next span. Adds rather
-        than assigns, because input keeps arriving while the cycle is down."""
-        with self._lock:
-            self._presses += max(0, int(presses))
-            self._clicks += max(0, int(clicks))
-            self._scrolls += max(0, int(scrolls))
-
     def discard_counts(self) -> tuple[int, int, int]:
         """Throw away everything counted so far, returning what was dropped.
 
@@ -416,17 +404,34 @@ class InputSource:
             return None
         # Snapshot-and-reset in one step — the next range accrues fresh. Shared
         # with discard_counts() so both paths clear exactly the same state.
-        presses, clicks, scrolls = self._take_counts()
-        if presses == 0 and clicks == 0 and scrolls == 0:
+        counts = self._take_counts()
+        if not any(counts):
             return None
-        return self._event(range_start, range_end, presses, clicks, scrolls)
+        return self._event(range_start, range_end, counts)
+
+    def peek_input_event(
+        self, range_start: datetime, range_end: datetime
+    ) -> Optional[dict]:
+        """The event ``drain_input_event`` would build over the same range,
+        WITHOUT resetting anything. For the fraud analyzer, which needs to see
+        the counts at the top of a cycle; the destructive drain stays next to
+        the send, so a cycle that dies (or is taken over) in between loses
+        nothing and cannot re-send a stale snapshot under the id a replacement
+        cycle already used. Same None cases as the drain."""
+        if not self.available():
+            return None
+        if range_end <= range_start:
+            return None
+        counts = self.counts
+        if not any(counts):
+            return None
+        return self._event(range_start, range_end, counts)
 
     def _event(
-        self, start: datetime, end: datetime,
-        presses: int, clicks: int, scrolls: int,
+        self, start: datetime, end: datetime, counts: tuple[int, ...],
     ) -> dict:
         duration = (end - start).total_seconds()
-        data = {"presses": presses, "clicks": clicks, "scrolls": scrolls}
+        data = dict(zip(INPUT_COUNT_KEYS, counts))
         app = self._frontmost_app()
         if app:
             data["app"] = app
