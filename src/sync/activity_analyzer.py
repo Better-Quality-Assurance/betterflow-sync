@@ -387,13 +387,14 @@ class ActivityAnalyzer:
         # drained with more counts, a failed cycle recovered over a longer span,
         # an ActivityWatch event that grew) sends a superset. Replaced, never
         # summed. Dropping it left the analyzer on the stale, smaller counts.
+        # Matched against what was stored BEFORE this call: same-id events inside
+        # one batch were always kept side by side, and still are.
         by_id = {e.id: i for i, e in enumerate(self._input_events)}
         new_events = []
         changed = False
         for e in events:
             idx = by_id.get(e.id)
             if idx is None:
-                by_id[e.id] = len(self._input_events)
                 self._input_events.append(e)
                 new_events.append(e)
                 changed = True
@@ -429,7 +430,11 @@ class ActivityAnalyzer:
     def _supersedes(new: AWEvent, old: AWEvent) -> bool:
         """True when ``new`` (same id as ``old``) covers strictly more: a later
         end, or the same end with larger counts. Equal or smaller never
-        replaces, so a redelivered stale copy cannot shrink the stored one."""
+        replaces, so a redelivered stale copy cannot shrink the stored one.
+        A different start under the same id is not a longer view of the same
+        span (an id collision): keep the stored event, as dedupe always did."""
+        if new.timestamp != old.timestamp:
+            return False
         new_end = new.timestamp + timedelta(seconds=max(new.duration, 0))
         old_end = old.timestamp + timedelta(seconds=max(old.duration, 0))
         if new_end != old_end:
