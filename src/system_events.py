@@ -2,7 +2,7 @@
 
 Platform-specific implementations:
 - macOS: pyobjc NSWorkspace notifications + SCNetworkReachability
-- Windows: ctypes hidden window message pump
+- Windows: ctypes hidden top-level window message pump
 - Linux: systemd-logind PrepareForSleep D-Bus signal (via jeepney)
 - Fallback: socket-based network poller
 """
@@ -315,8 +315,104 @@ def _start_macos_network_listener(
 
 
 # ---------------------------------------------------------------------------
-# Windows: hidden message-only window for power/session events
+# Windows: hidden top-level window for power/session events
 # ---------------------------------------------------------------------------
+
+# Win32 message constants used by the listener's window procedure.
+_WM_POWERBROADCAST = 0x0218
+_WM_QUERYENDSESSION = 0x0011
+_WM_ENDSESSION = 0x0016
+_WM_WTSSESSION_CHANGE = 0x02B1
+_PBT_APMSUSPEND = 0x0004
+_PBT_APMRESUMEAUTOMATIC = 0x0012
+_WTS_SESSION_LOCK = 0x7
+_WTS_SESSION_UNLOCK = 0x8
+_NOTIFY_FOR_THIS_SESSION = 0
+_WS_EX_TOOLWINDOW = 0x00000080
+
+
+def _declare_win32_listener_signatures(user32, kernel32, wtsapi32, functype):
+    """Declare argtypes/restype for every Win32 call the listener makes.
+
+    Returns ``(WNDPROC, WNDCLASSW)``. Without these declarations ctypes passes
+    and returns plain 32-bit ``c_int``: ``GetModuleHandleW`` truncated the
+    64-bit HMODULE, and ``DefWindowProcW`` raised ``ArgumentError: int too long
+    to convert`` on the 64-bit lParam of WM_NCCREATE, so window creation failed
+    and the listener never delivered a sleep, wake or lock event (#277, same
+    defect class as the input hook fixed in #275).
+
+    ``functype`` is ``ctypes.WINFUNCTYPE`` in production; tests pass
+    ``ctypes.CFUNCTYPE`` so this runs on any OS.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    LRESULT = wintypes.LPARAM  # noqa: N806 — Win32 name; pointer-sized signed (LONG_PTR)
+    WNDPROC = functype(  # noqa: N806
+        LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    )
+
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HANDLE),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    user32.DefWindowProcW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.DefWindowProcW.restype = LRESULT
+    user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.GetMessageW.argtypes = [
+        wintypes.LPMSG, wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = wintypes.BOOL  # signed: -1 is the error return
+    user32.TranslateMessage.argtypes = [wintypes.LPMSG]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [wintypes.LPMSG]
+    user32.DispatchMessageW.restype = LRESULT
+
+    wtsapi32.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+    wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+
+    return WNDPROC, WNDCLASSW
+
+
+def _load_win32_listener_api():
+    """Return ``(user32, kernel32, wtsapi32, WNDPROC, WNDCLASSW)``.
+
+    Private ``WinDLL`` instances, NOT the shared ``ctypes.windll.*``: setting
+    argtypes on the global objects would silently change every other module's
+    calls to the same functions.
+    """
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    wndproc, wndclass = _declare_win32_listener_signatures(
+        user32, kernel32, wtsapi32, ctypes.WINFUNCTYPE,
+    )
+    return user32, kernel32, wtsapi32, wndproc, wndclass
+
 
 def _start_windows_listener(
     on_sleep: Callable,
@@ -329,68 +425,45 @@ def _start_windows_listener(
     try:
         import ctypes
         import ctypes.wintypes as wintypes
-    except ImportError:
-        logger.warning("ctypes not available — sleep/wake detection disabled")
+        user32, kernel32, wtsapi32, WNDPROC, WNDCLASSW = _load_win32_listener_api()  # noqa: N806
+    except (ImportError, OSError, AttributeError) as e:
+        logger.warning("Win32 API not available (%s) — sleep/wake detection disabled", e)
         return
 
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-
-    # Constants
-    WM_POWERBROADCAST = 0x0218
-    WM_QUERYENDSESSION = 0x0011
-    WM_WTSSESSION_CHANGE = 0x02B1
-    WM_DESTROY = 0x0002
-    PBT_APMSUSPEND = 0x0004
-    PBT_APMRESUMEAUTOMATIC = 0x0012
-    WTS_SESSION_LOCK = 0x7
-    WTS_SESSION_UNLOCK = 0x8
-    NOTIFY_FOR_THIS_SESSION = 0
-    HWND_MESSAGE = -3
-
-    WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM,
-    )
-
     def wnd_proc(hwnd, msg, wparam, lparam):
-        if msg == WM_POWERBROADCAST:
-            if wparam == PBT_APMSUSPEND:
+        if msg == _WM_POWERBROADCAST:
+            if wparam == _PBT_APMSUSPEND:
                 logger.info("System sleep detected — pausing")
                 _safe_call(on_sleep)
-            elif wparam == PBT_APMRESUMEAUTOMATIC:
+            elif wparam == _PBT_APMRESUMEAUTOMATIC:
                 logger.info("System wake detected — resuming")
                 _safe_call(on_wake)
-        elif msg == WM_WTSSESSION_CHANGE:
-            if wparam == WTS_SESSION_LOCK and on_screen_lock:
+        elif msg == _WM_WTSSESSION_CHANGE:
+            if wparam == _WTS_SESSION_LOCK and on_screen_lock:
                 logger.info("Screen locked — treating as AFK")
                 _safe_call(on_screen_lock)
-            elif wparam == WTS_SESSION_UNLOCK and on_screen_unlock:
+            elif wparam == _WTS_SESSION_UNLOCK and on_screen_unlock:
                 logger.info("Screen unlocked — user returned")
                 _safe_call(on_screen_unlock)
-        elif msg == WM_QUERYENDSESSION:
-            logger.info("System shutdown detected")
-            _safe_call(on_shutdown)
-            return 1  # Allow shutdown to proceed
+        elif msg == _WM_QUERYENDSESSION:
+            # Only a QUESTION: the user can still cancel (unsaved document,
+            # Restart Manager). Tearing down here would leave a running agent
+            # that records nothing. Answer yes, never veto, do nothing else.
+            return 1
+        elif msg == _WM_ENDSESSION:
+            # wParam is TRUE only when the session really is ending. FALSE
+            # means it was cancelled after QUERYENDSESSION: keep running.
+            if wparam:
+                logger.info("System shutdown detected")
+                _safe_call(on_shutdown)
+            return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     def run_message_pump():
+        # Kept on the thread for its whole life: if the callback object is
+        # collected, Windows calls into freed memory.
         wnd_proc_cb = WNDPROC(wnd_proc)
-
         class_name = "BetterFlowEvents"
-
-        class WNDCLASSW(ctypes.Structure):
-            _fields_ = [
-                ("style", wintypes.UINT),
-                ("lpfnWndProc", WNDPROC),
-                ("cbClsExtra", ctypes.c_int),
-                ("cbWndExtra", ctypes.c_int),
-                ("hInstance", wintypes.HINSTANCE),
-                ("hIcon", wintypes.HICON),
-                ("hCursor", wintypes.HANDLE),
-                ("hbrBackground", wintypes.HBRUSH),
-                ("lpszMenuName", wintypes.LPCWSTR),
-                ("lpszClassName", wintypes.LPCWSTR),
-            ]
 
         wc = WNDCLASSW()
         wc.lpfnWndProc = wnd_proc_cb
@@ -398,33 +471,54 @@ def _start_windows_listener(
         wc.lpszClassName = class_name
 
         if not user32.RegisterClassW(ctypes.byref(wc)):
-            logger.warning("Failed to register window class for system events")
+            logger.warning(
+                "Failed to register window class for system events (error %s)",
+                ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?",
+            )
             return
 
+        # A TOP-LEVEL window that is never shown, NOT HWND_MESSAGE: Windows
+        # broadcasts WM_POWERBROADCAST (sleep/wake) and WM_QUERYENDSESSION /
+        # WM_ENDSESSION (shutdown; we act on the latter) to top-level windows, and a message-only window "does not
+        # receive broadcast messages". WS_EX_TOOLWINDOW keeps it out of Alt+Tab;
+        # with no WS_VISIBLE and no ShowWindow it has no taskbar button either.
         hwnd = user32.CreateWindowExW(
-            0, class_name, "BetterFlow Events", 0,
+            _WS_EX_TOOLWINDOW, class_name, "BetterFlow Events", 0,
             0, 0, 0, 0,
-            HWND_MESSAGE, None, wc.hInstance, None,
+            None, None, wc.hInstance, None,
         )
         if not hwnd:
-            logger.warning("Failed to create message window for system events")
+            logger.warning(
+                "Failed to create hidden window for system events (error %s)",
+                ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else "?",
+            )
             return
 
         # Register for WTS session notifications (lock/unlock)
         try:
-            wtsapi32 = ctypes.windll.wtsapi32
-            wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
-        except Exception:
-            logger.debug("WTS session notification registration failed")
+            if not wtsapi32.WTSRegisterSessionNotification(hwnd, _NOTIFY_FOR_THIS_SESSION):
+                logger.warning("WTS session notification registration refused — lock/unlock not reported")
+        except Exception as e:
+            logger.warning("WTS session notification registration failed (%s) — lock/unlock not reported", e)
 
-        logger.debug("Windows system event listener started")
+        # INFO, not DEBUG: an uploaded log must be able to say whether the
+        # listener started (#277 could not tell from four days of log).
+        logger.info("Windows system event listener started")
 
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
-    thread = threading.Thread(target=run_message_pump, name="system-power-listener", daemon=True)
+    def run_guarded():
+        # An exception on this thread would otherwise go to threading's
+        # excepthook (stderr) and never reach the uploaded log.
+        try:
+            run_message_pump()
+        except Exception:
+            logger.warning("Windows system event listener crashed — sleep/wake/lock not reported", exc_info=True)
+
+    thread = threading.Thread(target=run_guarded, name="system-power-listener", daemon=True)
     thread.start()
 
 

@@ -43,7 +43,8 @@ def test_it_still_warns_and_still_names_the_count():
     kwargs = engine.error_reporter.capture.call_args.kwargs
     assert kwargs["level"] == "warning"
     assert kwargs["fingerprint"] == "offline-queue-events-dropped"
-    assert "3" in engine.error_reporter.capture.call_args[0][0]
+    # The count rides in context, not the message (#266).
+    assert kwargs["context"]["dropped_count"] == 3
 
 
 def test_the_benign_flush_path_is_untouched():

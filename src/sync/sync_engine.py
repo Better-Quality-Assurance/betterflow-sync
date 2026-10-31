@@ -3848,9 +3848,12 @@ class SyncEngine:
             return
         try:
             self.error_reporter.capture(
-                f"In-process window probe blind for {failures} consecutive samples",
+                # Constant message, count in context (#266: see
+                # _report_dropped_events).
+                "In-process window probe blind for consecutive samples",
                 level="warning",
                 tags={"component": "inproc-window"},
+                context={"consecutive_failures": failures},
                 fingerprint="inproc-window-blind",
             )
         except Exception:
@@ -4038,9 +4041,11 @@ class SyncEngine:
             return
         try:
             self.error_reporter.capture(
-                f"In-process AFK idle clock blind for {failures} consecutive cycles",
+                # Constant message, count in context (#266).
+                "In-process AFK idle clock blind for consecutive cycles",
                 level="warning",
                 tags={"component": "inproc-afk"},
+                context={"consecutive_failures": failures},
                 fingerprint="inproc-afk-blind",
             )
         except Exception:
@@ -4898,9 +4903,14 @@ class SyncEngine:
             # high-resolution timeline in the ops ingest, which the privacy model
             # avoids (privacy F3; same discipline as the blind-tracker report).
             window = self._dropped_window_age(summary.get("oldest"), summary.get("newest"))
+            # CONSTANT messages; every value rides in `context` (#266). The
+            # ingest splits rows by a hash of the normalised MESSAGE even when
+            # we send a fingerprint (betterqa-bot mixClientFingerprint), and its
+            # normaliser does not eat bare numbers, so an age or count in the
+            # message turned one dead-letter condition into one row and one
+            # Slack alert per event. tests/test_alert_message_constant.py.
             if real > 0:
                 other = count - real
-                extra = f"; {other} other unstorable" if other > 0 else ""
                 # The server's status code, and ONLY that. The full rejection
                 # text is kept in the local dead-letter row where an engineer can
                 # pull it deliberately; it must not ride to the cross-tenant ops
@@ -4909,21 +4919,33 @@ class SyncEngine:
                 # (privacy F4, same reason bucket ids are reduced to types).
                 # Allowlist a safe shape rather than blocklisting unsafe ones —
                 # the ways free text can carry a title are unbounded.
-                extra += self._dropped_reason_code(summary.get("last_errors"))
+                reason = self._dropped_reason_code(summary.get("last_errors"))
                 self.error_reporter.capture(
-                    f"Dropped {real} queued event(s) after max retries — the "
-                    f"server rejected them; held in dead-letter for replay, not "
-                    f"discarded (buckets={buckets}, {window}{extra})",
+                    "Dropped queued event(s) after max retries — the server "
+                    "rejected them; held in dead-letter for replay, not "
+                    "discarded",
                     level="warning",
                     tags={"component": "offline-queue"},
+                    context={
+                        "dropped_count": real,
+                        "other_unstorable_count": other,
+                        "buckets": buckets,
+                        "window": window,
+                        "reason": reason.lstrip("; ") or "none recorded",
+                    },
                     fingerprint="offline-queue-events-dropped",
                 )
             else:
                 self.error_reporter.capture(
-                    f"Flushed {count} unstorable queued event(s) — stale or no "
-                    f"bucket, never server-acceptable (buckets={buckets}, {window})",
+                    "Flushed unstorable queued event(s) — stale or no bucket, "
+                    "never server-acceptable",
                     level="info",
                     tags={"component": "offline-queue"},
+                    context={
+                        "flushed_count": count,
+                        "buckets": buckets,
+                        "window": window,
+                    },
                     fingerprint="offline-queue-events-flushed-unstorable",
                 )
         except Exception:
@@ -4966,11 +4988,14 @@ class SyncEngine:
             return
         try:
             self.error_reporter.capture(
-                f"Agent {AGENT_VERSION} is below the server minimum "
-                f"{min_version} and is still running — the update has not "
-                f"applied. Window-title categorisation degrades while stuck.",
+                # Constant message, versions in context (#266): one condition,
+                # one row, however many versions the fleet is stuck on.
+                "Agent is below the server minimum version and is still "
+                "running — the update has not applied. Window-title "
+                "categorisation degrades while stuck.",
                 level="warning",
                 tags={"component": "self-update"},
+                context={"agent_version": AGENT_VERSION, "min_version": min_version},
                 fingerprint="agent-below-minimum-version",
                 dedup_window=3600.0,
             )
@@ -5026,9 +5051,11 @@ class SyncEngine:
             return
         try:
             self.error_reporter.capture(
-                f"Agent log upload failed: {reason}",
+                # Constant message, reason in context (#266).
+                "Agent log upload failed",
                 level="warning",
                 tags={"component": "log-upload"},
+                context={"reason": reason},
                 fingerprint="log-upload-failed",
             )
         except Exception:
