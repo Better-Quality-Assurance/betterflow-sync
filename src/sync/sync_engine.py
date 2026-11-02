@@ -1924,7 +1924,21 @@ class SyncEngine:
             window_events, window_pending = self._build_inproc_window(
                 datetime.now(timezone.utc)
             )
-            all_events.extend(window_events)
+            # Same path as an ActivityWatch window event, so these get the
+            # activity classification and the client fraud score (they used to
+            # upload as raw dicts with neither). The transform ids the event
+            # ``<id>:0``, so ``win-inproc_<host>_<ms>`` becomes
+            # ``win-inproc_<host>_<ms>:0`` (TASK-002178 item 3). Its returned
+            # checkpoint is ignored: this stream's own checkpoint is committed
+            # via ``window_pending`` after the confirmed send.
+            transformed_window, _ = self._transform_and_checkpoint(
+                [AWEvent.from_dict(ev) for ev in window_events],
+                self.window_source.bucket_id,
+                BUCKET_TYPE_WINDOW,
+                stats,
+                cycle,
+            )
+            all_events.extend(transformed_window)
 
         # Pending in-process input checkpoint for this cycle, kept as a LOCAL for
         # the same wedge-recovery reason window_pending is (see _build_inproc_window).
