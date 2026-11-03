@@ -105,7 +105,8 @@ def test_inproc_window_events_carry_the_client_fraud_score():
     assert windows, f"no in-process window event uploaded: {sent!r}"
     for ev in windows:
         assert ev["bucket_type"] == BUCKET_TYPE_WINDOW
-        assert "fraud_score" in ev, ev
+        assert isinstance(ev.get("fraud_score"), (int, float)), ev
+        assert "fraud_signals" in ev, ev
         assert "activity_state" in ev, ev
         assert ev["activity_metrics"]["presses"] > 0, ev["activity_metrics"]
 
@@ -134,3 +135,33 @@ def test_an_excluded_app_never_leaves_the_machine_via_the_inproc_window_stream()
     eng.sync()
 
     assert not [e for e in _inproc_windows(sent) if e["data"].get("app") == "SecretVault"], sent
+
+
+def test_a_one_sample_inproc_span_is_not_dropped_by_the_flicker_filter():
+    """The in-process sampler ticks every 5 s, which is exactly the AW flicker
+    filter's 5 s minimum, so an app frontmost for one sample yields a ~5 s span
+    and jitter puts about half of them at 4.99 s. The filter exists for
+    ActivityWatch's sub-second heartbeat fragments; applied here it dropped
+    real focus (review finding on PR #299). Samples: Editor, Slack 4.99 s later,
+    Editor 4.99 s after that."""
+    eng, sent = _engine([(50, "Editor", "a"), (45.01, "Slack", "b"),
+                         (40.02, "Editor", "a"), (30, "Editor", "a")])
+    eng.input_source._on_press(10)
+
+    eng.sync()
+
+    apps = [e["data"].get("app") for e in _inproc_windows(sent)]
+    assert "Slack" in apps, [(e["data"].get("app"), e["duration"]) for e in _inproc_windows(sent)]
+
+
+def test_a_cycle_boundary_tail_under_5s_is_uploaded():
+    """A span cut by the cycle boundary is an artifact of the cut, not a
+    flicker; the next cycle builds only from samples after the checkpoint, so a
+    dropped tail is lost for good."""
+    eng, sent = _engine([(50, "Editor", "a"), (3, "Browser", "t")])
+    eng.input_source._on_press(10)
+
+    eng.sync()
+
+    assert any(e["data"].get("app") == "Browser" for e in _inproc_windows(sent)), \
+        [(e["data"].get("app"), e["duration"]) for e in _inproc_windows(sent)]

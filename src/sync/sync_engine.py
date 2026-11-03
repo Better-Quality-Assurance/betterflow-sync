@@ -1924,7 +1924,8 @@ class SyncEngine:
             window_events, window_pending = self._build_inproc_window(
                 datetime.now(timezone.utc)
             )
-            # Same path as an ActivityWatch window event, so these get the
+            # Same classify-and-score transform an ActivityWatch window event
+            # gets (not the AW gap-fill / call-detector steps), so these get the
             # activity classification and the client fraud score (they used to
             # upload as raw dicts with neither). The transform ids the event
             # ``<id>:0``, so ``win-inproc_<host>_<ms>`` becomes
@@ -2663,7 +2664,7 @@ class SyncEngine:
                     app = event.app
                     if app and app in self.config.privacy.exclude_apps:
                         stats.window_drop_excluded_apps.add(app)
-                    elif event.duration < self.config.sync.min_window_event_seconds:
+                    elif event.duration < self._min_event_seconds(bucket_id, bucket_type):
                         stats.window_drop_short += 1
 
         # Batch fraud assessment: one call per cycle instead of per-event.
@@ -3057,6 +3058,25 @@ class SyncEngine:
 
         return filled
 
+    _MIN_EVENT_SECONDS = 0.5
+
+    def _min_event_seconds(self, bucket_id: str, bucket_type: str) -> float:
+        """Shortest event ``_transform_event`` uploads for this bucket.
+
+        Window/web events from ActivityWatch use ``min_window_event_seconds``
+        (default 5 s) to drop AW's sub-second heartbeat flickers. The agent's
+        own in-process window stream is exempt: it is sampled every 5 s, so a
+        one-sample focus is ~5 s give or take jitter, and a span cut at a cycle
+        boundary is an artifact of the cut. Neither is a flicker, and the next
+        cycle never rebuilds a dropped slice (PR #299 review). It and every
+        non-window stream keep the 0.5 s floor.
+        """
+        if _is_window_like(bucket_type) and not (
+            self.window_source is not None and bucket_id == self.window_source.bucket_id
+        ):
+            return self.config.sync.min_window_event_seconds
+        return self._MIN_EVENT_SECONDS
+
     def _transform_event(
         self,
         event: AWEvent,
@@ -3096,10 +3116,7 @@ class SyncEngine:
         # Window/web events use a configurable minimum (default 5s) to filter
         # sub-second flickers. AFK/input events keep the 0.5s floor since they
         # have legitimately short durations (e.g. input telemetry at 1s).
-        if _is_window_like(bucket_type):
-            if event.duration < self.config.sync.min_window_event_seconds:
-                return None
-        elif event.duration < 0.5:
+        if event.duration < self._min_event_seconds(bucket_id, bucket_type):
             return None
 
         # Build data object
