@@ -165,3 +165,19 @@ def test_a_cycle_boundary_tail_under_5s_is_uploaded():
 
     assert any(e["data"].get("app") == "Browser" for e in _inproc_windows(sent)), \
         [(e["data"].get("app"), e["duration"]) for e in _inproc_windows(sent)]
+
+
+def test_the_aw_window_flicker_filter_still_applies_when_a_window_source_is_wired():
+    """main.py wires a WindowSource on every device, flag on or off, so an
+    exemption keyed on "window_source is not None" instead of the bucket id
+    would strip the 5 s flicker filter fleet-wide (round-2 review mutant M3)."""
+    from src.sync.aw_client import AWEvent
+
+    eng, _ = _engine([])
+    assert eng.window_source is not None
+    short = AWEvent.from_dict({
+        "id": 1, "timestamp": datetime.now(timezone.utc).isoformat(),
+        "duration": 3.0, "data": {"app": "Editor", "title": "a"},
+    })
+    assert eng._transform_event(short, "aw-watcher-window_host", BUCKET_TYPE_WINDOW) is None
+    assert eng._transform_event(short, INPROC_BUCKET, BUCKET_TYPE_WINDOW) is not None
