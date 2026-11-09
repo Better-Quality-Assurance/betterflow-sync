@@ -59,7 +59,13 @@ def _held(server, key):
 
 def test_macos_catch_up_over_24h_is_counted_once(monkeypatch):
     """The real emitter holds 1000 presses across a 25 h AW outage and posts
-    them on recovery; what the server stores must total 1000, not 2000."""
+    them on recovery; what the server stores must total 1000, not 2000.
+
+    The person types THROUGH the outage (one press every 90 s): a span only
+    stretches over held counts while input continues. 1000 presses up front and
+    then 25 h of silence is a sleep, not an outage, and since the 2026-11-09 fix
+    (tests/test_input_span_across_sleep.py) it is stamped where the presses were.
+    """
     clock = _Clock(T0)
     _install_clock(monkeypatch, clock)
     aw = _ScriptedAW()
@@ -67,10 +73,12 @@ def test_macos_catch_up_over_24h_is_counted_once(monkeypatch):
     aw.fail = True
 
     ticks = 25 * 3600 // 10
+    tick = {"n": 0}
 
     def typing():
-        if clock.now == T0 + timedelta(seconds=10):  # all 1000 up front
-            _press(w, 1000)
+        if tick["n"] % 9 == 0:  # 1000 presses, 90 s apart, < _MAX_INPUT_SILENCE_S
+            _press(w, 1)
+        tick["n"] += 1
 
     def recover():
         aw.fail = False
