@@ -110,7 +110,7 @@ def test_drain_builds_event_with_counts_and_resets():
     src._on_press(5)
     src._on_click(2)
     src._on_scroll(1)
-    ev = src.drain_input_event(T0, T0 + timedelta(seconds=60))
+    [ev] = src.drain_input_events(T0, T0 + timedelta(seconds=60))
     assert ev is not None
     assert ev["data"] == {"presses": 5, "clicks": 2, "scrolls": 1}
     assert ev["bucket_id"] == "bf-input-inproc_host"
@@ -120,31 +120,31 @@ def test_drain_builds_event_with_counts_and_resets():
     # Counters reset after the drain.
     assert src.counts == (0, 0, 0)
     # A second drain over a fresh (empty) span yields nothing.
-    assert src.drain_input_event(T0 + timedelta(seconds=60),
-                                 T0 + timedelta(seconds=120)) is None
+    assert src.drain_input_events(T0 + timedelta(seconds=60),
+                                 T0 + timedelta(seconds=120)) == []
 
 
-def test_drain_zero_counts_returns_none_and_holds_counters():
+def test_drain_zero_counts_returns_nothing_and_holds_counters():
     src = _src(_FakeBackend())
-    assert src.drain_input_event(T0, T0 + timedelta(seconds=60)) is None
+    assert src.drain_input_events(T0, T0 + timedelta(seconds=60)) == []
     # No counters to hold, but the counters stay at zero (not mutated below zero).
     assert src.counts == (0, 0, 0)
 
 
-def test_drain_none_when_unavailable_and_preserves_counts():
+def test_drain_nothing_when_unavailable_and_preserves_counts():
     # No backend -> never available -> a period produces no event (gap), and the
     # counts injected are NOT drained/reset.
     src = _src(backend=None)
     src._on_press(3)
-    assert src.drain_input_event(T0, T0 + timedelta(seconds=60)) is None
+    assert src.drain_input_events(T0, T0 + timedelta(seconds=60)) == []
     assert src.counts == (3, 0, 0)  # preserved
 
 
-def test_drain_none_for_empty_or_inverted_range():
+def test_drain_nothing_for_empty_or_inverted_range():
     src = _src(_FakeBackend())
     src._on_press(1)
-    assert src.drain_input_event(T0, T0) is None
-    assert src.drain_input_event(T0 + timedelta(seconds=1), T0) is None
+    assert src.drain_input_events(T0, T0) == []
+    assert src.drain_input_events(T0 + timedelta(seconds=1), T0) == []
     # Counters untouched by a rejected range.
     assert src.counts == (1, 0, 0)
 
@@ -152,7 +152,7 @@ def test_drain_none_for_empty_or_inverted_range():
 def test_event_id_is_ms_precision_and_stable():
     src = _src(_FakeBackend())
     src._on_press(1)
-    ev = src.drain_input_event(T0, T0 + timedelta(seconds=30))
+    [ev] = src.drain_input_events(T0, T0 + timedelta(seconds=30))
     assert ev["id"] == f"input-inproc_host_{int(T0.timestamp() * 1000)}"
 
 
@@ -160,7 +160,7 @@ def test_event_includes_app_when_getter_available():
     src = InputSource(hostname="host", backend=_FakeBackend(),
                       frontmost_app_getter=lambda: "Code")
     src._on_press(1)
-    ev = src.drain_input_event(T0, T0 + timedelta(seconds=30))
+    [ev] = src.drain_input_events(T0, T0 + timedelta(seconds=30))
     assert ev["data"]["app"] == "Code"
 
 
@@ -168,7 +168,7 @@ def test_event_omits_app_when_getter_blank_or_fails():
     src = InputSource(hostname="host", backend=_FakeBackend(),
                       frontmost_app_getter=lambda: "")
     src._on_press(1)
-    ev = src.drain_input_event(T0, T0 + timedelta(seconds=30))
+    [ev] = src.drain_input_events(T0, T0 + timedelta(seconds=30))
     assert "app" not in ev["data"]
 
     def _boom():
@@ -177,7 +177,7 @@ def test_event_omits_app_when_getter_blank_or_fails():
     src2 = InputSource(hostname="host", backend=_FakeBackend(),
                        frontmost_app_getter=_boom)
     src2._on_click(1)
-    ev2 = src2.drain_input_event(T0, T0 + timedelta(seconds=30))
+    [ev2] = src2.drain_input_events(T0, T0 + timedelta(seconds=30))
     assert "app" not in ev2["data"]  # a failing probe must not fail the drain
 
 

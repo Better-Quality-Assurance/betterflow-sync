@@ -2463,7 +2463,11 @@ class BetterFlowApp:
                 from sync.macos_window_watcher import MacOSWindowWatcher
                 from sync.macos_input_watcher import MacOSInputWatcher
             self.window_watcher = MacOSWindowWatcher(self.aw)
-            self.input_watcher = MacOSInputWatcher(self.aw)
+            # Held input counts split at the configured AFK timeout, read live so
+            # a server-pushed value applies without a restart (input_span.py).
+            self.input_watcher = MacOSInputWatcher(
+                self.aw, max_silence_s=self._input_max_silence_s,
+            )
             self.aw_manager.disable_component("bf-window-tracker")
 
         logger.info("Creating sync engine...")
@@ -2610,6 +2614,7 @@ class BetterFlowApp:
             from sync.input_source import InputSource
         input_source = InputSource(
             hostname=self.coordinator.sync_engine._hostname,
+            max_silence_s=self._input_max_silence_s,
         )
         self.coordinator.sync_engine.input_source = input_source
         self.input_source = input_source
@@ -3936,6 +3941,15 @@ class BetterFlowApp:
                 subprocess.Popen(["explorer", "/select,", str(zip_path)])
         except Exception as e:
             logger.error(f"Failed to export logs: {e}")
+
+    def _input_max_silence_s(self) -> float:
+        """Longest input-free stretch one input span may bridge: the configured
+        AFK timeout (37 of 44 devices run 20 min, the shipped default is 10).
+        Past it the agent itself calls the person away, and the server bills an
+        input span as active time. Shared by both input senders through
+        src/sync/input_span.py, which falls back to its default when this
+        cannot be read."""
+        return float(self.config.aw.afk_timeout_minutes) * 60.0
 
     def _on_config_updated(self) -> None:
         """Handle server config update — apply AFK timeout, then the working-hours

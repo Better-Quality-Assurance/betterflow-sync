@@ -1827,16 +1827,16 @@ class SyncEngine:
         # Draining here instead let an abandoned cycle later send its stale snapshot
         # under the id the replacement cycle had already used (same checkpoint, same
         # id), overwriting the replacement's larger count.
-        input_event: Optional[dict] = None
+        input_events: list[dict] = []
         if skip_external_input:
-            input_event = self._peek_inproc_input(datetime.now(timezone.utc))
+            input_events = self._peek_inproc_input(datetime.now(timezone.utc))
         # Fetch input events for activity analysis before processing window
         # events. The returned context is threaded explicitly through the
         # transform path — no per-cycle state lives on the instance.
         cycle = self._prepare_input_analysis(
             input_buckets,
             analyze_external=not skip_external_input,
-            inproc_input_event=input_event,
+            inproc_input_events=input_events,
         )
 
         # When the agent is the sole per-app window source (in-process), drop the
@@ -1946,26 +1946,33 @@ class SyncEngine:
         input_pending: Optional[datetime] = None
         if skip_external_input:
             # Sole-source path: drain the accumulated keystroke/click/scroll
-            # counts into one event for the slice since the last covered instant.
-            sent_input_event, input_pending = self._build_inproc_input(
+            # counts into events (one per segment) for the slice since the last
+            # covered instant.
+            sent_input_events, input_pending = self._build_inproc_input(
                 datetime.now(timezone.utc)
             )
-            if sent_input_event is not None:
+            if sent_input_events:
                 # The top-of-cycle peek covered [cp, t_peek]; this drain covers
-                # [cp, t_drain] under the SAME id, so whatever was typed in
+                # [cp, t_drain] under the SAME ids, so whatever was typed in
                 # between is uploaded but unseen by the analyzer. Feed the
-                # unsplit drained event (the peek was unsplit too): the analyzer
+                # unsplit drained events (the peek was unsplit too): the analyzer
                 # REPLACES the peek's entry by id, never sums. Windows scored
                 # this cycle already ran; this serves the next cycle's windows,
                 # whose peek starts at the new checkpoint (a disjoint span, so
                 # no double count).
-                drained = self._parse_inproc_input_for_analysis(sent_input_event)
-                if drained is not None:
-                    self._activity_analyzer.add_input_events([drained])
+                drained = [
+                    parsed for parsed in (
+                        self._parse_inproc_input_for_analysis(ev)
+                        for ev in sent_input_events
+                    ) if parsed is not None
+                ]
+                if drained:
+                    self._activity_analyzer.add_input_events(drained)
                 # Same >24h cap as every ActivityWatch event, same splitter: a
-                # machine that slept past a day and was typed on at wake drains its
-                # counts into one over-cap span.
-                all_events.extend(_split_over_long_event(sent_input_event))
+                # person who typed through more than a day without a silence
+                # longer than the AFK timeout drains into one over-cap span.
+                for ev in sent_input_events:
+                    all_events.extend(_split_over_long_event(ev))
 
         # Live snapshot of any ongoing call — WITHOUT ending it. The id derives
         # from (app, start), so the server upserts one growing row per meeting.
@@ -2082,7 +2089,7 @@ class SyncEngine:
         input_buckets: list,
         *,
         analyze_external: bool = True,
-        inproc_input_event: Optional[dict] = None,
+        inproc_input_events: Optional[list[dict]] = None,
     ) -> _SyncCycleContext:
         """Fetch recent input events, feed the activity analyzer, and return a
         fresh cycle context recording whether input data exists.
@@ -2092,7 +2099,7 @@ class SyncEngine:
 
         ``analyze_external`` is False when the in-process source has replaced
         the external input bucket for upload; the analyzer then reads only
-        ``inproc_input_event`` (this cycle's drain, with its real
+        ``inproc_input_events`` (this cycle's drain, with their real
         [range_start, range_end] span, which the analyzer pro-rates). The
         external buckets are still read for ``last_input_at`` exactly as
         before, so the foreground-activity anchor does not change.
@@ -2115,8 +2122,8 @@ class SyncEngine:
         analyzed: list[AWEvent] = (
             list(input_events_for_analysis) if analyze_external else []
         )
-        if inproc_input_event is not None:
-            inproc = self._parse_inproc_input_for_analysis(inproc_input_event)
+        for inproc_event in inproc_input_events or ():
+            inproc = self._parse_inproc_input_for_analysis(inproc_event)
             if inproc is not None:
                 analyzed.append(inproc)
         self._activity_analyzer.add_input_events(analyzed)
@@ -4069,11 +4076,11 @@ class SyncEngine:
 
     def _build_inproc_input(
         self, now: datetime
-    ) -> tuple[Optional[dict], Optional[datetime]]:
-        """Drain accumulated input counts into one event for [checkpoint, now].
+    ) -> tuple[list[dict], Optional[datetime]]:
+        """Drain accumulated input counts into events within [checkpoint, now].
         First cycle seeds the checkpoint at `now` (account only while running).
 
-        Returns ``(event_or_None, pending)`` where `pending` is the checkpoint the
+        Returns ``(events, pending)`` where `pending` is the checkpoint the
         caller must commit via ``_commit_inproc_input_checkpoint`` AFTER a
         confirmed send. The pending value is RETURNED, not stored on the instance,
         for the same wedge-recovery concurrency reason as ``_build_inproc_window``.
@@ -4081,44 +4088,45 @@ class SyncEngine:
         Re-seed rather than build when the checkpoint can't be trusted (mirrors
         _build_inproc_window):
           - now <= cp: the wall clock stepped backward (NTP/manual), or nothing
-            new to cover. Re-seed to `now` so the stream doesn't stall. Any counts
-            accrued so far are intentionally dropped (we can't attribute them to a
-            trustworthy range) — unlike window/AFK, counts have no sample log to
-            rebuild from, but a clock step back is rare and bounded.
-        Unlike AFK/window there is no gap>retention branch: counts don't come from
-        a time-bounded sample deque, so a long sleep simply means whatever was
-        typed before it drains into the (long) span — harmless, since the counts
-        themselves are real. The drain returns None on a zero-count span, so an
-        idle span emits nothing."""
+            new to cover. Re-seed to `now` so the stream doesn't stall. The held
+            counts stay held and drain into the next span.
+        Unlike AFK/window there is no gap>retention branch, and a long gap is
+        NOT harmless: the server bills an input span as active time, so a press
+        held across a sleep and stamped [checkpoint, now] billed the whole sleep
+        (device 53, 2026-11-09: 68 h, 13.6 h billed). The source therefore
+        stamps each segment of held counts from its first count to its last
+        (src/sync/input_span.py, the rule MacOSInputWatcher uses too), split at
+        silences longer than the AFK timeout. The drain returns [] on a
+        zero-count span, so an idle span emits nothing."""
         if not self._should_use_inproc_input():
-            return None, None
+            return [], None
         cp = self._input_inproc_checkpoint
         if cp is None:
             self._input_inproc_checkpoint = now
-            return None, None
+            return [], None
         if now <= cp:
             self._input_inproc_checkpoint = now
-            return None, None
-        event = self.input_source.drain_input_event(cp, now)
-        if event is None:
+            return [], None
+        events = self.input_source.drain_input_events(cp, now)
+        if not events:
             # Nothing counted this span: advance the checkpoint so the next span
             # starts at `now` (no event to send, so no confirmed-send gate needed).
             self._input_inproc_checkpoint = now
-            return None, None
-        return event, now
+            return [], None
+        return events, now
 
-    def _peek_inproc_input(self, now: datetime) -> Optional[dict]:
-        """The input event ``_build_inproc_input`` would drain for [checkpoint, now],
-        built WITHOUT touching the counters or the checkpoint. Feeds the fraud
-        analyzer at the top of a cycle; the send site drains for real. None when
-        there is nothing to analyse (flag off, checkpoint not seeded, clock stepped
-        back, nothing counted)."""
+    def _peek_inproc_input(self, now: datetime) -> list[dict]:
+        """The input events ``_build_inproc_input`` would drain for [checkpoint,
+        now], built WITHOUT touching the counters or the checkpoint. Feeds the
+        fraud analyzer at the top of a cycle; the send site drains for real. []
+        when there is nothing to analyse (flag off, checkpoint not seeded, clock
+        stepped back, nothing counted)."""
         if not self._should_use_inproc_input():
-            return None
+            return []
         cp = self._input_inproc_checkpoint
         if cp is None or now <= cp:
-            return None
-        return self.input_source.peek_input_event(cp, now)
+            return []
+        return self.input_source.peek_input_events(cp, now)
 
     def _commit_inproc_input_checkpoint(
         self, stats: SyncStats, pending: Optional[datetime]
@@ -4126,7 +4134,7 @@ class SyncEngine:
         """Advance the in-process input checkpoint past the just-drained span.
 
         UNLIKE the window/AFK commits, this advances even on a QUEUED (failed)
-        send. drain_input_event already destructively reset the counters into
+        send. drain_input_events already destructively reset the counters into
         this cycle's stable-id event, so the counts now live ONLY in that event —
         which the offline queue redelivers, upserted idempotently by id. Holding
         the checkpoint (as window/AFK do, to rebuild from samples) would instead

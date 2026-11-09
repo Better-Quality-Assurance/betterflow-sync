@@ -31,7 +31,7 @@ def event_app(event: dict) -> Optional[str]:
 
     Every producer in this codebase writes the app name to ``data.app``
     (``SyncEngine._populate_window_data``, ``WindowSource._event``,
-    ``InputSource.drain_input_event``, ``SyncEngine._make_call_bf_event``).
+    ``InputSource.drain_input_events``, ``SyncEngine._make_call_bf_event``).
     Tolerant of a malformed event: anything that isn't a dict-with-a-dict-data
     simply has no app, and is therefore not excluded.
     """

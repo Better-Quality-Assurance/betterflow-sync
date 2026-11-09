@@ -53,7 +53,7 @@ def test_flag_off_is_no_op():
     assert eng._should_use_inproc_input() is False
     assert eng._should_skip_external_input() is False
     # Build is inert even with counts present, and the counters are untouched.
-    assert eng._build_inproc_input(T0 + timedelta(seconds=60)) == (None, None)
+    assert eng._build_inproc_input(T0 + timedelta(seconds=60)) == ([], None)
     assert eng.input_source.counts == (5, 0, 0)
 
 
@@ -83,8 +83,8 @@ def test_first_build_seeds_checkpoint_and_emits_nothing():
     eng = _engine(True)
     eng.input_source = _source()
     eng.input_source._on_press(3)  # counts before first cycle
-    event, pending = eng._build_inproc_input(T0)
-    assert event is None and pending is None
+    events, pending = eng._build_inproc_input(T0)
+    assert events == [] and pending is None
     assert eng._input_inproc_checkpoint == T0
 
 
@@ -94,8 +94,8 @@ def test_build_drains_counts_into_event():
     eng._build_inproc_input(T0)  # seed
     eng.input_source._on_press(7)
     eng.input_source._on_click(2)
-    event, pending = eng._build_inproc_input(T0 + timedelta(seconds=60))
-    assert event is not None
+    events, pending = eng._build_inproc_input(T0 + timedelta(seconds=60))
+    [event] = events
     assert event["data"]["presses"] == 7
     assert event["data"]["clicks"] == 2
     assert event["bucket_id"] == "bf-input-inproc_host"
@@ -109,8 +109,8 @@ def test_zero_count_span_advances_checkpoint_without_event():
     eng = _engine(True)
     eng.input_source = _source()
     eng._build_inproc_input(T0)  # seed
-    event, pending = eng._build_inproc_input(T0 + timedelta(seconds=60))
-    assert event is None and pending is None
+    events, pending = eng._build_inproc_input(T0 + timedelta(seconds=60))
+    assert events == [] and pending is None
     # Checkpoint advanced so the next span starts fresh (no stall).
     assert eng._input_inproc_checkpoint == T0 + timedelta(seconds=60)
 
@@ -120,8 +120,8 @@ def test_clock_step_back_reseeds():
     eng.input_source = _source()
     eng._build_inproc_input(T0)  # seed at T0
     eng.input_source._on_press(1)
-    event, pending = eng._build_inproc_input(T0 - timedelta(seconds=30))
-    assert event is None and pending is None
+    events, pending = eng._build_inproc_input(T0 - timedelta(seconds=30))
+    assert events == [] and pending is None
     assert eng._input_inproc_checkpoint == T0 - timedelta(seconds=30)
 
 
@@ -245,7 +245,7 @@ def test_private_time_keystrokes_are_discarded_not_billed():
     # The real proof: the next drain emits nothing for the private span.
     assert engine._build_inproc_input(
         engine._input_inproc_checkpoint + timedelta(seconds=60)
-    )[0] is None
+    )[0] == []
 
 
 def test_discarding_private_counts_does_not_touch_a_later_keystroke():
@@ -258,10 +258,11 @@ def test_discarding_private_counts_does_not_touch_a_later_keystroke():
     engine._advance_checkpoints_to_now("private_leave")
 
     engine.input_source._on_press(7)  # typed AFTER resuming — real work
-    event, pending = engine._build_inproc_input(
+    events, pending = engine._build_inproc_input(
         engine._input_inproc_checkpoint + timedelta(seconds=60)
     )
-    assert event is not None, "post-resume input must still be counted"
+    assert events, "post-resume input must still be counted"
+    [event] = events
     assert event["data"]["presses"] == 7
 
 
