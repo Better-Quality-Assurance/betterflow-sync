@@ -50,10 +50,10 @@ def _span(ev):
 # -- 1. macOS emitter: a break during an AW outage --------------------------
 
 
-def _outage_break(monkeypatch):
-    """AW down; 1 press/s for 9 min (540); a 15 min break, AW still down; one
-    press; AW recovers on the next tick. Returns (aw, typing_from, typing_to,
-    break_mid, wake_press_at)."""
+def _outage_break(monkeypatch, per_tick=10, typing_ticks=54):
+    """AW down; ``per_tick`` presses per 10 s for ``typing_ticks`` ticks
+    (default 1 press/s for 9 min = 540); a 15 min break, AW still down; one
+    press; AW recovers on the next tick. Returns (aw, marks)."""
     clock = _Clock(T0)
     _install_clock(monkeypatch, clock)
     aw = _ScriptedAW()
@@ -63,7 +63,7 @@ def _outage_break(monkeypatch):
 
     def type_10():  # one tick = 10 s at 1 press/s
         marks.setdefault("from", clock.now)
-        _press(w, 10)
+        _press(w, per_tick)
         marks["to"] = clock.now
 
     def quiet():
@@ -76,14 +76,18 @@ def _outage_break(monkeypatch):
     def recover():
         aw.fail = False
 
-    script = [type_10] * 54 + [quiet] * 90 + [wake_press, recover]
+    script = [type_10] * typing_ticks + [quiet] * 90 + [wake_press, recover]
     _run(monkeypatch, w, clock, script)
     marks["break_mid"] = marks["to"] + timedelta(minutes=7, seconds=30)
     return aw, marks
 
 
 def test_outage_break_does_not_trip_the_rate_signal(monkeypatch):
-    aw, marks = _outage_break(monkeypatch)
+    """1 h at 150/min, then the break. The analyzer rates per 5-min window, so
+    the brief's 541-press repro (~108/min per window) never tripped it client
+    side; 9000 presses relocated into 10 s do (1800/min)."""
+    aw, marks = _outage_break(monkeypatch, per_tick=25, typing_ticks=360)
+    assert sum(ev["data"]["presses"] for ev in aw.posted) == 9001
     analyzer = ActivityAnalyzer(fraud_config=FraudDetectionConfig())
     analyzer.add_input_events([_aw_event(ev, eid=i) for i, ev in enumerate(aw.posted)])
     a = analyzer.get_fraud_assessment(marks["wake"] + timedelta(seconds=10), app="Editor")
