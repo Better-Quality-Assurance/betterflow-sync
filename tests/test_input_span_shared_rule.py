@@ -326,3 +326,42 @@ def test_guard_inproc_sender_stamps_through_the_shared_helper(monkeypatch):
     assert [(s.start.isoformat(), round(s.duration_s, 2), s.counts[0]) for s in spans] == [
         (ev["timestamp"], ev["duration"], ev["data"]["presses"]) for ev in events
     ]
+
+
+# -- 6. a wall clock that steps back while typing ----------------------------
+
+
+def test_clock_step_back_while_typing_keeps_ten_second_spans(monkeypatch):
+    """#302 round-2 review: idle, idle, clock back 120 s, then 30 presses per
+    tick. The emitter's accounted instant was then later than `now`, every
+    instant clamped up to it, and each post became a zero-duration event at
+    one frozen instant (origin/main always posted >= 10 s)."""
+    clock = _Clock(T0)
+    _install_clock(monkeypatch, clock)
+    aw = _ScriptedAW()
+    w = _watcher(aw)
+
+    def idle():
+        pass
+
+    def step_back_and_type():
+        clock.now = clock.now - timedelta(seconds=120)
+        _press(w, 30)
+
+    def type30():
+        _press(w, 30)
+
+    _run(monkeypatch, w, clock, [idle, idle, step_back_and_type, type30, type30, type30])
+    assert [e["data"]["presses"] for e in aw.posted] == [30, 30, 30, 30]
+    assert all(e["duration"] >= 10.0 for e in aw.posted), [
+        (e["timestamp"], e["duration"]) for e in aw.posted
+    ]
+    assert len({e["timestamp"] for e in aw.posted}) == 4, "not frozen at one instant"
+
+
+def test_floor_after_now_is_ignored_not_clamped_to():
+    held = HeldInputSpans(max_silence_s=600.0, pad_s=10.0)
+    now = T0
+    held.note(now, presses=3)
+    [span] = held.stamp(now, floor=now + timedelta(seconds=120))
+    assert (span.start, span.end) == (now - timedelta(seconds=10), now)

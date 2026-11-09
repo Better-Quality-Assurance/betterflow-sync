@@ -201,6 +201,14 @@ class HeldInputSpans:
         separately they would share a start, hence a key and an event id, and
         the server's upsert on id would keep only one of them."""
         silence = timedelta(seconds=self.max_silence_s())
+        if floor is not None and floor > now:
+            # The wall clock stepped back past the accounted instant. Clamping
+            # to that floor would lift every instant to it and end each span
+            # where it starts (zero duration, all at one frozen instant, #302
+            # round-2 review). The floor says nothing about this timeline, so
+            # stamp as if nothing were accounted: [now - pad, now] at least,
+            # the shape the emitter always produced before this rule.
+            floor = None
         last_seg = self._segments[-1] if self._segments else None
         # Clamping is monotonic and segment starts strictly increase, so
         # segments sharing a clamped first count are always adjacent.
