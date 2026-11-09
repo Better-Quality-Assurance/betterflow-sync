@@ -14,8 +14,9 @@ events from 00:00 Bucharest, and the live fetch added a 6885 s piece. The
 server counts an input span as active wall-clock time, so BetterFlow showed
 13.6 h tracked for a machine that was asleep until 12:55 local.
 
-The fix in ``MacOSInputWatcher``: held counts never stretch across a silence
-longer than ``_MAX_INPUT_SILENCE_S``. These tests drive the real emitter loop
+The fix (src/sync/input_span.py, shared with the in-process InputSource): held
+counts never stretch across a silence longer than the configured AFK timeout;
+the silence closes the held segment where its counts were typed. These tests drive the real emitter loop
 and the real tap callback with a scripted clock (no threads, no sleeps).
 """
 
@@ -100,26 +101,34 @@ def test_press_just_before_sleep_is_not_stamped_across_the_sleep(monkeypatch):
 
 def test_wake_keypress_does_not_bridge_the_sleep(monkeypatch):
     """The key that wakes the Mac reaches the tap before the frozen emitter
-    ticks: the held span must restart at it, not run back to Friday."""
+    ticks. The press held from before the sleep is CLOSED as its own segment
+    where it was typed, and the wake press opens a new one: neither span runs
+    across the sleep, and no count is moved from one into the other (moving
+    them is what crammed an outage's counts into 10 s, #302 review)."""
     clock = _Clock(T0)
     _install_clock(monkeypatch, clock)
     aw = _AW()
     w = miw.MacOSInputWatcher(aw, emit_interval=10.0)
+    press_at = {}
 
     def press_sleep_wake_press():
         clock.now += timedelta(seconds=5)
+        press_at["before"] = clock.now
         _press(w)
         clock.now += SLEEP
         _press(w)
 
     _run(monkeypatch, w, [press_sleep_wake_press])
 
-    assert len(aw.posted) == 1
-    ev = aw.posted[0]
-    assert ev["data"]["presses"] == 2, "counts are kept, only the span is honest"
-    start, end = _span(ev)
-    assert ev["duration"] <= 10.0, f"span covers the sleep: {ev}"
-    assert end == clock.now
+    assert len(aw.posted) == 2, aw.posted
+    before, wake = aw.posted
+    assert (before["data"]["presses"], wake["data"]["presses"]) == (1, 1)
+    b_start, b_end = _span(before)
+    assert b_start <= press_at["before"] <= b_end
+    assert b_end - press_at["before"] <= timedelta(seconds=10)
+    w_start, w_end = _span(wake)
+    assert wake["duration"] <= 10.0, f"span covers the sleep: {wake}"
+    assert w_end == clock.now
 
 
 def test_no_posted_event_overlaps_the_sleep(monkeypatch):

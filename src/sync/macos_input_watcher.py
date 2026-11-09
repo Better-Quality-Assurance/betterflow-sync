@@ -10,8 +10,8 @@ Requires the same Accessibility permission as the window watcher.
 import logging
 import platform
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Callable, Optional, Union
 
 try:
     from ..ui.permissions import (
@@ -25,6 +25,11 @@ except ImportError:
         check_input_monitoring,
         has_capture_permissions,
     )
+
+try:
+    from .input_span import DEFAULT_MAX_SILENCE_S, HeldInputSpans
+except ImportError:  # PyInstaller bundle (src/ is import root)
+    from sync.input_span import DEFAULT_MAX_SILENCE_S, HeldInputSpans
 
 logger = logging.getLogger(__name__)
 
@@ -76,18 +81,14 @@ class MacOSInputWatcher:
     # of toggling the switch in System Settings, without spamming logs.
     _PERMISSION_RETRY_INTERVAL_S = 30.0
 
-    # Longest input-free stretch a held span may bridge. Held counts normally
-    # drain within one emit interval; they outlive it only when a post failed
-    # (AW down) or the emitter thread was frozen with the machine (sleep,
-    # hibernate). A post-failure span is honest while the person keeps typing,
-    # so the span is kept. A silence longer than this is not "input activity" by
-    # any reading -- it is past the agent's default AFK timeout (10 min) -- and
-    # the server bills an input span as active wall-clock time: device 53,
-    # 2026-11-09, one press held across a 68 h sleep was stamped as a 68 h input
-    # event and billed 13.6 h of a day the laptop spent asleep.
-    _MAX_INPUT_SILENCE_S = 600.0
 
-    def __init__(self, aw_client, emit_interval: float = 10.0, count_only: bool = False):
+    def __init__(
+        self,
+        aw_client,
+        emit_interval: float = 10.0,
+        count_only: bool = False,
+        max_silence_s: Union[float, Callable[[], float]] = DEFAULT_MAX_SILENCE_S,
+    ):
         self._aw = aw_client
         self._emit_interval = emit_interval
         # count_only: run ONLY the CGEventTap counter — no emitter thread and no
@@ -101,7 +102,8 @@ class MacOSInputWatcher:
         self._hostname = platform.node()
         self._bucket_id = f"aw-watcher-input_{self._hostname}"
 
-        # Counters — updated from CGEventTap callback, read/reset by emitter
+        # Raw counters — count_only mode only: updated from the CGEventTap
+        # callback, read-and-zeroed by the in-process backend's poll
         self._presses = 0
         self._clicks = 0
         self._scrolls = 0
@@ -112,12 +114,19 @@ class MacOSInputWatcher:
         # input recently" probe works regardless of where in the emit cycle
         # we land.
         self._last_input_at: Optional[datetime] = None
-        # When the first count still held in the counters was recorded — the
-        # start of the span the next post covers. None while the counters are
-        # empty. Without it a post that follows failed posts carried the whole
-        # outage's counts stamped as the last 10 s, which reads as superhuman
-        # typing to the fraud analyzer (implausible_input_rate). Local only.
-        self._span_start: Optional[datetime] = None
+        # The same held counts as segments with first/last count instants, split
+        # at silences longer than max_silence_s (the configured AFK timeout). The
+        # emitter stamps each segment's own span from it (src/sync/input_span.py,
+        # the rule shared with InputSource): an outage's counts are not crammed
+        # into the last 10 s (implausible_input_rate), and counts held across a
+        # sleep or a long break are not stretched over it (device 53, 2026-11-09:
+        # one press held across a 68 h sleep was billed 13.6 h). Emitter mode
+        # only: in count_only mode the InputSource keeps its own. Local only.
+        self._held = HeldInputSpans(max_silence_s=max_silence_s, pad_s=emit_interval)
+        # The instant up to which the emitter has accounted for input: its last
+        # tick that found nothing held, or its last successful post. The floor a
+        # held span may start from, like the in-process stream's checkpoint.
+        self._accounted_until: Optional[datetime] = None
         self._lock = threading.Lock()
 
         # Store CFRunLoop ref so stop() can break out of it
@@ -204,7 +213,8 @@ class MacOSInputWatcher:
             self._presses = 0
             self._clicks = 0
             self._scrolls = 0
-            self._span_start = None
+            self._held.clear()
+            self._accounted_until = None
         self._run_loop = None
         self._tap_ref = None
 
@@ -344,42 +354,44 @@ class MacOSInputWatcher:
 
         # Read outside the lock: it calls into Quartz.
         repeat = event_type == _kCGEventKeyDown and _is_autorepeat(event)
+        # Classify ONCE: the counters and the held spans are both fed from this
+        # one triple, so they cannot disagree about what an event counts as.
+        presses = clicks = scrolls = 0
+        recognized = True
+        if event_type == _kCGEventKeyDown:
+            # A repeat stays "recognized": it is real input, so it still
+            # moves the input-observed timestamp below; it is not a press.
+            if not repeat:
+                presses = 1
+        elif event_type in (
+            _kCGEventLeftMouseDown,
+            _kCGEventRightMouseDown,
+            _kCGEventOtherMouseDown,
+        ):
+            clicks = 1
+        elif event_type == _kCGEventScrollWheel:
+            scrolls = 1
+        else:
+            recognized = False
         with self._lock:
-            recognized = True
-            if event_type == _kCGEventKeyDown:
-                # A repeat stays "recognized": it is real input, so it still
-                # moves the input-observed timestamp below; it is not a press.
-                if not repeat:
-                    self._presses += 1
-            elif event_type in (
-                _kCGEventLeftMouseDown,
-                _kCGEventRightMouseDown,
-                _kCGEventOtherMouseDown,
-            ):
-                self._clicks += 1
-            elif event_type == _kCGEventScrollWheel:
-                self._scrolls += 1
-            else:
-                recognized = False
+            if self._count_only:
+                # count_only: the in-process backend drains these raw counters
+                # (with _last_input_at as their instant) into InputSource's own
+                # HeldInputSpans. The emitter never reads them.
+                self._presses += presses
+                self._clicks += clicks
+                self._scrolls += scrolls
             if recognized:
                 # Monotonic input-observed timestamp used by the bf-idle-tracker
                 # health check — see SyncCoordinator._check_idle_tracker_health.
                 # We update under the same lock that guards the counters so a
                 # concurrent reader gets a coherent (count, ts) pair.
                 now = datetime.now(timezone.utc)
-                # Counts still held from before a long silence (the emitter was
-                # frozen by a sleep, or AW was down): restart the span here so it
-                # never bridges the silence. The counts are kept; only the span
-                # moves. See _MAX_INPUT_SILENCE_S.
-                if (
-                    self._span_start is not None
-                    and self._last_input_at is not None
-                    and (now - self._last_input_at).total_seconds() > self._MAX_INPUT_SILENCE_S
-                ):
-                    self._span_start = now
                 self._last_input_at = now
-                if self._span_start is None:
-                    self._span_start = self._last_input_at
+                if not self._count_only:
+                    self._held.note(
+                        now, presses=presses, clicks=clicks, scrolls=scrolls,
+                    )
 
         return event
 
@@ -436,20 +448,24 @@ class MacOSInputWatcher:
     def _run_emitter(self) -> None:
         """Periodically read counters and post events to AW."""
         while not self._stop_event.wait(self._emit_interval):
-            # Snapshot without zeroing — we only zero AFTER the post succeeds.
-            # Previously we zeroed under the lock and then posted: if the post
-            # failed, that batch's counters were lost forever. Now a failure
-            # leaves counters intact so the next cycle picks them up.
+            # Snapshot without zeroing — we only remove what was sent AFTER the
+            # post succeeds, so a failed post leaves the counts for the next tick.
             with self._lock:
-                presses = self._presses
-                clicks = self._clicks
-                scrolls = self._scrolls
-                span_start = self._span_start
-                last_input_at = self._last_input_at
+                emit_now = datetime.now(timezone.utc)
+                # Gate on the held spans, the same store the events are built
+                # from, so a nonzero gate can never meet an empty span list.
+                # Skip zero-count events to avoid 8,640 idle events/day.
+                # AFK bucket already handles idle detection. Nothing held means
+                # everything up to now is accounted for.
+                if not any(self._held.totals()):
+                    self._accounted_until = emit_now
+                    continue
+                # One span per segment of held counts, never one span over all
+                # of them: see src/sync/input_span.py. In steady state that is a
+                # single [last tick, now] span, the old [now - 10 s, now] stamp.
+                spans = self._held.stamp(emit_now, floor=self._accounted_until)
 
-            # Skip zero-count events to avoid 8,640 idle events/day.
-            # AFK bucket already handles idle detection.
-            if presses == 0 and clicks == 0 and scrolls == 0:
+            if not spans:
                 continue
 
             # Tag the batch with the currently focused app so the server can
@@ -460,65 +476,40 @@ class MacOSInputWatcher:
             # time, which is a small, acceptable approximation.
             app_name, app_bundle = self._current_frontmost_app()
 
-            # Stamp the span the counts actually cover. After failed posts the
-            # counters hold the whole outage, so [now - interval, now] would
-            # compress it into 10 s; start at the first held count instead.
-            # Never shorter than one interval: in steady state that is exactly
-            # the old [now - 10 s, now] stamp, and a sub-interval span would
-            # only inflate any rate computed as count / duration.
-            emit_now = datetime.now(timezone.utc)
-            start = emit_now - timedelta(seconds=self._emit_interval)
-            end = emit_now
-            if span_start is not None and span_start < start:
-                start = span_start
-                # The span ends at the post only if input continued up to it.
-                # After a silence longer than _MAX_INPUT_SILENCE_S (typically:
-                # this thread was frozen by a sleep and the counts were typed
-                # just before it) end it one interval after the last count
-                # instead of at the wake instant, which would claim the whole
-                # sleep as input activity.
-                if (
-                    last_input_at is not None
-                    and (emit_now - last_input_at).total_seconds() > self._MAX_INPUT_SILENCE_S
-                ):
-                    end = min(
-                        emit_now,
-                        max(last_input_at, start + timedelta(seconds=self._emit_interval)),
-                    )
-            try:
+            events = []
+            for span in spans:
                 data = {
-                    "presses": presses,
-                    "clicks": clicks,
-                    "scrolls": scrolls,
+                    "presses": span.counts[0],
+                    "clicks": span.counts[1],
+                    "scrolls": span.counts[2],
                 }
                 if app_name:
                     data["app"] = app_name
                 if app_bundle:
                     data["bundle"] = app_bundle
-                self._aw.post_events(self._bucket_id, [{
-                    "timestamp": start.isoformat(),
-                    "duration": (end - start).total_seconds(),
+                events.append({
+                    "timestamp": span.start.isoformat(),
+                    "duration": span.duration_s,
                     "data": data,
-                }])
+                })
+            try:
+                self._aw.post_events(self._bucket_id, events)
             except Exception as e:
                 # Leave the counters alone so the next tick re-sends them.
                 logger.warning("Input emitter post failed (will retry): %s", e)
                 continue
 
-            # Post succeeded — atomically subtract the counts we just sent.
-            # Subtracting (rather than zeroing) preserves any events the event
-            # tap recorded between the snapshot and this point. Clamp to zero
-            # to defend against the (narrow) permission-retry race where two
-            # emitter threads briefly run concurrently and would otherwise
-            # double-subtract the same snapshot into negative counts —
-            # negative values would corrupt the server-side fraud signal.
+            # Post succeeded — atomically remove the counts we just sent.
+            # Removing (rather than clearing) preserves any events the event
+            # tap recorded between the snapshot and this point. consume() clamps
+            # to zero and skips segments already gone, defending against the
+            # (narrow) permission-retry race where two emitter threads briefly
+            # run concurrently and would otherwise double-subtract the same
+            # snapshot into negative counts — negative values would corrupt the
+            # server-side fraud signal.
             with self._lock:
-                self._presses = max(0, self._presses - presses)
-                self._clicks = max(0, self._clicks - clicks)
-                self._scrolls = max(0, self._scrolls - scrolls)
                 # Whatever is left arrived after the snapshot, so its span
                 # starts no earlier than this post.
-                if self._presses or self._clicks or self._scrolls:
-                    self._span_start = emit_now
-                else:
-                    self._span_start = None
+                self._held.consume(spans, taken_at=emit_now)
+                if self._accounted_until is None or emit_now > self._accounted_until:
+                    self._accounted_until = emit_now

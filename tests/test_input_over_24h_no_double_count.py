@@ -8,9 +8,12 @@ presses over 25 h reached the server as 2 x 1000.
 Two producers can emit such a span:
   * MacOSInputWatcher after an ActivityWatch outage > 24 h (its counters are
     held across failed posts and re-sent with the real, uncapped span);
-  * the in-process InputSource on a machine typed on right after sleeping past
-    a day (no splitter ran at all on that path, so the over-cap event went out
-    whole and was dead-lettered).
+  * the in-process InputSource holding more than a day of continuous typing
+    (no splitter ran at all on that path, so the over-cap event went out whole
+    and was dead-lettered). Since #302 a span only stretches while input
+    continues, so these fixtures type THROUGH the span; a press followed by a
+    day of silence is now stamped where it was typed
+    (tests/test_input_span_shared_rule.py).
 
 The server here is a FAKE applying the real validator's duration rule and
 upserting on id, so what is asserted is what the SERVER holds.
@@ -132,12 +135,21 @@ def test_split_shares_sum_exactly_and_follow_chunk_length():
     assert all(c["data"]["app"] == "Editor" for c in chunks)
 
 
-def test_inproc_input_slept_past_a_day_reaches_the_server_in_full():
+def test_inproc_input_over_a_day_reaches_the_server_in_full():
     """The in-process stream (Windows default) never went through the splitter:
-    a 25 h span uploaded whole and the server's 86400 cap refused it."""
+    a 25 h span uploaded whole and the server's 86400 cap refused it.
+
+    Renamed from ``..._slept_past_a_day_...``: that fixture held 1000 presses
+    typed at the END of a 25 h checkpoint gap and asserted they uploaded over
+    [checkpoint, now], i.e. stamped across 25 h of silence. That is the shape
+    #302 removes (the server bills an input span as active time). The splitter
+    is still needed for a span that is honestly longer than a day, so the
+    presses are now typed through the 25 h, one every 90 s."""
     eng, _analyzer, sent = _inproc_engine()
-    eng._input_inproc_checkpoint = datetime.now(timezone.utc) - timedelta(hours=25)
-    eng.input_source._on_press(1000)
+    cp = datetime.now(timezone.utc) - timedelta(hours=25)
+    eng._input_inproc_checkpoint = cp
+    for k in range(1000):
+        eng.input_source._on_press(1, now=cp + timedelta(seconds=90 * k))
 
     eng.sync()
 
@@ -170,11 +182,14 @@ def test_every_numeric_field_of_a_real_input_event_survives_the_split():
     ``moves`` key, say) is copied into each chunk and fails here without anyone
     having to remember to extend a list."""
     src = InputSource(hostname="h", backend=_Backend(), frontmost_app_getter=lambda: "Editor")
-    src._on_press(1001)
-    src._on_click(7)
-    src._on_scroll(3)
     start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=51)
-    event = src.drain_input_event(start, start + timedelta(hours=51))
+    # Typed through the 51 h (one press every 3 min), so the source honestly
+    # holds a span longer than the cap.
+    for k in range(1001):
+        src._on_press(1, now=start + timedelta(seconds=180 * k))
+    src._on_click(7, now=start + timedelta(hours=1))
+    src._on_scroll(3, now=start + timedelta(hours=2))
+    [event] = src.drain_input_events(start, start + timedelta(hours=51))
 
     chunks = _split_over_long_event(event)
 

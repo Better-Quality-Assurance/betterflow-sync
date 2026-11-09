@@ -122,10 +122,9 @@ class _ScriptedInputSource(InputSource):
     def __init__(self, app: str):
         super().__init__(hostname="host", frontmost_app_getter=lambda: app)
         self._available = True
-        with self._lock:
-            self._presses = 42
-            self._clicks = 7
-            self._scrolls = 3
+        self._on_press(42)
+        self._on_click(7)
+        self._on_scroll(3)
 
     def available(self) -> bool:
         return True
@@ -227,10 +226,11 @@ def test_inproc_input_source_excluded_app_never_reaches_the_wire():
     engine.input_source = _ScriptedInputSource(EXCLUDED_APP)
     assert engine._should_use_inproc_input() is True
     engine._build_inproc_input(t0)  # seeds the checkpoint
-    engine.input_source._presses = 42  # re-accrue after the seed drain
-    event, pending = engine._build_inproc_input(t0 + timedelta(seconds=60))
+    # The seed does not drain: the 42 presses accrued in __init__ are still held.
+    events, pending = engine._build_inproc_input(t0 + timedelta(seconds=60))
 
-    assert event is not None and event["data"]["app"] == EXCLUDED_APP
+    [event] = events
+    assert event["data"]["app"] == EXCLUDED_APP
     assert pending is not None
 
     engine._send_events([event], SyncStats())
@@ -246,9 +246,8 @@ def test_inproc_input_source_still_sends_non_excluded_apps():
     t0 = _now()
     engine.input_source = _ScriptedInputSource(ALLOWED_APP)
     engine._build_inproc_input(t0)
-    engine.input_source._presses = 42
-    event, _ = engine._build_inproc_input(t0 + timedelta(seconds=60))
-    assert event is not None
+    events, _ = engine._build_inproc_input(t0 + timedelta(seconds=60))
+    [event] = events
 
     engine._send_events([event], SyncStats())
     sent = recorder.transmitted_events()

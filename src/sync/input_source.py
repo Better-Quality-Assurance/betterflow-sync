@@ -6,7 +6,7 @@ blocked (Windows UIPI / AV) and produces ZERO input events for hours.
 Mirrors ``WindowSource`` / ``AfkSource``: thread-safe state under a lock, an
 ``available()`` that delegates to the backend (no cached verdict — see
 ``InputSource.available``), a single-source-of-truth ``bucket_id``, and a
-drain-and-build reconstructor (``drain_input_event``). Enabled by default on
+drain-and-build reconstructor (``drain_input_events``). Enabled by default on
 Windows, where the external tracker is known to report zero input on affected
 devices; macOS stays opt-in under its Input Monitoring grant.
 
@@ -33,13 +33,15 @@ import logging
 import platform
 import threading
 import time
-from datetime import datetime
-from typing import Callable, Optional
+from datetime import datetime, timezone
+from typing import Callable, Optional, Union
 
 try:
     from .aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
+    from .input_span import DEFAULT_MAX_SILENCE_S, HeldInputSpans, StampedSpan
 except ImportError:  # PyInstaller bundle (src/ is import root)
     from sync.aw_client import BUCKET_TYPE_INPUT, INPUT_COUNT_KEYS
+    from sync.input_span import DEFAULT_MAX_SILENCE_S, HeldInputSpans, StampedSpan
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +86,12 @@ class InputSource:
 
     Divergence from ``WindowSource``: there is no per-cycle sampling. A backend
     thread increments the counters live (``_on_press`` / ``_on_click`` /
-    ``_on_scroll``); the sync cycle only DRAINS the accumulated counts into an
-    event for [checkpoint, now] and resets them. A period with no backend
+    ``_on_scroll``); the sync cycle only DRAINS the accumulated counts into
+    events within [checkpoint, now] and resets them. The counts are held as
+    segments with first/last count instants (``HeldInputSpans``, the rule shared
+    with ``MacOSInputWatcher``), so a span ends where the input did and a silence
+    longer than the AFK timeout splits it: a press before a sleep is never
+    stamped over the sleep. A period with no backend
     available produces no event (gap), exactly like a blind WindowSource probe —
     we never invent counts.
     """
@@ -96,15 +102,15 @@ class InputSource:
         *,
         backend=_UNSET,
         frontmost_app_getter=_UNSET,
+        max_silence_s: Union[float, Callable[[], float]] = DEFAULT_MAX_SILENCE_S,
     ) -> None:
         self._hostname = hostname
-        # Thread-safe counters, incremented by the backend listener thread and
-        # snapshot-and-reset by drain_input_event on the sync thread. Guarded by
-        # the same lock so a drain reads a coherent (presses, clicks, scrolls)
-        # triple.
-        self._presses = 0
-        self._clicks = 0
-        self._scrolls = 0
+        # Thread-safe held counts, incremented by the backend listener thread and
+        # snapshot-and-reset by drain_input_events on the sync thread, kept as
+        # segments split at silences longer than ``max_silence_s`` (pass the
+        # configured AFK timeout). Guarded by one lock so a drain reads a
+        # coherent set of (presses, clicks, scrolls) segments.
+        self._held = HeldInputSpans(max_silence_s=max_silence_s)
         self._lock = threading.Lock()
         # Liveness for capture_state(): when the backend last saw ANY input
         # (mouse moves included, where the backend can see them), and when the
@@ -136,19 +142,24 @@ class InputSource:
 
     # -- backend callbacks (called from the listener thread) ------------------
 
-    def _on_press(self, n: int = 1) -> None:
-        with self._lock:
-            self._presses += n
-        self.note_event()
+    def _on_press(self, n: int = 1, now: Optional[datetime] = None) -> None:
+        self._record(now, presses=n)
 
-    def _on_click(self, n: int = 1) -> None:
-        with self._lock:
-            self._clicks += n
-        self.note_event()
+    def _on_click(self, n: int = 1, now: Optional[datetime] = None) -> None:
+        self._record(now, clicks=n)
 
-    def _on_scroll(self, n: int = 1) -> None:
+    def _on_scroll(self, n: int = 1, now: Optional[datetime] = None) -> None:
+        self._record(now, scrolls=n)
+
+    def _record(self, now: Optional[datetime], presses: int = 0,
+                clicks: int = 0, scrolls: int = 0) -> None:
+        """Hold counts observed at ``now`` (wall clock by default: the span they
+        are uploaded under is wall-clock, and a sleep must show as a silence,
+        which a monotonic clock that stops while asleep would hide)."""
+        if now is None:
+            now = datetime.now(timezone.utc)
         with self._lock:
-            self._scrolls += n
+            self._held.note(now, presses=presses, clicks=clicks, scrolls=scrolls)
         self.note_event()
 
     def note_event(self, now: Optional[float] = None) -> None:
@@ -287,17 +298,21 @@ class InputSource:
         discard path can never diverge over which counters they clear (a fourth
         counter added to one and not the other would leak into the next span)."""
         with self._lock:
-            counts = (self._presses, self._clicks, self._scrolls)
-            self._presses = 0
-            self._clicks = 0
-            self._scrolls = 0
+            counts = self._held.totals()
+            self._clear_held_locked()
         return counts
+
+    def _clear_held_locked(self) -> None:
+        """Reset ALL held count state. Caller holds ``self._lock``. The one
+        reset both the drain (``_build_events``) and the discard path
+        (``_take_counts``) call, so they always clear exactly the same state."""
+        self._held.clear()
 
     def discard_counts(self) -> tuple[int, int, int]:
         """Throw away everything counted so far, returning what was dropped.
 
         For a window that must never be recorded at all — Private Time, a manual
-        pause, a working-hours close. Unlike drain_input_event this emits no
+        pause, a working-hours close. Unlike drain_input_events this emits no
         event and does NOT depend on available(): the counters have to be
         cleared even when the backend has already stopped, or the keystrokes
         stall and land on the next span the moment counting resumes.
@@ -338,7 +353,7 @@ class InputSource:
         """Current (presses, clicks, scrolls) accumulated since the last drain.
         For diagnostics/tests; the live values, read under the lock."""
         with self._lock:
-            return (self._presses, self._clicks, self._scrolls)
+            return self._held.totals()
 
     def available(self) -> bool:
         """True when the backend can currently count input. Delegates — the
@@ -381,57 +396,57 @@ class InputSource:
         app = str(app or "").strip()
         return app or None
 
-    def drain_input_event(
+    def drain_input_events(
         self, range_start: datetime, range_end: datetime
-    ) -> Optional[dict]:
-        """Snapshot-and-reset the counters and build ONE input event spanning
-        [range_start, range_end] carrying the accumulated counts.
+    ) -> list[dict]:
+        """Snapshot-and-reset the held counts and build the input events that
+        carry them within [range_start, range_end]: one per segment of held
+        counts (src/sync/input_span.py). In steady state that is ONE event
+        spanning [range_start, range_end], as before; a silence longer than the
+        AFK timeout ends a span at its last count, so a press before a sleep is
+        not stamped over the sleep.
 
-        Returns None (and leaves the counters untouched) when the source isn't
+        Returns [] (and leaves the counts untouched) when the source isn't
         available, when the range is empty/inverted, or when nothing was counted
         — a zero-count period is a gap, never an emitted zero event (mirrors
         ``MacOSInputWatcher``'s skip-zero and WindowSource's blind handling; it
         also avoids ~1,440 empty events/day).
 
-        The counters are reset ONLY after we've captured the snapshot to build
-        the event, so the accumulation for the next range starts clean. On a
-        send failure the caller holds the checkpoint and the counts are already
-        folded into this (idempotent, stable-id) event, which the offline queue
-        redelivers — the same durability model as the AFK/window streams."""
-        if not self.available():
-            return None
-        if range_end <= range_start:
-            return None
-        # Snapshot-and-reset in one step — the next range accrues fresh. Shared
-        # with discard_counts() so both paths clear exactly the same state.
-        counts = self._take_counts()
-        if not any(counts):
-            return None
-        return self._event(range_start, range_end, counts)
+        The counts are reset in the same locked step that stamps them, so the
+        accumulation for the next range starts clean. On a send failure the
+        counts are already folded into these (idempotent, stable-id) events,
+        which the offline queue redelivers — the same durability model as the
+        AFK/window streams."""
+        return self._build_events(range_start, range_end, take=True)
 
-    def peek_input_event(
+    def peek_input_events(
         self, range_start: datetime, range_end: datetime
-    ) -> Optional[dict]:
-        """The event ``drain_input_event`` would build over the same range,
+    ) -> list[dict]:
+        """The events ``drain_input_events`` would build over the same range,
         WITHOUT resetting anything. For the fraud analyzer, which needs to see
         the counts at the top of a cycle; the destructive drain stays next to
         the send, so a cycle that dies (or is taken over) in between loses
         nothing and cannot re-send a stale snapshot under the id a replacement
-        cycle already used. Same None cases as the drain."""
-        if not self.available():
-            return None
-        if range_end <= range_start:
-            return None
-        counts = self.counts
-        if not any(counts):
-            return None
-        return self._event(range_start, range_end, counts)
+        cycle already used. Same [] cases as the drain. A peek and a later drain
+        of the same segment share its id (``StampedSpan.key``)."""
+        return self._build_events(range_start, range_end, take=False)
 
-    def _event(
-        self, start: datetime, end: datetime, counts: tuple[int, ...],
-    ) -> dict:
-        duration = (end - start).total_seconds()
-        data = dict(zip(INPUT_COUNT_KEYS, counts))
+    def _build_events(
+        self, range_start: datetime, range_end: datetime, *, take: bool
+    ) -> list[dict]:
+        if not self.available():
+            return []
+        if range_end <= range_start:
+            return []
+        with self._lock:
+            spans = self._held.stamp(range_end, floor=range_start)
+            if take:
+                # The same reset discard_counts() uses (via _take_counts).
+                self._clear_held_locked()
+        return [self._event(span) for span in spans]
+
+    def _event(self, span: StampedSpan) -> dict:
+        data = dict(zip(INPUT_COUNT_KEYS, span.counts))
         app = self._frontmost_app()
         if app:
             data["app"] = app
@@ -440,9 +455,11 @@ class InputSource:
             # two drains can legitimately start within the same whole second on a
             # fast manual sync + cycle overlap; a second-truncated id would
             # collide and the server upsert would drop one, under-counting.
-            "id": f"input-inproc_{self._hostname}_{int(start.timestamp() * 1000)}",
-            "timestamp": start.isoformat(),
-            "duration": round(duration, 2),
+            # Keyed on span.key, not span.start: the key does not move with
+            # `now`, so the peek and the drain of one segment share an id.
+            "id": f"input-inproc_{self._hostname}_{int(span.key.timestamp() * 1000)}",
+            "timestamp": span.start.isoformat(),
+            "duration": round(span.duration_s, 2),
             "bucket_id": self.bucket_id,
             "bucket_type": BUCKET_TYPE_INPUT,
             "data": data,
@@ -1103,12 +1120,27 @@ class _MacOSTapBackend:
         source."""
         with self._drain_lock:
             presses, clicks, scrolls = self._drain_watcher_counts()
+            # Fold at the TAP's instant, not this poll's: the poll freezes with
+            # the machine, so a press counted just before a sleep would
+            # otherwise be held (and uploaded) at the wake instant.
+            at = self._watcher_last_input_at()
             if presses > 0:
-                self._source._on_press(presses)
+                self._source._on_press(presses, now=at)
             if clicks > 0:
-                self._source._on_click(clicks)
+                self._source._on_click(clicks, now=at)
             if scrolls > 0:
-                self._source._on_scroll(scrolls)
+                self._source._on_scroll(scrolls, now=at)
+
+    def _watcher_last_input_at(self) -> Optional[datetime]:
+        """The watcher's last input instant, read under its lock (None when
+        there is no watcher or it has none; the source then uses the wall
+        clock). Read right after the drain, so it is the instant of the last
+        drained count, or of input a few microseconds newer."""
+        w = self._watcher
+        if w is None:
+            return None
+        with w._lock:
+            return getattr(w, "_last_input_at", None)
 
     def discard_pending(self) -> None:
         """Drop whatever the wrapped watcher has counted but not yet handed over.

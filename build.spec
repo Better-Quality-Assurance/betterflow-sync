@@ -246,6 +246,7 @@ hiddenimports = [
     "auth.browser_auth",
     "sync.macos_window_watcher",
     "sync.macos_input_watcher",
+    "sync.input_span",  # Held input span rule, imported by both input senders
     "sync.foreground_activity",  # Foreground-CPU activity detection
     "_build_info",  # Generated at build time by the spec preamble
 ]
