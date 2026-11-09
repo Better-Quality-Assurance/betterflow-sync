@@ -76,6 +76,17 @@ class MacOSInputWatcher:
     # of toggling the switch in System Settings, without spamming logs.
     _PERMISSION_RETRY_INTERVAL_S = 30.0
 
+    # Longest input-free stretch a held span may bridge. Held counts normally
+    # drain within one emit interval; they outlive it only when a post failed
+    # (AW down) or the emitter thread was frozen with the machine (sleep,
+    # hibernate). A post-failure span is honest while the person keeps typing,
+    # so the span is kept. A silence longer than this is not "input activity" by
+    # any reading -- it is past the agent's default AFK timeout (10 min) -- and
+    # the server bills an input span as active wall-clock time: device 53,
+    # 2026-11-09, one press held across a 68 h sleep was stamped as a 68 h input
+    # event and billed 13.6 h of a day the laptop spent asleep.
+    _MAX_INPUT_SILENCE_S = 600.0
+
     def __init__(self, aw_client, emit_interval: float = 10.0, count_only: bool = False):
         self._aw = aw_client
         self._emit_interval = emit_interval
@@ -355,7 +366,18 @@ class MacOSInputWatcher:
                 # health check — see SyncCoordinator._check_idle_tracker_health.
                 # We update under the same lock that guards the counters so a
                 # concurrent reader gets a coherent (count, ts) pair.
-                self._last_input_at = datetime.now(timezone.utc)
+                now = datetime.now(timezone.utc)
+                # Counts still held from before a long silence (the emitter was
+                # frozen by a sleep, or AW was down): restart the span here so it
+                # never bridges the silence. The counts are kept; only the span
+                # moves. See _MAX_INPUT_SILENCE_S.
+                if (
+                    self._span_start is not None
+                    and self._last_input_at is not None
+                    and (now - self._last_input_at).total_seconds() > self._MAX_INPUT_SILENCE_S
+                ):
+                    self._span_start = now
+                self._last_input_at = now
                 if self._span_start is None:
                     self._span_start = self._last_input_at
 
@@ -423,6 +445,7 @@ class MacOSInputWatcher:
                 clicks = self._clicks
                 scrolls = self._scrolls
                 span_start = self._span_start
+                last_input_at = self._last_input_at
 
             # Skip zero-count events to avoid 8,640 idle events/day.
             # AFK bucket already handles idle detection.
@@ -445,8 +468,23 @@ class MacOSInputWatcher:
             # only inflate any rate computed as count / duration.
             emit_now = datetime.now(timezone.utc)
             start = emit_now - timedelta(seconds=self._emit_interval)
+            end = emit_now
             if span_start is not None and span_start < start:
                 start = span_start
+                # The span ends at the post only if input continued up to it.
+                # After a silence longer than _MAX_INPUT_SILENCE_S (typically:
+                # this thread was frozen by a sleep and the counts were typed
+                # just before it) end it one interval after the last count
+                # instead of at the wake instant, which would claim the whole
+                # sleep as input activity.
+                if (
+                    last_input_at is not None
+                    and (emit_now - last_input_at).total_seconds() > self._MAX_INPUT_SILENCE_S
+                ):
+                    end = min(
+                        emit_now,
+                        max(last_input_at, start + timedelta(seconds=self._emit_interval)),
+                    )
             try:
                 data = {
                     "presses": presses,
@@ -459,7 +497,7 @@ class MacOSInputWatcher:
                     data["bundle"] = app_bundle
                 self._aw.post_events(self._bucket_id, [{
                     "timestamp": start.isoformat(),
-                    "duration": (emit_now - start).total_seconds(),
+                    "duration": (end - start).total_seconds(),
                     "data": data,
                 }])
             except Exception as e:
