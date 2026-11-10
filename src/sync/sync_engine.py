@@ -1641,9 +1641,7 @@ class SyncEngine:
             # morning resume would upload a cap-length span covering hours
             # that were contractually not recorded.
             self.flush_engagement_detectors("capture_suppressed")
-            if self.bf.is_reachable() and not self.queue.is_empty():
-                if self._drain_gate_allows(stats):
-                    self._process_queue(stats)
+            self._drain_offline_queue(stats)
             with self._state_lock:
                 self._heartbeat_count += 1
                 should_heartbeat = self._heartbeat_count >= self._heartbeat_interval
@@ -2008,19 +2006,7 @@ class SyncEngine:
         # (else two ~94s chains stack past _DO_SYNC_DEADLINE; the queue drains
         # next cycle). _drain_gate_allows adds the floor that stops "next cycle"
         # from being the answer forever — see its docstring.
-        if self.bf.is_reachable() and not self.queue.is_empty():
-            if self._drain_gate_allows(stats):
-                self._process_queue(stats)
-            else:
-                # The regular send already burned most of the watchdog budget
-                # (slow/hung server). Skip the drain this cycle so two ~94s chains
-                # don't stack past the deadline; it drains next cycle. Log it so a
-                # climbing queue_size traces to drain-skips, not ingest failure.
-                logger.debug(
-                    "Skipping queue drain this cycle: budget %ds already spent "
-                    "(queue_size=%d)",
-                    self._QUEUE_SKIP_IF_CYCLE_ELAPSED, self.queue.size(),
-                )
+        self._drain_offline_queue(stats)
 
         # Check heartbeat counter — actual HTTP call is deferred to
         # after sync() returns so _sync_lock is not held during the
@@ -4374,6 +4360,60 @@ class SyncEngine:
         """
         self._cycle_delivered = True
 
+    def _drain_gate_verdict(self) -> str:
+        """The PURE half of ``_drain_gate_allows``: what it would decide now,
+        with no side effect (#291).
+
+        - ``"allow"``: the budget is not spent; the gate drains.
+        - ``"refuse"``: the budget is spent and this cycle already put events
+          on the wire. The gate refuses and does NOT touch the floor counter.
+        - ``"count"``: the budget is spent and nothing was delivered. The
+          answer depends on the starvation-floor counter, which the gate moves.
+
+        The drain sites call this BEFORE ``bf.is_reachable()``. On ``"refuse"``
+        the probe can change nothing (no drain, no count), and against a
+        blackholed API it costs about 20s (2 endpoints x 2 addresses x
+        ``REACHABILITY_TIMEOUT``) on a cycle that may already be at budget + one
+        chain, which is the 156s "Sync overran" of #291. On ``"count"`` the
+        probe still runs: an unreachable cycle must keep not counting toward the
+        floor, exactly as before, so the probe is the counter's input.
+        """
+        if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+            return "allow"
+        if self._cycle_delivered:
+            return "refuse"
+        return "count"
+
+    def _drain_probe_can_matter(self) -> bool:
+        """True unless the drain gate's answer is already a side-effect-free
+        refusal, in which case the reachability probe ahead of it is skipped."""
+        return self._drain_gate_verdict() != "refuse"
+
+    def _drain_offline_queue(self, stats: SyncStats) -> None:
+        """Drain the offline queue when this cycle's gate allows it (#291).
+
+        The pure gate is asked first. On a side-effect-free refusal the
+        reachability probe is skipped, and the refusal is still logged, so a
+        climbing queue_size traces to drain-skips rather than ingest failure.
+        """
+        if self.queue.is_empty():
+            return
+        # An unreachable probe result is not a refusal to log: the queue
+        # simply waits for the next cycle.
+        if self._drain_probe_can_matter() and not self.bf.is_reachable():
+            return
+        if self._drain_gate_allows(stats):
+            self._process_queue(stats)
+            return
+        # The regular send already burned most of the watchdog budget
+        # (slow/hung server). Skip the drain this cycle so two ~94s chains
+        # don't stack past the deadline; it drains next cycle.
+        logger.debug(
+            "Skipping queue drain this cycle: budget %ds already spent "
+            "(queue_size=%d)",
+            self._QUEUE_SKIP_IF_CYCLE_ELAPSED, self.queue.size(),
+        )
+
     def _drain_gate_allows(self, stats: SyncStats) -> bool:
         """Whether to drain the offline queue this cycle — budget gate plus a
         floor so it can never refuse forever.
@@ -4422,11 +4462,13 @@ class SyncEngine:
         two it was. It must be set on ``stats``, not logged: the ops digest
         reads message + count and never reads context or logs.
         """
-        if not self._cycle_network_budget_exceeded(self._QUEUE_SKIP_IF_CYCLE_ELAPSED):
+        verdict = self._drain_gate_verdict()
+        if verdict == "allow":
             self._consecutive_undelivered_cycles = 0
             return True
-        if self._cycle_delivered:
+        if verdict == "refuse":
             return False
+        # verdict == "count": the counting step below.
         self._consecutive_undelivered_cycles += 1
         if self._consecutive_undelivered_cycles < self._DELIVERY_STARVATION_FLOOR_CYCLES:
             return False
