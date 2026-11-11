@@ -36,7 +36,7 @@ try:
         REASON_CREDENTIALS_CHANGED, SyncResult,
     )
     from .http_client import (
-        REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
+        CONNECT_FAILED_REASON_KINDS, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
@@ -61,7 +61,7 @@ except ImportError:
         REASON_CREDENTIALS_CHANGED, SyncResult,
     )
     from sync.http_client import (
-        REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
+        CONNECT_FAILED_REASON_KINDS, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
@@ -128,6 +128,14 @@ _LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
     # both open "Server returned", and an item takes the FIRST prefix it
     # matches, so a 429 is "rate-limited" and not also "server-unavailable".
     (REASON_TIMEOUT, "timeout"),
+    # Sub-kinds FIRST (connect-failed:ssl, :proxy, :refused, ...): each opens
+    # with REASON_CONNECT_FAILED, so the bare entry below would otherwise take
+    # them all. The tokens are literals in http_client's fixed table, never
+    # derived from the reason, whose detail (errno / SSL code) stays local.
+    *CONNECT_FAILED_REASON_KINDS,
+    # Kept as a fallback: http_client no longer emits the bare sentence, but a
+    # reason built elsewhere from the constant must still be named, not
+    # dropped to `unclassified`.
     (REASON_CONNECT_FAILED, "connect-failed"),
     (REASON_DNS_FAILED, "dns-failed"),
     (REASON_CONNECTION_DROPPED, "connection-dropped"),

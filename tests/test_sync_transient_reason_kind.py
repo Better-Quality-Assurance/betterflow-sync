@@ -65,7 +65,9 @@ def _dns_reason() -> str:
 
 PRODUCERS = {
     "timeout": lambda: _reason_from(body=requests.exceptions.ReadTimeout("read timed out")),
-    "connect-failed": lambda: _reason_from(body=requests.exceptions.ConnectionError("refused")),
+    # A bare ConnectionError with no socket/SSL/proxy cause is the `other`
+    # sub-kind; the named sub-kinds are pinned in test_sync_connect_failure_subkind.
+    "connect-failed:other": lambda: _reason_from(body=requests.exceptions.ConnectionError("refused")),
     "dns-failed": _dns_reason,
     "connection-dropped": lambda: _reason_from(body=requests.exceptions.ChunkedEncodingError("x")),
     "server-error": lambda: _reason_from(status=502),
