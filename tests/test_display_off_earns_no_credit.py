@@ -363,3 +363,25 @@ def test_gate_turned_off_mid_span_still_closes_it_at_wake():
 
     assert _lock_spans(handler) == [(_at(10, 0), _at(10, 2)), (_at(18, 0), None)]
     assert handler.sync_engine.resume.call_count == 2, "once at the wake, once at the unlock"
+
+
+def test_gate_turned_on_after_a_legacy_pair_still_closes_the_next_span():
+    """A gate-off display-off whose only wake was the display wake leaves the
+    legacy dedup state at "woken". If the gate turns on before the next
+    display-off, that stale state must not swallow the next display wake --
+    otherwise the span stays open, #271's Critical by another road."""
+    handler = _make_handler(lock_time_capable=False)
+    patcher, clock = _clock(_at(9, 0))
+    with patcher:
+        handler.on_display_sleep()
+        clock.t = _at(9, 5)
+        handler.on_display_wake()  # no DidWake follows: legacy state stays "woken"
+
+        handler.sync_engine.config.capabilities.lock_time = True
+        clock.t = _at(10, 0)
+        handler.on_display_sleep()
+        clock.t = _at(10, 2)
+        handler.on_display_wake()
+
+    assert _lock_spans(handler) == [(_at(10, 0), _at(10, 2))]
+    assert handler._display_off_start is None
