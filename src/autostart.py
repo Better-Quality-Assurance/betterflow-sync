@@ -232,6 +232,7 @@ _WIN_VALUE_NAME = "BetterFlow"
 def _set_windows(enabled: bool) -> bool:
     import winreg
 
+    previous = _windows_run_value() if enabled else None
     key = winreg.OpenKey(
         winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_SET_VALUE
     )
@@ -241,7 +242,16 @@ def _set_windows(enabled: bool) -> bool:
                 logger.warning("Auto-start not supported in dev mode on Windows")
                 return False
             winreg.SetValueEx(key, _WIN_VALUE_NAME, 0, winreg.REG_SZ, sys.executable)
-            logger.info("Added registry Run key for auto-start")
+            if previous and not _same_windows_exe(previous, sys.executable):
+                # The old path is the copy support should ask the user to
+                # delete (Sachi, 2026-11-11: three old copies on one laptop).
+                logger.info(
+                    "Auto-start re-pointed from another copy: %s -> %s",
+                    previous,
+                    sys.executable,
+                )
+            else:
+                logger.info("Added registry Run key for auto-start")
         else:
             try:
                 winreg.DeleteValue(key, _WIN_VALUE_NAME)
@@ -253,22 +263,74 @@ def _set_windows(enabled: bool) -> bool:
     return True
 
 
-def _get_windows() -> bool:
+def _windows_run_value() -> Optional[str]:
+    """The exe path stored in our Run value, or None if there is none."""
     import winreg
 
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY, 0, winreg.KEY_READ
         )
+    except OSError as e:
+        logger.warning(f"Could not open the Run key: {e}")
+        return None
+    try:
+        value, _kind = winreg.QueryValueEx(key, _WIN_VALUE_NAME)
+        return str(value)
+    except FileNotFoundError:
+        return None  # Not registered: the normal "not enabled" case.
+    except OSError as e:
+        # Read failure (e.g. access denied). The old _get_windows() caught
+        # this and reported not-enabled; keep that so the tray never crashes.
+        logger.warning(f"Could not read the Run value: {e}")
+        return None
+    finally:
+        winreg.CloseKey(key)
+
+
+def _windows_exe_from_run_value(value: str) -> str:
+    """The executable a Run value launches: a quoted first token, or the whole
+    value (our own writer stores a bare sys.executable, which may contain
+    spaces, so an unquoted value is never split)."""
+    value = value.strip()
+    if value.startswith('"'):
+        end = value.find('"', 1)
+        return value[1:end] if end > 0 else value[1:]
+    return value
+
+
+def _same_windows_exe(stored: str, current: str) -> bool:
+    """True if the Run value launches ``current``. Windows paths are
+    case-insensitive and accept either slash; ntpath (not os.path) so the
+    comparison is the same when the tests run on macOS/Linux."""
+    import ntpath
+
+    a = ntpath.normcase(ntpath.normpath(_windows_exe_from_run_value(stored)))
+    b = ntpath.normcase(ntpath.normpath(current))
+    if a == b:
+        return True
+    if sys.platform == "win32":
+        # 8.3 short names (C:\Users\ADMINI~1\...) spell the same file
+        # differently; let the filesystem decide when both exist.
         try:
-            winreg.QueryValueEx(key, _WIN_VALUE_NAME)
-            return True
-        except FileNotFoundError:
+            return os.path.samefile(a, b)
+        except OSError as e:
+            # Either path missing (e.g. the old copy was deleted): not the
+            # same exe. Logged so a failed comparison is never silent.
+            logger.warning(f"Could not compare Run value with this exe: {e}")
             return False
-        finally:
-            winreg.CloseKey(key)
-    except OSError:
-        return False
+    return False
+
+
+def _get_windows() -> bool:
+    # A Run value that launches ANOTHER copy is not "this app starts at
+    # login": the old copy wins every login and self-updates, and the current
+    # copy never re-points it. Treat it as not-enabled so ensure_synced()
+    # rewrites it, the same contract as _get_macos / _macos_plist_is_current.
+    # (Sachi, device 16: 1.5.29 started at every login while 1.5.145 was
+    # installed, 2026-11-06 to 11-11.)
+    stored = _windows_run_value()
+    return stored is not None and _same_windows_exe(stored, sys.executable)
 
 
 # -- Linux: XDG autostart .desktop entry --------------------------------------
