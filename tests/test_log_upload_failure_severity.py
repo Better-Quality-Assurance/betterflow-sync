@@ -100,7 +100,11 @@ class TestLogUploadFailureSeverity:
         reports = self.recorder.by_fingerprint(_FINGERPRINT)
         assert len(reports) == 1, self.recorder.captures
         assert reports[0]["level"] == "warning"
-        assert _OFFLINE in reports[0]["context"]["reason"]  # not the message (#266)
+        # In context, not the message (#266); as its bounded kind token, never
+        # str(e), which can carry a server body (ops_exception_summary).
+        assert reports[0]["context"]["reason"] == (
+            "upload POST failed: BetterFlowClientError [connect-failed]"
+        )
 
     def test_unreachable_api_emits_no_error_level_report_at_all(self):
         """The noise property stated end-to-end: a handled transient must not

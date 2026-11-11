@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 # Unpatchable aliases for the account-isolation code: several suites patch
 # this module's `datetime` to freeze the clock, and an isinstance()/parse
 # against a Mock would fail closed on every event.
@@ -36,7 +38,7 @@ try:
         REASON_CREDENTIALS_CHANGED, SyncResult,
     )
     from .http_client import (
-        CONNECT_FAILED_REASON_KINDS, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
+        CONNECT_FAILED_REASON_KINDS, classify_connect_failure, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
@@ -61,7 +63,7 @@ except ImportError:
         REASON_CREDENTIALS_CHANGED, SyncResult,
     )
     from sync.http_client import (
-        CONNECT_FAILED_REASON_KINDS, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
+        CONNECT_FAILED_REASON_KINDS, classify_connect_failure, REASON_CONNECT_FAILED, REASON_CONNECTION_DROPPED, REASON_DNS_FAILED, REASON_RATE_LIMIT_BACKOFF, REASON_RATE_LIMITED, REASON_SERVER_ERROR, REASON_SERVER_UNAVAILABLE, REASON_TIMEOUT, REASON_DECODING_FAILED,
     )
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
@@ -187,6 +189,38 @@ def local_reason_kinds(reasons) -> list[str]:
     if any_unmatched:
         ordered.append(_UNCLASSIFIED_KIND)
     return ordered
+
+
+def ops_exception_summary(exc: BaseException) -> str:
+    """The ONE way an arbitrary exception is named on the cross-tenant ops ingest.
+
+    Never ``str(exc)``. requests puts the request URL in str() of its
+    exceptions, query string and all (a token in ``?token=`` rides along), and
+    a proxy URL carries ``user:pass@``; a BetterFlowClientError can carry a
+    server body that echoes a window title. The full text belongs in
+    betterflow.log, which stays on the device.
+
+    Emits the exception's CLASS name, plus a bounded token for the two shapes
+    that can be named without reading free text, through the vocabularies the
+    failed-sync report already uses:
+      * a requests ConnectionError: classify_connect_failure (#305), reduced to
+        its ``connect-failed:<kind>`` / ``dns-failed`` token by
+        local_reason_kinds. The errno / SSL-code detail stays local, exactly as
+        it does for a failed sync.
+      * a BetterFlowClientError: its HTTP status, or its reason kind.
+    Anything else is the class name alone: deny by default.
+    """
+    name = type(exc).__name__[:80]
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        reason = classify_connect_failure(exc)
+    elif isinstance(exc, BetterFlowClientError):
+        reason = str(exc)
+        status = _SERVER_STATUS_RE.match(reason)
+        if status:
+            return f"{name} [server status {status.group(1)}]"
+    else:
+        return name
+    return f"{name} [{','.join(local_reason_kinds(reason))}]"
 
 
 def server_status_summary(reasons) -> str:
@@ -5045,7 +5079,7 @@ class SyncEngine:
             raise  # let _send_heartbeat surface re-login
         except BetterFlowClientError as e:
             logger.debug("Log upload failed (will retry next heartbeat): %s", e)
-            self._report_upload_failure(f"upload POST failed: {e}")
+            self._report_upload_failure(f"upload POST failed: {ops_exception_summary(e)}")
 
     def _report_dropped_events(self, summary: dict) -> None:
         """Surface permanently-dropped queued events to the ops ingest, split by

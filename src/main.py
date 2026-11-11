@@ -38,7 +38,7 @@ try:
     )
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from .sync.sync_engine import server_status_summary
+    from .sync.sync_engine import ops_exception_summary, server_status_summary
     from .sync.http_client import BetterFlowAuthError, transient_failure_counter
     from .sync.os_idle import get_system_idle_seconds
     from .sync.input_source import SILENT_NO_EVENT_S
@@ -76,7 +76,7 @@ except ImportError:
     )
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
-    from sync.sync_engine import server_status_summary
+    from sync.sync_engine import ops_exception_summary, server_status_summary
     from sync.http_client import BetterFlowAuthError, transient_failure_counter
     from sync.os_idle import get_system_idle_seconds
     from sync.input_source import SILENT_NO_EVENT_S
@@ -1281,6 +1281,9 @@ class SyncCoordinator:
             (self._check_auth_warn, "auth_warn"),
             (self._check_idle_tracker_health, "idle_tracker_health"),
             (self._check_private_auto_end, "private_auto_end"),
+            # Clears native-crash.log of dumps this process outlived (a handled
+            # Windows SEH exception), so only a real fatal is reported next launch.
+            (native_crash_log.checkpoint, "native_crash_checkpoint"),
         ]
         for fn, label in [t for t in tasks if t[0] is not None]:
             self._run_tick_task(fn, label)
@@ -1320,7 +1323,9 @@ class SyncCoordinator:
                 f"background tick is silently broken",
                 level="error",
                 tags={"component": "tick-60s", "task": label},
-                context={"consecutive_failures": n, "last_error": str(exc)},
+                # Never str(exc): a requests error carries its URL (query
+                # string tokens, proxy user:pass). Full text is logged above.
+                context={"consecutive_failures": n, "last_error": ops_exception_summary(exc)},
                 fingerprint=f"tick-60s-{label}",
             )
         except Exception:
@@ -3126,7 +3131,8 @@ class BetterFlowApp:
                 if self.error_reporter is not None:
                     try:
                         self.error_reporter.capture(
-                            f"Reconnect attempt raised unexpectedly: {e}",
+                            # Class + bounded kind only; the full text is logged above.
+                            f"Reconnect attempt raised unexpectedly: {ops_exception_summary(e)}",
                             level="warning",
                             tags={"component": "reconnect"},
                             fingerprint="reconnect-unexpected-error",
@@ -4274,6 +4280,9 @@ class BetterFlowApp:
         self.bf.close()
         self.queue.close()
         self.aw_manager.stop()
+        # Every dump written so far was survived: this is a clean exit. A
+        # native crash later in teardown still lands in the (now empty) file.
+        native_crash_log.checkpoint(final=True)
 
         logger.info("Shutdown complete")
 

@@ -95,16 +95,22 @@ class TestPayload:
             assert body["context"]["consecutive_failures"] == 3
 
     def test_includes_stack_from_exception(self) -> None:
+        # The frames and the class reach the ingest; the MESSAGE does not
+        # (str(exc) is where a URL's query string or a server body leaks).
+        # Held in a variable so the raise line's source text cannot carry it.
+        message = "kaboom-" + "secret-message"
         r = _reporter()
         try:
-            raise ValueError("kaboom")
+            raise ValueError(message)
         except ValueError as e:
             with patch("src.error_reporter.requests.post") as post:
                 post.return_value = MagicMock(status_code=200, text="ok")
                 r.capture("crashed", level="fatal", exc=e, block=True)
                 body = post.call_args.kwargs["json"]
-                assert "ValueError: kaboom" in body["stack"]
                 assert "Traceback" in body["stack"]
+                assert "test_includes_stack_from_exception" in body["stack"]
+                assert body["stack"].rstrip().endswith("ValueError")
+                assert "secret-message" not in body["stack"]
 
 
 class TestDedup:
