@@ -47,7 +47,7 @@ import urllib3.exceptions
 from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from src.sync.bf_client import BetterFlowClient, BetterFlowClientError
-from src.sync.http_client import REASON_CONNECT_FAILED, classify_connect_failure
+from src.sync.http_client import REASON_CONNECT_FAILED
 from src.sync.sync_engine import local_reason_kinds, server_status_summary
 
 
@@ -294,6 +294,14 @@ def _openssl_verify_error(context: BaseException = None) -> ssl.SSLError:
     return err
 
 
+def _classify(exc):
+    # Imported at call time, not module level: against pre-fix code the name
+    # does not exist, and a module-level ImportError would fail the whole file
+    # (CONTROLs included) at collection instead of on these assertions.
+    from src.sync.http_client import classify_connect_failure
+    return classify_connect_failure(exc)
+
+
 def test_proxy_tls_failure_names_the_ssl_code_and_outranks_a_socket_errno():
     # The chain ALSO holds a refused errno: the ssl code must win inside the
     # proxy branch, as it does outside it.
@@ -301,7 +309,7 @@ def test_proxy_tls_failure_names_the_ssl_code_and_outranks_a_socket_errno():
     proxy_err = urllib3.exceptions.ProxyError(
         "Unable to connect to proxy", urllib3.exceptions.SSLError(ssl_err))
     exc = requests.exceptions.ProxyError(MaxRetryError(None, "/api", reason=proxy_err))
-    failure = classify_connect_failure(exc)
+    failure = _classify(exc)
     assert failure.retryable
     assert failure.message == \
         f"{REASON_CONNECT_FAILED} (proxy: ssl CERTIFICATE_VERIFY_FAILED)", failure.message
@@ -309,7 +317,7 @@ def test_proxy_tls_failure_names_the_ssl_code_and_outranks_a_socket_errno():
 
 
 def test_proxy_failure_with_no_socket_or_ssl_cause_names_its_class():
-    failure = classify_connect_failure(
+    failure = _classify(
         requests.exceptions.ProxyError("Cannot connect to proxy."))
     assert failure.retryable
     assert failure.message == f"{REASON_CONNECT_FAILED} (proxy: ProxyError)", failure.message
@@ -320,7 +328,7 @@ def test_ssl_outranks_a_socket_errno_in_the_same_chain():
     ssl_err = _openssl_verify_error(ConnectionResetError(errno.ECONNRESET, "reset"))
     exc = requests.exceptions.SSLError(
         MaxRetryError(None, "/api", reason=urllib3.exceptions.SSLError(ssl_err)))
-    failure = classify_connect_failure(exc)
+    failure = _classify(exc)
     assert failure.message == \
         f"{REASON_CONNECT_FAILED} (ssl: CERTIFICATE_VERIFY_FAILED)", failure.message
     assert local_reason_kinds([failure.message]) == ["connect-failed:ssl"]
