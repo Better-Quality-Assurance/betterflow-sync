@@ -1,18 +1,22 @@
 """Base HTTP client with retry logic for BetterFlow API."""
 
+import errno
 import gzip
 import json
 import logging
 import os
+import re
 import socket
+import ssl
 import sys
 import threading
 import time
-from typing import Optional
+from typing import NamedTuple, Optional
 from urllib.parse import urlparse
 
 import certifi
 import requests
+import urllib3.exceptions
 
 try:
     from .. import __version__
@@ -36,6 +40,38 @@ REASON_CONNECT_FAILED = "Cannot connect to BetterFlow API"
 REASON_CONNECTION_DROPPED = "Connection dropped mid-response"
 REASON_TIMEOUT = "Request timed out"
 REASON_DECODING_FAILED = "Response body decoding failed"
+
+#: Sub-kinds of REASON_CONNECT_FAILED. A connect failure's message is
+#: ``f"{REASON_CONNECT_FAILED} (<sub>: <detail>)"``, e.g.
+#: "Cannot connect to BetterFlow API (ssl: CERTIFICATE_VERIFY_FAILED)". The
+#: whole message (detail included) goes to betterflow.log and the local
+#: dead-letter; the cross-tenant ops ingest gets ONLY the token from
+#: CONNECT_FAILED_REASON_KINDS, chosen by prefix, never the detail.
+#:
+#: Why: requests' SSLError and ProxyError are ConnectionError subclasses, so TLS
+#: interception, a dead proxy, ECONNREFUSED and ECONNRESET all collapsed into one
+#: bare sentence and nobody could tell which (device 50, "[connect-failed]").
+#:
+#: Each prefix ends in ":" so no sub-kind is a prefix of another; all of them
+#: start with REASON_CONNECT_FAILED, so a plain startswith(REASON_CONNECT_FAILED)
+#: test keeps matching every one. sync_engine splices the table into
+#: _LOCAL_REASON_KINDS AHEAD of the bare REASON_CONNECT_FAILED entry, so the
+#: more specific prefix matches first.
+REASON_CONNECT_FAILED_PROXY = f"{REASON_CONNECT_FAILED} (proxy:"
+REASON_CONNECT_FAILED_SSL = f"{REASON_CONNECT_FAILED} (ssl:"
+REASON_CONNECT_FAILED_REFUSED = f"{REASON_CONNECT_FAILED} (refused:"
+REASON_CONNECT_FAILED_RESET = f"{REASON_CONNECT_FAILED} (reset:"
+REASON_CONNECT_FAILED_UNREACHABLE = f"{REASON_CONNECT_FAILED} (unreachable:"
+REASON_CONNECT_FAILED_OTHER = f"{REASON_CONNECT_FAILED} (other:"
+
+CONNECT_FAILED_REASON_KINDS: tuple[tuple[str, str], ...] = (
+    (REASON_CONNECT_FAILED_PROXY, "connect-failed:proxy"),
+    (REASON_CONNECT_FAILED_SSL, "connect-failed:ssl"),
+    (REASON_CONNECT_FAILED_REFUSED, "connect-failed:refused"),
+    (REASON_CONNECT_FAILED_RESET, "connect-failed:reset"),
+    (REASON_CONNECT_FAILED_UNREACHABLE, "connect-failed:unreachable"),
+    (REASON_CONNECT_FAILED_OTHER, "connect-failed:other"),
+)
 
 __all__ = [
     "BaseApiClient",
@@ -335,6 +371,144 @@ class _TransientError(Exception):
     def __init__(self, message: str, retry_after: Optional[float] = None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+# ---- Connect-failure classification -----------------------------------------
+#
+# ONE rule for "why did this requests.ConnectionError happen", used by
+# do_request's except branch. DNS stays first and stays NON-retryable (N8); the
+# rest are transient and named by a sub-kind from CONNECT_FAILED_REASON_KINDS.
+#
+# The detail is bounded on purpose: an errno integer, an OpenSSL reason CODE
+# (e.g. CERTIFICATE_VERIFY_FAILED, never its free-text verify_message, which
+# carries the certificate's host names), or an exception CLASS name. Never a
+# host, port, URL, header or body — str() of these exceptions carries the URL.
+
+
+def _errno_set(*names: str) -> frozenset:
+    # POSIX names plus the Winsock spellings, where the platform has them.
+    return frozenset(
+        getattr(errno, n) for n in names if isinstance(getattr(errno, n, None), int)
+    )
+
+
+_REFUSED_ERRNOS = _errno_set("ECONNREFUSED", "WSAECONNREFUSED")
+_RESET_ERRNOS = _errno_set("ECONNRESET", "WSAECONNRESET")
+_UNREACHABLE_ERRNOS = _errno_set(
+    "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN",
+    "WSAEHOSTUNREACH", "WSAENETUNREACH", "WSAENETDOWN",
+)
+_SSL_TYPES = (requests.exceptions.SSLError, urllib3.exceptions.SSLError, ssl.SSLError)
+_PROXY_TYPES = (requests.exceptions.ProxyError, urllib3.exceptions.ProxyError)
+_TOKEN_RE = re.compile(r"[^A-Za-z0-9_]")
+_MAX_TOKEN_CHARS = 48
+_MAX_CHAIN_NODES = 32
+
+
+def _bounded_token(value: str) -> str:
+    return _TOKEN_RE.sub("", value)[:_MAX_TOKEN_CHARS] or "unknown"
+
+
+def _exception_chain(exc: BaseException) -> list:
+    """Every exception reachable from exc, breadth-first, cycle-safe.
+
+    requests/urllib3 bury the real cause in different places: ``__cause__`` /
+    ``__context__``, MaxRetryError.reason, and exception ARGS
+    (ConnectionError(MaxRetryError), ProtocolError('...', ConnectionResetError)).
+    """
+    seen: set = set()
+    out: list = []
+    queue = [exc]
+    while queue and len(out) < _MAX_CHAIN_NODES:
+        node = queue.pop(0)
+        if not isinstance(node, BaseException) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        out.append(node)
+        queue.append(node.__cause__)
+        queue.append(node.__context__)
+        queue.append(getattr(node, "reason", None))
+        queue.extend(getattr(node, "args", ()) or ())
+    return out
+
+
+def _socket_detail(nodes: list) -> Optional[tuple[str, str]]:
+    """(prefix, detail) for the first socket-level cause, or None."""
+    for node in nodes:
+        if isinstance(node, _SSL_TYPES):
+            continue  # ssl.SSLError is an OSError whose errno is OpenSSL's
+        code = getattr(node, "errno", None) if isinstance(node, OSError) else None
+        if isinstance(node, ConnectionRefusedError) or code in _REFUSED_ERRNOS:
+            return REASON_CONNECT_FAILED_REFUSED, f"errno {code}"
+        if isinstance(node, ConnectionResetError) or code in _RESET_ERRNOS:
+            return REASON_CONNECT_FAILED_RESET, f"errno {code}"
+        if code in _UNREACHABLE_ERRNOS:
+            return REASON_CONNECT_FAILED_UNREACHABLE, f"errno {code}"
+    return None
+
+
+def _ssl_detail(nodes: list) -> Optional[str]:
+    ssl_nodes = [n for n in nodes if isinstance(n, _SSL_TYPES)]
+    if not ssl_nodes:
+        return None
+    for node in ssl_nodes:
+        reason = getattr(node, "reason", None)
+        if isinstance(node, ssl.SSLError) and isinstance(reason, str) and reason:
+            return _bounded_token(reason)
+    return _bounded_token(type(ssl_nodes[-1]).__name__)
+
+
+def _other_detail(nodes: list) -> str:
+    for node in nodes:
+        code = getattr(node, "errno", None) if isinstance(node, OSError) else None
+        if isinstance(code, int) and not isinstance(node, _SSL_TYPES):
+            return f"errno {code}"
+    return _bounded_token(type(nodes[-1]).__name__)
+
+
+def _strip_prefix(prefix: str) -> str:
+    # "Cannot connect to BetterFlow API (refused:" -> "refused"
+    return prefix[len(REASON_CONNECT_FAILED) + 2:-1]
+
+
+class ConnectFailure(NamedTuple):
+    retryable: bool
+    message: str
+
+
+def classify_connect_failure(exc: BaseException) -> ConnectFailure:
+    """Name the cause of a requests ConnectionError. See the block comment above.
+
+    Precedence, first match wins: DNS (non-retryable) > proxy > ssl > refused >
+    reset > unreachable > other. Proxy outranks the socket causes because a
+    proxy chain CONTAINS one (ProxyError <- NewConnectionError <-
+    ConnectionRefusedError) and the hop that failed is the proxy.
+    """
+    nodes = _exception_chain(exc)
+    for node in nodes:
+        if isinstance(node, socket.gaierror):
+            return ConnectFailure(False, f"{REASON_DNS_FAILED}: {node}")
+
+    if any(isinstance(n, _PROXY_TYPES) for n in nodes):
+        ssl_code = _ssl_detail(nodes)
+        sock = _socket_detail(nodes)
+        if ssl_code is not None:
+            inner = f"ssl {ssl_code}"
+        elif sock is not None:
+            inner = f"{_strip_prefix(sock[0])} {sock[1]}"
+        else:
+            inner = _other_detail(nodes)
+        return ConnectFailure(True, f"{REASON_CONNECT_FAILED_PROXY} {inner})")
+
+    ssl_code = _ssl_detail(nodes)
+    if ssl_code is not None:
+        return ConnectFailure(True, f"{REASON_CONNECT_FAILED_SSL} {ssl_code})")
+
+    sock = _socket_detail(nodes)
+    if sock is not None:
+        return ConnectFailure(True, f"{sock[0]} {sock[1]})")
+
+    return ConnectFailure(True, f"{REASON_CONNECT_FAILED_OTHER} {_other_detail(nodes)})")
 
 
 class BaseApiClient:
@@ -659,15 +833,12 @@ class BaseApiClient:
                     raise BetterFlowClientError("Invalid JSON in API response") from e
 
             except requests.exceptions.ConnectionError as e:
-                # DNS resolution failures are not retryable (N8)
-                cause = e.__cause__
-                while cause is not None:
-                    if isinstance(cause, socket.gaierror):
-                        raise BetterFlowClientError(
-                            f"{REASON_DNS_FAILED}: {cause}"
-                        ) from e
-                    cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
-                raise _TransientError(REASON_CONNECT_FAILED)
+                # DNS resolution failures are not retryable (N8); every other
+                # cause is transient and named (classify_connect_failure).
+                failure = classify_connect_failure(e)
+                if not failure.retryable:
+                    raise BetterFlowClientError(failure.message) from e
+                raise _TransientError(failure.message)
             except requests.exceptions.ChunkedEncodingError:
                 raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:
