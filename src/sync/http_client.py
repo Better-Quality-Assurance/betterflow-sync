@@ -11,7 +11,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import NamedTuple, Optional
+from typing import Optional
 from urllib.parse import urlparse
 
 import certifi
@@ -58,6 +58,7 @@ REASON_DECODING_FAILED = "Response body decoding failed"
 #: _LOCAL_REASON_KINDS AHEAD of the bare REASON_CONNECT_FAILED entry, so the
 #: more specific prefix matches first.
 REASON_CONNECT_FAILED_PROXY = f"{REASON_CONNECT_FAILED} (proxy:"
+REASON_CONNECT_FAILED_TIMEOUT = f"{REASON_CONNECT_FAILED} (timeout:"
 REASON_CONNECT_FAILED_SSL = f"{REASON_CONNECT_FAILED} (ssl:"
 REASON_CONNECT_FAILED_REFUSED = f"{REASON_CONNECT_FAILED} (refused:"
 REASON_CONNECT_FAILED_RESET = f"{REASON_CONNECT_FAILED} (reset:"
@@ -66,6 +67,7 @@ REASON_CONNECT_FAILED_OTHER = f"{REASON_CONNECT_FAILED} (other:"
 
 CONNECT_FAILED_REASON_KINDS: tuple[tuple[str, str], ...] = (
     (REASON_CONNECT_FAILED_PROXY, "connect-failed:proxy"),
+    (REASON_CONNECT_FAILED_TIMEOUT, "connect-failed:timeout"),
     (REASON_CONNECT_FAILED_SSL, "connect-failed:ssl"),
     (REASON_CONNECT_FAILED_REFUSED, "connect-failed:refused"),
     (REASON_CONNECT_FAILED_RESET, "connect-failed:reset"),
@@ -376,8 +378,19 @@ class _TransientError(Exception):
 # ---- Connect-failure classification -----------------------------------------
 #
 # ONE rule for "why did this requests.ConnectionError happen", used by
-# do_request's except branch. DNS stays first and stays NON-retryable (N8); the
-# rest are transient and named by a sub-kind from CONNECT_FAILED_REASON_KINDS.
+# do_request's except branch. Every cause is TRANSIENT (retried). DNS is named
+# first, as REASON_DNS_FAILED; the rest by a sub-kind from
+# CONNECT_FAILED_REASON_KINDS.
+#
+# DNS is retried on purpose. The old branch meant to make it non-retryable
+# (N8) by walking __cause__ for a socket.gaierror, but requests raises
+# ConnectionError(MaxRetryError) inside an except block WITHOUT `from`, so
+# __cause__ is None and the walk never ran: every real DNS failure on main was
+# retried and reported as "Cannot connect to BetterFlow API". That retry is
+# the behaviour the fleet has lived with (a resolver blip right after wake or
+# a network switch recovers on the next attempt), so naming DNS must not
+# change it. Only the label changes: "DNS resolution failed: errno N" / ops
+# `dns-failed`.
 #
 # The detail is bounded on purpose: an errno integer, an OpenSSL reason CODE
 # (e.g. CERTIFICATE_VERIFY_FAILED, never its free-text verify_message, which
@@ -471,44 +484,63 @@ def _strip_prefix(prefix: str) -> str:
     return prefix[len(REASON_CONNECT_FAILED) + 2:-1]
 
 
-class ConnectFailure(NamedTuple):
-    retryable: bool
-    message: str
+def _is_connect_timeout(nodes: list) -> bool:
+    # requests.ConnectTimeout subclasses BOTH ConnectionError and Timeout, so
+    # do_request's `except ConnectionError` catches it before `except Timeout`.
+    # urllib3's NewConnectionError SUBCLASSES ConnectTimeoutError, so a plain
+    # isinstance on ConnectTimeoutError would call every refused connect a
+    # timeout: exclude it, exactly as requests' own adapter does.
+    for node in nodes:
+        if isinstance(node, requests.exceptions.ConnectTimeout):
+            return True
+        if isinstance(node, urllib3.exceptions.ConnectTimeoutError) and not isinstance(
+            node, urllib3.exceptions.NewConnectionError
+        ):
+            return True
+    return False
 
 
-def classify_connect_failure(exc: BaseException) -> ConnectFailure:
-    """Name the cause of a requests ConnectionError. See the block comment above.
+def classify_connect_failure(exc: BaseException) -> str:
+    """The reason message for a requests ConnectionError. See the block comment above.
 
-    Precedence, first match wins: DNS (non-retryable) > proxy > ssl > refused >
-    reset > unreachable > other. Proxy outranks the socket causes because a
-    proxy chain CONTAINS one (ProxyError <- NewConnectionError <-
+    Precedence, first match wins: DNS > proxy > timeout > ssl > refused > reset
+    > unreachable > other. Proxy outranks the rest because a proxy chain
+    CONTAINS a socket cause (ProxyError <- NewConnectionError <-
     ConnectionRefusedError) and the hop that failed is the proxy.
     """
     nodes = _exception_chain(exc)
     for node in nodes:
         if isinstance(node, socket.gaierror):
-            return ConnectFailure(False, f"{REASON_DNS_FAILED}: {node}")
+            # errno only: str(gaierror) is resolver text, and errno is the part
+            # that says which failure (EAI_NONAME vs EAI_AGAIN) structurally.
+            code = node.errno if isinstance(node.errno, int) else "unknown"
+            return f"{REASON_DNS_FAILED}: errno {code}"
 
     if any(isinstance(n, _PROXY_TYPES) for n in nodes):
         ssl_code = _ssl_detail(nodes)
         sock = _socket_detail(nodes)
-        if ssl_code is not None:
+        if _is_connect_timeout(nodes):
+            inner = "timeout"
+        elif ssl_code is not None:
             inner = f"ssl {ssl_code}"
         elif sock is not None:
             inner = f"{_strip_prefix(sock[0])} {sock[1]}"
         else:
             inner = _other_detail(nodes)
-        return ConnectFailure(True, f"{REASON_CONNECT_FAILED_PROXY} {inner})")
+        return f"{REASON_CONNECT_FAILED_PROXY} {inner})"
+
+    if _is_connect_timeout(nodes):
+        return f"{REASON_CONNECT_FAILED_TIMEOUT} connect)"
 
     ssl_code = _ssl_detail(nodes)
     if ssl_code is not None:
-        return ConnectFailure(True, f"{REASON_CONNECT_FAILED_SSL} {ssl_code})")
+        return f"{REASON_CONNECT_FAILED_SSL} {ssl_code})"
 
     sock = _socket_detail(nodes)
     if sock is not None:
-        return ConnectFailure(True, f"{sock[0]} {sock[1]})")
+        return f"{sock[0]} {sock[1]})"
 
-    return ConnectFailure(True, f"{REASON_CONNECT_FAILED_OTHER} {_other_detail(nodes)})")
+    return f"{REASON_CONNECT_FAILED_OTHER} {_other_detail(nodes)})"
 
 
 class BaseApiClient:
@@ -833,12 +865,10 @@ class BaseApiClient:
                     raise BetterFlowClientError("Invalid JSON in API response") from e
 
             except requests.exceptions.ConnectionError as e:
-                # DNS resolution failures are not retryable (N8); every other
-                # cause is transient and named (classify_connect_failure).
-                failure = classify_connect_failure(e)
-                if not failure.retryable:
-                    raise BetterFlowClientError(failure.message) from e
-                raise _TransientError(failure.message)
+                # Every cause, DNS included, is transient and retried; only
+                # the name differs (classify_connect_failure says why DNS is
+                # retried).
+                raise _TransientError(classify_connect_failure(e))
             except requests.exceptions.ChunkedEncodingError:
                 raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:

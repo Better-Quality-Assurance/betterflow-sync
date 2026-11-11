@@ -309,44 +309,126 @@ def test_proxy_tls_failure_names_the_ssl_code_and_outranks_a_socket_errno():
     proxy_err = urllib3.exceptions.ProxyError(
         "Unable to connect to proxy", urllib3.exceptions.SSLError(ssl_err))
     exc = requests.exceptions.ProxyError(MaxRetryError(None, "/api", reason=proxy_err))
-    failure = _classify(exc)
-    assert failure.retryable
-    assert failure.message == \
-        f"{REASON_CONNECT_FAILED} (proxy: ssl CERTIFICATE_VERIFY_FAILED)", failure.message
-    assert local_reason_kinds([failure.message]) == ["connect-failed:proxy"]
+    message = _classify(exc)
+    assert message == f"{REASON_CONNECT_FAILED} (proxy: ssl CERTIFICATE_VERIFY_FAILED)", message
+    assert local_reason_kinds([message]) == ["connect-failed:proxy"]
+
+
+def test_a_proxy_connect_timeout_is_named_timeout_inside_the_proxy_branch():
+    # The timeout check sits inside the proxy branch too: a timed-out proxy hop
+    # must read as "proxy: timeout", not as its class name or a socket cause.
+    reason = urllib3.exceptions.ConnectTimeoutError(None, "Connection timed out")
+    proxy_err = urllib3.exceptions.ProxyError("Unable to connect to proxy", reason)
+    exc = requests.exceptions.ProxyError(MaxRetryError(None, "/api", reason=proxy_err))
+    message = _classify(exc)
+    assert message == f"{REASON_CONNECT_FAILED} (proxy: timeout)", message
+    assert local_reason_kinds([message]) == ["connect-failed:proxy"]
 
 
 def test_proxy_failure_with_no_socket_or_ssl_cause_names_its_class():
-    failure = _classify(
-        requests.exceptions.ProxyError("Cannot connect to proxy."))
-    assert failure.retryable
-    assert failure.message == f"{REASON_CONNECT_FAILED} (proxy: ProxyError)", failure.message
-    assert local_reason_kinds([failure.message]) == ["connect-failed:proxy"]
+    message = _classify(requests.exceptions.ProxyError("Cannot connect to proxy."))
+    assert message == f"{REASON_CONNECT_FAILED} (proxy: ProxyError)", message
+    assert local_reason_kinds([message]) == ["connect-failed:proxy"]
 
 
 def test_ssl_outranks_a_socket_errno_in_the_same_chain():
     ssl_err = _openssl_verify_error(ConnectionResetError(errno.ECONNRESET, "reset"))
     exc = requests.exceptions.SSLError(
         MaxRetryError(None, "/api", reason=urllib3.exceptions.SSLError(ssl_err)))
-    failure = _classify(exc)
-    assert failure.message == \
-        f"{REASON_CONNECT_FAILED} (ssl: CERTIFICATE_VERIFY_FAILED)", failure.message
-    assert local_reason_kinds([failure.message]) == ["connect-failed:ssl"]
+    message = _classify(exc)
+    assert message == f"{REASON_CONNECT_FAILED} (ssl: CERTIFICATE_VERIFY_FAILED)", message
+    assert local_reason_kinds([message]) == ["connect-failed:ssl"]
 
 
-# ---- CONTROLS (pass pre- and post-fix) ---------------------------------------
+# ---- Connect timeout ---------------------------------------------------------
+#
+# Not a real socket: a loopback listener with a full backlog still completes the
+# handshake on macOS (measured: 64 queued connects, then a ReadTimeout, not a
+# ConnectTimeout), and on Windows it answers with an RST. So the chain requests'
+# adapter raises for a connect timeout (ConnectTimeout <- MaxRetryError <-
+# urllib3 ConnectTimeoutError) is built from the real classes and driven
+# through the real client.
 
 
-def test_CONTROL_dns_failure_is_still_dns_and_still_not_retried():
-    err = requests.exceptions.ConnectionError("Max retries exceeded")
-    err.__cause__ = socket.gaierror(8, "nodename nor servname provided, or not known")
+def _connect_timeout_reason() -> str:
+    reason = urllib3.exceptions.ConnectTimeoutError(None, "Connection timed out")
+    err = requests.exceptions.ConnectTimeout(MaxRetryError(None, "/api", reason=reason))
     client = BetterFlowClient(api_url="https://bf.example.test/api", token="t", device_id="d")
     with responses.RequestsMock() as rsps:
         rsps.add(responses.POST, "https://bf.example.test/api/events/batch", body=err)
         with pytest.raises(BetterFlowClientError) as exc:
-            client._request("POST", "events/batch", data={"events": []})
-        assert len(rsps.calls) == 1  # DNS is not retried (N8)
-    assert local_reason_kinds([str(exc.value)]) == ["dns-failed"], str(exc.value)
+            client._request("POST", "events/batch", data={"events": []}, retry=False)
+    return str(exc.value)
+
+
+def test_a_connect_timeout_is_named_connect_failed_timeout():
+    # ConnectTimeout is a ConnectionError AND a Timeout; `except ConnectionError`
+    # catches it first, where it used to read as an anonymous connect failure.
+    reason = _connect_timeout_reason()
+    assert reason == f"{REASON_CONNECT_FAILED} (timeout: connect)", reason
+    assert local_reason_kinds([reason]) == ["connect-failed:timeout"], reason
+
+
+def test_a_refused_connect_is_not_mistaken_for_a_timeout():
+    # urllib3's NewConnectionError SUBCLASSES ConnectTimeoutError: a naive
+    # isinstance turns every refused connect into a timeout. Real socket.
+    reason, _ = _refused_reason()
+    assert local_reason_kinds([reason]) == ["connect-failed:refused"], reason
+
+
+# ---- DNS: a REAL lookup through the real client -------------------------------
+#
+# `.invalid` is reserved (RFC 6761): the resolver must answer NXDOMAIN, and no
+# request leaves the machine. The earlier version of this test hand-set
+# err.__cause__ = gaierror, a shape requests never produces (it raises
+# ConnectionError(MaxRetryError) inside an except block, without `from`), so it
+# passed on main and on a branch that changed real DNS behaviour.
+#
+# Main vs this branch, measured with this exact call: main makes 3 attempts and
+# says "Cannot connect to BetterFlow API"; a draft of this branch made 1 attempt
+# (non-retryable). The attempt-count assertion pins main's behaviour; the label
+# assertions pin the new name.
+
+_DNS_PROBE_HOST = "bf-dns-probe.invalid"
+
+
+def test_a_real_dns_failure_is_retried_like_main_and_named_dns_failed():
+    try:
+        socket.getaddrinfo(_DNS_PROBE_HOST, 443)
+    except socket.gaierror:
+        pass
+    else:
+        pytest.skip("this resolver answers for .invalid; cannot produce a DNS failure")
+    from src.sync.retry import RetryConfig
+
+    client = BetterFlowClient(api_url=f"https://{_DNS_PROBE_HOST}/api", token="t", device_id="d")
+    original = client._session.request
+    attempts = []
+
+    def counting_request(*args, **kwargs):
+        attempts.append(1)
+        return original(*args, **kwargs)
+
+    client._session.request = counting_request
+    try:
+        with pytest.raises(BetterFlowClientError) as exc:
+            client._request(
+                "POST", "events/batch", data={"events": []},
+                retry_config_override=RetryConfig(max_retries=2, base_delay=0.01,
+                                                  max_delay=0.01, jitter=False),
+            )
+    finally:
+        client.close()
+    reason = str(exc.value)
+    assert len(attempts) == 3, f"DNS must be retried as on main: {len(attempts)} attempt(s)"
+    assert exc.value.is_transient, reason
+    assert re.fullmatch(r"DNS resolution failed: errno -?\d+", reason), reason
+    assert _DNS_PROBE_HOST not in reason, reason
+    assert server_status_summary([reason]) == \
+        "; 1 local reason(s) [dns-failed] recorded in local dead-letter", reason
+
+
+# ---- CONTROLS (pass pre- and post-fix) ---------------------------------------
 
 
 def test_CONTROL_ops_tokens_never_carry_interpolated_text(tmp_path):
