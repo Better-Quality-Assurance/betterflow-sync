@@ -236,6 +236,7 @@ hiddenimports = [
     "autostart",
     "windows_tray",  # Windows 11 tray-icon promotion (best-effort, win-only)
     "error_reporter",  # Failure reporting to betterqa-bot logs channel
+    "native_crash_log",  # faulthandler dump to a file + next-launch report
     "_build_secrets",  # Generated at build time (baked DSN); gitignored
     "display_info",
     "reminders",

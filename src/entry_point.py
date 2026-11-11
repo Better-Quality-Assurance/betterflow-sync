@@ -71,6 +71,29 @@ else:
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
 
+# Re-point faulthandler from stderr to a file in the log dir. On a windowed
+# Windows build stderr is the null device (see _ensure_std_streams), so the
+# enable() above writes every native crash to nowhere: the agent just vanishes
+# (Sachi, 2026-11-11). main.py reports the previous run's dump on the next
+# launch. _native_crash_file must stay referenced for the life of the process:
+# faulthandler keeps only the descriptor, which closes if the object is freed.
+# Wrapped like the enable() above: a diagnostic aid must never break startup.
+# The --privacy-notice child is a throwaway Tk host the live agent spawns from
+# its own executable; it must never own the agent's crash file. (enable() also
+# refuses while another process holds the file, which covers a second launch
+# turned away as "already running".)
+_native_crash_file = None
+if "--privacy-notice" not in sys.argv[1:]:
+    try:
+        from config import Config as _Config
+        import native_crash_log as _native_crash_log
+
+        _native_crash_file = _native_crash_log.enable(_Config.get_log_dir())
+    except Exception as _e:
+        # Logging is not configured yet; stderr is the only channel (and is the
+        # null device on Windows, which is exactly the case the file is for).
+        sys.stderr.write(f"BetterFlow: native crash log unavailable: {_e}\n")
+
 # Warn if running directly from a DMG (macOS).  The mounted disk image
 # can be ejected while the app is running, which causes a SIGBUS crash
 # because the executable's memory-mapped code pages become invalid.
