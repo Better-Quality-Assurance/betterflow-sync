@@ -31,7 +31,7 @@ item 3 OUT of #271 and is retired here.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 from src.system_event_handler import SystemEventHandler
