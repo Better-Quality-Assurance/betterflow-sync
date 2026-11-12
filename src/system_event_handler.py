@@ -385,6 +385,10 @@ class SystemEventHandler:
         with self._pause_state_lock:
             start = self._display_off_start
             self._display_off_start = None
+            # The display is on again: a lock that took over this display-off
+            # is now an ordinary lock, so a later lid close must flush it
+            # rather than merge it into the sleep (review round 3).
+            self._lock_began_at_display_off = False
             user_paused = self._user_paused
             pre_private = self._pre_lock_private
             wake_instant = datetime.now(timezone.utc)
