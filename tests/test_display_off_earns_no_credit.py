@@ -494,3 +494,31 @@ def test_a_real_lock_before_the_display_off_still_stops_the_bridge():
 
     assert _lock_spans(handler) == [(_at(10, 0), _at(10, 0, 2)), (_at(12, 0), None)]
     handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 0, 2))
+
+
+def test_a_display_wake_ends_the_lid_close_merge_for_a_converted_lock():
+    """Review round 3. Idle from 08:55: display-off 09:00:00, lock :05,
+    display wake on the lock screen :20, lid close :40 (display-off) and
+    WillSleep :41, wake 09:30, unlock 09:30:10. The lock that took over the
+    09:00 display-off is a real lock in the gap by the time of the lid close
+    40s later: it must be flushed at the sleep, not merged into it (which
+    would let the server bridge 08:55-09:00 and read the lock as sleep)."""
+    handler = _make_handler()
+    patcher, clock = _clock(_at(9, 0))
+    with patcher:
+        handler.on_display_sleep()
+        clock.t = _at(9, 0, 5)
+        handler.on_screen_lock()
+        clock.t = _at(9, 0, 20)
+        handler.on_display_wake()
+        clock.t = _at(9, 0, 40)
+        handler.on_display_sleep()
+        clock.t = _at(9, 0, 41)
+        handler.on_system_sleep()
+        clock.t = _at(9, 30)
+        handler.on_system_wake()
+        clock.t = _at(9, 30, 10)
+        handler.on_screen_unlock()
+
+    assert _lock_spans(handler) == [(_at(9, 0), _at(9, 0, 41)), (_at(9, 30), None)]
+    assert handler.sync_engine.send_sleep_event.call_args_list == [((_at(9, 0, 41),),)]
