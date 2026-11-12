@@ -429,8 +429,11 @@ def test_display_off_then_sleep_just_past_the_window_still_uploads_the_span():
 
 
 def test_lock_seen_during_a_lid_close_still_reopens_at_wake():
-    """Lid close with password-on-sleep: display-off, lock, WillSleep within
-    the window. The lock is real, so the existing lock path owns it."""
+    """Lid close with password-on-sleep (the usual corporate setting):
+    display-off 10:00:00, lock 10:00:01, WillSleep 10:00:02. One suspend:
+    no lock_time before the sleep (it would cancel the server's sleep
+    bridge), the sleep starts at the display-off, and because the screen is
+    still locked the lock reopens at the wake and the unlock closes it."""
     handler = _make_handler()
     patcher, clock = _clock(_at(10, 0))
     with patcher:
@@ -439,9 +442,52 @@ def test_lock_seen_during_a_lid_close_still_reopens_at_wake():
         handler.on_screen_lock()
         clock.t = _at(10, 0, 2)
         handler.on_system_sleep()
+        assert _lock_spans(handler) == [], "nothing may be uploaded before the sleep"
         clock.t = _at(12, 0)
         handler.on_system_wake()
         clock.t = _at(12, 1)
         handler.on_screen_unlock()
 
-    assert _lock_spans(handler)[-1] == (_at(12, 0), None)
+    assert _lock_spans(handler) == [(_at(12, 0), None)]
+    handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 0))
+    handler.sync_engine.resume.assert_called_once()
+
+
+def test_lock_on_a_display_off_then_sleep_past_the_window_uploads_the_lock():
+    """Same shape, but the sleep comes 65s after the display-off: outside
+    the window, so this is a display-off, a lock, then a separate sleep."""
+    handler = _make_handler()
+    patcher, clock = _clock(_at(10, 0))
+    with patcher:
+        handler.on_display_sleep()
+        clock.t = _at(10, 0, 1)
+        handler.on_screen_lock()
+        clock.t = _at(10, 1, 5)
+        handler.on_system_sleep()
+        clock.t = _at(12, 0)
+        handler.on_system_wake()
+        clock.t = _at(12, 1)
+        handler.on_screen_unlock()
+
+    assert _lock_spans(handler) == [(_at(10, 0), _at(10, 1, 5)), (_at(12, 0), None)]
+    handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 1, 5))
+
+
+def test_a_real_lock_before_the_display_off_still_stops_the_bridge():
+    """Ctrl-Cmd-Q: a deliberate lock BEFORE the display-off is a real lock
+    in the gap, even with a sleep 2s later. Unchanged: flushed at the sleep."""
+    handler = _make_handler()
+    patcher, clock = _clock(_at(10, 0))
+    with patcher:
+        handler.on_screen_lock()
+        clock.t = _at(10, 0, 1)
+        handler.on_display_sleep()
+        clock.t = _at(10, 0, 2)
+        handler.on_system_sleep()
+        clock.t = _at(12, 0)
+        handler.on_system_wake()
+        clock.t = _at(12, 1)
+        handler.on_screen_unlock()
+
+    assert _lock_spans(handler) == [(_at(10, 0), _at(10, 0, 2)), (_at(12, 0), None)]
+    handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 0, 2))
