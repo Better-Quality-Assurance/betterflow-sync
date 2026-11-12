@@ -445,6 +445,15 @@ def _exception_chain(exc: BaseException) -> list:
     return out
 
 
+def _errno_or_class(node: BaseException, code) -> str:
+    # A node matched by CLASS can carry no errno: http.client.RemoteDisconnected
+    # is a ConnectionResetError built from a message alone (the peer closed
+    # before answering — a keep-alive dropped by a server or load balancer, or
+    # an RST the client read as EOF). Formatting that as "errno None" tells the
+    # reader nothing and looks like a bug; name the class instead.
+    return f"errno {code}" if isinstance(code, int) else _bounded_token(type(node).__name__)
+
+
 def _socket_detail(nodes: list) -> Optional[tuple[str, str]]:
     """(prefix, detail) for the first socket-level cause, or None."""
     for node in nodes:
@@ -452,9 +461,9 @@ def _socket_detail(nodes: list) -> Optional[tuple[str, str]]:
             continue  # ssl.SSLError is an OSError whose errno is OpenSSL's
         code = getattr(node, "errno", None) if isinstance(node, OSError) else None
         if isinstance(node, ConnectionRefusedError) or code in _REFUSED_ERRNOS:
-            return REASON_CONNECT_FAILED_REFUSED, f"errno {code}"
+            return REASON_CONNECT_FAILED_REFUSED, _errno_or_class(node, code)
         if isinstance(node, ConnectionResetError) or code in _RESET_ERRNOS:
-            return REASON_CONNECT_FAILED_RESET, f"errno {code}"
+            return REASON_CONNECT_FAILED_RESET, _errno_or_class(node, code)
         if code in _UNREACHABLE_ERRNOS:
             return REASON_CONNECT_FAILED_UNREACHABLE, f"errno {code}"
     return None

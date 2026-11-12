@@ -111,6 +111,48 @@ def _reset_reason() -> tuple[str, int]:
         srv.close()
 
 
+def _remote_close_reason() -> tuple[str, int]:
+    # The server reads the request and closes with a FIN, never answering: the
+    # keep-alive a server or load balancer drops. http.client raises
+    # RemoteDisconnected for it, a ConnectionResetError built WITHOUT an errno.
+    # On Linux a real RST (_reset_reason) is read this way too, ~1% of the time
+    # (21 of 2000 in python:3.11; main run 43171894746 hit it).
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def close_without_answer():
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        # Read the WHOLE request (headers, then Content-Length bytes of body)
+        # before closing: unread bytes would make close() send an RST instead.
+        buf = b""
+        with contextlib.suppress(OSError):
+            while b"\r\n\r\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            head, _, body = buf.partition(b"\r\n\r\n")
+            m = re.search(rb"(?im)^content-length:\s*(\d+)", head)
+            want = int(m.group(1)) if m else 0
+            while len(body) < want:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                body += chunk
+        conn.close()
+
+    t = threading.Thread(target=close_without_answer, daemon=True)
+    t.start()
+    try:
+        return _reason_at(f"http://127.0.0.1:{port}/api"), port
+    finally:
+        t.join(5)
+        srv.close()
+
+
 def _ssl_reason(tmp_path) -> tuple[str, int]:
     openssl = shutil.which("openssl")
     if openssl is None:
@@ -197,8 +239,20 @@ def test_refused_reason_names_the_errno_locally():
 
 def test_reset_reason_names_the_errno_locally():
     reason, port = _reset_reason()
-    assert re.fullmatch(re.escape(REASON_CONNECT_FAILED) + r" \(reset: errno \d+\)", reason), reason
+    # A real RST surfaces as ConnectionResetError(ECONNRESET) almost always,
+    # and on Linux occasionally as RemoteDisconnected (the client read EOF):
+    # both are real, and neither may print "errno None".
+    assert re.fullmatch(
+        re.escape(REASON_CONNECT_FAILED) + r" \(reset: (errno \d+|RemoteDisconnected)\)", reason
+    ), reason
     assert "127.0.0.1" not in reason and str(port) not in reason, reason
+
+
+def test_a_remote_close_without_an_answer_names_its_class_not_errno_none():
+    reason, port = _remote_close_reason()
+    assert reason == f"{REASON_CONNECT_FAILED} (reset: RemoteDisconnected)", reason
+    assert "127.0.0.1" not in reason and str(port) not in reason, reason
+    assert local_reason_kinds([reason]) == ["connect-failed:reset"], reason
 
 
 def test_ssl_reason_names_the_openssl_code_locally(tmp_path):
