@@ -2908,6 +2908,8 @@ class BetterFlowApp:
                 on_network_change=self._on_network_change,
                 on_screen_lock=self._on_screen_lock,
                 on_screen_unlock=self._on_screen_unlock,
+                on_display_sleep=self._on_display_sleep,
+                on_display_wake=self._on_display_wake,
                 reachability_host=api_host,
                 reachability_port=api_port,
             )
@@ -3875,6 +3877,23 @@ class BetterFlowApp:
     def _on_system_wake(self) -> None:
         if self._shutdown_event.is_set():
             return
+        self._before_wake()
+        self.sys_events.on_system_wake()
+
+    def _on_display_sleep(self) -> None:
+        if self._shutdown_event.is_set():
+            return
+        self.sys_events.on_display_sleep()
+
+    def _on_display_wake(self) -> None:
+        # A display wake may be the only wake a display-off gets (and, gate
+        # off, it runs the legacy wake path), so it gets the same pre-work.
+        if self._shutdown_event.is_set():
+            return
+        self._before_wake()
+        self.sys_events.on_display_wake()
+
+    def _before_wake(self) -> None:
         # Re-evaluate the window BEFORE anything else touches the trackers. A laptop
         # that slept at 21:00 (inside the window) and wakes at 23:00 (outside it)
         # would otherwise come back with every recorder running and keep them up
@@ -3883,7 +3902,6 @@ class BetterFlowApp:
         # A wake can land on the far side of a boundary the sleeping process
         # slept through — recompute the next edge from the new now().
         self.coordinator.arm_capture_boundary()
-        self.sys_events.on_system_wake()
 
     def _on_system_shutdown(self) -> None:
         # Teardown stops the recorders but not the process. A real logoff or

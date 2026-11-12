@@ -37,8 +37,13 @@ def start_system_event_listener(
     on_screen_unlock: Callable = None,  # fn() — screen unlocked
     reachability_host: str = "",  # Host to check for network reachability
     reachability_port: int = 443,  # Port to check for network reachability
+    on_display_sleep: Callable = None,  # fn() — macOS display turned off
+    on_display_wake: Callable = None,   # fn() — macOS display turned on
 ) -> None:
     """Start platform-specific system event listeners.
+
+    ``on_display_sleep``/``on_display_wake`` are macOS only. Without them the
+    display notifications share the sleep/wake callbacks, as before #273.
 
     All listeners run on daemon threads and die automatically on process exit.
     """
@@ -50,7 +55,10 @@ def start_system_event_listener(
         _safe_call(on_network_change, True)
         # Still start power/screen listeners, just skip network monitoring
         if _system == "Darwin":
-            _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
+            _start_macos_power_listener(
+                on_sleep, on_wake, on_shutdown,
+                on_display_sleep=on_display_sleep, on_display_wake=on_display_wake,
+            )
             if on_screen_lock or on_screen_unlock:
                 _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
         elif _system == "Windows":
@@ -60,7 +68,10 @@ def start_system_event_listener(
         return
 
     if _system == "Darwin":
-        _start_macos_power_listener(on_sleep, on_wake, on_shutdown)
+        _start_macos_power_listener(
+                on_sleep, on_wake, on_shutdown,
+                on_display_sleep=on_display_sleep, on_display_wake=on_display_wake,
+            )
         _start_macos_network_listener(on_network_change, host=host)
         if on_screen_lock or on_screen_unlock:
             _start_macos_screen_lock_listener(on_screen_lock, on_screen_unlock)
@@ -82,8 +93,16 @@ def _start_macos_power_listener(
     on_sleep: Callable,
     on_wake: Callable,
     on_shutdown: Callable,
+    on_display_sleep: Callable = None,
+    on_display_wake: Callable = None,
 ) -> None:
-    """Listen for macOS sleep/wake/shutdown via NSWorkspace notifications."""
+    """Listen for macOS sleep/wake/shutdown via NSWorkspace notifications.
+
+    With ``on_display_sleep``/``on_display_wake`` the ScreensDidSleep /
+    ScreensDidWake pair gets its own selectors and its own dedup flag, so a
+    WillSleep after a display-off still reaches ``on_sleep`` (#273). Without
+    them, all four share one deduped pair exactly as before.
+    """
     try:
         from AppKit import NSWorkspace
         from Foundation import NSObject
@@ -92,7 +111,8 @@ def _start_macos_power_listener(
         return
 
     # Deduplication flag — both ScreensDidSleep and WillSleep can fire
-    state = {"sleeping": False}
+    state = {"sleeping": False, "display_off": False}
+    split_display = on_display_sleep is not None or on_display_wake is not None
 
     class _PowerObserver(NSObject):
         def handleSleep_(self, notification):
@@ -106,6 +126,20 @@ def _start_macos_power_listener(
                 state["sleeping"] = False
                 logger.info("System wake detected on %s - resuming", threading.current_thread().name)
                 _safe_call(on_wake)
+
+        def handleDisplaySleep_(self, notification):
+            if not state["display_off"]:
+                state["display_off"] = True
+                logger.info("Display off detected on %s", threading.current_thread().name)
+                if on_display_sleep:
+                    _safe_call(on_display_sleep)
+
+        def handleDisplayWake_(self, notification):
+            if state["display_off"]:
+                state["display_off"] = False
+                logger.info("Display on detected on %s", threading.current_thread().name)
+                if on_display_wake:
+                    _safe_call(on_display_wake)
 
         def handleShutdown_(self, notification):
             logger.info("System shutdown detected")
@@ -121,7 +155,7 @@ def _start_macos_power_listener(
             "NSWorkspaceWillSleepNotification", None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleSleep:",
+            observer, "handleDisplaySleep:" if split_display else "handleSleep:",
             "NSWorkspaceScreensDidSleepNotification", None,
         )
 
@@ -131,7 +165,7 @@ def _start_macos_power_listener(
             "NSWorkspaceDidWakeNotification", None,
         )
         center.addObserver_selector_name_object_(
-            observer, "handleWake:",
+            observer, "handleDisplayWake:" if split_display else "handleWake:",
             "NSWorkspaceScreensDidWakeNotification", None,
         )
 
