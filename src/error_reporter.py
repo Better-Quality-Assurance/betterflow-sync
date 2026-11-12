@@ -26,11 +26,13 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import sys
 import threading
 import time
 import traceback
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -55,6 +57,80 @@ _MAX_STACK = 50_000
 # differing only past 128 would then group together with nothing local saying
 # why. Ours are short slugs; this is a guard, not a working limit.
 _MAX_FINGERPRINT = 128
+
+
+def _summary(exc: BaseException) -> str:
+    """sync_engine.ops_exception_summary, imported late (this module loads
+    first); if it cannot load, the class name alone, which is what it would
+    have emitted for an unclassified exception anyway."""
+    try:
+        try:
+            from .sync.sync_engine import ops_exception_summary
+        except ImportError:
+            from sync.sync_engine import ops_exception_summary
+        return ops_exception_summary(exc)
+    except Exception:  # noqa: BLE001 - a report must never fail over naming
+        return type(exc).__name__
+
+
+def _stack_without_messages(exc: BaseException) -> str:
+    """The traceback of ``exc`` and its causes, with every exception MESSAGE
+    replaced by _summary(). Frames (file, line, function, source line) are the
+    diagnosis; the message is where str(exc) leaks a URL's query string or a
+    server body, and traceback.format_exception prints it verbatim."""
+    chain: list = []
+    node: Optional[BaseException] = exc
+    while node is not None and all(node is not c for c in chain) and len(chain) < 16:
+        chain.append(node)
+        node = node.__cause__ or (None if node.__suppress_context__ else node.__context__)
+    parts: list = []
+    for i, e in enumerate(reversed(chain)):
+        if i:
+            parts.append("\nThe above exception led to the following one:\n\n")
+        parts.append("Traceback (most recent call last):\n")
+        parts.extend(traceback.format_tb(e.__traceback__))
+        parts.append(_summary(e) + "\n")
+    return "".join(parts)
+
+
+def _home_dirs() -> list:
+    """This user's home directory spellings, longest first. A directory of 3
+    characters or fewer (``/``, ``C:\\``) is never treated as a home: replacing
+    it would mangle every path."""
+    found = set()
+    for value in (str(Path.home()), os.environ.get("USERPROFILE"), os.environ.get("HOME")):
+        if value:
+            value = value.rstrip("/\\")
+            if len(value) > 3:
+                found.add(value)
+    return sorted(found, key=len, reverse=True)
+
+
+def strip_home(value: Any) -> Any:
+    """Replace this user's home directory with ``~`` in every string of
+    ``value`` (recursing into dicts, lists and tuples). Frame paths in a stack
+    or a faulthandler dump are ``C:\\Users\\<login>\\...`` / ``/Users/<login>/...``,
+    and the login is the person's name. Applied once, in _build_payload, so
+    every report gets it rather than whichever producer remembered."""
+    homes = _home_dirs()
+    if not homes:
+        return value
+    flags = re.IGNORECASE if sys.platform == "win32" else 0
+    # Not followed by a name character: home /Users/al must not eat /Users/alice.
+    pattern = re.compile(
+        "|".join(re.escape(h) for h in homes) + r"(?![\w.-])", flags
+    )
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, str):
+            return pattern.sub("~", v)
+        if isinstance(v, dict):
+            return {walk(k): walk(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return type(v)(walk(x) for x in v)
+        return v
+
+    return walk(value)
 
 
 class ErrorReporter:
@@ -273,12 +349,11 @@ class ErrorReporter:
             payload["fingerprint"] = fingerprint[:_MAX_FINGERPRINT]
 
         if exc is not None:
-            stack = "".join(
-                traceback.format_exception(type(exc), exc, exc.__traceback__)
-            )
-            payload["stack"] = stack[:_MAX_STACK]
+            payload["stack"] = _stack_without_messages(exc)[:_MAX_STACK]
 
-        return payload
+        # Last, over everything that leaves: the user's home path is the one
+        # identifier every frame path carries (see strip_home).
+        return strip_home(payload)
 
     def _post(self, payload: dict) -> None:
         """POST the report. Swallows all transport errors (logged, never raised)."""
@@ -328,7 +403,8 @@ def install_crash_hooks(reporter: ErrorReporter) -> Callable[[], None]:
         if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
             try:
                 reporter.capture(
-                    f"Unhandled exception: {exc_type.__name__}: {exc_value}",
+                    # Never str(exc_value): it can carry a URL's query string.
+                    f"Unhandled exception: {_summary(exc_value)}",
                     level="fatal",
                     exc=exc_value,
                     tags={"component": "uncaught"},
@@ -344,7 +420,7 @@ def install_crash_hooks(reporter: ErrorReporter) -> Callable[[], None]:
         ):
             try:
                 reporter.capture(
-                    f"Unhandled thread exception: {args.exc_type.__name__}: {args.exc_value}",
+                    f"Unhandled thread exception: {_summary(args.exc_value)}",
                     level="fatal",
                     exc=args.exc_value,
                     tags={
