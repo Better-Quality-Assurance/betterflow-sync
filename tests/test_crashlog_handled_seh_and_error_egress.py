@@ -29,6 +29,7 @@ that formats a proxy URL into a ConnectionError.
 from __future__ import annotations
 
 import faulthandler
+import os
 import sys
 import threading
 from pathlib import Path
@@ -67,9 +68,38 @@ def _handled_seh(fh) -> None:
     fh.flush()
 
 
+def _end_this_run(log_dir: Path) -> None:
+    """What the OS does when the owning process exits: every handle it held is
+    closed. The next launch is a NEW process, so it must not find this run's
+    crash-file handle (or its owner lock) still open. On Windows that matters:
+    a file Python opened is not shared for delete, so the next launch's rotate
+    (os.replace) fails while it is open, enable() returns None and nothing is
+    reported. That is a same-process artifact; a dead process holds nothing."""
+    fh = native_crash_log._owned_file
+    native_crash_log._owned_file = None
+    native_crash_log._settle_size = 0
+    if fh is not None and not fh.closed:
+        faulthandler.disable()
+        fh.close()
+    lock = native_crash_log._owner_locks.pop(str(Path(log_dir) / native_crash_log.LOCK_FILE), None)
+    if lock is not None:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # Unlock explicitly: Windows releases a closed handle's locks "when
+            # resources allow", not necessarily before the next enable().
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        lock.close()
+
+
 def _next_launch_report(log_dir: Path) -> Mock:
-    """The next process: take ownership, rotate, report what the last run left."""
-    native_crash_log.enable(log_dir)
+    """The previous process ends; the next one takes ownership, rotates, and
+    reports what the last run left."""
+    _end_this_run(log_dir)
+    # Fail loudly if the next launch could not take over: otherwise every
+    # "not reported" assertion below passes vacuously.
+    assert native_crash_log.enable(log_dir) is not None, "next launch could not take ownership"
     reporter = Mock()
     native_crash_log.report_previous(log_dir, reporter)
     return reporter
@@ -161,8 +191,10 @@ def test_truncation_does_not_leave_a_hole_before_the_next_dump(tmp_path):
     fh = native_crash_log.enable(tmp_path)
     _handled_seh(fh)
     assert native_crash_log.checkpoint(final=True) > 0
-    fh.write("Fatal Python error: Aborted\n")
-    fh.flush()
+    # Write the way faulthandler does: raw bytes on the descriptor. fh.write()
+    # would go through text mode and become "\r\n" on Windows, which
+    # faulthandler never produces.
+    os.write(fh.fileno(), b"Fatal Python error: Aborted\n")
     data = (tmp_path / CRASH_FILE).read_bytes()
     assert data == b"Fatal Python error: Aborted\n"
 
@@ -287,7 +319,9 @@ def test_excepthook_stack_frames_lose_the_home_prefix(monkeypatch):
             endpoint="https://e", dsn="d", release="t"
         )._build_payload("m", "fatal", e, None, None)
     assert str(home) not in payload["stack"]
-    assert "~/tests/test_crashlog_handled_seh_and_error_egress.py" in payload["stack"]
+    # Frame paths use the platform separator ("~\\tests\\..." on Windows).
+    expected = os.path.join("~", "tests", "test_crashlog_handled_seh_and_error_egress.py")
+    assert expected in payload["stack"]
 
 
 def test_a_longer_sibling_login_is_not_mangled(monkeypatch):
