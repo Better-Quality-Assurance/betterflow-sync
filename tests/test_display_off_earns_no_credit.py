@@ -412,13 +412,13 @@ def test_lid_close_display_off_then_sleep_2s_later_uploads_no_lock():
 
 
 def test_display_off_then_sleep_just_past_the_window_still_uploads_the_span():
-    from src.system_event_handler import DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS as n
+    from src.system_event_handler import DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS
 
     handler = _make_handler()
     patcher, clock = _clock(_at(10, 0))
     with patcher:
         handler.on_display_sleep()
-        sleep_at = _at(10, 0) + timedelta(seconds=n + 1)
+        sleep_at = _at(10, 0) + timedelta(seconds=DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS + 1)
         clock.t = sleep_at
         handler.on_system_sleep()
         clock.t = _at(12, 0)

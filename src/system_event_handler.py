@@ -12,6 +12,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# A display-off followed by a real system sleep within this many seconds is
+# ONE suspend (a lid close fires ScreensDidSleep a second or two before
+# WillSleep), not a display-off and then a sleep: the display-off span is
+# dropped and the sleep span starts at the display-off instant, exactly as
+# the legacy path reported it. Uploading those seconds as lock_time would put
+# a lock in the gap before the sleep start, and the server's sleep presence
+# bridge (AgentAnalyticsService::bridgeActivityToSleepStarts) would then
+# cancel the suspend's grace. 60 is the server's own SLEEP_ABUT_TOLERANCE_
+# SECONDS, the window it already treats as "the same suspend moment"; the
+# client's double-notification handling (listener dedup, keep-earliest sleep
+# start) has no time window of its own to reuse. A display-off from
+# inactivity that is followed by a sleep within a minute loses at most that
+# minute to the sleep's grace, which is today's behaviour for every display-off.
+DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS = 60
+
 
 class SystemEventHandler:
     """Routes system events (sleep, wake, lock, network) to appropriate actions.
@@ -161,8 +176,14 @@ class SystemEventHandler:
                 # difference: no real lock was seen, so nothing reopens at
                 # wake. The sleep that follows reports as sleep_time.
                 if self._display_off_start is not None:
-                    display_off_to_flush = self._display_off_start
+                    display_off_start = self._display_off_start
                     self._display_off_start = None
+                    held = (sleep_boundary - display_off_start).total_seconds()
+                    if held <= DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS:
+                        # One suspend (lid close): the sleep owns this time.
+                        self._sleep_start = display_off_start
+                    else:
+                        display_off_to_flush = display_off_start
             else:
                 logger.debug(
                     "on_system_sleep fired while a prior _sleep_start is still pending "
