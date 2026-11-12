@@ -450,7 +450,10 @@ def test_lock_seen_during_a_lid_close_still_reopens_at_wake():
 
     assert _lock_spans(handler) == [(_at(12, 0), None)]
     handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 0))
-    handler.sync_engine.resume.assert_called_once()
+    # Twice, as on main for any lock seen during a sleep: on_system_wake
+    # resumes (it does not consult _locked_while_asleep), then the unlock
+    # resumes again. Not changed by #273.
+    assert handler.sync_engine.resume.call_count == 2
 
 
 def test_lock_on_a_display_off_then_sleep_past_the_window_uploads_the_lock():

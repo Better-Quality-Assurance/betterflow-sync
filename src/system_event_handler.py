@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS = 60
 
 
+def _display_off_is_part_of_sleep(display_off_at: datetime, sleep_at: datetime) -> bool:
+    """True when a display-off at display_off_at and a sleep at sleep_at are
+    ONE suspend (a lid close), so the sleep owns the time from the display-off.
+
+    The single implementation of the rule: a bare display-off and a lock that
+    took over a display-off must classify the same timing identically.
+    """
+    return (sleep_at - display_off_at).total_seconds() <= DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS
+
+
 class SystemEventHandler:
     """Routes system events (sleep, wake, lock, network) to appropriate actions.
 
@@ -102,6 +112,12 @@ class SystemEventHandler:
         # Only a REAL screenIsLocked arriving while it is open turns it into a
         # lock span (backdated to the display-off), closed by the unlock.
         self._display_off_start: Optional[datetime] = None
+        # True while _lock_start is a display-off span that a real lock took
+        # over (on_screen_lock). A lid close with password-on-sleep fires
+        # display-off, lock, WillSleep within a second or two: _system_sleep
+        # then treats it as ONE suspend, like a bare display-off, instead of
+        # flushing a lock span that would cancel the server's sleep bridge.
+        self._lock_began_at_display_off = False
         # Gate off: a display-off is the legacy sleep it always was. The
         # macOS listener used to feed ScreensDidSleep and WillSleep into ONE
         # deduped callback; they are routed separately now, so this flag
@@ -169,17 +185,26 @@ class SystemEventHandler:
                 # below, for the same reason: a span must not silently run
                 # through a sleep it was never measuring.
                 if self._lock_start is not None:
-                    lock_start_to_flush = self._lock_start
+                    lock_start = self._lock_start
                     self._lock_start = None
                     self._locked_while_asleep = True
+                    if self._lock_began_at_display_off and _display_off_is_part_of_sleep(
+                        lock_start, sleep_boundary
+                    ):
+                        # Lid close with password-on-sleep: one suspend. The
+                        # sleep owns this time from the display-off; the
+                        # lock still reopens at wake (_locked_while_asleep).
+                        self._sleep_start = lock_start
+                    else:
+                        lock_start_to_flush = lock_start
+                self._lock_began_at_display_off = False
                 # Same split for a display-off span (#273), with one
                 # difference: no real lock was seen, so nothing reopens at
                 # wake. The sleep that follows reports as sleep_time.
                 if self._display_off_start is not None:
                     display_off_start = self._display_off_start
                     self._display_off_start = None
-                    held = (sleep_boundary - display_off_start).total_seconds()
-                    if held <= DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS:
+                    if _display_off_is_part_of_sleep(display_off_start, sleep_boundary):
                         # One suspend (lid close): the sleep owns this time.
                         self._sleep_start = display_off_start
                     else:
@@ -461,8 +486,10 @@ class SystemEventHandler:
                 # so nothing between display-off and unlock is credited.
                 self._lock_start = self._display_off_start
                 self._display_off_start = None
+                self._lock_began_at_display_off = True
             elif self._lock_start is None:
                 self._lock_start = datetime.now(timezone.utc)
+                self._lock_began_at_display_off = False
             else:
                 logger.debug(
                     "on_screen_lock fired while a prior _lock_start is still pending "
@@ -490,6 +517,7 @@ class SystemEventHandler:
             pre_lock_private = self._pre_lock_private
             lock_start = self._lock_start
             self._lock_start = None
+            self._lock_began_at_display_off = False
             # CRITICAL: an unlock is authoritative — it means the lock state
             # is OVER, full stop, even if on_system_wake hasn't run yet (the
             # lock/unlock and sleep/wake listeners are independent OS threads
