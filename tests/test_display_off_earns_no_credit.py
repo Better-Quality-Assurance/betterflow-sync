@@ -31,7 +31,7 @@ item 3 OUT of #271 and is retired here.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from src.system_event_handler import SystemEventHandler
@@ -385,3 +385,63 @@ def test_gate_turned_on_after_a_legacy_pair_still_closes_the_next_span():
 
     assert _lock_spans(handler) == [(_at(10, 0), _at(10, 2))]
     assert handler._display_off_start is None
+
+
+# -- lid close: ScreensDidSleep a moment before WillSleep (review round 1) ---
+
+
+def test_lid_close_display_off_then_sleep_2s_later_uploads_no_lock():
+    """A lid close fires ScreensDidSleep a second or two before WillSleep.
+    That is one suspend, not a display-off: uploading the 2s as lock_time
+    would make the server's sleep bridge see a lock in the gap and cancel
+    the suspend's presence grace. The sleep owns that time, from the
+    display-off instant, exactly as the legacy path reported it."""
+    handler = _make_handler()
+    patcher, clock = _clock(_at(10, 0))
+    with patcher:
+        handler.on_display_sleep()
+        clock.t = _at(10, 0, 2)
+        handler.on_system_sleep()
+        clock.t = _at(12, 0)
+        handler.on_system_wake()
+        handler.on_display_wake()
+
+    handler.sync_engine.send_lock_event.assert_not_called()
+    handler.sync_engine.send_sleep_event.assert_called_once_with(_at(10, 0))
+    handler.sync_engine.resume.assert_called_once()
+
+
+def test_display_off_then_sleep_just_past_the_window_still_uploads_the_span():
+    from src.system_event_handler import DISPLAY_OFF_IS_SLEEP_WITHIN_SECONDS as n
+
+    handler = _make_handler()
+    patcher, clock = _clock(_at(10, 0))
+    with patcher:
+        handler.on_display_sleep()
+        sleep_at = _at(10, 0) + timedelta(seconds=n + 1)
+        clock.t = sleep_at
+        handler.on_system_sleep()
+        clock.t = _at(12, 0)
+        handler.on_system_wake()
+
+    assert _lock_spans(handler) == [(_at(10, 0), sleep_at)]
+    handler.sync_engine.send_sleep_event.assert_called_once_with(sleep_at)
+
+
+def test_lock_seen_during_a_lid_close_still_reopens_at_wake():
+    """Lid close with password-on-sleep: display-off, lock, WillSleep within
+    the window. The lock is real, so the existing lock path owns it."""
+    handler = _make_handler()
+    patcher, clock = _clock(_at(10, 0))
+    with patcher:
+        handler.on_display_sleep()
+        clock.t = _at(10, 0, 1)
+        handler.on_screen_lock()
+        clock.t = _at(10, 0, 2)
+        handler.on_system_sleep()
+        clock.t = _at(12, 0)
+        handler.on_system_wake()
+        clock.t = _at(12, 1)
+        handler.on_screen_unlock()
+
+    assert _lock_spans(handler)[-1] == (_at(12, 0), None)
