@@ -26,6 +26,7 @@ try:
     from .aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from .config import Config, setup_logging
     from . import error_reporter
+    from . import native_crash_log
     from .browser_tracker import start_browser_tracker
     from .display_info import start_display_tracker
     from .hardware_serial import get_hardware_serial
@@ -63,6 +64,7 @@ except ImportError:
     from aw_manager import IDLE_BLIND_RESTART_THRESHOLD, AWManager
     from config import Config, setup_logging
     import error_reporter
+    import native_crash_log
     from browser_tracker import start_browser_tracker
     from display_info import start_display_tracker
     from hardware_serial import get_hardware_serial
@@ -2517,6 +2519,10 @@ class BetterFlowApp:
             context_provider=self._error_context,
         )
         error_reporter.install_crash_hooks(self.error_reporter)
+        # The excepthooks above never see a NATIVE crash; entry_point points
+        # faulthandler at a file for those, and the previous run's dump (if it
+        # died that way) is logged and reported here, once.
+        native_crash_log.report_previous(Config.get_log_dir(), self.error_reporter)
 
         # Sync coordinator (created before reminder manager so callback can be injected cleanly)
         self.coordinator = SyncCoordinator(
