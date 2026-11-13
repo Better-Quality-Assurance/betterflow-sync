@@ -117,8 +117,10 @@ def strip_home(value: Any) -> Any:
         return value
     flags = re.IGNORECASE if sys.platform == "win32" else 0
     # Not followed by a name character: home /Users/al must not eat /Users/alice.
+    # The group is load-bearing: without it the lookahead binds only to the LAST
+    # alternative, and which spelling is last depends on set (hash) order.
     pattern = re.compile(
-        "|".join(re.escape(h) for h in homes) + r"(?![\w.-])", flags
+        "(?:" + "|".join(re.escape(h) for h in homes) + r")(?![\w.-])", flags
     )
 
     def walk(v: Any) -> Any:

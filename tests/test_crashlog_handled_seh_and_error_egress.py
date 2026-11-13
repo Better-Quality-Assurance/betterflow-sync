@@ -330,6 +330,20 @@ def test_a_longer_sibling_login_is_not_mangled(monkeypatch):
     assert error_reporter.strip_home("/Users/alice/x /Users/al/y") == "/Users/alice/x ~/y"
 
 
+@pytest.mark.parametrize(
+    "homes",
+    [["/Users/al", "\\Users\\al"], ["\\Users\\al", "/Users/al"]],
+    ids=["slash-first", "backslash-first"],
+)
+def test_sibling_login_boundary_holds_for_every_home_spelling_order(monkeypatch, homes):
+    # Equal-length spellings of one home (Path.home() vs $HOME on Windows) come
+    # back from a set in hash order. The boundary lookahead must apply to EACH
+    # alternative, not just the last one in the pattern.
+    monkeypatch.setattr(error_reporter, "_home_dirs", lambda: list(homes))
+    assert error_reporter.strip_home("/Users/alice/x /Users/al/y") == "/Users/alice/x ~/y"
+    assert error_reporter.strip_home("\\Users\\alice\\x \\Users\\al\\y") == "\\Users\\alice\\x ~\\y"
+
+
 # --------------------------------------------------------------------------- #
 # (c) last_error never carries the URL's query string or proxy credentials    #
 # --------------------------------------------------------------------------- #
