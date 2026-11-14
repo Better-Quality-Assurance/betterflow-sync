@@ -5292,6 +5292,19 @@ class SyncEngine:
         return strip_home(tail.decode("utf-8")).encode("utf-8")
 
     @staticmethod
+    def _drop_partial_first_line(window: bytes, starts_on_line: bool) -> bytes:
+        """A tail window cut out of the middle of a file usually begins inside a
+        line. ``/Users/alice/x`` cut after 3 bytes reads ``ers/alice/x``, which
+        strip_home cannot recognise, so the login would be uploaded. Drop up to
+        and including the first newline unless the window provably starts on a
+        line. A window with no newline at all is one partial line: dropped whole
+        (fail closed)."""
+        if starts_on_line:
+            return window
+        nl = window.find(b"\n")
+        return b"" if nl < 0 else window[nl + 1 :]
+
+    @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
         """Return up to the last ``max_bytes`` of a log file as VALID UTF-8
         (matching the server's per-file tail cap). Returns ``None`` if it can't
@@ -5309,11 +5322,15 @@ class SyncEngine:
         try:
             size = path.stat().st_size
             with open(path, "rb") as f:
-                if size > max_bytes:
-                    f.seek(size - max_bytes)
+                # One byte before the window tells whether it starts on a line.
+                cut = size > max_bytes
+                if cut:
+                    f.seek(size - max_bytes - 1)
                 raw = f.read()
         except OSError:
             return None
+        if cut:
+            raw = SyncEngine._drop_partial_first_line(raw[1:], raw[:1] == b"\n")
         # Re-encode so the result is always valid UTF-8 the server can store.
         return raw.decode("utf-8", errors="replace").encode("utf-8")
 
@@ -5385,7 +5402,8 @@ class SyncEngine:
         if len(joined) > max_bytes:
             # Keep the NEWEST max_bytes — the same end the server keeps, so the
             # two agree instead of the server silently trimming the other one.
-            joined = joined[-max_bytes:]
+            on_line = joined[-max_bytes - 1 : -max_bytes] == b"\n"
+            joined = SyncEngine._drop_partial_first_line(joined[-max_bytes:], on_line)
             # A byte slice can land inside a multi-byte character. Drop leading
             # continuation bytes (0x80-0xBF) so the result stays valid UTF-8 —
             # one invalid byte makes the server's INSERT fail with MySQL 1366 and

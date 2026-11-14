@@ -102,3 +102,50 @@ def test_redaction_failure_uploads_nothing(tmp_path, monkeypatch):
     engine._send_heartbeat()
 
     bf.upload_logs.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Round 2 (I-B): a tail window that starts MID-path must not leak a fragment   #
+# --------------------------------------------------------------------------- #
+
+MAX = 512 * 1024
+
+
+def test_window_starting_mid_home_path_sends_no_login_fragment(tmp_path, monkeypatch):
+    # 524,299 bytes: the 512 KiB window starts 11 bytes in, 3 bytes into
+    # "/Users/alice/...", so the raw tail begins "ers/alice/..." which strip_home
+    # (which needs the whole "/Users/alice") cannot see.
+    monkeypatch.setattr(error_reporter, "_home_dirs", lambda: ["/Users/alice"])
+    head = b"12345678" + b"/Users/alice/src/app.py\n"
+    body = (CONTROL + "\n").encode()
+    pad = MAX + 11 - len(head)
+    content = head + body * (pad // len(body))
+    content += b"x" * (MAX + 11 - len(content) - 1) + b"\n"
+    assert len(content) == MAX + 11
+    assert content[11:].startswith(b"ers/alice/")
+    (tmp_path / "betterflow.log").write_bytes(content)
+    engine, bf = _engine(tmp_path)
+
+    engine._send_heartbeat()
+
+    sent = bf.upload_logs.call_args.args[0]
+    assert b"alice" not in sent
+    assert len(sent) <= MAX
+    # Not over-trimmed: the whole lines after the partial one are all there.
+    assert sent.count(CONTROL.encode()) >= (pad // len(body)) - 1
+
+
+@pytest.mark.parametrize("max_bytes", range(8, 60))
+def test_no_cut_point_of_the_tail_reads_leaves_a_login_fragment(tmp_path, max_bytes):
+    # Every possible window start, live file and rotated span alike.
+    live = tmp_path / "betterflow.log"
+    live.write_bytes(b"\xff\xfe junk\n  File \"/Users/alice/a.py\", line 1\nlast\n")
+    (tmp_path / "betterflow.log.1").write_bytes(b"old /Users/alice/b.py\nolder\n")
+    for tail in (
+        SyncEngine._read_log_tail(live, max_bytes),
+        SyncEngine._read_rotated_log_tail(live, max_bytes),
+    ):
+        # A whole "/Users/alice" is what strip_home removes; any "alice" left
+        # after that is a fragment it could not see.
+        text = tail.decode("utf-8").replace("/Users/alice", "~")
+        assert "alice" not in text, (max_bytes, text)
