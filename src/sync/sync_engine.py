@@ -5070,6 +5070,16 @@ class SyncEngine:
             return
         relaunch_tail = self._read_log_tail(log_dir / "self-update-relaunch.log")
         try:
+            # The same redaction crash reports get (error_reporter.strip_home):
+            # a raw tail carries /Users/<login>/..., the person's OS login.
+            # Fail closed: if it cannot be applied, nothing is uploaded.
+            log_tail = self._strip_home_from_log(log_tail)
+            relaunch_tail = self._strip_home_from_log(relaunch_tail)
+        except Exception as e:  # noqa: BLE001 - never ship an unredacted tail
+            logger.warning("logs_requested: could not redact home path: %s", type(e).__name__)
+            self._report_upload_failure("home-path redaction failed")
+            return
+        try:
             self.bf.upload_logs(log_tail, relaunch_tail)
             logger.info("Uploaded log tail on server request (%d bytes)", len(log_tail))
         except BetterFlowAuthError:
@@ -5266,6 +5276,20 @@ class SyncEngine:
             )
         except Exception:
             logger.debug("log-upload-failure report failed", exc_info=True)
+
+    @staticmethod
+    def _strip_home_from_log(tail: Optional[bytes]) -> Optional[bytes]:
+        """``error_reporter.strip_home`` over a log tail (bytes in, bytes out).
+        ``None``/``b""`` pass through. The tail is already valid UTF-8
+        (_read_log_tail normalises it) and the substitution only shrinks it."""
+        if not tail:
+            return tail
+        # Late import: error_reporter imports the sync package (a cycle at load).
+        try:
+            from ..error_reporter import strip_home
+        except ImportError:  # PyInstaller bundle (src/ is import root)
+            from error_reporter import strip_home
+        return strip_home(tail.decode("utf-8")).encode("utf-8")
 
     @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
