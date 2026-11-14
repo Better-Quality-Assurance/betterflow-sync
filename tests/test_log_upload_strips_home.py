@@ -52,12 +52,16 @@ def _engine(log_dir):
 def test_uploaded_log_tail_shows_home_as_tilde(tmp_path, monkeypatch, home, sep):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(home)))
     monkeypatch.setattr(error_reporter, "_home_dirs", lambda: [home])
+    # Two or more home-bearing lines per log, and two on one line: a strip_home
+    # that replaces only the first match (count=1) must turn this red.
     frame = f'  File "{home}{sep}src{sep}app.py", line 4, in run'
+    frame2 = f'  File "{home}{sep}src{sep}b.py", line 9, in go; also {home}{sep}c.py'
     (tmp_path / "betterflow.log").write_text(
-        f"{CONTROL}\n{frame}\n{CONTROL}\n", encoding="utf-8"
+        f"{CONTROL}\n{frame}\n{frame2}\n{CONTROL}\n", encoding="utf-8"
     )
     (tmp_path / "self-update-relaunch.log").write_text(
-        f"relaunch {home}{sep}AppData{sep}x\n{CONTROL}\n", encoding="utf-8"
+        f"relaunch {home}{sep}AppData{sep}x\nagain {home}{sep}AppData{sep}y\n{CONTROL}\n",
+        encoding="utf-8",
     )
     engine, bf = _engine(tmp_path)
 
@@ -68,11 +72,15 @@ def test_uploaded_log_tail_shows_home_as_tilde(tmp_path, monkeypatch, home, sep)
     text = log_tail.decode("utf-8")
     assert "alice" not in text
     assert f'  File "~{sep}src{sep}app.py", line 4, in run' in text
+    assert f'  File "~{sep}src{sep}b.py", line 9, in go; also ~{sep}c.py' in text
+    assert text.count("~") == 3  # every one of the 3 home occurrences redacted
     # A line with no home path is untouched.
     assert text.count(CONTROL) == 2
     rtext = relaunch_tail.decode("utf-8")
     assert "alice" not in rtext
     assert f"relaunch ~{sep}AppData{sep}x" in rtext
+    assert f"again ~{sep}AppData{sep}y" in rtext
+    assert rtext.count("~") == 2
     assert CONTROL in rtext
 
 
@@ -98,10 +106,16 @@ def test_redaction_failure_uploads_nothing(tmp_path, monkeypatch):
 
     monkeypatch.setattr(se, "strip_home", boom)
     engine, bf = _engine(tmp_path)
+    engine.error_reporter = Mock()
 
     engine._send_heartbeat()
 
     bf.upload_logs.assert_not_called()
+    # The admin's request must stay diagnosable: the failure is reported.
+    engine.error_reporter.capture.assert_called_once()
+    assert engine.error_reporter.capture.call_args.kwargs["context"] == {
+        "reason": "home-path redaction failed"
+    }
 
 
 # --------------------------------------------------------------------------- #
