@@ -163,3 +163,35 @@ def test_no_cut_point_of_the_tail_reads_leaves_a_login_fragment(tmp_path, max_by
         # after that is a fragment it could not see.
         text = tail.decode("utf-8").replace("/Users/alice", "~")
         assert "alice" not in text, (max_bytes, text)
+
+
+# --------------------------------------------------------------------------- #
+# Round 3: witnesses for the two partial-line drops                            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("max_bytes", range(39, 45))
+def test_rotated_final_cap_trim_drops_the_partial_line(tmp_path, monkeypatch, max_bytes):
+    # The live file is small, so the rotated file is read with the leftover
+    # budget; its three cp1252 bytes (\x97) become U+FFFD (3 bytes each), so the
+    # joined result overshoots max_bytes and the FINAL cap trim cuts it. For
+    # these budgets the cut lands inside "/Users/alice/b.py", and only the
+    # partial-line drop in that trim stops the tail beginning "rs/alice/b.py".
+    monkeypatch.setattr(error_reporter, "_home_dirs", lambda: ["/Users/alice"])
+    live = tmp_path / "betterflow.log"
+    live.write_bytes(b"live line\n")
+    (tmp_path / "betterflow.log.1").write_bytes(b"/Users/alice/b.py failed \x97\x97\x97\n")
+    tail = SyncEngine._read_rotated_log_tail(live, max_bytes)
+    assert len(tail) <= max_bytes
+    sent = SyncEngine._strip_home_from_log(tail).decode("utf-8")
+    assert "alice" not in sent and "rs/" not in sent, (max_bytes, sent)
+
+
+def test_window_with_no_newline_is_dropped_whole(tmp_path):
+    # One partial line and nothing else: "lice/very/..." is the login fragment
+    # strip_home cannot see, so the whole window must go (fail closed).
+    path = tmp_path / "betterflow.log"
+    path.write_bytes(b"0123/Users/alice/very/long/line/no/newline")
+    tail = SyncEngine._read_log_tail(path, 30)
+    assert b"lice" not in (tail or b"")
+    assert tail == b""
