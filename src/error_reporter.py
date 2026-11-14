@@ -106,6 +106,62 @@ def _home_dirs() -> list:
     return sorted(found, key=len, reverse=True)
 
 
+# One separator, however it was spelled on the way here: "/", "\\", the doubled
+# "\\\\" that repr() (so str(OSError)) produces, or the four that json.dumps of
+# that produces. A run is bounded to 8 and may only START after a non-backslash:
+# an unbounded ``\\+`` retried from every offset of a long backslash run is
+# quadratic (131,072 backslashes took 39 s), and strip_home runs over a 512 KB
+# log tail on the heartbeat thread. Limit: a run of 9+ backslashes between two
+# components of the home is not recognised (nothing produces one).
+_BS = r"(?<!\\)\\{%d,8}"
+_SEP = "(?:" + _BS % 1 + "|/)"
+
+
+_SHORT_INVALID = re.compile(r"[ .\"/\\\[\]:;=,+]")
+
+
+def _short_name_regex(login: str) -> str:
+    """The 8.3 short name Windows derives for ``login`` (Microsoft KB 142982):
+    spaces and invalid characters dropped, every period but the LAST dropped,
+    the part before the last period cut to 6 characters + ``~N``, the part
+    after it cut to 3. ``alice.wonderland`` -> ``ALICE~1.WON``,
+    ``john.smith`` -> ``JOHN~1.SMI``, ``administrator`` -> ``ADMINI~1``.
+    Matches ``~1``..``~9``. Not handled: the hash form Windows uses after ~4
+    collisions (``P310C~1.ZNO``), which cannot be derived from the name.
+    Returns "" when nothing is left to match."""
+    stem, dot, ext = login.rpartition(".")
+    if not dot:  # no period at all: rpartition puts the whole name in ext
+        stem, ext = ext, ""
+    stem = _SHORT_INVALID.sub("", stem)[:6]
+    ext = _SHORT_INVALID.sub("", ext)[:3]
+    if not stem:
+        return ""
+    return re.escape(stem) + "~[1-9]" + (re.escape("." + ext) if ext else "")
+
+
+def _home_regex(home: str) -> str:
+    """Regex source matching ``home`` in every spelling a log or traceback
+    carries: any separator run of 1-8 backslashes or a "/" (see _SEP), a UNC
+    admin share (``\\\\HOST\\C$\\Users\\alice``), and, for a login with a space or
+    a period or over 8 characters, the 8.3 short name Windows derives for it
+    (see _short_name_regex; the hash form is not covered). The short name is
+    derived from the documented rule and has not been checked on a real
+    Windows machine."""
+    parts = re.split(r"[\\/]+", home)
+    first = parts[0]
+    rest = [re.escape(p) for p in parts[1:]]
+    login = parts[-1]
+    if re.match(r"^[A-Za-z]:$", first):
+        head = f"(?:{re.escape(first)}|{_BS % 2}[^\\\\/\\s\"']+{_BS % 1}{re.escape(first[0])}\\$)"
+    else:
+        head = re.escape(first)  # "" for a POSIX home: the leading separator follows
+    if len(parts) > 1 and (len(login) > 8 or re.search(r"[ .]", login)):
+        short = _short_name_regex(login)
+        if short:
+            rest[-1] = f"(?:{rest[-1]}|{short})"
+    return head + "".join(_SEP + r for r in rest)
+
+
 def strip_home(value: Any) -> Any:
     """Replace this user's home directory with ``~`` in every string of
     ``value`` (recursing into dicts, lists and tuples). Frame paths in a stack
@@ -115,12 +171,13 @@ def strip_home(value: Any) -> Any:
     homes = _home_dirs()
     if not homes:
         return value
-    flags = re.IGNORECASE if sys.platform == "win32" else 0
+    # Windows and macOS (APFS) are case-insensitive: /users/alice is the same home.
+    flags = re.IGNORECASE if sys.platform in ("win32", "darwin") else 0
     # Not followed by a name character: home /Users/al must not eat /Users/alice.
     # The group is load-bearing: without it the lookahead binds only to the LAST
     # alternative, and which spelling is last depends on set (hash) order.
     pattern = re.compile(
-        "(?:" + "|".join(re.escape(h) for h in homes) + r")(?![\w.-])", flags
+        "(?:" + "|".join(_home_regex(h) for h in homes) + r")(?![\w.-])", flags
     )
 
     def walk(v: Any) -> Any:

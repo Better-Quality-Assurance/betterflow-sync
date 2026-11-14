@@ -680,9 +680,15 @@ class BetterFlowClient(BaseApiClient):
         success. Not retried here — if it fails the flag stays set and the next
         heartbeat re-attempts.
 
-        Privacy note: this is an admin-initiated diagnostic pull. The log can
-        contain app names, the device hostname (in bucket ids), and OS usernames
-        in stack-trace paths, and server RESPONSE text (which can echo a value the
+        Privacy note: this is an admin-initiated diagnostic pull. The caller
+        (SyncEngine._upload_requested_logs) redacts the home directory
+        (error_reporter.strip_home) in the spellings it recognises: plain,
+        doubled/JSON-escaped and forward-slash paths, UNC admin shares and the
+        derivable 8.3 short name. NOT covered: the login standing alone outside
+        a path, the hash-form 8.3 name Windows uses after ~4 collisions, and a
+        separator run of 9+ backslashes. The log can still
+        contain app names, the device hostname (in bucket ids), and server
+        RESPONSE text (which can echo a value the
         server rejected, including a window title) — but NOT auth tokens
         (those are never logged). Acceptable within the tenant-admin trust model.
         """

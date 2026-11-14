@@ -5070,6 +5070,16 @@ class SyncEngine:
             return
         relaunch_tail = self._read_log_tail(log_dir / "self-update-relaunch.log")
         try:
+            # The same redaction crash reports get (error_reporter.strip_home):
+            # a raw tail carries /Users/<login>/..., the person's OS login.
+            # Fail closed: if it cannot be applied, nothing is uploaded.
+            log_tail = self._strip_home_from_log(log_tail)
+            relaunch_tail = self._strip_home_from_log(relaunch_tail)
+        except Exception as e:  # noqa: BLE001 - never ship an unredacted tail
+            logger.warning("logs_requested: could not redact home path: %s", type(e).__name__)
+            self._report_upload_failure("home-path redaction failed")
+            return
+        try:
             self.bf.upload_logs(log_tail, relaunch_tail)
             logger.info("Uploaded log tail on server request (%d bytes)", len(log_tail))
         except BetterFlowAuthError:
@@ -5268,6 +5278,33 @@ class SyncEngine:
             logger.debug("log-upload-failure report failed", exc_info=True)
 
     @staticmethod
+    def _strip_home_from_log(tail: Optional[bytes]) -> Optional[bytes]:
+        """``error_reporter.strip_home`` over a log tail (bytes in, bytes out).
+        ``None``/``b""`` pass through. The tail is already valid UTF-8
+        (_read_log_tail normalises it) and the substitution only shrinks it."""
+        if not tail:
+            return tail
+        # Late import: error_reporter imports the sync package (a cycle at load).
+        try:
+            from ..error_reporter import strip_home
+        except ImportError:  # PyInstaller bundle (src/ is import root)
+            from error_reporter import strip_home
+        return strip_home(tail.decode("utf-8")).encode("utf-8")
+
+    @staticmethod
+    def _drop_partial_first_line(window: bytes, starts_on_line: bool) -> bytes:
+        """A tail window cut out of the middle of a file usually begins inside a
+        line. ``/Users/alice/x`` cut after 3 bytes reads ``ers/alice/x``, which
+        strip_home cannot recognise, so the login would be uploaded. Drop up to
+        and including the first newline unless the window provably starts on a
+        line. A window with no newline at all is one partial line: dropped whole
+        (fail closed)."""
+        if starts_on_line:
+            return window
+        nl = window.find(b"\n")
+        return b"" if nl < 0 else window[nl + 1 :]
+
+    @staticmethod
     def _read_log_tail(path, max_bytes: int = 512 * 1024) -> Optional[bytes]:
         """Return up to the last ``max_bytes`` of a log file as VALID UTF-8
         (matching the server's per-file tail cap). Returns ``None`` if it can't
@@ -5285,11 +5322,15 @@ class SyncEngine:
         try:
             size = path.stat().st_size
             with open(path, "rb") as f:
-                if size > max_bytes:
-                    f.seek(size - max_bytes)
+                # One byte before the window tells whether it starts on a line.
+                cut = size > max_bytes
+                if cut:
+                    f.seek(size - max_bytes - 1)
                 raw = f.read()
         except OSError:
             return None
+        if cut:
+            raw = SyncEngine._drop_partial_first_line(raw[1:], raw[:1] == b"\n")
         # Re-encode so the result is always valid UTF-8 the server can store.
         return raw.decode("utf-8", errors="replace").encode("utf-8")
 
@@ -5349,7 +5390,19 @@ class SyncEngine:
             # _read_log_tail already normalises each chunk to valid UTF-8, so the
             # concatenation is valid too. One invalid byte makes the server's
             # INSERT fail with MySQL 1366 and drops the whole upload silently.
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                size = 0
             part = SyncEngine._read_log_tail(candidate, remaining)
+            if size > remaining:
+                # This file alone filled the budget. _read_log_tail dropped its
+                # partial first line, so len(part) < remaining, but the older
+                # file must not backfill that gap: the live-file-only result
+                # stays byte-identical to _read_log_tail alone.
+                if part:
+                    chunks.append(part)
+                break
             if not part:
                 # None (unreadable) and b"" (empty) both just mean "nothing here";
                 # keep going, because one bad rotation must not cost us the rest.
@@ -5361,7 +5414,8 @@ class SyncEngine:
         if len(joined) > max_bytes:
             # Keep the NEWEST max_bytes — the same end the server keeps, so the
             # two agree instead of the server silently trimming the other one.
-            joined = joined[-max_bytes:]
+            on_line = joined[-max_bytes - 1 : -max_bytes] == b"\n"
+            joined = SyncEngine._drop_partial_first_line(joined[-max_bytes:], on_line)
             # A byte slice can land inside a multi-byte character. Drop leading
             # continuation bytes (0x80-0xBF) so the result stays valid UTF-8 —
             # one invalid byte makes the server's INSERT fail with MySQL 1366 and

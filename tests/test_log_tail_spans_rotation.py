@@ -61,12 +61,15 @@ def test_a_full_current_log_is_unchanged(tmp_path):
     already fills the budget the result must be byte-identical to reading it
     alone — otherwise this is a payload regression on every device."""
     _write(tmp_path / "betterflow.log.1", "OLD\n")
-    _write(tmp_path / "betterflow.log", "x" * 4096)
+    # Real lines: a window with no newline at all is one partial line, which the
+    # tail reader now drops whole (BW TASK-002506, fail closed).
+    _write(tmp_path / "betterflow.log", ("x" * 99 + "\n") * 41)
 
     spanning = SyncEngine._read_rotated_log_tail(tmp_path / "betterflow.log", max_bytes=1024)
     single = SyncEngine._read_log_tail(tmp_path / "betterflow.log", max_bytes=1024)
 
     assert spanning == single
+    assert spanning  # not vacuous: both are non-empty
     assert b"OLD" not in spanning
 
 
