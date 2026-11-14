@@ -681,8 +681,12 @@ class BetterFlowClient(BaseApiClient):
         heartbeat re-attempts.
 
         Privacy note: this is an admin-initiated diagnostic pull. The caller
-        (SyncEngine._upload_requested_logs) redacts the home directory, so the
-        OS login does not travel in stack-trace paths. The log can still
+        (SyncEngine._upload_requested_logs) redacts the home directory
+        (error_reporter.strip_home) in the spellings it recognises: plain,
+        doubled/JSON-escaped and forward-slash paths, UNC admin shares and the
+        derivable 8.3 short name. NOT covered: the login standing alone outside
+        a path, the hash-form 8.3 name Windows uses after ~4 collisions, and a
+        separator run of 9+ backslashes. The log can still
         contain app names, the device hostname (in bucket ids), and server
         RESPONSE text (which can echo a value the
         server rejected, including a window title) — but NOT auth tokens
