@@ -5390,7 +5390,19 @@ class SyncEngine:
             # _read_log_tail already normalises each chunk to valid UTF-8, so the
             # concatenation is valid too. One invalid byte makes the server's
             # INSERT fail with MySQL 1366 and drops the whole upload silently.
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                size = 0
             part = SyncEngine._read_log_tail(candidate, remaining)
+            if size > remaining:
+                # This file alone filled the budget. _read_log_tail dropped its
+                # partial first line, so len(part) < remaining, but the older
+                # file must not backfill that gap: the live-file-only result
+                # stays byte-identical to _read_log_tail alone.
+                if part:
+                    chunks.append(part)
+                break
             if not part:
                 # None (unreadable) and b"" (empty) both just mean "nothing here";
                 # keep going, because one bad rotation must not cost us the rest.
