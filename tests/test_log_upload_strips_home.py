@@ -195,3 +195,12 @@ def test_window_with_no_newline_is_dropped_whole(tmp_path):
     tail = SyncEngine._read_log_tail(path, 30)
     assert b"lice" not in (tail or b"")
     assert tail == b""
+
+
+def test_window_starting_exactly_on_a_line_keeps_that_line(tmp_path):
+    # The byte before the window is "\n", so the first line is whole and must
+    # be kept (dropping it would silently discard a line for nothing).
+    path = tmp_path / "betterflow.log"
+    path.write_bytes(b"older line\n/Users/alice/whole.py\n")
+    tail = SyncEngine._read_log_tail(path, len(b"/Users/alice/whole.py\n"))
+    assert tail == b"/Users/alice/whole.py\n"
