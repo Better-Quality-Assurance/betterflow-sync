@@ -57,11 +57,42 @@ def test_windows_spellings_redacted(win, sp):
     assert "AppData" in out
 
 
-def test_short_name_8_3(monkeypatch):
+# 8.3 short names. Fixtures follow the DOCUMENTED rule, not our implementation:
+# Microsoft KB 142982 "How Windows Generates 8.3 File Names from Long File
+# Names": delete spaces and invalid characters; drop every period but the last;
+# the part before the last period is cut to 6 characters + "~N"; the part after
+# it (the "extension") is cut to 3. The KB's own example is "This is a long
+# filename.789" -> THISIS~1.789, i.e. the extension survives. So:
+#   john.smith       -> JOHN~1.SMI   (stem "john", extension "smi")
+#   alice.wonderland -> ALICE~1.WON
+#   administrator    -> ADMINI~1     (no period: 6 chars, no extension)
+# UNVERIFIED on a real Windows box: these come from the KB text. Limit: after
+# ~4 collisions Windows 2000+ switches to a hash form (a public example:
+# p.znosko -> P310C~1.ZNO); that form is not derivable and is not handled.
+@pytest.mark.parametrize("login,short", [
+    ("john.smith", "JOHN~1.SMI"),
+    ("alice.wonderland", "ALICE~1.WON"),
+    ("administrator", "ADMINI~1"),
+    ("john smith", "JOHNSM~1"),
+    ("a.b.company", "AB~1.COM"),
+], ids=["john.smith", "alice.wonderland", "administrator", "space", "two-dots"])
+@pytest.mark.parametrize("n", [1, 4, 9])
+def test_short_name_8_3(monkeypatch, login, short, n):
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(error_reporter, "_home_dirs", lambda: ["C:\\Users\\" + login])
+    stem, _, ext = short.partition(".")
+    short_n = stem.replace("~1", f"~{n}") + ("." + ext if ext else "")
+    out = error_reporter.strip_home(f"C:\\Users\\{short_n}\\AppData\\x and C:\\Users\\{login}\\y")
+    assert out == "~\\AppData\\x and ~\\y"
+
+
+def test_wrong_short_names_are_not_matched(monkeypatch):
+    # The pre-fix derivation produced ALICEW~1 (dots removed, then 6 chars);
+    # Windows never generates that for alice.wonderland.
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(error_reporter, "_home_dirs", lambda: ["C:\\Users\\alice.wonderland"])
-    out = error_reporter.strip_home("C:\\Users\\ALICEW~1\\AppData\\x and C:\\Users\\alice.wonderland\\y")
-    assert out == "~\\AppData\\x and ~\\y"
+    s = "C:\\Users\\ALICEW~1\\x"
+    assert error_reporter.strip_home(s) == s
 
 
 def test_controls_untouched(win):

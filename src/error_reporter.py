@@ -117,12 +117,36 @@ _BS = r"(?<!\\)\\{%d,8}"
 _SEP = "(?:" + _BS % 1 + "|/)"
 
 
+_SHORT_INVALID = re.compile(r"[ .\"/\\\[\]:;=,+]")
+
+
+def _short_name_regex(login: str) -> str:
+    """The 8.3 short name Windows derives for ``login`` (Microsoft KB 142982):
+    spaces and invalid characters dropped, every period but the LAST dropped,
+    the part before the last period cut to 6 characters + ``~N``, the part
+    after it cut to 3. ``alice.wonderland`` -> ``ALICE~1.WON``,
+    ``john.smith`` -> ``JOHN~1.SMI``, ``administrator`` -> ``ADMINI~1``.
+    Matches ``~1``..``~9``. Not handled: the hash form Windows uses after ~4
+    collisions (``P310C~1.ZNO``), which cannot be derived from the name.
+    Returns "" when nothing is left to match."""
+    stem, dot, ext = login.rpartition(".")
+    if not dot:  # no period at all: rpartition puts the whole name in ext
+        stem, ext = ext, ""
+    stem = _SHORT_INVALID.sub("", stem)[:6]
+    ext = _SHORT_INVALID.sub("", ext)[:3]
+    if not stem:
+        return ""
+    return re.escape(stem) + "~[1-9]" + (re.escape("." + ext) if ext else "")
+
+
 def _home_regex(home: str) -> str:
     """Regex source matching ``home`` in every spelling a log or traceback
-    carries: any separator run (see _SEP), a UNC admin share
-    (``\\\\HOST\\C$\\Users\\alice``), and, on a long or dotted login, the
-    8.3 short name Windows derives (``ALICEW~1`` for ``alice.wonderland``: the
-    first six characters, dots and spaces dropped, then ``~N``)."""
+    carries: any separator run of 1-8 backslashes or a "/" (see _SEP), a UNC
+    admin share (``\\\\HOST\\C$\\Users\\alice``), and, for a login with a space or
+    a period or over 8 characters, the 8.3 short name Windows derives for it
+    (see _short_name_regex; the hash form is not covered). The short name is
+    derived from the documented rule and has not been checked on a real
+    Windows machine."""
     parts = re.split(r"[\\/]+", home)
     first = parts[0]
     rest = [re.escape(p) for p in parts[1:]]
@@ -132,9 +156,9 @@ def _home_regex(home: str) -> str:
     else:
         head = re.escape(first)  # "" for a POSIX home: the leading separator follows
     if len(parts) > 1 and (len(login) > 8 or re.search(r"[ .]", login)):
-        short = re.sub(r"[ .]", "", login)[:6]
+        short = _short_name_regex(login)
         if short:
-            rest[-1] = f"(?:{rest[-1]}|(?i:{re.escape(short)})~\\d+)"
+            rest[-1] = f"(?:{rest[-1]}|{short})"
     return head + "".join(_SEP + r for r in rest)
 
 
