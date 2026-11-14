@@ -680,9 +680,11 @@ class BetterFlowClient(BaseApiClient):
         success. Not retried here — if it fails the flag stays set and the next
         heartbeat re-attempts.
 
-        Privacy note: this is an admin-initiated diagnostic pull. The log can
-        contain app names, the device hostname (in bucket ids), and OS usernames
-        in stack-trace paths, and server RESPONSE text (which can echo a value the
+        Privacy note: this is an admin-initiated diagnostic pull. The caller
+        (SyncEngine._upload_requested_logs) redacts the home directory, so the
+        OS login does not travel in stack-trace paths. The log can still
+        contain app names, the device hostname (in bucket ids), and server
+        RESPONSE text (which can echo a value the
         server rejected, including a window title) — but NOT auth tokens
         (those are never logged). Acceptable within the tenant-admin trust model.
         """
