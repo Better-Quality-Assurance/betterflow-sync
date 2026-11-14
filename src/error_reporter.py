@@ -108,8 +108,13 @@ def _home_dirs() -> list:
 
 # One separator, however it was spelled on the way here: "/", "\\", the doubled
 # "\\\\" that repr() (so str(OSError)) produces, or the four that json.dumps of
-# that produces.
-_SEP = r"(?:\\+|/)"
+# that produces. A run is bounded to 8 and may only START after a non-backslash:
+# an unbounded ``\\+`` retried from every offset of a long backslash run is
+# quadratic (131,072 backslashes took 39 s), and strip_home runs over a 512 KB
+# log tail on the heartbeat thread. Limit: a run of 9+ backslashes between two
+# components of the home is not recognised (nothing produces one).
+_BS = r"(?<!\\)\\{%d,8}"
+_SEP = "(?:" + _BS % 1 + "|/)"
 
 
 def _home_regex(home: str) -> str:
@@ -123,7 +128,7 @@ def _home_regex(home: str) -> str:
     rest = [re.escape(p) for p in parts[1:]]
     login = parts[-1]
     if re.match(r"^[A-Za-z]:$", first):
-        head = f"(?:{re.escape(first)}|\\\\+[^\\\\/\\s\"']+\\\\+{re.escape(first[0])}\\$)"
+        head = f"(?:{re.escape(first)}|{_BS % 2}[^\\\\/\\s\"']+{_BS % 1}{re.escape(first[0])}\\$)"
     else:
         head = re.escape(first)  # "" for a POSIX home: the leading separator follows
     if len(parts) > 1 and (len(login) > 8 or re.search(r"[ .]", login)):
