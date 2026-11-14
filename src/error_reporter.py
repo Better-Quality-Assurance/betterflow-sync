@@ -106,6 +106,33 @@ def _home_dirs() -> list:
     return sorted(found, key=len, reverse=True)
 
 
+# One separator, however it was spelled on the way here: "/", "\\", the doubled
+# "\\\\" that repr() (so str(OSError)) produces, or the four that json.dumps of
+# that produces.
+_SEP = r"(?:\\+|/)"
+
+
+def _home_regex(home: str) -> str:
+    """Regex source matching ``home`` in every spelling a log or traceback
+    carries: any separator run (see _SEP), a UNC admin share
+    (``\\\\HOST\\C$\\Users\\alice``), and, on a long or dotted login, the
+    8.3 short name Windows derives (``ALICEW~1`` for ``alice.wonderland``: the
+    first six characters, dots and spaces dropped, then ``~N``)."""
+    parts = re.split(r"[\\/]+", home)
+    first = parts[0]
+    rest = [re.escape(p) for p in parts[1:]]
+    login = parts[-1]
+    if re.match(r"^[A-Za-z]:$", first):
+        head = f"(?:{re.escape(first)}|\\\\+[^\\\\/\\s\"']+\\\\+{re.escape(first[0])}\\$)"
+    else:
+        head = re.escape(first)  # "" for a POSIX home: the leading separator follows
+    if len(parts) > 1 and (len(login) > 8 or re.search(r"[ .]", login)):
+        short = re.sub(r"[ .]", "", login)[:6]
+        if short:
+            rest[-1] = f"(?:{rest[-1]}|(?i:{re.escape(short)})~\\d+)"
+    return head + "".join(_SEP + r for r in rest)
+
+
 def strip_home(value: Any) -> Any:
     """Replace this user's home directory with ``~`` in every string of
     ``value`` (recursing into dicts, lists and tuples). Frame paths in a stack
@@ -115,12 +142,13 @@ def strip_home(value: Any) -> Any:
     homes = _home_dirs()
     if not homes:
         return value
-    flags = re.IGNORECASE if sys.platform == "win32" else 0
+    # Windows and macOS (APFS) are case-insensitive: /users/alice is the same home.
+    flags = re.IGNORECASE if sys.platform in ("win32", "darwin") else 0
     # Not followed by a name character: home /Users/al must not eat /Users/alice.
     # The group is load-bearing: without it the lookahead binds only to the LAST
     # alternative, and which spelling is last depends on set (hash) order.
     pattern = re.compile(
-        "(?:" + "|".join(re.escape(h) for h in homes) + r")(?![\w.-])", flags
+        "(?:" + "|".join(_home_regex(h) for h in homes) + r")(?![\w.-])", flags
     )
 
     def walk(v: Any) -> Any:
