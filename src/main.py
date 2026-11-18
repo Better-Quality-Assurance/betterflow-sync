@@ -252,13 +252,46 @@ class _CyclePhase:
     the outcome report fires without the Timer having run yet (elapsed can
     cross the deadline before the Timer thread is scheduled) — that is
     reported honestly as unknown, never backfilled from `name`.
+
+    It also accumulates the seconds spent in each phase (`timings()`), because
+    `at_deadline` alone misleads on a marginal overrun: the deadline passes in
+    whatever stage FOLLOWS the slow one. 2026-11-17: "finished at 153.6s in
+    phase 'post_sync'", where post_sync does no network I/O on the success
+    path and the ~150s had gone earlier. Assigning `name` closes the previous
+    phase's interval. Only the cycle thread assigns `name` or calls
+    `timings()`; the watchdog Timer reads `name` alone.
     """
 
-    __slots__ = ("name", "at_deadline")
+    __slots__ = ("_name", "at_deadline", "_clock", "_entered_at", "_seconds")
 
-    def __init__(self) -> None:
-        self.name = "startup"
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._name = "startup"
+        self._entered_at = clock()
+        self._seconds: dict = {}
         self.at_deadline = None
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self._close_interval()
+        self._name = value
+
+    def _close_interval(self) -> None:
+        now = self._clock()
+        self._seconds[self._name] = self._seconds.get(self._name, 0.0) + (
+            now - self._entered_at
+        )
+        self._entered_at = now
+
+    def timings(self) -> dict:
+        """Seconds spent in each phase so far, rounded to 0.1s, in the order
+        the phases were first entered. Includes the current phase up to now."""
+        self._close_interval()
+        return {name: round(secs, 1) for name, secs in self._seconds.items()}
 
 
 class SyncCoordinator:
@@ -1735,6 +1768,16 @@ class SyncCoordinator:
         """
         return time.monotonic()
 
+    def _phase_clock(self) -> float:
+        """The clock _CyclePhase measures per-phase durations with.
+
+        A seam of its own, deliberately NOT _monotonic: the cycle-duration seam
+        is read exactly twice per cycle and tests pin that count, while the
+        phase box reads its clock on every phase change. Diagnostic only; the
+        banding and the deadline decision never read it.
+        """
+        return time.monotonic()
+
     def _do_sync(self) -> None:
         """Perform a sync cycle."""
         my_lock = self._acquire_sync_slot()
@@ -1775,7 +1818,7 @@ class SyncCoordinator:
         # Where the cycle is right now, for the watchdog and the cycle-end
         # outcome report. Per-cycle box, never an instance attribute — see
         # _CyclePhase.
-        phase = _CyclePhase()
+        phase = _CyclePhase(clock=self._phase_clock)
 
         def _watchdog():
             if watchdog_cancelled.is_set():
@@ -1993,6 +2036,7 @@ class SyncCoordinator:
                 phase.name,
                 forced_drain=bool(getattr(stats, "forced_drain", False))
                 or forced_drain_raised,
+                phase_seconds=phase.timings(),
             )
 
         # Heartbeat runs AFTER _sync_lock is released — no need to hold
@@ -2011,6 +2055,7 @@ class SyncCoordinator:
         phase_at_exit: str,
         *,
         forced_drain: bool = False,
+        phase_seconds: Optional[dict] = None,
     ) -> None:
         """Record how long a cycle that breached the deadline actually ran.
 
@@ -2049,6 +2094,13 @@ class SyncCoordinator:
         the Timer thread ran), report that honestly as "unknown" rather than
         silently falling back to phase_at_exit, which would misattribute the
         overrun to whichever stage happened to be running last.
+
+        phase_seconds (from _CyclePhase.timings()) answers what phase_at_deadline
+        cannot: where the time went. On a marginal overrun the deadline passes
+        in the stage after the slow one, so the message also names the slowest
+        phase and its seconds; the digest reads message + count only. The
+        message already carries the elapsed figure, so one more number adds no
+        rows the elapsed figure did not already split.
         """
         if elapsed < self._DO_SYNC_DEADLINE or self.error_reporter is None:
             return
@@ -2068,6 +2120,15 @@ class SyncCoordinator:
         else:
             detail = ""
             fingerprint = _overrun_fingerprint(elapsed, self._DO_SYNC_DEADLINE)
+        phase_seconds = dict(phase_seconds or {})
+        slowest_phase = (
+            max(phase_seconds, key=phase_seconds.get) if phase_seconds else None
+        )
+        slowest = (
+            f"; slowest phase '{slowest_phase}' ({phase_seconds[slowest_phase]:.1f}s)"
+            if slowest_phase is not None
+            else ""
+        )
         # capture() documents "never raises", but its final threading.Thread(...)
         # .start() is unguarded and can raise RuntimeError on a resource-starved
         # machine — exactly the machine that overruns its deadline. Unguarded,
@@ -2078,7 +2139,8 @@ class SyncCoordinator:
         try:
             self.error_reporter.capture(
                 f"Sync overran the {self._DO_SYNC_DEADLINE}s deadline — "
-                f"finished at {elapsed:.1f}s in phase '{headline_phase}'{detail}",
+                f"finished at {elapsed:.1f}s in phase '{headline_phase}'"
+                f"{slowest}{detail}",
                 level="warning",
                 tags={"component": "sync-watchdog"},
                 context={
@@ -2087,6 +2149,8 @@ class SyncCoordinator:
                     "phase_at_exit": phase_at_exit,
                     "deadline_seconds": self._DO_SYNC_DEADLINE,
                     "forced_drain": forced_drain,
+                    "phase_seconds": phase_seconds,
+                    "slowest_phase": slowest_phase,
                 },
                 fingerprint=fingerprint,
                 # The occurrence counter IS the measurement here — the digest
