@@ -91,6 +91,12 @@ class TestOverrunReportNamesTheSlowestPhase(CoordinatorHarness):
     def test_overrun_in_post_sync_after_a_slow_sync_blames_sync(self):
         clock = _StepClock()
         self.coord._phase_clock = clock
+        # The cycle DURATION is scripted too (two reads: start, end), as in
+        # tests/test_watchdog_overrun_outcome.py. On the real clock the Timer
+        # can fire with measured elapsed a hair under the deadline (Windows
+        # monotonic resolution is ~15ms), and then no outcome report is sent.
+        cycle_reads = iter([2_000_000_000.0, 2_000_000_000.0 + 0.4])
+        self.coord._monotonic = lambda: next(cycle_reads)
         fired = self.watchdog_signal()
 
         def _slow_sync(*_a, **_k):
