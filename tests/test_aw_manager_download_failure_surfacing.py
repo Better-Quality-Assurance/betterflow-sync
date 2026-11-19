@@ -24,7 +24,7 @@ def _failing_manager(
 ):
     mgr = AWManager(aw_port=5600)
     mgr.error_reporter = Mock()
-    monkeypatch.setattr(mgr, "_get_binaries_dir", lambda: None)
+    monkeypatch.setattr(mgr, "_get_binaries_dir", lambda **_kw: None)
     monkeypatch.setattr(mgr, "_port_in_use", lambda: port_in_use)
     # These tests predate the attach points asking /api/0/info (#246). They
     # stubbed the port alone because a held socket was all the code read, and
@@ -102,7 +102,7 @@ def test_flag_clears_when_binaries_resolve_without_download(monkeypatch, tmp_pat
     _join_report_threads()
     assert mgr.tracker_download_failed is True
 
-    monkeypatch.setattr(mgr, "_get_binaries_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(mgr, "_get_binaries_dir", lambda **_kw: str(tmp_path))
     monkeypatch.setattr(mgr, "_reap_orphan_processes", lambda *a, **k: None)
     monkeypatch.setattr(mgr, "_start_component", lambda *a, **k: True)
     monkeypatch.setattr(mgr, "_wait_for_server", lambda: True)

@@ -100,7 +100,7 @@ def test_missing_stamp_off_darwin_is_replaced_by_the_bundle(tmp_path):
         assert reason is not None, "a stamp-less install off macOS must be replaced"
         assert "stamp" in reason
 
-        assert _mgr()._get_binaries_dir() == installed
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
         for name in ALL_COMPONENTS:
             assert _read(installed, name).startswith(b"NEW-v0.14.0b4-"), (
                 f"{name} on disk is still the first install's binary"
@@ -122,7 +122,7 @@ def test_missing_stamp_on_windows_replaces_the_exe_tree(tmp_path):
     meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
     env = _enter(_resolver_env(meipass, installed, system="Windows", plat="windows"))
     try:
-        assert _mgr()._get_binaries_dir() == installed
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
         for name in ALL_COMPONENTS:
             assert _read(installed, name, ".exe").startswith(b"NEW-")
     finally:
@@ -191,8 +191,10 @@ def _running():
 
 
 def test_running_trackers_defer_the_replace_and_log_once(tmp_path, caplog):
-    """Windows cannot delete a running .exe: replacing a live tree failed on
-    every cycle. Deferred while ours run, done once they are stopped."""
+    """Replacing the tree under our own running trackers would leave them
+    running the OLD binaries from the retired copy (the rename does not fail on
+    Windows) under a stamp saying the new ones are installed. Deferred while
+    ours run, done once they are stopped."""
     installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
     meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
     env = _enter(_resolver_env(meipass, installed, system="Windows", plat="windows"))
@@ -204,13 +206,13 @@ def test_running_trackers_defer_the_replace_and_log_once(tmp_path, caplog):
              patch.object(AWManager, "_install_to_persistent", return_value=True) as install, \
              caplog.at_level(logging.INFO, logger="src.aw_manager"):
             for _ in range(5):
-                assert mgr._get_binaries_dir() == installed
+                assert mgr._get_binaries_dir(reinstall=True) == installed
             assert install.call_count == 0, "replaced a tree whose trackers are running"
             deferred = [r for r in caplog.records if "deferred" in r.getMessage()]
             assert len(deferred) == 1, f"deferral logged {len(deferred)} times"
 
             proc.poll.return_value = 0  # stopped
-            mgr._get_binaries_dir()
+            mgr._get_binaries_dir(reinstall=True)
             assert install.call_count == 1, "not replaced once the trackers stopped"
     finally:
         _exit(env)
@@ -228,14 +230,14 @@ def test_failed_replace_backs_off_instead_of_retrying_every_cycle(tmp_path, capl
              patch("src.aw_manager.time.monotonic", side_effect=lambda: clock[0]), \
              caplog.at_level(logging.ERROR, logger="src.aw_manager"):
             for _ in range(10):
-                mgr._get_binaries_dir()
+                mgr._get_binaries_dir(reinstall=True)
                 clock[0] += 30
             assert install.call_count == 1, f"retried {install.call_count} times in 5 min"
             errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
             assert len(errors) == 1
 
             clock[0] += 900  # past the retry interval
-            mgr._get_binaries_dir()
+            mgr._get_binaries_dir(reinstall=True)
             assert install.call_count == 2, "never retried after the backoff"
     finally:
         _exit(env)
@@ -267,8 +269,8 @@ def test_locked_live_tree_is_left_intact(tmp_path):
 
 
 def test_lock_after_the_first_swap_rolls_the_earlier_swaps_back(tmp_path):
-    """The server swaps fine, then a watcher dir is locked (an orphan .exe).
-    The tree must not be left half new / half old."""
+    """The server swaps fine, then a watcher dir is locked (antivirus or an
+    open handle). The tree must not be left half new / half old."""
     installed = _tree(tmp_path / "installed", b"OLD-")
     bundle = _tree(tmp_path / "bundle", b"NEW-")
     real_rename = os.rename
@@ -326,30 +328,41 @@ def test_copy_failure_midway_leaves_the_live_tree_and_a_clean_retry(tmp_path):
 # (6) Launch with OUR OWN leftover tracker still running from the old tree.
 #
 # The case the replace exists for on Windows: the previous instance crashed or
-# was killed, its bf-data-service (and maybe watchers) survived, and they hold
-# their .exe files open. Windows refuses to rename that tree, so before the fix
-# the launch-time replace failed on exactly the machines it targets, and
-# `_start_locked` attached to the old server as "external" and ran the stale
-# trackers for another session. The fix reaps processes whose EXECUTABLE lives
-# in the persistent install dir (never by name) before replacing.
+# was killed and its bf-data-service (and maybe watchers) survived. Renaming
+# their tree does NOT fail (measured on windows-latest, PR #320 job
+# 135563436656), so the swap "succeeds" around them: they keep running the OLD
+# binaries from the retired `.bf-old-*` copy and hold the port, `_start_locked`
+# attaches to that server as "external", and the stamp already says the replace
+# landed, so nothing retries. The fix reaps processes whose EXECUTABLE lives in
+# the persistent install dir (never by name) before replacing, and REFUSES the
+# replace (no swap, no stamp, retried after the backoff) when one survives.
 # --------------------------------------------------------------------------
 
 
 class _FakeProc:
-    """A psutil.Process stand-in. `alive` flips False on terminate/kill."""
+    """A psutil.Process stand-in. `alive` flips False on terminate/kill, unless
+    `stubborn` (it survives both, as a process we lack the rights to stop does).
+    `exe=None` models psutil's AccessDenied answer for the executable path."""
 
-    def __init__(self, pid: int, exe: str):
+    def __init__(self, pid: int, exe, name: str = "", stubborn: bool = False):
         self.pid = pid
-        self.info = {"pid": pid, "exe": exe}
+        if not name and exe:
+            name = os.path.basename(exe)
+        self.info = {"pid": pid, "exe": exe, "name": name}
         self.alive = True
         self.terminated = False
+        self.killed = False
+        self.stubborn = stubborn
 
     def terminate(self):
         self.terminated = True
-        self.alive = False
+        if not self.stubborn:
+            self.alive = False
 
     def kill(self):
-        self.alive = False
+        self.killed = True
+        if not self.stubborn:
+            self.alive = False
 
     def is_running(self):
         return self.alive
@@ -364,20 +377,6 @@ def _psutil_patches(procs):
         patch("psutil.process_iter", side_effect=lambda *a, **kw: list(procs)),
         patch("psutil.wait_procs", side_effect=wait_procs),
     ]
-
-
-def _locking_rename(holders):
-    """os.rename that refuses to move a component dir while a holder runs from it."""
-    real_rename = os.rename
-
-    def rename(src, dst):
-        base = os.path.basename(src)
-        for p in holders:
-            if p.alive and os.path.dirname(p.info["exe"]) == src:
-                raise PermissionError(32, f"The process cannot access the file ({base})")
-        return real_rename(src, dst)
-
-    return rename
 
 
 def test_leftover_server_holding_the_tree_is_reaped_so_the_replace_lands(tmp_path):
@@ -395,10 +394,9 @@ def test_leftover_server_holding_the_tree_is_reaped_so_the_replace_lands(tmp_pat
     env = _enter(
         _resolver_env(meipass, installed, system="Windows", plat="windows")
         + _psutil_patches([leftover, foreign, sibling])
-        + [patch("src.aw_manager.os.rename", side_effect=_locking_rename([leftover]))]
     )
     try:
-        assert _mgr()._get_binaries_dir() == installed
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
         assert leftover.terminated, "our own leftover tracker was not stopped"
         assert foreign.alive and not foreign.terminated, "reaped a process outside our install"
         assert sibling.alive and not sibling.terminated, (
@@ -406,7 +404,7 @@ def test_leftover_server_holding_the_tree_is_reaped_so_the_replace_lands(tmp_pat
         )
         for name in ALL_COMPONENTS:
             assert _read(installed, name, ".exe").startswith(b"NEW-"), (
-                f"{name} is still the old binary: the leftover held the tree"
+                f"{name} is still the old binary"
             )
         assert os.path.isfile(os.path.join(installed, STAMP))
     finally:
@@ -423,7 +421,6 @@ def test_launch_starts_our_own_server_after_reaping_the_leftover(tmp_path):
     env = _enter(
         _resolver_env(meipass, installed, system="Windows", plat="windows")
         + _psutil_patches([leftover])
-        + [patch("src.aw_manager.os.rename", side_effect=_locking_rename([leftover]))]
     )
     try:
         mgr = _mgr()
@@ -455,7 +452,7 @@ def test_darwin_reinstall_does_not_reap(tmp_path):
     try:
         with patch.object(AWManager, "_tracker_reinstall_reason", return_value="arch"), \
              patch.object(AWManager, "_install_to_persistent", return_value=True):
-            _mgr()._get_binaries_dir()
+            _mgr()._get_binaries_dir(reinstall=True)
         assert not leftover.terminated
     finally:
         _exit(env)
@@ -483,10 +480,178 @@ def test_force_restart_applies_a_pending_replace_after_the_reap(tmp_path):
         _exit(env)
 
 
+def test_reap_missed_holder_refuses_the_replace_and_retries_later(tmp_path):
+    """A leftover the reap cannot stop (it survives terminate + kill). The swap
+    would NOT fail around it (renaming a running .exe's tree is allowed), so
+    before the fix the replace "succeeded", the stamp was written, and launch
+    attached to the stale server now running from the retired `.bf-old-*`
+    copy. Since the stamp matched, nothing ever retried.
+
+    Fixed: no swap, no stamp, the reason stays pending, and once the holder is
+    gone (and the backoff has passed) the next launch lands the replace."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    bundle = os.path.join(meipass, "resources", "trackers", "windows")
+    server_exe = os.path.join(installed, "bf-data-service", "bf-data-service.exe")
+    holder = _FakeProc(4242, server_exe, stubborn=True)
+    clock = [1000.0]
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([holder])
+        + [patch("src.aw_manager.time.monotonic", side_effect=lambda: clock[0])]
+    )
+    try:
+        mgr = _mgr()
+        started = []
+        with patch.object(AWManager, "_port_in_use", side_effect=lambda self=None: holder.alive), \
+             patch.object(AWManager, "_rosetta_required", return_value=False), \
+             patch.object(AWManager, "_start_component",
+                          side_effect=lambda name, d: started.append((name, d)) or True), \
+             patch.object(AWManager, "_wait_for_server", return_value=True), \
+             patch.object(AWManager, "_server_responding", return_value=True), \
+             patch.object(AWManager, "_reap_orphan_processes"):
+            mgr._start_locked()
+            assert holder.terminated and holder.killed, "the reap never tried"
+            assert not os.path.exists(os.path.join(installed, STAMP)), (
+                "stamp written although a leftover still runs from the old tree: "
+                "the replace will never be retried"
+            )
+            retired = [e for e in os.listdir(installed) if ".bf-old-" in e]
+            assert retired == [], (
+                f"swapped around a running leftover; it now serves from {retired}"
+            )
+            # What we are attached to is the live install, not a retired copy.
+            assert os.path.isfile(server_exe)
+            assert _read(installed, awm.BF_SERVER, ".exe").startswith(b"OLD-")
+            assert AWManager._tracker_reinstall_reason(installed, bundle) is not None
+
+            # The holder finally exits; the next launch lands the replace.
+            holder.alive = False
+            clock[0] += awm.REINSTALL_RETRY_INTERVAL + 1
+            relaunched = _mgr()
+            relaunched._start_locked()
+        assert not relaunched._using_external
+        assert (awm.BF_SERVER, installed) in started
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"NEW-"), name
+        assert AWManager._tracker_reinstall_reason(installed, bundle) is None
+    finally:
+        _exit(env)
+
+
+def test_uninspectable_process_named_like_a_tracker_blocks_but_is_never_killed(tmp_path):
+    """psutil reports exe=None on AccessDenied. A process NAMED like one of our
+    components may be ours running from this tree: never killed (a name is not
+    proof), but the replace waits for it rather than stamping around it."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    hidden = _FakeProc(7070, None, name="bf-data-service.exe")
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([hidden])
+    )
+    try:
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
+        assert not hidden.terminated and not hidden.killed, "killed a process by NAME"
+        assert not os.path.exists(os.path.join(installed, STAMP))
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"OLD-"), name
+    finally:
+        _exit(env)
+
+
+def test_uninspectable_process_with_another_name_does_not_block(tmp_path):
+    """Control: every Windows host has AccessDenied processes (services, other
+    users). Counting those would block every replace forever."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    system_proc = _FakeProc(4, None, name="svchost.exe")
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([system_proc])
+    )
+    try:
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
+        assert not system_proc.terminated
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"NEW-"), name
+        assert os.path.isfile(os.path.join(installed, STAMP))
+    finally:
+        _exit(env)
+
+
+def test_mid_session_resolve_never_reaps_the_attached_external_server(tmp_path):
+    """Attached to an external server (not in `_processes`, so the
+    `_managed_tracker_running` guard cannot see it) that runs from the
+    persistent tree. A mid-session resolve (idle tracker stop/start,
+    restart_idle_tracker, the health loop, the AFK-timeout update) must not
+    reap it or replace the tree: nothing would re-probe the port, leaving
+    `_using_external` True on a dead server."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    external = _FakeProc(
+        4242, os.path.join(installed, "bf-data-service", "bf-data-service.exe")
+    )
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([external])
+    )
+    try:
+        mgr = _mgr()
+        mgr._using_external = True
+        mgr._processes = {}
+        with patch.object(AWManager, "_start_component", return_value=True), \
+             patch.object(AWManager, "_reap_orphan_processes"):
+            assert mgr._get_binaries_dir() == installed
+            mgr.restart_idle_tracker("blind")
+            with mgr._lifecycle_lock:
+                mgr._stop_idle_tracker_locked()
+        assert external.alive and not external.terminated, (
+            "a mid-session resolve killed the external server we are attached to"
+        )
+        assert mgr._using_external
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"OLD-"), name
+        assert not os.path.exists(os.path.join(installed, STAMP))
+    finally:
+        _exit(env)
+
+
+def test_windows_legacy_flat_exe_install_is_replaced(tmp_path):
+    """A Windows LEGACY FLAT install keeps `<name>.exe` directly in the install
+    dir. The swap removed only `<name>` (no extension), so the flat .exe
+    survived, `_resolve_binary_path` (flat first) kept spawning it, and the
+    stamp was written on top: the replace never took and never retried."""
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    for name in ALL_COMPONENTS:
+        (installed / (name + ".exe")).write_bytes(b"OLD-flat-" + name.encode())
+    installed = str(installed)
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    bundle = os.path.join(meipass, "resources", "trackers", "windows")
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([])
+    )
+    try:
+        assert _mgr()._get_binaries_dir(reinstall=True) == installed
+        for name in ALL_COMPONENTS:
+            resolved = awm._resolve_binary_path(installed, name)
+            assert resolved == os.path.join(installed, name, name + ".exe"), (
+                f"{name} still resolves to {resolved}"
+            )
+            with open(resolved, "rb") as fh:
+                assert fh.read().startswith(b"NEW-"), name
+        assert AWManager._tracker_reinstall_reason(installed, bundle) is None
+    finally:
+        _exit(env)
+
+
 # --------------------------------------------------------------------------
-# (7) REAL Windows: a real running .exe really locks its directory, and the
-# reap really releases it. Runs on the windows-latest PR leg
-# (windows-tests.yml); everything above models these semantics with fakes.
+# (7) REAL Windows: a real running .exe is reaped and the tree replaced. Runs
+# on the windows-latest PR leg (windows-tests.yml). It does NOT lock its
+# directory (that leg measured it), and the fakes above model exactly that:
+# os.rename is the real one, and only the reap's outcome gates the replace.
 # --------------------------------------------------------------------------
 
 
@@ -514,7 +679,7 @@ def test_real_windows_running_tracker_is_reaped_and_tree_replaced(tmp_path):
 
         env = _enter(_resolver_env(meipass, installed, system="Windows", plat="windows"))
         try:
-            assert _mgr()._get_binaries_dir() == installed
+            assert _mgr()._get_binaries_dir(reinstall=True) == installed
         finally:
             _exit(env)
 

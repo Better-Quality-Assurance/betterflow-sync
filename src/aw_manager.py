@@ -181,7 +181,8 @@ DOWNLOAD_RETRY_MAX_INTERVAL = 3600  # 1 hour
 BUNDLE_STAMP_FILE = ".bundle-stamp"
 # A reinstall that FAILED is not retried before this. The reason is recomputed
 # on every _get_binaries_dir call (several per 60s cycle), so without it a
-# replace that keeps failing (a tracker exe locked by a process we do not own)
+# replace that keeps failing (a leftover tracker the reap cannot stop, a tree
+# locked by antivirus)
 # logs the same ERROR every cycle for the life of the install.
 REINSTALL_RETRY_INTERVAL = 600.0  # 10 minutes
 
@@ -234,12 +235,26 @@ def _binaries_present(directory: str) -> bool:
     return all(_resolve_binary_path(directory, name) is not None for name in ALL_COMPONENTS)
 
 
+def _binary_ext() -> str:
+    return ".exe" if platform.system() == "Windows" else ""
+
+
+def _flat_binary_path(directory: str, name: str) -> str:
+    """The LEGACY FLAT launcher path for `name` (`<dir>/<name>[.exe]`).
+
+    The one definition of it: `_resolve_binary_path` prefers this path, and
+    the tracker swap must retire exactly this file, or the old launcher keeps
+    winning resolution under a stamp that says the new bundle is installed.
+    """
+    return os.path.join(directory, name + _binary_ext())
+
+
 def _resolve_binary_path(directory: str, name: str) -> Optional[str]:
     """Resolve component binary path (supports both flat and bundled layouts)."""
-    ext = ".exe" if platform.system() == "Windows" else ""
+    ext = _binary_ext()
 
     # Legacy flat layout: trackers/darwin/bf-window-tracker
-    flat = os.path.join(directory, name + ext)
+    flat = _flat_binary_path(directory, name)
     if os.path.isfile(flat):
         # On macOS, watcher binaries need adjacent runtime files in flat mode.
         if platform.system() == "Darwin" and name in BF_WATCHERS:
@@ -371,14 +386,36 @@ def _reap_processes_under_dir(install_dir: str, keep: set[int]) -> int:
     """Stop every process whose EXECUTABLE lives inside ``install_dir``.
 
     For the persistent tracker replace off macOS: a tracker left running from
-    that tree by a previous instance (crash, force-quit, Task Manager) holds
-    its .exe open, and Windows then refuses to rename the tree, so the replace
-    fails on exactly the machines it exists to heal. Matching on the resolved
-    executable path, never on a process name, means a same-named process from
-    any other install, user or product is never touched. PIDs in ``keep`` are
-    spared. Cross-platform via psutil (``_find_pids_by_path`` is pgrep-only and
-    returns nothing on Windows). Best-effort: returns how many were stopped,
-    and never raises.
+    that tree by a previous instance (crash, force-quit, Task Manager) does NOT
+    stop the swap. Measured on real windows-latest (PR #320, job 135563436656):
+    renaming the directory of a running .exe does not raise. What it does is
+    worse: the leftover keeps running the OLD binary from the retired
+    ``.bf-old-*`` copy and keeps holding the port, so ``_start_locked`` attaches
+    to it as "external" while the stamp already says the replace landed, and
+    nothing ever retries. So the reap's OUTCOME is what decides whether the
+    replace may proceed, and that is what this returns.
+
+    Matching on the resolved executable path, never on a process name, means a
+    same-named process from any other install, user or product is never
+    touched. PIDs in ``keep`` are spared. Cross-platform via psutil
+    (``_find_pids_by_path`` is pgrep-only and returns nothing on Windows).
+
+    Returns how many processes may STILL be running from ``install_dir``
+    afterwards (0 = the replace may proceed). Counted:
+
+    - a process that outlived terminate + wait + kill + wait;
+    - a process whose executable could not be read (psutil reports ``exe`` as
+      None on AccessDenied) but whose NAME is one of our components. It is
+      never killed (the name is not proof it is ours), but it may be ours, and
+      a wrong "proceed" here is the permanent stale attach above, whereas a
+      wrong "wait" only keeps the trackers already on disk for one more
+      backoff interval. Uninspectable processes with any other name are not
+      counted: every Windows host has some, and counting them would block
+      every replace forever;
+    - every candidate, when the scan or the wait itself failed (could not tell).
+
+    psutil missing returns 0: there is no way to look at all, and the build
+    without it predates this reap, so it keeps the old behaviour. Never raises.
     """
     try:
         import psutil
@@ -389,12 +426,21 @@ def _reap_processes_under_dir(install_dir: str, keep: set[int]) -> int:
         root = os.path.normcase(os.path.realpath(install_dir))
     except OSError:
         return 0
+    ours = {os.path.normcase(n) for n in ALL_COMPONENTS}
     victims = []
+    uninspectable = 0
     try:
-        for proc in psutil.process_iter(["pid", "exe"]):
+        for proc in psutil.process_iter(["pid", "exe", "name"]):
             info = getattr(proc, "info", None) or {}
             pid, exe = info.get("pid"), info.get("exe")
-            if not exe or pid is None or pid in keep:
+            if pid is None or pid in keep:
+                continue
+            if not exe:
+                name = os.path.normcase(str(info.get("name") or ""))
+                if name.endswith(".exe"):
+                    name = name[: -len(".exe")]
+                if name in ours:
+                    uninspectable += 1
                 continue
             try:
                 exe_norm = os.path.normcase(os.path.realpath(exe))
@@ -404,10 +450,18 @@ def _reap_processes_under_dir(install_dir: str, keep: set[int]) -> int:
             if inside:
                 victims.append(proc)
     except Exception:
-        logger.debug("process scan under %s failed", install_dir, exc_info=True)
-        return 0
+        logger.warning("Process scan under %s failed", install_dir, exc_info=True)
+        return max(1, len(victims) + uninspectable)
+    if uninspectable:
+        logger.warning(
+            "%d process(es) named like our trackers could not be inspected "
+            "(access denied); not stopping them, and not replacing %s while "
+            "they may be running from it",
+            uninspectable,
+            install_dir,
+        )
     if not victims:
-        return 0
+        return uninspectable
     for proc in victims:
         logger.warning(
             "Stopping leftover tracker PID %s running from %s before replacing it",
@@ -426,10 +480,17 @@ def _reap_processes_under_dir(install_dir: str, keep: set[int]) -> int:
             except Exception:
                 logger.debug("kill PID %s failed", proc.pid, exc_info=True)
         if alive:
-            psutil.wait_procs(alive, timeout=SHUTDOWN_TIMEOUT)
+            _, alive = psutil.wait_procs(alive, timeout=SHUTDOWN_TIMEOUT)
     except Exception:
-        logger.debug("waiting for reaped trackers failed", exc_info=True)
-    return len(victims)
+        logger.warning("Waiting for reaped trackers under %s failed", install_dir, exc_info=True)
+        return len(victims) + uninspectable
+    for proc in alive:
+        logger.warning(
+            "Leftover tracker PID %s is still running from %s after kill",
+            proc.pid,
+            install_dir,
+        )
+    return len(alive) + uninspectable
 
 
 def _terminate_pid(pid: int, grace: float = SHUTDOWN_TIMEOUT) -> None:
@@ -1413,7 +1474,7 @@ class AWManager:
         # and resolving afterwards would block that very machine on the trackers
         # it is about to stop having — capture dead forever on a device whose
         # whole fix is one directory copy away.
-        binaries_dir = self._get_binaries_dir()
+        binaries_dir = self._get_binaries_dir(reinstall=True)
 
         # AFTER the resolve above, not before it: off macOS a pending tracker
         # replace first stops our own leftover trackers still running from the
@@ -1825,7 +1886,7 @@ class AWManager:
             # watcher processes before the replace. On Windows that reap is a
             # no-op (_find_pids_by_path is pgrep-only); there the replace's own
             # _reap_processes_under_dir stops anything still running from the
-            # tree before it renames.
+            # tree, and refuses the replace if something survives.
             binaries_dir = self._get_binaries_dir(reinstall=False)
             if binaries_dir:
                 # Reap a hung server too — in external mode it isn't in
@@ -1833,7 +1894,7 @@ class AWManager:
                 for name in (BF_SERVER, *BF_WATCHERS):
                     self._reap_orphan_processes(name, binaries_dir)
             # Nothing of ours is running now: apply any pending reinstall.
-            self._get_binaries_dir()
+            self._get_binaries_dir(reinstall=True)
             # Drop external attachment so _start_locked starts our own server
             # if the port is now free after the reap.
             self._using_external = False
@@ -2792,12 +2853,28 @@ class AWManager:
             return age
         return self._get_latest_event_age("aw-watcher-afk")
 
-    def _get_binaries_dir(self, reinstall: bool = True) -> Optional[str]:
+    def _get_binaries_dir(self, reinstall: Optional[bool] = None) -> Optional[str]:
         """Resolve path to tracker binaries directory.
 
-        `reinstall=False` resolves an existing persistent install without
-        replacing it, for a caller that must first reap processes still
-        running from that tree (force_restart).
+        `reinstall=True` also applies a pending persistent-tracker replace,
+        which off macOS first STOPS every process running from that tree.
+        Off macOS only a caller that has just stopped the stack and re-probes
+        the port afterwards may pass it: `_start_locked` (launch, and every
+        rebuild, which probe the port after this resolve) and `force_restart`
+        (after `_stop_locked` + its own reap). Every other caller is
+        mid-session (idle tracker stop/start, restart_idle_tracker, the health
+        loop, the AFK-timeout update) and passes nothing, which off macOS
+        resolves only. A mid-session reap there could kill the EXTERNAL server
+        we are attached to (it is not in `_processes`, so
+        `_managed_tracker_running` cannot see it), leaving `_using_external`
+        True on a dead port with nothing to rebuild it. Off macOS a pending
+        replace is therefore retried only at the next start or force_restart.
+
+        The default (`None`) on macOS still reinstalls mid-session, as it
+        always has: there is no reap there, and its two reasons (a blind
+        tracker, a wrong-architecture one) are repairs that must not wait for
+        an app restart. `reinstall=False` never reinstalls (force_restart's
+        pre-reap resolve).
 
         Priority: persistent install dir > dev path > PyInstaller bundle.
         This order ensures that binaries with existing macOS Accessibility
@@ -2809,6 +2886,8 @@ class AWManager:
         is granted per-binary path) survives app updates.
         """
         plat = _get_platform_key()
+        if reinstall is None:
+            reinstall = platform.system() == "Darwin"
 
         # Persistent install directory (auto-downloaded, permissions survive updates)
         install_dir = _get_install_dir()
@@ -2865,19 +2944,25 @@ class AWManager:
         Two guards, both because _get_binaries_dir is re-entered several times
         a minute for the life of the process:
 
-        - **Off macOS, never while our trackers run.** Windows refuses to
-          delete or rename a running .exe, so replacing a live tree failed on
-          every cycle and logged "reinstall FAILED" forever. The replacement is
+        - **Off macOS, never while our trackers run.** Renaming the tree of a
+          running .exe does NOT fail on Windows (measured, windows-latest, PR
+          #320 job 135563436656), so a live replace would "succeed" while our
+          trackers kept running the OLD binaries from the retired copy, and
+          the stamp would then say the replace had landed. The replacement is
           deferred to the next moment nothing of ours is running: every
           _start_locked resolves binaries BEFORE spawning (app launch, which
           every update goes through) and force_restart stops the stack AND
-          reaps stray server/watcher processes before it asks for one.
-          macOS keeps its old behaviour (replace immediately): unlinking a
+          reaps stray server/watcher processes before it asks for one. Off
+          macOS only those two callers pass `reinstall=True` (see
+          _get_binaries_dir), so a failed or blocked replace is retried at
+          the next start or force_restart, never mid-session. macOS keeps its
+          old behaviour (replace immediately, on any resolve): unlinking a
           running binary is allowed there, and its two reasons are repairs for
           a tracker that is already blind or cannot start at all.
-        - **A failed attempt is not retried before REINSTALL_RETRY_INTERVAL**,
-          so a tree locked by a process we do not own (a stray tracker from a
-          previous instance) costs one ERROR per ten minutes, not one a cycle.
+        - **A failed or blocked attempt is not retried before
+          REINSTALL_RETRY_INTERVAL**, so a leftover tracker the reap could not
+          stop (or a tree locked by antivirus) costs one log line per ten
+          minutes, not one a cycle.
         """
         if platform.system() != "Darwin" and self._managed_tracker_running():
             if self._reinstall_deferred_reason != reason:
@@ -2897,17 +2982,42 @@ class AWManager:
         logger.warning("Reinstalling bundled trackers: %s.", reason)
         if platform.system() != "Darwin":
             # Nothing WE launched is running (checked above), but a previous
-            # instance's trackers may still be running from this tree and hold
-            # its .exe files: the launch after a crash, a force-quit or a
-            # Task Manager kill, i.e. the common Windows case. Stop them first,
-            # matched by executable path inside install_dir, never by name.
-            # _start_locked probes the port only AFTER this resolve, so it
-            # starts our own server instead of attaching to the one stopped
-            # here. Not on macOS: renaming a running binary is allowed there
-            # and its reinstall behaviour is unchanged.
+            # instance's trackers may still be running from this tree: the
+            # launch after a crash, a force-quit or a Task Manager kill, i.e.
+            # the common Windows case. Stop them first, matched by executable
+            # path inside install_dir, never by name. _start_locked probes the
+            # port only AFTER this resolve, so it starts our own server instead
+            # of attaching to the one stopped here. Not on macOS: its
+            # reinstall behaviour is unchanged.
             keep = {os.getpid()}
             keep.update(p.pid for p in self._processes.values() if p.poll() is None)
-            _reap_processes_under_dir(install_dir, keep)
+            survivors = _reap_processes_under_dir(install_dir, keep)
+            if survivors:
+                # The swap would NOT fail on this (renaming a running .exe's
+                # tree is allowed), so it is refused here instead: a survivor
+                # keeps running the old binary from the retired copy, holds
+                # the port, and _start_locked attaches to it as "external"
+                # under a stamp that says the replace landed, so nothing ever
+                # retries. Not replacing keeps the reason pending; the
+                # existing trackers stay in use and the backoff below spaces
+                # out the retry. Logged once per reason, not per attempt.
+                self._reinstall_failed_reason = reason
+                self._reinstall_failed_at = time.monotonic()
+                blocked_key = f"blocked: {reason}"
+                if self._reinstall_deferred_reason != blocked_key:
+                    logger.warning(
+                        "Tracker reinstall NOT done: %d leftover tracker process(es) "
+                        "may still be running from %s and could not be stopped. The "
+                        "existing trackers stay in use; retried the next time the "
+                        "trackers are started or restarted, no sooner than %d s from "
+                        "now. Reason it was attempted: %s.",
+                        survivors,
+                        install_dir,
+                        int(REINSTALL_RETRY_INTERVAL),
+                        reason,
+                    )
+                    self._reinstall_deferred_reason = blocked_key
+                return
         # Read the result: a silent failure here leaves the stale trackers in
         # place with nothing in the log saying the repair never landed.
         if self._install_to_persistent(base, install_dir):
@@ -2919,7 +3029,8 @@ class AWManager:
         self._reinstall_failed_at = time.monotonic()
         logger.error(
             "Tracker reinstall FAILED — the existing trackers stay in use and this "
-            "will be retried in %d s. Reason it was attempted: %s.",
+            "will be retried no sooner than %d s from now (off macOS: at the next "
+            "tracker start or restart). Reason it was attempted: %s.",
             int(REINSTALL_RETRY_INTERVAL),
             reason,
         )
@@ -3095,9 +3206,13 @@ class AWManager:
         staging dir (the slow, failure-prone part), and only then is each live
         dir renamed aside and the staged one renamed into place. A copy that
         fails therefore touches nothing live; deleting the live tree first and
-        copying second left a half-written tree whenever the copy died. On
-        Windows the rename of a dir holding a running .exe fails too, and that
-        leaves the old tree intact rather than gone.
+        copying second left a half-written tree whenever the copy died. A
+        rename that fails (a dir locked by antivirus or an open handle) leaves
+        the old tree intact rather than gone. A merely RUNNING .exe does not
+        make it fail (measured on windows-latest, PR #320 job 135563436656),
+        which is why the caller must stop every process running from the tree
+        first and refuse the replace if one survives
+        (_reinstall_persistent_locked).
 
         The bundle stamp is removed before the first swap and written only
         after the whole tree is in place, so an install interrupted between
@@ -3140,8 +3255,8 @@ class AWManager:
             try:
                 AWManager._swap_staged(install_dir, staged, retired, swapped)
             except OSError:
-                # Without this a failure on a LATER component (a watcher .exe
-                # locked by an orphan after the server already swapped) leaves
+                # Without this a failure on a LATER component (a watcher dir
+                # locked by antivirus after the server already swapped) leaves
                 # a tree that is half new, half old, and our trackers start
                 # from it.
                 AWManager._roll_back_swaps(swapped, retired)
@@ -3150,7 +3265,7 @@ class AWManager:
 
             for old in retired:
                 try:
-                    shutil.rmtree(old)
+                    AWManager._remove_retired(old)
                 except OSError as e:
                     # Inert (nothing resolves to a `.bf-old-*` dir) and swept
                     # by the next install; never a reason to fail this one.
@@ -3189,7 +3304,11 @@ class AWManager:
         for dst_subdir, old in reversed(swapped):
             aside = f"{dst_subdir}.bf-old-rollback-{os.getpid()}-{time.monotonic_ns()}"
             try:
-                os.rename(dst_subdir, aside)
+                # A retired Windows flat launcher has nothing at its live path
+                # (the new copy lives in the component dir), so only the old
+                # file is put back.
+                if os.path.lexists(dst_subdir):
+                    os.rename(dst_subdir, aside)
                 os.rename(old, dst_subdir)
                 retired.remove(old)
             except OSError as e:
@@ -3218,8 +3337,9 @@ class AWManager:
     ) -> None:
         """Rename each live component aside and its staged copy into place.
 
-        Records every retired old dir in `retired` and every completed swap
-        that has an old dir to restore in `swapped`. On the first failure it
+        Records every retired old dir (and retired Windows flat launcher) in
+        `retired` and every completed swap that has an old entry to restore
+        in `swapped`. On the first failure it
         puts THAT component's live tree back and raises; the caller rolls
         back the earlier ones.
         """
@@ -3260,6 +3380,32 @@ class AWManager:
                 raise
             if old is not None:
                 swapped.append((dst_subdir, old))
+            flat = _flat_binary_path(install_dir, name)
+            if flat != dst_subdir and os.path.isfile(flat):
+                # The Windows LEGACY FLAT launcher is `<name>.exe`, not
+                # `<name>`, so the branch above never sees it and it would
+                # survive the swap. _resolve_binary_path checks the flat path
+                # FIRST, so that old .exe would keep being the one spawned
+                # while the stamp says this bundle is installed: the replace
+                # would never take and never retry. Retired only AFTER the new
+                # tree is in place, and RENAMED aside rather than deleted, with
+                # the rename recorded in `swapped`: if a LATER component fails,
+                # the rollback puts this launcher back, so every component
+                # keeps resolving to its old flat binary instead of this one
+                # switching to the new tree while the rest stay old.
+                aside = f"{flat}.bf-old-{os.getpid()}-{time.monotonic_ns()}"
+                os.rename(flat, aside)
+                retired.append(aside)
+                swapped.append((flat, aside))
+
+    @staticmethod
+    def _remove_retired(path: str) -> None:
+        """Remove a retired `.bf-old-*` entry: a component dir, or a Windows
+        flat launcher FILE retired by `_swap_staged`. Raises OSError."""
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
 
     @staticmethod
     def _sweep_install_leftovers(install_dir: str) -> None:
@@ -3281,6 +3427,6 @@ class AWManager:
                 shutil.rmtree(path)  # must succeed, or the copy below fails
             elif ".bf-old-" in entry:
                 try:
-                    shutil.rmtree(path)
+                    AWManager._remove_retired(path)
                 except OSError as e:
                     logger.warning("Could not remove retired tracker dir %s: %s", path, e)
