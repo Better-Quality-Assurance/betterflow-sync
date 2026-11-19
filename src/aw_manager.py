@@ -340,8 +340,11 @@ def _find_pids_by_path(binary_path: str) -> list[int]:
 
     Path-scoped on purpose: matching the full install path (not the bare name)
     means we never touch an unrelated process that merely shares a name. Unix
-    only — the Windows updater replaces files via a batch script rather than an
-    orphaning ``os._exit``, so there is no orphan to reap there.
+    only (pgrep), so ``_reap_orphan_processes`` is a NO-OP on Windows. Windows
+    does get orphans (a crashed or force-quit instance leaves its trackers
+    running); the only reap that reaches them today is
+    ``_reap_processes_under_dir``, and only ahead of a persistent-tracker
+    replace. Two reap primitives with different coverage is known debt.
     """
     if platform.system() not in ("Darwin", "Linux"):
         return []
@@ -1817,10 +1820,12 @@ class AWManager:
                 return False
             logger.warning("Force-restarting tracker stack (%s)", reason or "unspecified")
             self._stop_locked()
-            # Resolve WITHOUT reinstalling first: a pending tracker replace
-            # must not run while the hung server / stray watchers below still
-            # hold their .exe files (Windows refuses the rename, which would
-            # start the retry backoff on exactly the restart meant to heal).
+            # Resolve WITHOUT reinstalling first, reap, then apply any pending
+            # replace. On macOS/Linux the pgrep reap below clears stray server/
+            # watcher processes before the replace. On Windows that reap is a
+            # no-op (_find_pids_by_path is pgrep-only); there the replace's own
+            # _reap_processes_under_dir stops anything still running from the
+            # tree before it renames.
             binaries_dir = self._get_binaries_dir(reinstall=False)
             if binaries_dir:
                 # Reap a hung server too — in external mode it isn't in

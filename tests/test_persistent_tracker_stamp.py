@@ -386,15 +386,23 @@ def test_leftover_server_holding_the_tree_is_reaped_so_the_replace_lands(tmp_pat
     # Same NAME, different install: must never be touched (path-scoped, not by name).
     foreign_dir = tmp_path / "someone-else" / "bf-data-service"
     foreign = _FakeProc(5151, str(foreign_dir / "bf-data-service.exe"))
+    # A sibling dir sharing the install dir's PREFIX (`windows2` next to
+    # `windows`): a string-prefix match would wrongly take it as "inside".
+    sibling = _FakeProc(
+        6161, os.path.join(installed + "2", "bf-data-service", "bf-data-service.exe")
+    )
     env = _enter(
         _resolver_env(meipass, installed, system="Windows", plat="windows")
-        + _psutil_patches([leftover, foreign])
+        + _psutil_patches([leftover, foreign, sibling])
         + [patch("src.aw_manager.os.rename", side_effect=_locking_rename([leftover]))]
     )
     try:
         assert _mgr()._get_binaries_dir() == installed
         assert leftover.terminated, "our own leftover tracker was not stopped"
         assert foreign.alive and not foreign.terminated, "reaped a process outside our install"
+        assert sibling.alive and not sibling.terminated, (
+            "reaped a process in a sibling dir that merely shares the install prefix"
+        )
         for name in ALL_COMPONENTS:
             assert _read(installed, name, ".exe").startswith(b"NEW-"), (
                 f"{name} is still the old binary: the leftover held the tree"
@@ -450,3 +458,71 @@ def test_darwin_reinstall_does_not_reap(tmp_path):
         assert not leftover.terminated
     finally:
         _exit(env)
+
+
+def test_force_restart_applies_a_pending_replace_after_the_reap(tmp_path):
+    """force_restart is the one mid-session route that retries a replace the
+    launch could not land (deferred or failed). It must still apply it."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([])
+    )
+    try:
+        mgr = _mgr()
+        with patch.object(AWManager, "_reap_orphan_processes"), \
+             patch.object(AWManager, "_start_locked", return_value=True):
+            assert mgr.force_restart("test") is True
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"NEW-"), (
+                f"{name}: force_restart did not apply the pending replace"
+            )
+    finally:
+        _exit(env)
+
+
+# --------------------------------------------------------------------------
+# (7) REAL Windows: a real running .exe really locks its directory, and the
+# reap really releases it. Runs on the windows-latest PR leg
+# (windows-tests.yml); everything above models these semantics with fakes.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Win32 process + NTFS lock semantics")
+def test_real_windows_running_tracker_is_reaped_and_tree_replaced(tmp_path):
+    import shutil as _sh
+    import subprocess as _sp
+    import time as _t
+
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    server_dir = os.path.join(installed, "bf-data-service")
+    exe = os.path.join(server_dir, "bf-data-service.exe")
+    ping = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
+    _sh.copyfile(ping, exe)
+    proc = _sp.Popen([exe, "-n", "120", "127.0.0.1"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    try:
+        _t.sleep(1.0)
+        assert proc.poll() is None, "the stand-in tracker did not stay running"
+        # CONTROL: without a reap the tree really is locked. If this rename
+        # succeeds, the premise of the reap is wrong on this Windows.
+        with pytest.raises(OSError):
+            os.rename(server_dir, server_dir + ".probe")
+
+        env = _enter(_resolver_env(meipass, installed, system="Windows", plat="windows"))
+        try:
+            assert _mgr()._get_binaries_dir() == installed
+        finally:
+            _exit(env)
+
+        assert proc.poll() is not None, "our leftover tracker is still running"
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"NEW-"), (
+                f"{name} is still the old binary on real Windows"
+            )
+        assert os.path.isfile(os.path.join(installed, STAMP))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
