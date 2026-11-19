@@ -345,7 +345,8 @@ def test_a_matching_arch_is_not_reinstalled_for_arch_reasons(tmp_path):
     installed = _tracker_tree(tmp_path, _CPU_TYPE_ARM64, "ok-installed")
     bundled = _tracker_tree(tmp_path, _CPU_TYPE_ARM64, "ok-bundled")
     with patch("src.aw_manager.platform.machine", return_value=ARM64), \
-         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False):
+         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False), \
+         patch("src.aw_manager.platform.system", return_value="Darwin"):  # macOS case; the bundle-stamp reason is off there
         assert AWManager._tracker_reinstall_reason(installed, bundled) is None
 
 
@@ -354,7 +355,8 @@ def test_an_intel_mac_keeps_its_x86_trackers(tmp_path):
     installed = _tracker_tree(tmp_path, _CPU_TYPE_X86_64, "intel-installed")
     bundled = _tracker_tree(tmp_path, _CPU_TYPE_X86_64, "intel-bundled")
     with patch("src.aw_manager.platform.machine", return_value=X86_64), \
-         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False):
+         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False), \
+         patch("src.aw_manager.platform.system", return_value="Darwin"):  # macOS case; the bundle-stamp reason is off there
         assert AWManager._tracker_reinstall_reason(installed, bundled) is None
 
 
@@ -368,7 +370,8 @@ def test_an_unreadable_bundle_does_not_trigger_a_reinstall(tmp_path):
         d.mkdir(parents=True)
         (d / (component + _EXE)).write_bytes(b"nope")
     with patch("src.aw_manager.platform.machine", return_value=ARM64), \
-         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False):
+         patch.object(AWManager, "_should_reinstall_for_signing", return_value=False), \
+         patch("src.aw_manager.platform.system", return_value="Darwin"):  # macOS case; the bundle-stamp reason is off there
         assert AWManager._tracker_reinstall_reason(installed, str(bundled)) is None
 
 
