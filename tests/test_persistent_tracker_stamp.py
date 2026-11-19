@@ -242,7 +242,8 @@ def test_failed_replace_backs_off_instead_of_retrying_every_cycle(tmp_path, capl
 
 
 def test_locked_live_tree_is_left_intact(tmp_path):
-    """The Windows lock itself: renaming the live dir aside raises. The old
+    """A locked live dir (antivirus or another open handle; a merely RUNNING
+    .exe does not lock it, see the real-Windows test): renaming it aside raises. The old
     tree must still be complete (capture keeps working) and the stamp absent,
     so a later attempt retries."""
     installed = _tree(tmp_path / "installed", b"OLD-")
@@ -505,10 +506,11 @@ def test_real_windows_running_tracker_is_reaped_and_tree_replaced(tmp_path):
     try:
         _t.sleep(1.0)
         assert proc.poll() is None, "the stand-in tracker did not stay running"
-        # CONTROL: without a reap the tree really is locked. If this rename
-        # succeeds, the premise of the reap is wrong on this Windows.
-        with pytest.raises(OSError):
-            os.rename(server_dir, server_dir + ".probe")
+        # No "the tree is locked" control here, on purpose. One was tried and
+        # windows-latest disproved it (PR #320, job 135563436656: renaming the
+        # directory of a running .exe did NOT raise). So the staged swap is not
+        # blocked by a running tracker; the reap is still required so the NEW
+        # binaries are the ones that start, which the asserts below witness.
 
         env = _enter(_resolver_env(meipass, installed, system="Windows", plat="windows"))
         try:
