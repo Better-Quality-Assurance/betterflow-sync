@@ -1,6 +1,7 @@
 """Manage bundled tracker processes (ActivityWatch components, white-labeled)."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -171,6 +172,26 @@ CAPTURE_UNAVAILABLE_REPORTS = {
 DOWNLOAD_RETRY_MIN_INTERVAL = 300  # 5 minutes
 DOWNLOAD_RETRY_MAX_INTERVAL = 3600  # 1 hour
 
+# Records WHICH bundled tracker tree a persistent install was copied from.
+# Without it a Windows/Linux machine keeps the trackers of its FIRST install
+# forever: `_install_to_persistent` copies once, both other reinstall reasons
+# are macOS-only, and the Windows uninstaller leaves %APPDATA% alone, so neither
+# an update nor an uninstall+reinstall ever replaced them (AW v0.13.2 ->
+# v0.14.0b4 reached no existing Windows machine). See _stamp_reinstall_reason.
+BUNDLE_STAMP_FILE = ".bundle-stamp"
+# A reinstall that FAILED is not retried before this. The reason is recomputed
+# on every _get_binaries_dir call (several per 60s cycle), so without it a
+# replace that keeps failing (a tracker exe locked by a process we do not own)
+# logs the same ERROR every cycle for the life of the install.
+REINSTALL_RETRY_INTERVAL = 600.0  # 10 minutes
+
+# sha256 of a bundled tracker tree, keyed by its directory. A PyInstaller
+# bundle (`sys._MEIPASS`) is immutable for the life of the process, and the
+# reason is asked several times a minute, so the tree (tens of MB) is hashed
+# once per process instead of once per call.
+_BUNDLE_DIGEST_CACHE: dict[str, Optional[str]] = {}
+_BUNDLE_DIGEST_LOCK = threading.Lock()
+
 
 def _get_platform_key() -> str:
     """The on-disk tracker directory name. Delegates to the one definition.
@@ -233,6 +254,85 @@ def _resolve_binary_path(directory: str, name: str) -> Optional[str]:
         return bundled
 
     return None
+
+
+def _compute_tree_digest(tree_dir: str) -> Optional[str]:
+    """sha256 over every file `_install_to_persistent` would copy from `tree_dir`.
+
+    Content, not a version string: an app version changes on every release
+    even when the trackers are byte-identical (a needless stop/replace per
+    update), and AW_VERSION alone misses a rebuilt or re-signed tree under the
+    same pin. Relative path (POSIX separators, so the digest is host-neutral),
+    size and bytes all feed it, in sorted order. None means "could not tell"
+    (nothing to hash, or a read failed) and must never trigger a reinstall.
+    """
+    h = hashlib.sha256()
+    found = False
+    try:
+        for name in ALL_COMPONENTS:
+            comp = os.path.join(tree_dir, name)
+            if not os.path.isdir(comp):
+                continue
+            entries = []
+            for root, dirs, files in os.walk(comp):
+                dirs.sort()
+                for f in files:
+                    entries.append(os.path.join(root, f))
+            for p in sorted(entries):
+                rel = os.path.relpath(p, tree_dir).replace(os.sep, "/")
+                h.update(rel.encode("utf-8") + b"\0")
+                h.update(str(os.path.getsize(p)).encode("ascii") + b"\0")
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                found = True
+    except OSError as e:
+        logger.warning("Could not hash tracker tree %s: %s", tree_dir, e)
+        return None
+    return h.hexdigest() if found else None
+
+
+def _bundle_tree_digest(bundle_dir: str) -> Optional[str]:
+    """Memoized `_compute_tree_digest` for an (immutable) bundled tree."""
+    with _BUNDLE_DIGEST_LOCK:
+        if bundle_dir in _BUNDLE_DIGEST_CACHE:
+            return _BUNDLE_DIGEST_CACHE[bundle_dir]
+    digest = _compute_tree_digest(bundle_dir)
+    with _BUNDLE_DIGEST_LOCK:
+        # Only a real answer is cached: a transient read failure must not pin
+        # "could not tell" for the life of the process.
+        if digest is not None:
+            _BUNDLE_DIGEST_CACHE[bundle_dir] = digest
+    return digest
+
+
+def _read_bundle_stamp(install_dir: str) -> Optional[str]:
+    """The bundle digest recorded in `install_dir`, or None if absent/unreadable.
+
+    None is deliberately the SAME answer as "a different bundle": an install
+    with no stamp was made by a build that predates stamping, i.e. exactly the
+    stale trees this exists to replace.
+    """
+    path = os.path.join(install_dir, BUNDLE_STAMP_FILE)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        logger.warning("Unreadable tracker bundle stamp %s: %s", path, e)
+        return None
+    digest = data.get("bundle_sha256") if isinstance(data, dict) else None
+    return digest if isinstance(digest, str) and digest else None
+
+
+def _write_bundle_stamp(install_dir: str, digest: str) -> None:
+    """Atomically record which bundle `install_dir` now holds."""
+    path = os.path.join(install_dir, BUNDLE_STAMP_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"bundle_sha256": digest, "aw_version": AW_VERSION}, fh)
+    os.replace(tmp, path)
 
 
 def _find_pids_by_path(binary_path: str) -> list[int]:
@@ -578,6 +678,14 @@ class AWManager:
         # are unrunnable: a sibling that starts fine must not unlatch on behalf
         # of a component that is permanently blind. Guarded by _lifecycle_lock.
         self._exec_failed_components: set[str] = set()
+        # Persistent-tracker reinstall bookkeeping (see _get_binaries_dir).
+        # The reason whose last attempt FAILED, and when; a repeat of the same
+        # reason is not retried before REINSTALL_RETRY_INTERVAL. And the reason
+        # last DEFERRED because our trackers were running, so the deferral is
+        # logged once rather than on every cycle. Guarded by _lifecycle_lock.
+        self._reinstall_failed_reason: Optional[str] = None
+        self._reinstall_failed_at: float = float("-inf")
+        self._reinstall_deferred_reason: Optional[str] = None
 
     @property
     def idle_tracker_blind(self) -> bool:
@@ -1638,12 +1746,18 @@ class AWManager:
                 return False
             logger.warning("Force-restarting tracker stack (%s)", reason or "unspecified")
             self._stop_locked()
-            binaries_dir = self._get_binaries_dir()
+            # Resolve WITHOUT reinstalling first: a pending tracker replace
+            # must not run while the hung server / stray watchers below still
+            # hold their .exe files (Windows refuses the rename, which would
+            # start the retry backoff on exactly the restart meant to heal).
+            binaries_dir = self._get_binaries_dir(reinstall=False)
             if binaries_dir:
                 # Reap a hung server too — in external mode it isn't in
                 # _processes, so _stop_locked() can't reach it.
                 for name in (BF_SERVER, *BF_WATCHERS):
                     self._reap_orphan_processes(name, binaries_dir)
+            # Nothing of ours is running now: apply any pending reinstall.
+            self._get_binaries_dir()
             # Drop external attachment so _start_locked starts our own server
             # if the port is now free after the reap.
             self._using_external = False
@@ -2602,8 +2716,12 @@ class AWManager:
             return age
         return self._get_latest_event_age("aw-watcher-afk")
 
-    def _get_binaries_dir(self) -> Optional[str]:
+    def _get_binaries_dir(self, reinstall: bool = True) -> Optional[str]:
         """Resolve path to tracker binaries directory.
+
+        `reinstall=False` resolves an existing persistent install without
+        replacing it, for a caller that must first reap processes still
+        running from that tree (force_restart).
 
         Priority: persistent install dir > dev path > PyInstaller bundle.
         This order ensures that binaries with existing macOS Accessibility
@@ -2627,7 +2745,7 @@ class AWManager:
             # stable across updates. The user must re-grant Input Monitoring
             # once (the new signing identity is a fresh TCC subject), but it
             # then survives every future update instead of breaking on each one.
-            if getattr(sys, "frozen", False):
+            if reinstall and getattr(sys, "frozen", False):
                 base = os.path.join(sys._MEIPASS, "resources", "trackers", plat)
                 if os.path.isdir(base) and _binaries_present(base):
                     # Log the reason the check actually found, not a fixed
@@ -2636,19 +2754,8 @@ class AWManager:
                     # for the user, and only one of them costs them a re-grant.
                     reason = self._tracker_reinstall_reason(install_dir, base)
                     if reason:
-                        logger.warning("Reinstalling bundled trackers: %s.", reason)
-                        # Read the result. The reason is recomputed every cycle,
-                        # so a silent failure here is not a one-off — it is the
-                        # same warning every 60 seconds for the life of the
-                        # install, with capture dead throughout and nothing in
-                        # the log saying the repair never landed.
-                        if not self._install_to_persistent(base, install_dir):
-                            logger.error(
-                                "Tracker reinstall FAILED — capture stays blocked and "
-                                "this will be retried every cycle. Reason it was "
-                                "attempted: %s.",
-                                reason,
-                            )
+                        with self._lifecycle_lock:
+                            self._reinstall_persistent_locked(base, install_dir, reason)
             return install_dir
 
         # Development: relative to project root (already has permissions)
@@ -2668,6 +2775,65 @@ class AWManager:
                 return base
 
         return None
+
+    def _managed_tracker_running(self) -> bool:
+        """True while any tracker process WE launched is still alive."""
+        return any(p.poll() is None for p in self._processes.values())
+
+    def _reinstall_persistent_locked(self, base: str, install_dir: str, reason: str) -> None:
+        """Replace the persistent trackers with the bundle's, if it is safe now.
+
+        Caller holds _lifecycle_lock. Never raises; the trackers already on
+        disk stay in use whatever happens here.
+
+        Two guards, both because _get_binaries_dir is re-entered several times
+        a minute for the life of the process:
+
+        - **Off macOS, never while our trackers run.** Windows refuses to
+          delete or rename a running .exe, so replacing a live tree failed on
+          every cycle and logged "reinstall FAILED" forever. The replacement is
+          deferred to the next moment nothing of ours is running: every
+          _start_locked resolves binaries BEFORE spawning (app launch, which
+          every update goes through) and force_restart stops the stack AND
+          reaps stray server/watcher processes before it asks for one.
+          macOS keeps its old behaviour (replace immediately): unlinking a
+          running binary is allowed there, and its two reasons are repairs for
+          a tracker that is already blind or cannot start at all.
+        - **A failed attempt is not retried before REINSTALL_RETRY_INTERVAL**,
+          so a tree locked by a process we do not own (a stray tracker from a
+          previous instance) costs one ERROR per ten minutes, not one a cycle.
+        """
+        if platform.system() != "Darwin" and self._managed_tracker_running():
+            if self._reinstall_deferred_reason != reason:
+                logger.info(
+                    "Tracker reinstall deferred until the trackers are next stopped "
+                    "(they are running now): %s.",
+                    reason,
+                )
+                self._reinstall_deferred_reason = reason
+            return
+        if (
+            self._reinstall_failed_reason == reason
+            and time.monotonic() - self._reinstall_failed_at < REINSTALL_RETRY_INTERVAL
+        ):
+            logger.debug("Tracker reinstall backing off after a failure: %s", reason)
+            return
+        logger.warning("Reinstalling bundled trackers: %s.", reason)
+        # Read the result: a silent failure here leaves the stale trackers in
+        # place with nothing in the log saying the repair never landed.
+        if self._install_to_persistent(base, install_dir):
+            self._reinstall_failed_reason = None
+            self._reinstall_failed_at = float("-inf")
+            self._reinstall_deferred_reason = None
+            return
+        self._reinstall_failed_reason = reason
+        self._reinstall_failed_at = time.monotonic()
+        logger.error(
+            "Tracker reinstall FAILED — the existing trackers stay in use and this "
+            "will be retried in %d s. Reason it was attempted: %s.",
+            int(REINSTALL_RETRY_INTERVAL),
+            reason,
+        )
 
     @staticmethod
     def _tracker_team_identifier(binary_path: str) -> Optional[str]:
@@ -2700,8 +2866,11 @@ class AWManager:
     def _tracker_reinstall_reason(cls, install_dir: str, bundle_dir: str) -> Optional[str]:
         """Why the persistent trackers must be replaced, or None to keep them.
 
+        Three reasons, checked in order: architecture, signing (both macOS
+        only) and the bundle stamp (Windows/Linux only, _stamp_reinstall_reason).
+
         Returns a short sentence for the log rather than a bool, because the
-        two reasons need different words and #213 was written after a surface
+        reasons need different words and #213 was written after a surface
         confidently named the wrong cause for 90 minutes. A caller that logs one
         fixed message for every reinstall repeats that mistake one layer down.
 
@@ -2760,7 +2929,47 @@ class AWManager:
                 f"{idle} once after this update"
             )
 
-        return None
+        return cls._stamp_reinstall_reason(install_dir, bundle_dir)
+
+    @staticmethod
+    def _stamp_reinstall_reason(install_dir: str, bundle_dir: str) -> Optional[str]:
+        """Off macOS: replace persistent trackers this build did not ship.
+
+        The persistent copy is made once and then kept, and before this check
+        the only reasons to replace it (architecture, signing) were macOS-only,
+        so a Windows or Linux machine ran the trackers of its FIRST install
+        forever. A missing stamp therefore MUST trigger: every install made
+        before stamping existed has none, and those are the machines to heal.
+
+        **Not on macOS, deliberately.** macOS grants Input Monitoring and
+        Accessibility per binary path + signature, and a replaced binary can
+        lose its grant, costing the user a re-grant on every tracker change.
+        macOS keeps the architecture and signing reasons above, which fire
+        only when the installed copy is genuinely broken. Windows and Linux
+        have no per-binary permission to lose, so replacing is free there.
+
+        Fails toward KEEPING the installed copy when the bundle cannot be
+        hashed ("could not tell" is never "different").
+        """
+        if platform.system() == "Darwin":
+            return None
+        bundled = _bundle_tree_digest(bundle_dir)
+        if bundled is None:
+            return None
+        installed = _read_bundle_stamp(install_dir)
+        if installed == bundled:
+            return None
+        if installed is None:
+            return (
+                "persistent trackers carry no bundle stamp, so they predate this "
+                "build and may be from the first install — replacing them with the "
+                f"trackers this build ships (ActivityWatch {AW_VERSION})"
+            )
+        return (
+            f"persistent trackers (bundle {installed[:12]}) differ from the trackers "
+            f"this build ships (bundle {bundled[:12]}, ActivityWatch {AW_VERSION}) — "
+            "replacing them"
+        )
 
     @classmethod
     def _should_reinstall_for_signing(cls, install_dir: str, bundle_dir: str) -> bool:
@@ -2792,50 +3001,197 @@ class AWManager:
 
         This ensures macOS Accessibility permission (granted per binary path)
         survives app updates, since the persistent path never changes.
+
+        **Staged, then swapped.** Every component is first copied to a sibling
+        staging dir (the slow, failure-prone part), and only then is each live
+        dir renamed aside and the staged one renamed into place. A copy that
+        fails therefore touches nothing live; deleting the live tree first and
+        copying second left a half-written tree whenever the copy died. On
+        Windows the rename of a dir holding a running .exe fails too, and that
+        leaves the old tree intact rather than gone.
+
+        The bundle stamp is removed before the first swap and written only
+        after the whole tree is in place, so an install interrupted between
+        swaps reads as "not this bundle" and a later attempt redoes it.
         """
+        staged: list[tuple[str, str]] = []
         try:
             os.makedirs(install_dir, exist_ok=True)
+            AWManager._sweep_install_leftovers(install_dir)
             for name in ALL_COMPONENTS:
                 src_subdir = os.path.join(source_dir, name)
-                dst_subdir = os.path.join(install_dir, name)
-                if os.path.isdir(src_subdir):
-                    if os.path.isdir(dst_subdir):
-                        shutil.rmtree(dst_subdir)
-                    elif os.path.exists(dst_subdir):
-                        # A LEGACY FLAT install puts a FILE at this path
-                        # (`trackers/darwin/bf-idle-tracker`) rather than a
-                        # directory, so the isdir branch above misses it and
-                        # copytree then raises FileExistsError. Every reinstall
-                        # fails, and because the reason is recomputed each cycle
-                        # the device logs the same warning every 60 seconds and
-                        # never repairs — permanently, on exactly the machines
-                        # #216 exists to rescue.
-                        #
-                        # Removing the launcher is also what fixes RESOLUTION:
-                        # _resolve_binary_path checks the flat path FIRST, so a
-                        # surviving file here would keep winning over the
-                        # bundled tree we are about to write. The flat layout's
-                        # other siblings (`Python`, `libssl…`) are inert once
-                        # the launcher is gone, since nothing resolves to them
-                        # on their own.
-                        os.remove(dst_subdir)
-                    shutil.copytree(src_subdir, dst_subdir)
-                    # Ensure binaries are executable
-                    for root, _, files in os.walk(dst_subdir):
-                        for f in files:
-                            p = os.path.join(root, f)
-                            if os.path.basename(p).startswith("bf-"):
-                                st = os.stat(p)
-                                os.chmod(p, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-                            # Strip quarantine (macOS only; `xattr` does not exist
-                            # on Linux and would raise FileNotFoundError here).
-                            if platform.system() == "Darwin":
-                                subprocess.run(
-                                    ["xattr", "-d", "com.apple.quarantine", p],
-                                    capture_output=True,
-                                )
+                if not os.path.isdir(src_subdir):
+                    continue
+                staging = os.path.join(install_dir, name + ".bf-staging")
+                shutil.copytree(src_subdir, staging)
+                staged.append((name, staging))
+                # Ensure binaries are executable
+                for root, _, files in os.walk(staging):
+                    for f in files:
+                        p = os.path.join(root, f)
+                        if os.path.basename(p).startswith("bf-"):
+                            st = os.stat(p)
+                            os.chmod(p, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                        # Strip quarantine (macOS only; `xattr` does not exist
+                        # on Linux and would raise FileNotFoundError here).
+                        if platform.system() == "Darwin":
+                            subprocess.run(
+                                ["xattr", "-d", "com.apple.quarantine", p],
+                                capture_output=True,
+                            )
+
+            stamp = os.path.join(install_dir, BUNDLE_STAMP_FILE)
+            if os.path.exists(stamp):
+                os.remove(stamp)
+
+            retired: list[str] = []
+            # (live dir, its retired old dir) for every component already
+            # swapped, so a later component's failure can put them back.
+            swapped: list[tuple[str, str]] = []
+            try:
+                AWManager._swap_staged(install_dir, staged, retired, swapped)
+            except OSError:
+                # Without this a failure on a LATER component (a watcher .exe
+                # locked by an orphan after the server already swapped) leaves
+                # a tree that is half new, half old, and our trackers start
+                # from it.
+                AWManager._roll_back_swaps(swapped, retired)
+                raise
+            staged = []
+
+            for old in retired:
+                try:
+                    shutil.rmtree(old)
+                except OSError as e:
+                    # Inert (nothing resolves to a `.bf-old-*` dir) and swept
+                    # by the next install; never a reason to fail this one.
+                    logger.warning("Could not remove retired tracker dir %s: %s", old, e)
+
+            if not _binaries_present(install_dir):
+                logger.warning(f"Tracker install to {install_dir} is incomplete")
+                return False
+            digest = _bundle_tree_digest(source_dir)
+            if digest is not None:
+                _write_bundle_stamp(install_dir, digest)
             logger.info(f"Installed tracker binaries to {install_dir}")
-            return _binaries_present(install_dir)
+            return True
         except Exception as e:
             logger.warning(f"Failed to install trackers to persistent dir: {e}")
+            for _, staging in staged:
+                if not os.path.isdir(staging):
+                    continue  # already swapped into place
+                try:
+                    shutil.rmtree(staging)
+                except OSError as cleanup_err:
+                    logger.warning(
+                        "Could not remove tracker staging dir %s: %s", staging, cleanup_err
+                    )
             return False
+
+    @staticmethod
+    def _roll_back_swaps(swapped: list[tuple[str, str]], retired: list[str]) -> None:
+        """Undo completed swaps, newest first, restoring each old live dir.
+
+        The new copy is moved to a `.bf-old-*` name (swept by the next
+        install). Best-effort per component: a failure is logged, the new copy
+        is put back if the component would otherwise have no tree at all, and
+        the remaining components are still restored.
+        """
+        for dst_subdir, old in reversed(swapped):
+            aside = f"{dst_subdir}.bf-old-rollback-{os.getpid()}-{time.monotonic_ns()}"
+            try:
+                os.rename(dst_subdir, aside)
+                os.rename(old, dst_subdir)
+                retired.remove(old)
+            except OSError as e:
+                logger.error(
+                    "Could not roll back tracker swap of %s (old copy kept at %s): %s",
+                    dst_subdir,
+                    old,
+                    e,
+                )
+                if not os.path.exists(dst_subdir) and os.path.isdir(aside):
+                    try:
+                        os.rename(aside, dst_subdir)
+                    except OSError as restore_err:
+                        logger.error(
+                            "Tracker dir %s is missing after a failed rollback: %s",
+                            dst_subdir,
+                            restore_err,
+                        )
+
+    @staticmethod
+    def _swap_staged(
+        install_dir: str,
+        staged: list[tuple[str, str]],
+        retired: list[str],
+        swapped: list[tuple[str, str]],
+    ) -> None:
+        """Rename each live component aside and its staged copy into place.
+
+        Records every retired old dir in `retired` and every completed swap
+        that has an old dir to restore in `swapped`. On the first failure it
+        puts THAT component's live tree back and raises; the caller rolls
+        back the earlier ones.
+        """
+        for name, staging in staged:
+            dst_subdir = os.path.join(install_dir, name)
+            old = None
+            if os.path.isdir(dst_subdir):
+                old = os.path.join(
+                    install_dir, f"{name}.bf-old-{os.getpid()}-{time.monotonic_ns()}"
+                )
+                os.rename(dst_subdir, old)
+                retired.append(old)
+            elif os.path.exists(dst_subdir):
+                # A LEGACY FLAT install puts a FILE at this path
+                # (`trackers/darwin/bf-idle-tracker`) rather than a
+                # directory, so the rename above is skipped and the swap
+                # below would raise. Every reinstall fails, and because the
+                # reason is recomputed each cycle the device never repairs
+                # — permanently, on exactly the machines #216 exists to
+                # rescue.
+                #
+                # Removing the launcher is also what fixes RESOLUTION:
+                # _resolve_binary_path checks the flat path FIRST, so a
+                # surviving file here would keep winning over the bundled
+                # tree we are about to write. The flat layout's other
+                # siblings (`Python`, `libssl…`) are inert once the
+                # launcher is gone, since nothing resolves to them on their
+                # own.
+                os.remove(dst_subdir)
+            try:
+                os.rename(staging, dst_subdir)
+            except OSError:
+                # Put the live tree back rather than leave this component
+                # with no binary at all.
+                if old is not None and not os.path.exists(dst_subdir):
+                    os.rename(old, dst_subdir)
+                    retired.remove(old)
+                raise
+            if old is not None:
+                swapped.append((dst_subdir, old))
+
+    @staticmethod
+    def _sweep_install_leftovers(install_dir: str) -> None:
+        """Remove staging/retired dirs a previous interrupted install left.
+
+        A leftover staging dir would make the next copytree raise
+        FileExistsError, i.e. one failed install would fail every later one.
+        A retired dir that cannot be removed yet (still locked) is left for
+        the next sweep: it is never resolved as a tracker.
+        """
+        try:
+            entries = os.listdir(install_dir)
+        except OSError as e:
+            logger.warning("Could not list %s for leftover sweep: %s", install_dir, e)
+            return
+        for entry in entries:
+            path = os.path.join(install_dir, entry)
+            if entry.endswith(".bf-staging"):
+                shutil.rmtree(path)  # must succeed, or the copy below fails
+            elif ".bf-old-" in entry:
+                try:
+                    shutil.rmtree(path)
+                except OSError as e:
+                    logger.warning("Could not remove retired tracker dir %s: %s", path, e)
