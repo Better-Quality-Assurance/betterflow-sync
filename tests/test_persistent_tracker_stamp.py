@@ -319,3 +319,134 @@ def test_copy_failure_midway_leaves_the_live_tree_and_a_clean_retry(tmp_path):
         for name in ALL_COMPONENTS:
             assert _read(installed, name).startswith(b"NEW-")
         assert AWManager._tracker_reinstall_reason(installed, bundle) is None
+
+
+# --------------------------------------------------------------------------
+# (6) Launch with OUR OWN leftover tracker still running from the old tree.
+#
+# The case the replace exists for on Windows: the previous instance crashed or
+# was killed, its bf-data-service (and maybe watchers) survived, and they hold
+# their .exe files open. Windows refuses to rename that tree, so before the fix
+# the launch-time replace failed on exactly the machines it targets, and
+# `_start_locked` attached to the old server as "external" and ran the stale
+# trackers for another session. The fix reaps processes whose EXECUTABLE lives
+# in the persistent install dir (never by name) before replacing.
+# --------------------------------------------------------------------------
+
+
+class _FakeProc:
+    """A psutil.Process stand-in. `alive` flips False on terminate/kill."""
+
+    def __init__(self, pid: int, exe: str):
+        self.pid = pid
+        self.info = {"pid": pid, "exe": exe}
+        self.alive = True
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
+        self.alive = False
+
+    def kill(self):
+        self.alive = False
+
+    def is_running(self):
+        return self.alive
+
+
+def _psutil_patches(procs):
+    def wait_procs(ps, timeout=None):
+        gone = [p for p in ps if not p.alive]
+        return gone, [p for p in ps if p.alive]
+
+    return [
+        patch("psutil.process_iter", side_effect=lambda *a, **kw: list(procs)),
+        patch("psutil.wait_procs", side_effect=wait_procs),
+    ]
+
+
+def _locking_rename(holders):
+    """os.rename that refuses to move a component dir while a holder runs from it."""
+    real_rename = os.rename
+
+    def rename(src, dst):
+        base = os.path.basename(src)
+        for p in holders:
+            if p.alive and os.path.dirname(p.info["exe"]) == src:
+                raise PermissionError(32, f"The process cannot access the file ({base})")
+        return real_rename(src, dst)
+
+    return rename
+
+
+def test_leftover_server_holding_the_tree_is_reaped_so_the_replace_lands(tmp_path):
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    leftover = _FakeProc(4242, os.path.join(installed, "bf-data-service", "bf-data-service.exe"))
+    # Same NAME, different install: must never be touched (path-scoped, not by name).
+    foreign_dir = tmp_path / "someone-else" / "bf-data-service"
+    foreign = _FakeProc(5151, str(foreign_dir / "bf-data-service.exe"))
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([leftover, foreign])
+        + [patch("src.aw_manager.os.rename", side_effect=_locking_rename([leftover]))]
+    )
+    try:
+        assert _mgr()._get_binaries_dir() == installed
+        assert leftover.terminated, "our own leftover tracker was not stopped"
+        assert foreign.alive and not foreign.terminated, "reaped a process outside our install"
+        for name in ALL_COMPONENTS:
+            assert _read(installed, name, ".exe").startswith(b"NEW-"), (
+                f"{name} is still the old binary: the leftover held the tree"
+            )
+        assert os.path.isfile(os.path.join(installed, STAMP))
+    finally:
+        _exit(env)
+
+
+def test_launch_starts_our_own_server_after_reaping_the_leftover(tmp_path):
+    """The port must be probed AFTER the reap. Probed before, launch sees the
+    leftover's socket, attaches to it as 'external', and the server it attached
+    to is the one the replace just killed."""
+    installed = _tree(tmp_path / "installed", b"OLD-", ext=".exe")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="windows", ext=".exe")
+    leftover = _FakeProc(4242, os.path.join(installed, "bf-data-service", "bf-data-service.exe"))
+    env = _enter(
+        _resolver_env(meipass, installed, system="Windows", plat="windows")
+        + _psutil_patches([leftover])
+        + [patch("src.aw_manager.os.rename", side_effect=_locking_rename([leftover]))]
+    )
+    try:
+        mgr = _mgr()
+        started = []
+        with patch.object(AWManager, "_port_in_use", side_effect=lambda self=None: leftover.alive), \
+             patch.object(AWManager, "_rosetta_required", return_value=False), \
+             patch.object(AWManager, "_start_component",
+                          side_effect=lambda name, d: started.append((name, d)) or True), \
+             patch.object(AWManager, "_wait_for_server", return_value=True), \
+             patch.object(AWManager, "_reap_orphan_processes"):
+            assert mgr._start_locked() is True
+        assert not mgr._using_external, "attached to the leftover server it just reaped"
+        assert started and started[0] == (awm.BF_SERVER, installed), started
+        assert _read(installed, awm.BF_SERVER, ".exe").startswith(b"NEW-")
+    finally:
+        _exit(env)
+
+
+def test_darwin_reinstall_does_not_reap(tmp_path):
+    """macOS keeps its old behaviour: unlinking a running binary is allowed
+    there, so nothing is killed for a reinstall (control)."""
+    installed = _tree(tmp_path / "installed", b"OLD-")
+    meipass = _frozen_bundle(tmp_path, b"NEW-", plat="darwin")
+    leftover = _FakeProc(4242, os.path.join(installed, "bf-data-service", "bf-data-service"))
+    env = _enter(
+        _resolver_env(meipass, installed, system="Darwin", plat="darwin")
+        + _psutil_patches([leftover])
+    )
+    try:
+        with patch.object(AWManager, "_tracker_reinstall_reason", return_value="arch"), \
+             patch.object(AWManager, "_install_to_persistent", return_value=True):
+            _mgr()._get_binaries_dir()
+        assert not leftover.terminated
+    finally:
+        _exit(env)

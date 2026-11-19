@@ -364,6 +364,71 @@ def _find_pids_by_path(binary_path: str) -> list[int]:
     return pids
 
 
+def _reap_processes_under_dir(install_dir: str, keep: set[int]) -> int:
+    """Stop every process whose EXECUTABLE lives inside ``install_dir``.
+
+    For the persistent tracker replace off macOS: a tracker left running from
+    that tree by a previous instance (crash, force-quit, Task Manager) holds
+    its .exe open, and Windows then refuses to rename the tree, so the replace
+    fails on exactly the machines it exists to heal. Matching on the resolved
+    executable path, never on a process name, means a same-named process from
+    any other install, user or product is never touched. PIDs in ``keep`` are
+    spared. Cross-platform via psutil (``_find_pids_by_path`` is pgrep-only and
+    returns nothing on Windows). Best-effort: returns how many were stopped,
+    and never raises.
+    """
+    try:
+        import psutil
+    except ImportError:
+        logger.debug("psutil unavailable; cannot reap processes under %s", install_dir)
+        return 0
+    try:
+        root = os.path.normcase(os.path.realpath(install_dir))
+    except OSError:
+        return 0
+    victims = []
+    try:
+        for proc in psutil.process_iter(["pid", "exe"]):
+            info = getattr(proc, "info", None) or {}
+            pid, exe = info.get("pid"), info.get("exe")
+            if not exe or pid is None or pid in keep:
+                continue
+            try:
+                exe_norm = os.path.normcase(os.path.realpath(exe))
+                inside = os.path.commonpath([root, exe_norm]) == root and exe_norm != root
+            except (OSError, ValueError):
+                continue  # different drive on Windows, unresolvable path
+            if inside:
+                victims.append(proc)
+    except Exception:
+        logger.debug("process scan under %s failed", install_dir, exc_info=True)
+        return 0
+    if not victims:
+        return 0
+    for proc in victims:
+        logger.warning(
+            "Stopping leftover tracker PID %s running from %s before replacing it",
+            proc.pid,
+            install_dir,
+        )
+        try:
+            proc.terminate()
+        except Exception:
+            logger.debug("terminate PID %s failed", proc.pid, exc_info=True)
+    try:
+        _, alive = psutil.wait_procs(victims, timeout=SHUTDOWN_TIMEOUT)
+        for proc in alive:
+            try:
+                proc.kill()
+            except Exception:
+                logger.debug("kill PID %s failed", proc.pid, exc_info=True)
+        if alive:
+            psutil.wait_procs(alive, timeout=SHUTDOWN_TIMEOUT)
+    except Exception:
+        logger.debug("waiting for reaped trackers failed", exc_info=True)
+    return len(victims)
+
+
 def _terminate_pid(pid: int, grace: float = SHUTDOWN_TIMEOUT) -> None:
     """SIGTERM a pid, then SIGKILL if it outlives the grace period."""
     try:
@@ -1339,7 +1404,21 @@ class AWManager:
             logger.debug("Tracker start refused: capture is suppressed")
             return False
 
-        # Probed BEFORE the Rosetta branch below, not after it. Our managed
+        # Resolved BEFORE the Rosetta gate, and exactly once. _get_binaries_dir
+        # is also the installer: on a frozen macOS build it replaces a stale
+        # x86_64 tracker tree with the bundled arm64 one. Asking the gate first
+        # and resolving afterwards would block that very machine on the trackers
+        # it is about to stop having — capture dead forever on a device whose
+        # whole fix is one directory copy away.
+        binaries_dir = self._get_binaries_dir()
+
+        # AFTER the resolve above, not before it: off macOS a pending tracker
+        # replace first stops our own leftover trackers still running from the
+        # persistent tree (a previous instance's bf-data-service included).
+        # Probed earlier, this saw that leftover's socket and attached to it
+        # as "external", i.e. to the server the replace had just stopped.
+        #
+        # Still probed BEFORE the Rosetta branch below, not after it. Our managed
         # binaries being unrunnable says nothing about whether SOMETHING is
         # capturing on this port: a user who hit the "nothing is being tracked"
         # wall and installed a native arm64 ActivityWatch themselves is
@@ -1351,14 +1430,6 @@ class AWManager:
         # bucket failure. The download-failure path a few lines down has always
         # asked this question in this order; the Rosetta path did not.
         server_already_running = self._port_in_use()
-
-        # Resolved BEFORE the Rosetta gate, and exactly once. _get_binaries_dir
-        # is also the installer: on a frozen macOS build it replaces a stale
-        # x86_64 tracker tree with the bundled arm64 one. Asking the gate first
-        # and resolving afterwards would block that very machine on the trackers
-        # it is about to stop having — capture dead forever on a device whose
-        # whole fix is one directory copy away.
-        binaries_dir = self._get_binaries_dir()
 
         # Trackers this machine cannot execute. Checked BEFORE spawning rather
         # than after 21 identical EBADARCH failures, and reported rather than
@@ -2819,6 +2890,19 @@ class AWManager:
             logger.debug("Tracker reinstall backing off after a failure: %s", reason)
             return
         logger.warning("Reinstalling bundled trackers: %s.", reason)
+        if platform.system() != "Darwin":
+            # Nothing WE launched is running (checked above), but a previous
+            # instance's trackers may still be running from this tree and hold
+            # its .exe files: the launch after a crash, a force-quit or a
+            # Task Manager kill, i.e. the common Windows case. Stop them first,
+            # matched by executable path inside install_dir, never by name.
+            # _start_locked probes the port only AFTER this resolve, so it
+            # starts our own server instead of attaching to the one stopped
+            # here. Not on macOS: renaming a running binary is allowed there
+            # and its reinstall behaviour is unchanged.
+            keep = {os.getpid()}
+            keep.update(p.pid for p in self._processes.values() if p.poll() is None)
+            _reap_processes_under_dir(install_dir, keep)
         # Read the result: a silent failure here leaves the stale trackers in
         # place with nothing in the log saying the repair never landed.
         if self._install_to_persistent(base, install_dir):
