@@ -270,7 +270,8 @@ class _CyclePhase:
     on the FAILURE path it used to run an unbudgeted is_reachable() probe
     (5-20s against a blackholed API) after sync() had spent ~144s — the
     hypothesised cause of that row (#318; the probe and the hours fetch are
-    now skipped when the cycle's last request failed to connect). It can also
+    now skipped when the cycle's last request got no answer — the hours
+    fetch on the success path too). It can also
     call aw_manager.force_restart on an AW bucket failure, so post_sync is not
     network- or block-free in general. Assigning `name` closes the previous
     phase's interval. Only the cycle thread assigns `name` or calls
@@ -1833,9 +1834,9 @@ class SyncCoordinator:
         # Read only by this thread (post_sync), so a plain int is enough. See
         # unreachable_since and _set_sync_failure_state.
         net_mark = network_outcome_mark()
-        # Set on the failure path when this cycle's last request could not
-        # reach the server: the rest of the cycle then makes no more network
-        # calls it has no budget for (#318).
+        # Set after sync() when this cycle's last request got no answer from
+        # the server: the rest of the cycle then makes no more network calls
+        # it has no budget for (#318).
         api_unreachable = False
 
         # Where the cycle is right now, for the watchdog and the cycle-end
@@ -1953,6 +1954,10 @@ class SyncCoordinator:
 
             phase.name = "sync"
             stats = self.sync_engine.sync()
+            # On BOTH branches below: a blackholed API can still yield
+            # success=True (session start swallowed, sends budget-skipped and
+            # queued), and the hours fetch must not connect then either.
+            api_unreachable = unreachable_since(net_mark)
 
             phase.name = "post_sync"
             if stats.aw_bucket_fetch_failed:
@@ -1999,7 +2004,6 @@ class SyncCoordinator:
             else:
                 for err in stats.errors:
                     logger.warning(f"Sync failed: {err}")
-                api_unreachable = unreachable_since(net_mark)
                 self._set_sync_failure_state(
                     stats.errors[0] if stats.errors else "Sync failed",
                     connect_failed=api_unreachable,
@@ -2012,8 +2016,8 @@ class SyncCoordinator:
 
             phase.name = "hours_fetch"
             if api_unreachable:
-                # get_status() would be one more 10s-per-address connect against
-                # an API this cycle just failed to reach, after sync() spent the
+                # get_status() would be one more 10-30s wait on an API this
+                # cycle just failed to reach, after sync() may have spent the
                 # budget — the same overrun as the probe (#318). Show the cache.
                 hours = self.hours.cached_hours_today()
             else:
@@ -2218,8 +2222,8 @@ class SyncCoordinator:
         gets set. Probe reachability: unreachable -> Offline (we're still
         tracking and queuing locally); reachable but failed -> a real Error.
 
-        ``connect_failed``: this cycle's last request could not reach the
-        server (unreachable_since). The probe's answer is
+        ``connect_failed``: this cycle's last request got no answer from the
+        server — connect failure or timeout (unreachable_since). The probe's answer is
         then known, and asking costs 5-20s against a blackholed API, after
         sync() has spent the cycle's network budget — enough to push the cycle
         past _DO_SYNC_DEADLINE in post_sync (#318). So go straight to Offline.

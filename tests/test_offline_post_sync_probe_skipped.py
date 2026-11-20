@@ -27,6 +27,7 @@ import urllib3.util.connection as urllib3_connection
 from src.sync.bf_client import BetterFlowClient
 from src.sync.http_client import BetterFlowClientError
 from src.sync.retry import RetryConfig
+from src.sync.sync_engine import SyncStats
 from src.ui.tray import TrayState
 from tests.test_sync_watchdog_outcome_classification import _CoordinatorHarness
 
@@ -265,3 +266,180 @@ class TestPostSyncProbe(_CoordinatorHarness):
         assert seen["n"] >= 2, "the reset-then-503 sequence did not happen"
         assert self.bf.is_reachable.call_count == 1
         self.tray.set_state.assert_any_call(TrayState.ERROR, "Server returned 503")
+
+    def test_success_shaped_cycle_on_a_blackholed_api_skips_the_hours_fetch(
+        self, monkeypatch
+    ):
+        """sync() can return success=True on a blackholed API: session start
+        fails and is swallowed, sends are budget-skipped and queued without an
+        error. The hours fetch must not connect on that branch either (review
+        round 2 of #321). Real SyncStats, so the success branch really runs."""
+        connects = []
+        sync_done = {"v": False}
+
+        def _connect(address, timeout=None, *args, **kwargs):
+            connects.append((sync_done["v"], timeout))
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(urllib3_connection, "create_connection", _connect)
+        client = BetterFlowClient(
+            api_url="https://api.example.test/api", token="t", device_id="d"
+        )
+        self.coord.bf = client
+        self.coord.hours.bf = client
+        del self.coord._fetch_hours_today
+
+        def _sync(*_a, **_k):
+            with pytest.raises(BetterFlowClientError):
+                client._request("POST", "sessions/start", data={}, retry=False)
+            sync_done["v"] = True
+            return SyncStats(events_queued=4)  # success=True, errors=[]
+
+        self.sync_engine.sync.side_effect = _sync
+        self.coord._do_sync()
+
+        after = [c for c in connects if c[0]]
+        assert after == [], f"connects after sync() returned: {after}"
+        hours_updates = [
+            c.kwargs["hours_today"]
+            for c in self.tray.update_stats.call_args_list
+            if "hours_today" in c.kwargs
+        ]
+        assert hours_updates == ["0h 0m"], hours_updates
+
+    def test_server_that_accepts_and_never_answers_gets_no_more_calls(self):
+        """A hung server or a captive portal holding the port: every request
+        read-times-out, which is not a ConnectionError. The probe and the hours
+        fetch would wait 5 + 5 + 10s more on it (review round 2 of #321)."""
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        accepted = []
+        sync_done = {"v": False}
+        stop = threading.Event()
+
+        def _accept():
+            listener.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    continue
+                accepted.append((sync_done["v"], conn))
+
+        threading.Thread(target=_accept, daemon=True).start()
+        try:
+            client = BetterFlowClient(
+                api_url=f"http://127.0.0.1:{listener.getsockname()[1]}/api",
+                token="t",
+                device_id="d",
+                timeout=1,
+            )
+            self.coord.bf = client
+            self.coord.hours.bf = client
+            del self.coord._fetch_hours_today
+
+            def _sync(*_a, **_k):
+                with pytest.raises(BetterFlowClientError, match="timed out"):
+                    client._request(
+                        "POST", "events/batch", data={"events": []}, retry=False
+                    )
+                sync_done["v"] = True
+                return _failed_stats("Request timed out")
+
+            self.sync_engine.sync.side_effect = _sync
+            self.coord._do_sync()
+        finally:
+            stop.set()
+            listener.close()
+            for _, conn in accepted:
+                conn.close()
+
+        after = [a for a, _ in accepted if a]
+        assert len(after) == 0, f"{len(after)} connection(s) after sync() returned"
+        assert TrayState.QUEUED in self._tray_states(), self._tray_states()
+
+    def test_recovered_connection_error_then_4xx_still_probes(self):
+        """Any HTTP answer clears the mark, not only a 5xx: reset on attempt 1,
+        then a definitive 400."""
+        seen = {"n": 0}
+
+        class _ResetThen400(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ResetThen400)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = BetterFlowClient(
+                api_url=f"http://127.0.0.1:{server.server_address[1]}/api",
+                token="t",
+                device_id="d",
+            )
+
+            def _sync(*_a, **_k):
+                with pytest.raises(BetterFlowClientError, match="400"):
+                    client._request(
+                        "POST",
+                        "events/batch",
+                        data={"events": []},
+                        retry_config_override=RetryConfig(
+                            max_retries=2, base_delay=0.01, jitter=False
+                        ),
+                    )
+                return _failed_stats("Upload rejected")
+
+            self.sync_engine.sync.side_effect = _sync
+            self.coord._do_sync()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert seen["n"] >= 2, "the reset-then-400 sequence did not happen"
+        assert self.bf.is_reachable.call_count == 1
+        self.tray.set_state.assert_any_call(TrayState.ERROR, "Upload rejected")
+
+    def test_sync_raising_with_no_network_failure_still_probes(self):
+        """Control for the except branch: sync() raises with a healthy API and
+        no request failed, so the probe decides — reachable -> Error."""
+        self.sync_engine.sync.side_effect = RuntimeError("bug, not network")
+        self.coord._do_sync()
+
+        assert self.bf.is_reachable.call_count == 1
+        self.tray.set_state.assert_any_call(TrayState.ERROR, "Sync error")
+
+    def test_connect_failure_on_another_thread_does_not_flip_this_cycle(
+        self, monkeypatch
+    ):
+        """The mark is per THREAD: a tray or heartbeat thread failing to connect
+        while this cycle runs must not make this cycle's failure read Offline."""
+        _blackhole(monkeypatch)
+        client = BetterFlowClient(
+            api_url="https://api.example.test/api", token="t", device_id="d"
+        )
+
+        def _other_thread_fails():
+            with pytest.raises(BetterFlowClientError):
+                client._request("GET", "heartbeat", retry=False)
+
+        def _sync(*_a, **_k):
+            t = threading.Thread(target=_other_thread_fails)
+            t.start()
+            t.join()
+            return _failed_stats("Upload rejected")
+
+        self.sync_engine.sync.side_effect = _sync
+        self.coord._do_sync()
+
+        assert self.bf.is_reachable.call_count == 1
+        self.tray.set_state.assert_any_call(TrayState.ERROR, "Upload rejected")
