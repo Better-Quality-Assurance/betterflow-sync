@@ -920,8 +920,12 @@ class BaseApiClient:
                 _note_request_outcome(answered=False)
                 raise _TransientError(classify_connect_failure(e))
             except requests.exceptions.ChunkedEncodingError:
+                # A status line arrived before the body broke: answered.
+                _note_request_outcome(answered=True)
                 raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:
+                # A status line arrived before the body broke: answered.
+                _note_request_outcome(answered=True)
                 raise _TransientError(REASON_DECODING_FAILED)
             except requests.exceptions.Timeout:
                 # Accepted the connection, never answered: see unreachable_since.

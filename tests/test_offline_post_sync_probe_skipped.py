@@ -7,8 +7,11 @@ Error. That probe tries two endpoints at REACHABILITY_TIMEOUT (5s) per resolved
 address and runs after ``sync()`` has spent the cycle's network budget, so
 against a blackholed API it pushed a ~144s cycle past the 150s watchdog.
 
-When this cycle has already seen a connect failure the answer is known: the
-API is unreachable, so the tray reads Offline without asking again.
+When this cycle's last request got no answer at all (connect failure or
+timeout) the answer is known: the API is unreachable, so the tray reads
+Offline without asking again, and no further network call is made. Any HTTP
+answer — any status, even one whose body is then cut off — leaves the probe
+to decide.
 
 The connect failure is produced by the REAL requests/urllib3 path (transport
 stubbed at urllib3's ``create_connection``, as in
@@ -443,3 +446,58 @@ class TestPostSyncProbe(_CoordinatorHarness):
 
         assert self.bf.is_reachable.call_count == 1
         self.tray.set_state.assert_any_call(TrayState.ERROR, "Upload rejected")
+
+    def test_reset_then_truncated_body_still_probes(self):
+        """A status line arrived, then the body was cut off: the server
+        ANSWERED, so the probe decides (review round 3 of #321)."""
+        seen = {"n": 0}
+
+        class _ResetThenTruncated(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b'{"ok": tr')
+                self.wfile.flush()
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ResetThenTruncated)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = BetterFlowClient(
+                api_url=f"http://127.0.0.1:{server.server_address[1]}/api",
+                token="t",
+                device_id="d",
+            )
+
+            def _sync(*_a, **_k):
+                with pytest.raises(BetterFlowClientError) as ei:
+                    client._request(
+                        "POST",
+                        "events/batch",
+                        data={"events": []},
+                        retry_config_override=RetryConfig(
+                            max_retries=2, base_delay=0.01, jitter=False
+                        ),
+                    )
+                return _failed_stats(str(ei.value))
+
+            self.sync_engine.sync.side_effect = _sync
+            self.coord._do_sync()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert seen["n"] >= 2, "the reset-then-truncated sequence did not happen"
+        assert self.bf.is_reachable.call_count == 1
+        assert TrayState.ERROR in self._tray_states(), self._tray_states()
