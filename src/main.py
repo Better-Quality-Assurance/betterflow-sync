@@ -41,8 +41,9 @@ try:
     from .sync.sync_engine import ops_exception_summary, server_status_summary
     from .sync.http_client import (
         BetterFlowAuthError,
-        connect_failure_count,
+        network_outcome_mark,
         transient_failure_counter,
+        unreachable_since,
     )
     from .sync.os_idle import get_system_idle_seconds
     from .sync.input_source import SILENT_NO_EVENT_S
@@ -83,8 +84,9 @@ except ImportError:
     from sync.sync_engine import ops_exception_summary, server_status_summary
     from sync.http_client import (
         BetterFlowAuthError,
-        connect_failure_count,
+        network_outcome_mark,
         transient_failure_counter,
+        unreachable_since,
     )
     from sync.os_idle import get_system_idle_seconds
     from sync.input_source import SILENT_NO_EVENT_S
@@ -266,10 +268,11 @@ class _CyclePhase:
     whatever stage FOLLOWS the slow one. 2026-11-17: "finished at 153.6s in
     phase 'post_sync'". post_sync does no network I/O on the success path, but
     on the FAILURE path it used to run an unbudgeted is_reachable() probe
-    (5-20s against a blackholed API) after sync() had spent ~144s — the likely
-    cause of that row (#318; the probe is now skipped when the cycle already
-    failed to connect). It can also call aw_manager.force_restart on an AW
-    bucket failure, so post_sync is not network- or block-free in general. Assigning `name` closes the previous
+    (5-20s against a blackholed API) after sync() had spent ~144s — the
+    hypothesised cause of that row (#318; the probe and the hours fetch are
+    now skipped when the cycle's last request failed to connect). It can also
+    call aw_manager.force_restart on an AW bucket failure, so post_sync is not
+    network- or block-free in general. Assigning `name` closes the previous
     phase's interval. Only the cycle thread assigns `name` or calls
     `timings()`; the watchdog Timer reads `name` alone.
     """
@@ -1826,10 +1829,14 @@ class SyncCoordinator:
         # failures can't misclassify the cycle that replaced it.
         cycle_transients = transient_failure_counter()
         transient_at_cycle_start = cycle_transients.value
-        # Requests that never reached the server, this thread. Read only by
-        # this thread (post_sync), so a plain int snapshot is enough. See
-        # connect_failure_count and _set_sync_failure_state.
-        connect_failures_at_cycle_start = connect_failure_count()
+        # Where this thread's request-outcome sequence stood at cycle start.
+        # Read only by this thread (post_sync), so a plain int is enough. See
+        # unreachable_since and _set_sync_failure_state.
+        net_mark = network_outcome_mark()
+        # Set on the failure path when this cycle's last request could not
+        # reach the server: the rest of the cycle then makes no more network
+        # calls it has no budget for (#318).
+        api_unreachable = False
 
         # Where the cycle is right now, for the watchdog and the cycle-end
         # outcome report. Per-cycle box, never an instance attribute — see
@@ -1992,11 +1999,10 @@ class SyncCoordinator:
             else:
                 for err in stats.errors:
                     logger.warning(f"Sync failed: {err}")
+                api_unreachable = unreachable_since(net_mark)
                 self._set_sync_failure_state(
                     stats.errors[0] if stats.errors else "Sync failed",
-                    connect_failed=(
-                        connect_failure_count() > connect_failures_at_cycle_start
-                    ),
+                    connect_failed=api_unreachable,
                 )
                 # The WHOLE list, not errors[0]: server_status_summary names every
                 # kind it recognises, and the first reason may be the one producer
@@ -2005,7 +2011,13 @@ class SyncCoordinator:
                 self._note_sync_failure(stats.errors or "Sync failed")
 
             phase.name = "hours_fetch"
-            hours = self._fetch_hours_today()
+            if api_unreachable:
+                # get_status() would be one more 10s-per-address connect against
+                # an API this cycle just failed to reach, after sync() spent the
+                # budget — the same overrun as the probe (#318). Show the cache.
+                hours = self.hours.cached_hours_today()
+            else:
+                hours = self._fetch_hours_today()
             self.tray.update_stats(
                 hours_today=hours if hours is not None else "---",
                 last_sync=datetime.now().strftime("%H:%M"),
@@ -2033,9 +2045,7 @@ class SyncCoordinator:
             logger.exception(f"Sync error: {e}")
             self._set_sync_failure_state(
                 "Sync error",
-                connect_failed=(
-                    connect_failure_count() > connect_failures_at_cycle_start
-                ),
+                connect_failed=unreachable_since(net_mark),
             )
             self._note_sync_failure("Sync error", exc=e)
         finally:
@@ -2208,13 +2218,14 @@ class SyncCoordinator:
         gets set. Probe reachability: unreachable -> Offline (we're still
         tracking and queuing locally); reachable but failed -> a real Error.
 
-        ``connect_failed``: this cycle already had a request that could not
-        reach the server (connect_failure_count moved). The probe's answer is
+        ``connect_failed``: this cycle's last request could not reach the
+        server (unreachable_since). The probe's answer is
         then known, and asking costs 5-20s against a blackholed API, after
         sync() has spent the cycle's network budget — enough to push the cycle
         past _DO_SYNC_DEADLINE in post_sync (#318). So go straight to Offline.
         A 5xx is NOT a connect failure: the server answered, and the probe still
-        decides between Offline and Error.
+        decides between Offline and Error — also when an earlier attempt in the
+        cycle hit a connection error and a later one got the 5xx.
         """
         if connect_failed:
             # No text: the label is STATUS_TEXT_STATES[QUEUED].

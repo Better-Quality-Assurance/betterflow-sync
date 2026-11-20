@@ -26,6 +26,7 @@ import urllib3.util.connection as urllib3_connection
 
 from src.sync.bf_client import BetterFlowClient
 from src.sync.http_client import BetterFlowClientError
+from src.sync.retry import RetryConfig
 from src.ui.tray import TrayState
 from tests.test_sync_watchdog_outcome_classification import _CoordinatorHarness
 
@@ -170,3 +171,97 @@ class TestPostSyncProbe(_CoordinatorHarness):
 
         assert self.bf.is_reachable.call_count == 0
         assert TrayState.QUEUED in self._tray_states(), self._tray_states()
+
+    def test_no_network_call_after_sync_returns_on_a_blackholed_api(
+        self, monkeypatch
+    ):
+        """End to end, with a REAL client wherever the coordinator talks to the
+        API (the probe and the hours fetch), not the harness's mocks. Skipping
+        the probe alone left hours_fetch's get_status(): one more 10s connect
+        per address after sync() had spent the budget (review of #321)."""
+        connects = []
+        sync_done = {"v": False}
+
+        def _connect(address, timeout=None, *args, **kwargs):
+            connects.append((sync_done["v"], timeout))
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(urllib3_connection, "create_connection", _connect)
+        client = BetterFlowClient(
+            api_url="https://api.example.test/api", token="t", device_id="d"
+        )
+        self.coord.bf = client
+        self.coord.hours.bf = client
+        del self.coord._fetch_hours_today  # un-stub the harness's hours mock
+
+        def _sync(*_a, **_k):
+            with pytest.raises(BetterFlowClientError):
+                client._request("POST", "events/batch", data={"events": []}, retry=False)
+            sync_done["v"] = True
+            return _failed_stats()
+
+        self.sync_engine.sync.side_effect = _sync
+        self.coord._do_sync()
+
+        after = [c for c in connects if c[0]]
+        assert after == [], f"connects after sync() returned: {after}"
+        assert TrayState.QUEUED in self._tray_states(), self._tray_states()
+        # The tray still gets the (cached) hours value.
+        hours_updates = [
+            c.kwargs["hours_today"]
+            for c in self.tray.update_stats.call_args_list
+            if "hours_today" in c.kwargs
+        ]
+        assert hours_updates == ["0h 0m"], hours_updates
+
+    def test_recovered_connection_error_then_503_still_probes(self):
+        """A stale keep-alive reset on attempt 1, then the server answers 503
+        until the chain is exhausted. The server ANSWERED: the probe decides,
+        and a reachable server with a failed sync is an Error — not Offline
+        because one attempt earlier in the cycle could not connect."""
+        seen = {"n": 0}
+
+        class _ResetThen503(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ResetThen503)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = BetterFlowClient(
+                api_url=f"http://127.0.0.1:{server.server_address[1]}/api",
+                token="t",
+                device_id="d",
+            )
+
+            def _sync(*_a, **_k):
+                with pytest.raises(BetterFlowClientError, match="503"):
+                    client._request(
+                        "POST",
+                        "events/batch",
+                        data={"events": []},
+                        retry_config_override=RetryConfig(
+                            max_retries=2, base_delay=0.01, jitter=False
+                        ),
+                    )
+                return _failed_stats("Server returned 503")
+
+            self.sync_engine.sync.side_effect = _sync
+            self.coord._do_sync()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        assert seen["n"] >= 2, "the reset-then-503 sequence did not happen"
+        assert self.bf.is_reachable.call_count == 1
+        self.tray.set_state.assert_any_call(TrayState.ERROR, "Server returned 503")
