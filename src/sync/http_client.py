@@ -81,8 +81,10 @@ __all__ = [
     "BetterFlowAuthError",
     "CredentialsChangedError",
     "resolve_ca_bundle",
+    "network_outcome_mark",
     "transient_failure_count",
     "transient_failure_counter",
+    "unreachable_since",
 ]
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,42 @@ def transient_failure_count() -> int:
     snapshot it and check whether it moved.
     """
     return transient_failure_counter().value
+
+
+def network_outcome_mark() -> int:
+    """A position in the calling thread's sequence of request outcomes.
+
+    Pass it to unreachable_since() later ON THE SAME THREAD.
+    """
+    return getattr(_thread_state, "net_seq", 0)
+
+
+def unreachable_since(mark: int) -> bool:
+    """True when this thread made a request after ``mark`` and its LATEST
+    request got no HTTP response at all: a connect failure or a timeout.
+
+    Narrower than the transient tally above, on purpose. That one also counts
+    5xx/503 answers, where the server DID respond, and every failed attempt in
+    a chain. Here any HTTP response (any status, 503 or 4xx included) clears
+    the mark, and only ``requests.exceptions.ConnectionError`` (DNS, refused,
+    connect timeout, reset before a response) or ``Timeout`` (a server or
+    middlebox that accepts the connection and never answers) sets it. So a
+    stale keep-alive reset followed by a 503 on retry reads as "reachable".
+    Accepted trade-off: a slow-but-up server whose upload read-times-out
+    reads as unreachable (tray Offline, not Error); the probe would have
+    spent 5-10s more to say otherwise.
+    SyncCoordinator._do_sync uses it after a failed sync to show Offline
+    without spending unbudgeted network calls (the reachability probe, the
+    hours fetch) past the cycle's network budget (#318).
+    """
+    return network_outcome_mark() > mark and getattr(
+        _thread_state, "last_outcome_unanswered", False
+    )
+
+
+def _note_request_outcome(*, answered: bool) -> None:
+    _thread_state.net_seq = network_outcome_mark() + 1
+    _thread_state.last_outcome_unanswered = not answered
 
 
 # ---- TLS CA bundle resolution -----------------------------------------------
@@ -819,6 +857,8 @@ class BaseApiClient:
                 if session is None:
                     raise BetterFlowClientError("Client has been closed")
                 response = session.request(method, url, **kwargs)
+                # The server answered (any status): see unreachable_since.
+                _note_request_outcome(answered=True)
 
                 if response.status_code == 401:
                     raise BetterFlowAuthError("Invalid or expired API token")
@@ -877,12 +917,19 @@ class BaseApiClient:
                 # Every cause, DNS included, is transient and retried; only
                 # the name differs (classify_connect_failure says why DNS is
                 # retried).
+                _note_request_outcome(answered=False)
                 raise _TransientError(classify_connect_failure(e))
             except requests.exceptions.ChunkedEncodingError:
+                # A status line arrived before the body broke: answered.
+                _note_request_outcome(answered=True)
                 raise _TransientError(REASON_CONNECTION_DROPPED)
             except requests.exceptions.ContentDecodingError:
+                # A status line arrived before the body broke: answered.
+                _note_request_outcome(answered=True)
                 raise _TransientError(REASON_DECODING_FAILED)
             except requests.exceptions.Timeout:
+                # Accepted the connection, never answered: see unreachable_since.
+                _note_request_outcome(answered=False)
                 raise _TransientError(REASON_TIMEOUT)
             except requests.exceptions.HTTPError as e:
                 error_detail = ""

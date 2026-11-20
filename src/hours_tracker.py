@@ -59,6 +59,11 @@ class HoursTracker:
             with self._state_lock:
                 return self._hours_today_cache
 
+    def cached_hours_today(self) -> str:
+        """The last successfully fetched value, with no network call."""
+        with self._state_lock:
+            return self._hours_today_cache
+
     def refresh_hours_today(self, *, logged_in: bool) -> None:
         """Refresh tray hours from server.
 
