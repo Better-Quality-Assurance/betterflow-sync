@@ -39,7 +39,11 @@ try:
     from .reminders import ReminderManager
     from .sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from .sync.sync_engine import ops_exception_summary, server_status_summary
-    from .sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from .sync.http_client import (
+        BetterFlowAuthError,
+        connect_failure_count,
+        transient_failure_counter,
+    )
     from .sync.os_idle import get_system_idle_seconds
     from .sync.input_source import SILENT_NO_EVENT_S
     from .system_events import start_system_event_listener
@@ -77,7 +81,11 @@ except ImportError:
     from reminders import ReminderManager
     from sync import AWClient, BetterFlowClient, OfflineQueue, SyncEngine
     from sync.sync_engine import ops_exception_summary, server_status_summary
-    from sync.http_client import BetterFlowAuthError, transient_failure_counter
+    from sync.http_client import (
+        BetterFlowAuthError,
+        connect_failure_count,
+        transient_failure_counter,
+    )
     from sync.os_idle import get_system_idle_seconds
     from sync.input_source import SILENT_NO_EVENT_S
     from system_events import start_system_event_listener
@@ -256,8 +264,12 @@ class _CyclePhase:
     It also accumulates the seconds spent in each phase (`timings()`), because
     `at_deadline` alone misleads on a marginal overrun: the deadline passes in
     whatever stage FOLLOWS the slow one. 2026-11-17: "finished at 153.6s in
-    phase 'post_sync'", where post_sync does no network I/O on the success
-    path and the ~150s had gone earlier. Assigning `name` closes the previous
+    phase 'post_sync'". post_sync does no network I/O on the success path, but
+    on the FAILURE path it used to run an unbudgeted is_reachable() probe
+    (5-20s against a blackholed API) after sync() had spent ~144s — the likely
+    cause of that row (#318; the probe is now skipped when the cycle already
+    failed to connect). It can also call aw_manager.force_restart on an AW
+    bucket failure, so post_sync is not network- or block-free in general. Assigning `name` closes the previous
     phase's interval. Only the cycle thread assigns `name` or calls
     `timings()`; the watchdog Timer reads `name` alone.
     """
@@ -1814,6 +1826,10 @@ class SyncCoordinator:
         # failures can't misclassify the cycle that replaced it.
         cycle_transients = transient_failure_counter()
         transient_at_cycle_start = cycle_transients.value
+        # Requests that never reached the server, this thread. Read only by
+        # this thread (post_sync), so a plain int snapshot is enough. See
+        # connect_failure_count and _set_sync_failure_state.
+        connect_failures_at_cycle_start = connect_failure_count()
 
         # Where the cycle is right now, for the watchdog and the cycle-end
         # outcome report. Per-cycle box, never an instance attribute — see
@@ -1977,7 +1993,10 @@ class SyncCoordinator:
                 for err in stats.errors:
                     logger.warning(f"Sync failed: {err}")
                 self._set_sync_failure_state(
-                    stats.errors[0] if stats.errors else "Sync failed"
+                    stats.errors[0] if stats.errors else "Sync failed",
+                    connect_failed=(
+                        connect_failure_count() > connect_failures_at_cycle_start
+                    ),
                 )
                 # The WHOLE list, not errors[0]: server_status_summary names every
                 # kind it recognises, and the first reason may be the one producer
@@ -2012,7 +2031,12 @@ class SyncCoordinator:
             self._handle_auth_error(e, source="sync")
         except Exception as e:
             logger.exception(f"Sync error: {e}")
-            self._set_sync_failure_state("Sync error")
+            self._set_sync_failure_state(
+                "Sync error",
+                connect_failed=(
+                    connect_failure_count() > connect_failures_at_cycle_start
+                ),
+            )
             self._note_sync_failure("Sync error", exc=e)
         finally:
             # Clear the wedge stamp only if we're still the current holder — a
@@ -2173,7 +2197,9 @@ class SyncCoordinator:
         except Exception:
             logger.debug("overrun-outcome report failed", exc_info=True)
 
-    def _set_sync_failure_state(self, error_message: str) -> None:
+    def _set_sync_failure_state(
+        self, error_message: str, *, connect_failed: bool = False
+    ) -> None:
         """Pick the right tray state for a failed sync.
 
         No internet should read "Offline", not "Error" — including the common
@@ -2181,7 +2207,19 @@ class SyncCoordinator:
         the OS network monitor doesn't always report, so paused_by_network never
         gets set. Probe reachability: unreachable -> Offline (we're still
         tracking and queuing locally); reachable but failed -> a real Error.
+
+        ``connect_failed``: this cycle already had a request that could not
+        reach the server (connect_failure_count moved). The probe's answer is
+        then known, and asking costs 5-20s against a blackholed API, after
+        sync() has spent the cycle's network budget — enough to push the cycle
+        past _DO_SYNC_DEADLINE in post_sync (#318). So go straight to Offline.
+        A 5xx is NOT a connect failure: the server answered, and the probe still
+        decides between Offline and Error.
         """
+        if connect_failed:
+            # No text: the label is STATUS_TEXT_STATES[QUEUED].
+            self.tray.set_state(TrayState.QUEUED)
+            return
         try:
             reachable = self.bf.is_reachable()
         except Exception:

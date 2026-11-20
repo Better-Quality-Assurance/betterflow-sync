@@ -81,6 +81,7 @@ __all__ = [
     "BetterFlowAuthError",
     "CredentialsChangedError",
     "resolve_ca_bundle",
+    "connect_failure_count",
     "transient_failure_count",
     "transient_failure_counter",
 ]
@@ -158,6 +159,25 @@ def transient_failure_count() -> int:
     snapshot it and check whether it moved.
     """
     return transient_failure_counter().value
+
+
+def connect_failure_count() -> int:
+    """The calling thread's count of requests that never reached the server.
+
+    Narrower than the transient tally above, on purpose: that one also counts
+    5xx/503 answers, where the server DID respond. This counts only
+    ``requests.exceptions.ConnectionError`` (DNS, refused, connect timeout,
+    reset before a response) — the failures that already answer "is the API
+    reachable?" with no. SyncCoordinator._do_sync snapshots it at cycle start
+    so a failed cycle that could not connect shows Offline without spending an
+    unbudgeted reachability probe after sync() (#318). Monotonic per thread;
+    meaningful only as a delta between two reads on the same thread.
+    """
+    return getattr(_thread_state, "connect_failures", 0)
+
+
+def _note_connect_failure() -> None:
+    _thread_state.connect_failures = connect_failure_count() + 1
 
 
 # ---- TLS CA bundle resolution -----------------------------------------------
@@ -877,6 +897,7 @@ class BaseApiClient:
                 # Every cause, DNS included, is transient and retried; only
                 # the name differs (classify_connect_failure says why DNS is
                 # retried).
+                _note_connect_failure()
                 raise _TransientError(classify_connect_failure(e))
             except requests.exceptions.ChunkedEncodingError:
                 raise _TransientError(REASON_CONNECTION_DROPPED)
