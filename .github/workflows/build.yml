@@ -281,7 +281,7 @@ jobs:
             dist/${{ matrix.asset_name }}-Update.zip
             dist/${{ matrix.asset_name }}-Setup.exe
             dist/${{ matrix.asset_name }}.AppImage
-          retention-days: 30
+          retention-days: 3
 
       # Best-effort teardown of the throwaway signing keychain + cert, even on
       # failure. Runners are ephemeral, but leaving the cert key around mid-job
