@@ -139,6 +139,19 @@ def _short_name_regex(login: str) -> str:
     return re.escape(stem) + "~[1-9]" + (re.escape("." + ext) if ext else "")
 
 
+def _login_regex(login: str) -> str:
+    """Regex source for every spelling of ``login`` we recognise: the name
+    itself and, for a login with a space or a period or over 8 characters, its
+    8.3 short name. The ONE place that rule lives: _home_regex redacts with it
+    and _residual_regex checks with it, so a spelling added here reaches both."""
+    name = re.escape(login)
+    if len(login) > 8 or re.search(r"[ .]", login):
+        short = _short_name_regex(login)
+        if short:
+            name = f"(?:{name}|{short})"
+    return name
+
+
 def _home_regex(home: str) -> str:
     """Regex source matching ``home`` in every spelling a log or traceback
     carries: any separator run of 1-8 backslashes or a "/" (see _SEP), a UNC
@@ -152,14 +165,56 @@ def _home_regex(home: str) -> str:
     rest = [re.escape(p) for p in parts[1:]]
     login = parts[-1]
     if re.match(r"^[A-Za-z]:$", first):
-        head = f"(?:{re.escape(first)}|{_BS % 2}[^\\\\/\\s\"']+{_BS % 1}{re.escape(first[0])}\\$)"
+        # A UNC admin share, plain (\\\\HOST\\C$) or extended-length
+        # (\\\\?\\UNC\\HOST\\C$, which realpath() returns for a network path).
+        head = (
+            f"(?:{re.escape(first)}|{_BS % 2}(?:\\?{_BS % 1}UNC{_BS % 1})?"
+            f"[^\\\\/\\s\"']+{_BS % 1}{re.escape(first[0])}\\$)"
+        )
     else:
         head = re.escape(first)  # "" for a POSIX home: the leading separator follows
-    if len(parts) > 1 and (len(login) > 8 or re.search(r"[ .]", login)):
-        short = _short_name_regex(login)
-        if short:
-            rest[-1] = f"(?:{rest[-1]}|{short})"
+    if len(parts) > 1:
+        rest[-1] = _login_regex(login)
     return head + "".join(_SEP + r for r in rest)
+
+
+# Where a home path ENDS. A separator, the end of the string, or a character
+# that cannot continue the folder name. Not "any non-name character": a Windows
+# login may hold a space, "(" or "'", so for home C:\\Users\\al the text
+# C:\\Users\\al bundy\\x is ANOTHER user's folder, and replacing the prefix gave
+# "~ bundy\\x" (part of their name kept, the path corrupted; issue #314).
+# So after a non-name character the rest of the component (characters legal in
+# a Windows file name, at most 255) must run out at a terminator, not reach a
+# separator. Text that does reach one is left for _residual_regex to drop.
+# Not handled: a sibling folder at the very END of a string ("...\\al bundy")
+# reads exactly like the home followed by prose, and is redacted.
+# Windows only. A macOS or Linux login cannot hold a space, "(" or "'", so
+# there the plain "not followed by a name character" boundary is exact; the
+# Windows one would read "/Users/al python=/usr/bin" as a folder " python="
+# and drop a line that redacts cleanly.
+_COMPONENT = r"[^\\/\r\n\t\"<>|*?:]"
+_HOME_END_WINDOWS = (
+    r"(?=[\\/]|$|(?![\w.-])" + _COMPONENT + r"{0,255}(?!" + _COMPONENT + r"|[\\/]))"
+)
+_HOME_END_POSIX = r"(?![\w.-])"
+_DROPPED = "[line dropped: unredactable home path]"
+
+
+def _residual_regex(home: str) -> str:
+    """Regex source matching this user's login still sitting under its parent
+    folder (``Users\\alice``, ``home/alice``, the 8.3 short name too), with any
+    separator run, and no drive or share prefix. Run
+    AFTER the substitution: a hit means a spelling the pattern did not redact,
+    and the line holding it is dropped rather than shipped.
+    The run is unbounded but may only START after a non-separator (the same
+    guard as _BS): with no parent (HOME=/root) an unanchored ``[\\/]+`` would be
+    retried from every offset of a long backslash run, which is quadratic."""
+    parts = [p for p in re.split(r"[\\/]+", home) if p]
+    parent = re.escape(parts[-2]) if len(parts) > 1 else ""
+    return (
+        r"(?<![\w.-])" + parent + r"(?<![\\/])[\\/]+"
+        + _login_regex(parts[-1]) + r"(?![\w.-])"
+    )
 
 
 def strip_home(value: Any) -> Any:
@@ -173,16 +228,28 @@ def strip_home(value: Any) -> Any:
         return value
     # Windows and macOS (APFS) are case-insensitive: /users/alice is the same home.
     flags = re.IGNORECASE if sys.platform in ("win32", "darwin") else 0
-    # Not followed by a name character: home /Users/al must not eat /Users/alice.
-    # The group is load-bearing: without it the lookahead binds only to the LAST
+    # The group is load-bearing: without it the boundary binds only to the LAST
     # alternative, and which spelling is last depends on set (hash) order.
+    end = _HOME_END_WINDOWS if sys.platform == "win32" else _HOME_END_POSIX
     pattern = re.compile(
-        "(?:" + "|".join(_home_regex(h) for h in homes) + r")(?![\w.-])", flags
+        "(?:" + "|".join(_home_regex(h) for h in homes) + ")" + end, flags
     )
+    residual = re.compile("|".join(_residual_regex(h) for h in homes), flags)
+
+    def redact(s: str) -> str:
+        out = pattern.sub("~", s)
+        if not residual.search(out):
+            return out
+        # This user's login is still there in a shape the pattern could not
+        # bound (another user's folder that starts with it, a spelling nothing
+        # here derives). Half a redaction is worse than none, so the LINE goes.
+        return "\n".join(
+            _DROPPED if residual.search(line) else line for line in out.split("\n")
+        )
 
     def walk(v: Any) -> Any:
         if isinstance(v, str):
-            return pattern.sub("~", v)
+            return redact(v)
         if isinstance(v, dict):
             return {walk(k): walk(x) for k, x in v.items()}
         if isinstance(v, (list, tuple)):
