@@ -37,7 +37,9 @@ def test_a_sibling_login_continued_by_a_legal_character_is_never_cut(win, tail):
     s = f'File "C:\\Users\\al{tail}\\AppData\\Local\\a.py", line 3'
     out = error_reporter.strip_home(s)
     # Untouched or dropped whole: never "~ bundy", half of someone else's name.
-    assert out in (s, error_reporter._DROPPED), out
+    # getattr: the pre-fix module has no _DROPPED, and the pre-fix run must fail
+    # on the mangled output, not on an AttributeError.
+    assert out in (s, getattr(error_reporter, "_DROPPED", None)), out
 
 
 @pytest.mark.parametrize(
