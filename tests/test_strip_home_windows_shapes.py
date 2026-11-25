@@ -32,7 +32,9 @@ def win(monkeypatch):
 
 
 @pytest.mark.parametrize("tail", [" bundy", "(work)", "'brien"])
-def test_a_sibling_login_continued_by_a_legal_character_is_never_cut(win, tail):
+def test_a_sibling_login_folder_followed_by_a_separator_is_never_cut(win, tail):
+    # Scope: only a sibling with a separator after it. Named at the end of a
+    # line or before a quote or colon it IS still cut (see _HOME_END_WINDOWS).
     win("C:\\Users\\al", "/c/Users/al")
     s = f'File "C:\\Users\\al{tail}\\AppData\\Local\\a.py", line 3'
     out = error_reporter.strip_home(s)

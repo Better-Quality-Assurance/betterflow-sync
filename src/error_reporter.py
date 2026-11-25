@@ -186,8 +186,12 @@ def _home_regex(home: str) -> str:
 # So after a non-name character the rest of the component (characters legal in
 # a Windows file name, at most 255) must run out at a terminator, not reach a
 # separator. Text that does reach one is left for _residual_regex to drop.
-# Not handled: a sibling folder at the very END of a string ("...\\al bundy")
-# reads exactly like the home followed by prose, and is redacted.
+# Not handled: a sibling folder named WITHOUT a separator after it is still
+# cut. Its name then ends at the end of the string or of a line, or before a
+# quote or colon, which reads exactly like this home followed by text. So
+# str(PermissionError(13, "Access is denied", "C:\\Users\\al bundy")) becomes
+# "... '~ bundy'" and the other person's surname survives. Only a sibling
+# followed by a separator ("C:\\Users\\al bundy\\x") is left whole or dropped.
 # Windows only. A macOS or Linux login cannot hold a space, "(" or "'", so
 # there the plain "not followed by a name character" boundary is exact; the
 # Windows one would read "/Users/al python=/usr/bin" as a folder " python="
