@@ -1297,6 +1297,13 @@ class SyncEngine:
             cp = getattr(self, attr, None)
             if isinstance(cp, _DateTime) and cp < since:
                 setattr(self, attr, since)
+        # Moving the input checkpoint is not enough on its own: the counters
+        # still hold the previous person's keystrokes, the next drain covers
+        # [since, now], and _clip_to_owner cannot see them because the event is
+        # stamped at or after `since` (#294). Same two steps as
+        # _advance_checkpoints_to_now. Unconditional: counts held with no
+        # checkpoint yet (first cycle) are the previous person's too.
+        self._discard_input_counts("account switch")
         discarded = 0
         for detector in (
             getattr(self, "_call_detector", None),
@@ -5466,6 +5473,29 @@ class SyncEngine:
             "last_sync": max(checkpoints.values()).isoformat() if checkpoints else None,
         }
 
+    def _discard_input_counts(self, reason: str) -> None:
+        """Throw away the in-process input counters. The second half of moving
+        the input checkpoint forward: advancing the checkpoint alone leaves the
+        counters holding every keystroke typed before it, and the next drain
+        stamps them on the first span after it. Never raises."""
+        if self.input_source is None:
+            return
+        try:
+            dropped = self.input_source.discard_counts()
+            if any(dropped):
+                # WHETHER a discard happened, never HOW MUCH. Every reason
+                # that reaches this method names a window this machine must not
+                # attribute — private time, a pause, outside working hours, a
+                # different person's session — and betterflow.log is uploaded to
+                # the server on admin request (_upload_requested_logs). An
+                # exact keystroke/click/scroll volume in that tail is a
+                # low-resolution recording of the window we just refused to
+                # record. The reason alone is what a reader needs to debug
+                # the mechanism.
+                logger.info("Discarded buffered in-process input counts on %s", reason)
+        except Exception as e:
+            logger.warning("Discarding in-process input counts failed: %s", e)
+
     def _advance_checkpoints_to_now(self, reason: str) -> None:
         """Fast-forward all known watcher checkpoints to now.
 
@@ -5505,24 +5535,7 @@ class SyncEngine:
         # would no-op and strand them until counting resumed.
         if self._input_inproc_checkpoint is not None:
             self._input_inproc_checkpoint = now
-        if self.input_source is not None:
-            try:
-                dropped = self.input_source.discard_counts()
-                if any(dropped):
-                    # WHETHER a discard happened, never HOW MUCH. Every reason
-                    # that reaches this method names a window this machine
-                    # contractually does not record — private time, a pause,
-                    # outside working hours — and betterflow.log is uploaded to
-                    # the server on admin request (_upload_requested_logs). An
-                    # exact keystroke/click/scroll volume in that tail is a
-                    # low-resolution recording of the window we just refused to
-                    # record. The reason alone is what a reader needs to debug
-                    # the mechanism.
-                    logger.info(
-                        "Discarded buffered in-process input counts on %s", reason
-                    )
-            except Exception as e:
-                logger.warning("Discarding in-process input counts failed: %s", e)
+        self._discard_input_counts(reason)
 
         bucket_ids: set[str] = set()
         buckets: list = []

@@ -630,6 +630,53 @@ class TestOneEgressRule:
         assert leaked == []
 
 
+    def test_input_counts_from_before_a_switch_are_not_uploaded_as_the_next_account(
+        self, tmp_path
+    ):
+        """Issue #294: _on_owner_since moved the input checkpoint up to the
+        switch but left the counters full. The next drain covers [since, now],
+        so Alice's keystrokes went out stamped inside Bob's window, where
+        _clip_to_owner cannot see them."""
+        from src.sync.input_source import InputSource
+
+        class _Backend:
+            def available(self):
+                return True
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        bf = FakeBF()
+        queue = OfflineQueue(db_path=tmp_path / "q.db")
+        mgr = _login_manager(bf, queue)
+        _browser_login(mgr, bf, "alice@corp.test", "tok-alice")
+        cfg = Config()
+        cfg.sync.in_process_input = True
+        eng = SyncEngine(aw=Mock(), bf=bf, queue=queue, config=cfg, time_tracker=Mock())
+        eng.input_source = InputSource(
+            hostname="host", backend=_Backend(), frontmost_app_getter=None
+        )
+        eng._input_inproc_checkpoint = datetime.now(timezone.utc) - timedelta(minutes=5)
+        eng.input_source._on_press(120)  # Alice typing, before the switch
+        eng.input_source._on_click(7)
+        eng.input_source._on_scroll(3)
+        _browser_login(mgr, bf, "bob@corp.test", "tok-bob")
+        with eng._egress_cycle():
+            assert eng.input_source.counts == (0, 0, 0), (
+                "the switch must discard the previous account's counters"
+            )
+            now = datetime.now(timezone.utc) + timedelta(seconds=1)
+            events, _ = eng._build_inproc_input(now)
+        carried = [
+            (e["data"].get("presses"), e["data"].get("clicks"), e["data"].get("scrolls"))
+            for e in events
+        ]
+        assert carried == [], f"Bob's first input events carry Alice's counts: {carried}"
+
+
 class TestNoLockAcrossNetworkIO:
     def test_a_hung_send_blocks_neither_another_send_nor_pause_nor_sign_in(self, tmp_path):
         bf = FakeBF()
