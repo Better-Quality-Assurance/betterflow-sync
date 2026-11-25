@@ -4034,6 +4034,10 @@ class SyncEngine:
         # span itself so the restored ledger still knows what this group covered.
         day = event_date.isoformat()
         self._persist_counted_time(bucket_id, event_key, seconds, day)
+        if not self.config.sync.in_process_window:
+            # Flag off (the default): there is no second source to dedup against,
+            # so skip the extra SQLite write and leave the default path as it was.
+            return
         self._persist_counted_time(
             _WALL_LEDGER_BUCKET_PREFIX + group,
             f"{start.isoformat()}|{bucket_id}|{event_key}",

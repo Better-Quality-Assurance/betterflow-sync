@@ -156,3 +156,23 @@ def test_restart_then_growth_only_credits_new_wall_time():
     eng2, tracker2 = _engine_on(store)
     _credit(eng2, EXTERNAL, _ev(7, T0, 90))
     assert tracker2.seconds == 5
+
+
+def test_flag_off_persists_only_the_per_event_row():
+    """Default installs must not pay for the ledger: one counted_time write per
+    credit, no `__wall_ledger__:` rows."""
+    eng, tracker = _engine()
+    eng.config.sync.in_process_window = False
+    _credit(eng, EXTERNAL, _ev(1, T0, 30))
+    assert tracker.seconds == 30
+    buckets = [c.args[0] for c in eng._persist_counted_time.call_args_list]
+    assert buckets == [EXTERNAL]
+
+
+def test_web_bucket_is_clipped_against_the_inprocess_window_stream():
+    """Pinned on purpose: browser (web) time over wall time the in-process window
+    stream already counted is the same minute, so it is credited once."""
+    eng, tracker = _engine()
+    _credit(eng, eng.window_source.bucket_id, _ev("win-inproc_host_1", T0, 55))
+    _credit(eng, "aw-watcher-web-chrome_host", _ev(9, T0, 55))
+    assert tracker.seconds == 55
