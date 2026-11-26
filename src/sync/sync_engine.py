@@ -43,6 +43,7 @@ try:
     from .protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from .activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from .daily_time_tracker import DailyTimeTracker
+    from .wall_time_ledger import WallTimeLedger
     from .call_detector import CallDetector, CallEvent
     from .foreground_activity import ForegroundActivityDetector, create_detector
     from .mic_activity import MicActivityDetector, create_mic_detector
@@ -68,6 +69,7 @@ except ImportError:
     from sync.protocols import AWClientProtocol, BFClientProtocol, OfflineQueueProtocol
     from sync.activity_analyzer import ActivityAnalyzer, EngagementThresholds
     from sync.daily_time_tracker import DailyTimeTracker
+    from sync.wall_time_ledger import WallTimeLedger
     from sync.call_detector import CallDetector, CallEvent
     from sync.foreground_activity import ForegroundActivityDetector, create_detector
     from sync.mic_activity import MicActivityDetector, create_mic_detector
@@ -154,6 +156,12 @@ _LOCAL_REASON_KINDS: tuple[tuple[str, str], ...] = (
 #: Emitted in place of a kind when a local reason matched none of the prefixes
 #: above. Never derived from the reason text.
 _UNCLASSIFIED_KIND = "unclassified"
+
+#: counted_time rows under this bucket prefix (+ "inproc"/"external") are not
+#: per-event dedup entries but the span a window source group covered, keyed
+#: "<start iso>|<bucket_id>|<event_id>". They re-seed the WallTimeLedger on load
+#: so the cross-source dedup (#300) has the same lifetime as counted-time.
+_WALL_LEDGER_BUCKET_PREFIX = "__wall_ledger__:"
 
 
 def local_reason_kinds(reasons) -> list[str]:
@@ -749,6 +757,10 @@ class SyncEngine:
         # Mutated only on the sync thread.
         self.window_source = None
         self._window_inproc_checkpoint: Optional[datetime] = None
+        # Which wall time each window source group has already credited to the
+        # tray total (#300): the external replay after a blind fallback must not
+        # re-credit what the in-process stream counted.
+        self._wall_time_ledger = WallTimeLedger()
         # NB: the per-cycle "pending" checkpoint is a LOCAL in sync() (threaded
         # build -> commit), not an instance field — see _build_inproc_window for
         # why (wedge re-arm can run two sync()s concurrently).
@@ -2327,8 +2339,14 @@ class SyncEngine:
             persisted = getter(today)
             if not isinstance(persisted, dict):
                 return
+            # The wall-time ledger is rebuilt from the same rows, so it can never
+            # outlive or predate the per-event counts it is reconciled against.
+            self._wall_time_ledger.clear()
             with self._cache_lock:
                 for (bucket_id, event_id), seconds in persisted.items():
+                    if bucket_id.startswith(_WALL_LEDGER_BUCKET_PREFIX):
+                        self._restore_wall_ledger_span(bucket_id, event_id, seconds)
+                        continue
                     self._time_cache[(bucket_id, event_id)] = float(seconds)
             # Housekeeping: drop counts from days we will never replay.
             pruner = getattr(self.queue, "prune_counted_time", None)
@@ -2342,6 +2360,19 @@ class SyncEngine:
                 )
         except Exception as e:  # never let cache restore block startup
             logger.warning("Counted-time cache restore failed: %s", e)
+
+    def _restore_wall_ledger_span(
+        self, ledger_bucket: str, key: str, seconds: float
+    ) -> None:
+        """Re-seed one persisted window-source span into the wall-time ledger."""
+        group = ledger_bucket[len(_WALL_LEDGER_BUCKET_PREFIX):]
+        try:
+            start = datetime.fromisoformat(key.split("|", 1)[0])
+            self._wall_time_ledger.record(
+                group, start, start + timedelta(seconds=float(seconds))
+            )
+        except (ValueError, TypeError) as e:
+            logger.warning("Skipping unreadable wall-ledger row %r: %s", key, e)
 
     def _persist_counted_time(
         self, bucket_id: str, event_id: str, counted_seconds: float, day: str
@@ -2786,25 +2817,9 @@ class SyncEngine:
         # double-counting or undercounting when segmentation changes
         # across cycles (e.g. AFK splits differ between syncs).
         if transformed and total_active_duration > 0:
-            event_date = event.timestamp.astimezone().date()
-            time_key = (bucket_id, str(event.id))
-            time_delta = 0.0
-            with self._cache_lock:
-                prev_counted = self._time_cache.get(time_key, 0.0)
-                delta = total_active_duration - prev_counted
-                if delta > 0:
-                    time_delta = delta
-                    self._time_cache[time_key] = total_active_duration
-            # Persist outside the cache lock to avoid blocking dedup with I/O
-            # (matches _classify_and_count_window's time_delta pattern).
-            if time_delta > 0:
-                self._time_tracker.add_active_time(time_delta, event_date)
-                # Persist the new cumulative so a restart/reconcile doesn't
-                # re-count this event (write-through, outside the cache lock).
-                self._persist_counted_time(
-                    bucket_id, str(event.id), total_active_duration,
-                    event_date.isoformat(),
-                )
+            self._credit_window_time(
+                bucket_id, str(event.id), event.timestamp, total_active_duration
+            )
 
         return transformed
 
@@ -3298,24 +3313,9 @@ class SyncEngine:
             and activity_state is not None
             and activity_state != "inactive"
         ):
-            event_date = event.timestamp.astimezone().date()
-            event_key = str(result["id"])
-            time_key = (bucket_id, event_key)
-            time_delta = 0.0
-            with self._cache_lock:
-                prev_counted = self._time_cache.get(time_key, 0.0)
-                delta = event.duration - prev_counted
-                if delta > 0:
-                    time_delta = delta
-                    self._time_cache[time_key] = event.duration
-            # Persist outside the cache lock to avoid blocking
-            # dedup checks with SQLite I/O
-            if time_delta > 0:
-                self._time_tracker.add_active_time(time_delta, event_date)
-                # Persist cumulative so a restart/reconcile doesn't re-count.
-                self._persist_counted_time(
-                    bucket_id, event_key, event.duration, event_date.isoformat()
-                )
+            self._credit_window_time(
+                bucket_id, str(result["id"]), event.timestamp, event.duration
+            )
 
     def _populate_window_data(self, event: AWEvent, app: Optional[str], data: dict) -> None:
         """Fill ``data`` for a window/web event: app, title, URL (with privacy
@@ -4001,6 +4001,56 @@ class SyncEngine:
             )
         except Exception:
             logger.debug("inproc-window-blind report failed", exc_info=True)
+
+    def _window_source_group(self, bucket_id: str) -> str:
+        in_process = (
+            self.window_source is not None and bucket_id == self.window_source.bucket_id
+        )
+        return "inproc" if in_process else "external"
+
+    def _credit_window_time(
+        self, bucket_id: str, event_key: str, start: datetime, seconds: float
+    ) -> None:
+        """Credit a window event's growth to the tray total, once per wall second.
+
+        The one place both crediting sites go through (#300). ``_time_cache``
+        and the persisted row hold the event's RAW cumulative duration, so a
+        replay or restart is a no-op exactly as before. Only the NEW part of the
+        span, ``[start+prev, start+seconds]``, is claimed in the wall-time
+        ledger, which subtracts whatever the OTHER window source (in-process vs
+        external) already covered, so a blind-probe fallback replay cannot count
+        the same minute twice and a growing event never loses its own time.
+        """
+        time_key = (bucket_id, event_key)
+        with self._cache_lock:
+            prev_counted = self._time_cache.get(time_key, 0.0)
+            if seconds <= prev_counted:
+                return
+            self._time_cache[time_key] = seconds
+        event_date = start.astimezone().date()
+        group = self._window_source_group(bucket_id)
+        credited = self._wall_time_ledger.claim(
+            group,
+            start + timedelta(seconds=prev_counted),
+            start + timedelta(seconds=seconds),
+        )
+        # Tracker and SQLite I/O outside the cache lock (no blocking dedup).
+        if credited > 0:
+            self._time_tracker.add_active_time(credited, event_date)
+        # Persist cumulative so a restart/reconcile doesn't re-count, plus the
+        # span itself so the restored ledger still knows what this group covered.
+        day = event_date.isoformat()
+        self._persist_counted_time(bucket_id, event_key, seconds, day)
+        if not self.config.sync.in_process_window:
+            # Flag off (the default): there is no second source to dedup against,
+            # so skip the extra SQLite write and leave the default path as it was.
+            return
+        self._persist_counted_time(
+            _WALL_LEDGER_BUCKET_PREFIX + group,
+            f"{start.isoformat()}|{bucket_id}|{event_key}",
+            seconds,
+            day,
+        )
 
     def _should_skip_external_window(self) -> bool:
         """Whether to drop the external bf-window-tracker bucket(s) from this
