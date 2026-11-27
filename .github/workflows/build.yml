@@ -281,7 +281,12 @@ jobs:
             dist/${{ matrix.asset_name }}-Update.zip
             dist/${{ matrix.asset_name }}-Setup.exe
             dist/${{ matrix.asset_name }}.AppImage
-          retention-days: 3
+          # One build is ~320 MB and the org's Free-plan artifact quota is
+          # 500 MB, shared by EVERY repo. At 3 days, one or two builds blocked
+          # uploads org-wide (2026-11-22..27). The release job deletes these
+          # once the GitHub Release holds them (release assets do not count
+          # toward the quota); 1 day covers a workflow_dispatch test build.
+          retention-days: 1
 
       # Best-effort teardown of the throwaway signing keychain + cert, even on
       # failure. Runners are ephemeral, but leaving the cert key around mid-job
@@ -298,6 +303,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write  # create the GitHub release + upload assets
+      actions: write   # delete this run's installer artifacts once released
 
     steps:
       - name: Download macOS ARM artifact
@@ -353,3 +359,20 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The installers now live on the GitHub Release, so free the org's
+      # shared artifact quota right away instead of waiting for expiry.
+      # Only this run's four installer artifacts, by exact name.
+      - name: Delete released installer artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "BetterFlow-macOS-arm64" or .name == "BetterFlow-macOS-x86_64" or .name == "BetterFlow-Windows" or .name == "BetterFlow-linux-x86_64") | .id')
+          for id in $ids; do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id"
+            echo "deleted artifact $id"
+          done
